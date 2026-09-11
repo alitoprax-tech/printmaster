@@ -51,7 +51,7 @@ jobs:
 
       - uses: codecov/codecov-action@v7
         with:
-          file: ./common/coverage.out
+          files: ./common/coverage.out
           flags: common
           fail_ci_if_error: false
 
@@ -81,7 +81,7 @@ jobs:
 
       - uses: codecov/codecov-action@v7
         with:
-          file: ./agent/coverage.out
+          files: ./agent/coverage.out
           flags: agent
           fail_ci_if_error: false
 
@@ -111,7 +111,7 @@ jobs:
 
       - uses: codecov/codecov-action@v7
         with:
-          file: ./server/coverage.out
+          files: ./server/coverage.out
           flags: server
           fail_ci_if_error: false
 
@@ -121,7 +121,7 @@ jobs:
 
       - uses: codecov/codecov-action@v7
         with:
-          file: ./server/coverage-integration.out
+          files: ./server/coverage-integration.out
           flags: server-integration
           fail_ci_if_error: false
 
