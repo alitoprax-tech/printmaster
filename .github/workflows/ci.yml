@@ -246,59 +246,47 @@ jobs:
           sleep 10
           docker compose -f docker-compose.e2e.yml ps
 
-      - name: Wait for services
-        run: |
-          echo "Waiting for server..."
-          server_ready=false
-          for i in {1..30}; do
-            if curl -sf http://localhost:9090/health > /dev/null 2>&1; then
-              echo "Server is ready!"
-              server_ready=true
-              break
-            fi
-            echo "Attempt $i: Server not ready yet..."
-            sleep 2
-          done
-          
-          if [ "$server_ready" = false ]; then
-            echo "::error::Server failed to become ready after 30 attempts"
-            echo "Docker logs for server:"
-            docker compose -f tests/docker-compose.e2e.yml logs server
-            exit 1
-          fi
-          
-          echo "Waiting for agent..."
-          agent_ready=false
-          for i in {1..30}; do
-            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
-              echo "Agent is ready!"
-              agent_ready=true
-              break
-            fi
-            echo "Attempt $i: Agent not ready yet..."
-            sleep 2
-          done
-          
-          if [ "$agent_ready" = false ]; then
-            echo "::error::Agent failed to become ready after 30 attempts"
-            echo "Docker logs for agent:"
-            docker compose -f tests/docker-compose.e2e.yml logs agent
-            exit 1
-          fi
+      - name: Wait for services (schema init)
+        run: ./tests/wait_for_e2e_services.sh
 
-      - name: Seed test data
+      # Seed data with the sqlite3 CLI while the servers are stopped. Seeding
+      # while the containers are running caused intermittent "database disk
+      # image is malformed" errors: the Go server holds server.db/agent.db
+      # open in WAL mode via the pure-Go modernc.org/sqlite driver, and
+      # writing into the same file concurrently from the C sqlite3 CLI (a
+      # different SQLite implementation) is an unsafe multi-writer race.
+      - name: Stop containers before seeding
+        working-directory: ./tests
+        run: docker compose -f docker-compose.e2e.yml down
+
+      - name: Seed test data (containers stopped)
         run: |
-          # Containers created the schema on startup, now seed test data
-          # Must seed from inside containers since they own the DB files
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends sqlite3
+
+          # Files are owned by root (container's default user); fold any
+          # pending WAL frames into the main file, then seed.
           echo "Seeding server test data..."
-          docker exec pm-e2e-server sh -c "cat > /tmp/seed.sql && sqlite3 /data/server.db < /tmp/seed.sql" < tests/testdata/seed/server_data.sql
-          
+          sudo sqlite3 tests/testdata/server/server.db "PRAGMA wal_checkpoint(FULL);"
+          sudo sqlite3 tests/testdata/server/server.db < tests/testdata/seed/server_data.sql
+
           echo "Seeding agent test data..."
-          docker exec pm-e2e-agent sh -c "cat > /tmp/seed.sql && sqlite3 /data/agent.db < /tmp/seed.sql" < tests/testdata/seed/agent_data.sql
-          
+          sudo sqlite3 tests/testdata/agent/agent.db "PRAGMA wal_checkpoint(FULL);"
+          sudo sqlite3 tests/testdata/agent/agent.db < tests/testdata/seed/agent_data.sql
+
           echo "Verifying seeded data..."
-          docker exec pm-e2e-server sqlite3 /data/server.db "SELECT 'Server devices: ' || COUNT(*) FROM devices;"
-          docker exec pm-e2e-agent sqlite3 /data/agent.db "SELECT 'Agent devices: ' || COUNT(*) FROM devices;"
+          sudo sqlite3 tests/testdata/server/server.db "SELECT 'Server devices: ' || COUNT(*) FROM devices;"
+          sudo sqlite3 tests/testdata/agent/agent.db "SELECT 'Agent devices: ' || COUNT(*) FROM devices;"
+
+      - name: Restart E2E environment (seeded data)
+        working-directory: ./tests
+        run: |
+          docker compose -f docker-compose.e2e.yml up -d server agent
+          echo "Waiting for services to be healthy..."
+          sleep 10
+          docker compose -f docker-compose.e2e.yml ps
+
+      - name: Wait for services (post-seed)
+        run: ./tests/wait_for_e2e_services.sh
 
       - uses: actions/setup-go@v6
         with:
