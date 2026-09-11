@@ -58,8 +58,9 @@ type Logger struct {
 	rotationPolicy RotationPolicy
 	rateLimiters   map[string]*rateLimiter
 	consoleOutput  bool
-	traceTags      map[string]bool // enabled trace tags for granular filtering
-	onLogCallback  func(LogEntry)  // callback for SSE broadcasting
+	traceTags      map[string]bool  // enabled trace tags for granular filtering
+	onLogCallback  func(LogEntry)   // callback for SSE broadcasting
+	nowFunc        func() time.Time // overridable clock for deterministic tests
 }
 
 // RotationPolicy defines when and how to rotate log files
@@ -86,6 +87,7 @@ func New(level LogLevel, logDir string, maxBufferSize int) *Logger {
 		rateLimiters:  make(map[string]*rateLimiter),
 		consoleOutput: true, // Default to console output
 		traceTags:     make(map[string]bool),
+		nowFunc:       time.Now,
 		rotationPolicy: RotationPolicy{
 			Enabled:    true,
 			MaxSizeMB:  50,
@@ -164,7 +166,7 @@ func (l *Logger) WarnRateLimited(key string, interval time.Duration, msg string,
 		l.rateLimiters[key] = limiter
 	}
 
-	now := time.Now()
+	now := l.nowFunc()
 	if now.Sub(limiter.lastLog) < limiter.interval {
 		l.mu.Unlock()
 		return // Skip this log

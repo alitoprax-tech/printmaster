@@ -13,6 +13,7 @@ func TestLoggerLevels(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	// Log at different levels
@@ -46,6 +47,7 @@ func TestLoggerContext(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	logger.Info("test message", "key1", "value1", "key2", 42)
@@ -69,6 +71,7 @@ func TestLoggerSetLevel(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	logger.Debug("debug1") // Should not appear
@@ -90,6 +93,7 @@ func TestLoggerCircularBuffer(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 5) // Small buffer size
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	// Log more than buffer size
@@ -116,6 +120,7 @@ func TestLoggerFileOutput(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 
 	logger.Info("test message", "key", "value")
 	logger.Close()
@@ -150,14 +155,20 @@ func TestLoggerFileOutput(t *testing.T) {
 func TestLoggerRateLimiting(t *testing.T) {
 	t.Parallel()
 
+	// Uses an injected fake clock instead of real sleeps so the test is
+	// deterministic and immune to scheduler/CPU jitter in the environment.
 	tmpDir := t.TempDir()
 	logger := New(WARN, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
-	// Log same key multiple times rapidly
+	fakeNow := time.Now()
+	logger.nowFunc = func() time.Time { return fakeNow }
+
+	const interval = 1 * time.Second
 	for i := 0; i < 10; i++ {
-		logger.WarnRateLimited("test-key", 1*time.Second, "rate limited message", "count", i)
-		time.Sleep(50 * time.Millisecond)
+		logger.WarnRateLimited("test-key", interval, "rate limited message", "count", i)
+		fakeNow = fakeNow.Add(50 * time.Millisecond)
 	}
 
 	buffer := logger.GetBuffer()
@@ -166,11 +177,11 @@ func TestLoggerRateLimiting(t *testing.T) {
 		t.Errorf("expected 1 log entry due to rate limiting, got %d", len(buffer))
 	}
 
-	// Wait for rate limit to expire
-	time.Sleep(1 * time.Second)
+	// Advance the fake clock past the interval.
+	fakeNow = fakeNow.Add(interval)
 
 	// This should log
-	logger.WarnRateLimited("test-key", 1*time.Second, "rate limited message", "count", 10)
+	logger.WarnRateLimited("test-key", interval, "rate limited message", "count", 10)
 
 	buffer = logger.GetBuffer()
 	if len(buffer) != 2 {
@@ -183,6 +194,7 @@ func TestLoggerDiagnostics(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	// Initially disabled
@@ -210,6 +222,7 @@ func TestLoggerFilteredBuffer(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(TRACE, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	logger.Error("error")
@@ -287,6 +300,7 @@ func TestLoggerRotation(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 100)
+	logger.SetConsoleOutput(false)
 
 	// Test with custom rotation policy - use fractional MB for testing
 	logger.rotationPolicy = RotationPolicy{
@@ -331,6 +345,7 @@ func TestLoggerConcurrency(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	logger := New(INFO, tmpDir, 1000)
+	logger.SetConsoleOutput(false)
 	defer logger.Close()
 
 	// Concurrent logging from multiple goroutines

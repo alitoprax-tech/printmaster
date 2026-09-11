@@ -61,8 +61,9 @@ type Logger struct {
 	rotationPolicy  RotationPolicy
 	rateLimiters    map[string]*rateLimiter
 	consoleOutput   bool
-	traceTags       map[string]bool // enabled trace tags for granular filtering
-	onLogCallback   func(LogEntry)  // callback for SSE broadcasting
+	traceTags       map[string]bool  // enabled trace tags for granular filtering
+	onLogCallback   func(LogEntry)   // callback for SSE broadcasting
+	nowFunc         func() time.Time // overridable clock for deterministic tests
 }
 
 // Global is an optional shared logger instance that components may use directly
@@ -105,6 +106,7 @@ func NewWithComponent(level LogLevel, logDir string, component string, maxBuffer
 		rateLimiters:  make(map[string]*rateLimiter),
 		consoleOutput: true, // Default to console output
 		traceTags:     make(map[string]bool),
+		nowFunc:       time.Now,
 		rotationPolicy: RotationPolicy{
 			Enabled:    true,
 			MaxSizeMB:  50,
@@ -183,7 +185,7 @@ func (l *Logger) WarnRateLimited(key string, interval time.Duration, msg string,
 		l.rateLimiters[key] = limiter
 	}
 
-	now := time.Now()
+	now := l.nowFunc()
 	if now.Sub(limiter.lastLog) < limiter.interval {
 		l.mu.Unlock()
 		return // Skip this log
