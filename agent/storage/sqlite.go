@@ -1033,6 +1033,7 @@ func (s *SQLiteStore) Get(ctx context.Context, serial string) (*Device, error) {
 	var gateway, dhcpServer, discoveryMethod, walkFilename sql.NullString
 	var isUSB, isDefault, isShared, usbWebUIAvailable sql.NullBool
 	var initialPageCount sql.NullInt64
+	var lastScanID sql.NullInt64
 
 	err := s.db.QueryRowContext(ctx, query, serial).Scan(
 		&device.Serial, &device.IP, &manufacturer, &model,
@@ -1040,7 +1041,7 @@ func (s *SQLiteStore) Get(ctx context.Context, serial string) (*Device, error) {
 		&gateway, &dnsJSON, &dhcpServer,
 		&consumablesJSON, &statusJSON,
 		&device.LastSeen, &device.CreatedAt, &device.FirstSeen, &device.IsSaved, &device.Visible,
-		&discoveryMethod, &walkFilename, &device.LastScanID, &rawJSON,
+		&discoveryMethod, &walkFilename, &lastScanID, &rawJSON,
 		&assetNumber, &location, &description, &webUIURL, &lockedFieldsJSON,
 		&deviceType, &sourceType, &isUSB, &initialPageCount,
 		&portName, &driverName, &isDefault, &isShared, &spoolerStatus, &usbWebUIAvailable,
@@ -1064,6 +1065,7 @@ func (s *SQLiteStore) Get(ctx context.Context, serial string) (*Device, error) {
 	device.DHCPServer = dhcpServer.String
 	device.DiscoveryMethod = discoveryMethod.String
 	device.WalkFilename = walkFilename.String
+	device.LastScanID = lastScanID.Int64
 
 	// Unmarshal JSON fields
 	if consumablesJSON.Valid && consumablesJSON.String != "" {
@@ -1417,6 +1419,7 @@ func (s *SQLiteStore) List(ctx context.Context, filter DeviceFilter) ([]*Device,
 		var gateway, dhcpServer, discoveryMethod, walkFilename sql.NullString
 		var isUSB, isDefault, isShared, usbWebUIAvailable sql.NullBool
 		var initialPageCount sql.NullInt64
+		var lastScanID sql.NullInt64
 
 		err := rows.Scan(
 			&device.Serial, &device.IP, &manufacturer, &model,
@@ -1424,7 +1427,7 @@ func (s *SQLiteStore) List(ctx context.Context, filter DeviceFilter) ([]*Device,
 			&gateway, &dnsJSON, &dhcpServer,
 			&consumablesJSON, &statusJSON,
 			&device.LastSeen, &device.CreatedAt, &device.FirstSeen, &device.IsSaved, &device.Visible,
-			&discoveryMethod, &walkFilename, &device.LastScanID, &rawJSON,
+			&discoveryMethod, &walkFilename, &lastScanID, &rawJSON,
 			&assetNumber, &location, &description, &webUIURL, &lockedFieldsJSON,
 			&deviceType, &sourceType, &isUSB, &initialPageCount,
 			&portName, &driverName, &isDefault, &isShared, &spoolerStatus, &usbWebUIAvailable,
@@ -1444,6 +1447,7 @@ func (s *SQLiteStore) List(ctx context.Context, filter DeviceFilter) ([]*Device,
 		device.DHCPServer = dhcpServer.String
 		device.DiscoveryMethod = discoveryMethod.String
 		device.WalkFilename = walkFilename.String
+		device.LastScanID = lastScanID.Int64
 
 		// Unmarshal JSON fields
 		if consumablesJSON.Valid && consumablesJSON.String != "" {
