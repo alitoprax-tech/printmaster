@@ -612,15 +612,17 @@ func (s *BaseStore) GetDevice(ctx context.Context, serial string) (*Device, erro
 	var device Device
 	var consumablesJSON, statusJSON, rawDataJSON sql.NullString
 	var deviceType, sourceType, portName, driverName, spoolerStatus sql.NullString
+	var manufacturer, model, hostname, firmware, macAddress, subnetMask, gateway sql.NullString
+	var discoveryMethod, assetNumber, location, description, webUIURL sql.NullString
 	var isUSB, isDefault, isShared, usbWebUIAvailable sql.NullBool
 
 	err := s.queryRowContext(ctx, query, serial).Scan(
-		&device.Serial, &device.AgentID, &device.IP, &device.Manufacturer,
-		&device.Model, &device.Hostname, &device.Firmware, &device.MACAddress,
-		&device.SubnetMask, &device.Gateway, &consumablesJSON, &statusJSON,
+		&device.Serial, &device.AgentID, &device.IP, &manufacturer,
+		&model, &hostname, &firmware, &macAddress,
+		&subnetMask, &gateway, &consumablesJSON, &statusJSON,
 		&device.LastSeen, &device.FirstSeen, &device.CreatedAt,
-		&device.DiscoveryMethod, &device.AssetNumber, &device.Location,
-		&device.Description, &device.WebUIURL, &rawDataJSON,
+		&discoveryMethod, &assetNumber, &location,
+		&description, &webUIURL, &rawDataJSON,
 		&deviceType, &sourceType, &isUSB, &portName, &driverName,
 		&isDefault, &isShared, &spoolerStatus, &usbWebUIAvailable)
 
@@ -630,6 +632,20 @@ func (s *BaseStore) GetDevice(ctx context.Context, serial string) (*Device, erro
 	if err != nil {
 		return nil, err
 	}
+
+	// Nullable TEXT columns (may be NULL for devices that never reported these fields)
+	device.Manufacturer = manufacturer.String
+	device.Model = model.String
+	device.Hostname = hostname.String
+	device.Firmware = firmware.String
+	device.MACAddress = macAddress.String
+	device.SubnetMask = subnetMask.String
+	device.Gateway = gateway.String
+	device.DiscoveryMethod = discoveryMethod.String
+	device.AssetNumber = assetNumber.String
+	device.Location = location.String
+	device.Description = description.String
+	device.WebUIURL = webUIURL.String
 
 	// Unmarshal JSON fields
 	if consumablesJSON.Valid {
@@ -792,20 +808,36 @@ func (s *BaseStore) scanDevices(rows *sql.Rows) ([]*Device, error) {
 		var device Device
 		var consumablesJSON, statusJSON, rawDataJSON sql.NullString
 		var deviceType, sourceType, portName, driverName, spoolerStatus sql.NullString
+		var manufacturer, model, hostname, firmware, macAddress, subnetMask, gateway sql.NullString
+		var discoveryMethod, assetNumber, location, description, webUIURL sql.NullString
 		var isUSB, isDefault, isShared, usbWebUIAvailable sql.NullBool
 
 		err := rows.Scan(
-			&device.Serial, &device.AgentID, &device.IP, &device.Manufacturer,
-			&device.Model, &device.Hostname, &device.Firmware, &device.MACAddress,
-			&device.SubnetMask, &device.Gateway, &consumablesJSON, &statusJSON,
+			&device.Serial, &device.AgentID, &device.IP, &manufacturer,
+			&model, &hostname, &firmware, &macAddress,
+			&subnetMask, &gateway, &consumablesJSON, &statusJSON,
 			&device.LastSeen, &device.FirstSeen, &device.CreatedAt,
-			&device.DiscoveryMethod, &device.AssetNumber, &device.Location,
-			&device.Description, &device.WebUIURL, &rawDataJSON,
+			&discoveryMethod, &assetNumber, &location,
+			&description, &webUIURL, &rawDataJSON,
 			&deviceType, &sourceType, &isUSB, &portName, &driverName,
 			&isDefault, &isShared, &spoolerStatus, &usbWebUIAvailable)
 		if err != nil {
 			return nil, err
 		}
+
+		// Nullable TEXT columns (may be NULL for devices that never reported these fields)
+		device.Manufacturer = manufacturer.String
+		device.Model = model.String
+		device.Hostname = hostname.String
+		device.Firmware = firmware.String
+		device.MACAddress = macAddress.String
+		device.SubnetMask = subnetMask.String
+		device.Gateway = gateway.String
+		device.DiscoveryMethod = discoveryMethod.String
+		device.AssetNumber = assetNumber.String
+		device.Location = location.String
+		device.Description = description.String
+		device.WebUIURL = webUIURL.String
 
 		// Unmarshal JSON fields
 		if consumablesJSON.Valid {

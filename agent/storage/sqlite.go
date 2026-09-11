@@ -1029,16 +1029,18 @@ func (s *SQLiteStore) Get(ctx context.Context, serial string) (*Device, error) {
 	var consumablesJSON, statusJSON, dnsJSON, rawJSON sql.NullString
 	var assetNumber, location, description, webUIURL, lockedFieldsJSON sql.NullString
 	var deviceType, sourceType, portName, driverName, spoolerStatus sql.NullString
+	var manufacturer, model, hostname, firmware, macAddress, subnetMask sql.NullString
+	var gateway, dhcpServer, discoveryMethod, walkFilename sql.NullString
 	var isUSB, isDefault, isShared, usbWebUIAvailable sql.NullBool
 	var initialPageCount sql.NullInt64
 
 	err := s.db.QueryRowContext(ctx, query, serial).Scan(
-		&device.Serial, &device.IP, &device.Manufacturer, &device.Model,
-		&device.Hostname, &device.Firmware, &device.MACAddress, &device.SubnetMask,
-		&device.Gateway, &dnsJSON, &device.DHCPServer,
+		&device.Serial, &device.IP, &manufacturer, &model,
+		&hostname, &firmware, &macAddress, &subnetMask,
+		&gateway, &dnsJSON, &dhcpServer,
 		&consumablesJSON, &statusJSON,
 		&device.LastSeen, &device.CreatedAt, &device.FirstSeen, &device.IsSaved, &device.Visible,
-		&device.DiscoveryMethod, &device.WalkFilename, &device.LastScanID, &rawJSON,
+		&discoveryMethod, &walkFilename, &device.LastScanID, &rawJSON,
 		&assetNumber, &location, &description, &webUIURL, &lockedFieldsJSON,
 		&deviceType, &sourceType, &isUSB, &initialPageCount,
 		&portName, &driverName, &isDefault, &isShared, &spoolerStatus, &usbWebUIAvailable,
@@ -1050,6 +1052,18 @@ func (s *SQLiteStore) Get(ctx context.Context, serial string) (*Device, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get device: %w", err)
 	}
+
+	// Nullable TEXT columns (may be NULL for devices that never reported these fields)
+	device.Manufacturer = manufacturer.String
+	device.Model = model.String
+	device.Hostname = hostname.String
+	device.Firmware = firmware.String
+	device.MACAddress = macAddress.String
+	device.SubnetMask = subnetMask.String
+	device.Gateway = gateway.String
+	device.DHCPServer = dhcpServer.String
+	device.DiscoveryMethod = discoveryMethod.String
+	device.WalkFilename = walkFilename.String
 
 	// Unmarshal JSON fields
 	if consumablesJSON.Valid && consumablesJSON.String != "" {
@@ -1399,16 +1413,18 @@ func (s *SQLiteStore) List(ctx context.Context, filter DeviceFilter) ([]*Device,
 		var consumablesJSON, statusJSON, dnsJSON, rawJSON sql.NullString
 		var assetNumber, location, description, webUIURL, lockedFieldsJSON sql.NullString
 		var deviceType, sourceType, portName, driverName, spoolerStatus sql.NullString
+		var manufacturer, model, hostname, firmware, macAddress, subnetMask sql.NullString
+		var gateway, dhcpServer, discoveryMethod, walkFilename sql.NullString
 		var isUSB, isDefault, isShared, usbWebUIAvailable sql.NullBool
 		var initialPageCount sql.NullInt64
 
 		err := rows.Scan(
-			&device.Serial, &device.IP, &device.Manufacturer, &device.Model,
-			&device.Hostname, &device.Firmware, &device.MACAddress, &device.SubnetMask,
-			&device.Gateway, &dnsJSON, &device.DHCPServer,
+			&device.Serial, &device.IP, &manufacturer, &model,
+			&hostname, &firmware, &macAddress, &subnetMask,
+			&gateway, &dnsJSON, &dhcpServer,
 			&consumablesJSON, &statusJSON,
 			&device.LastSeen, &device.CreatedAt, &device.FirstSeen, &device.IsSaved, &device.Visible,
-			&device.DiscoveryMethod, &device.WalkFilename, &device.LastScanID, &rawJSON,
+			&discoveryMethod, &walkFilename, &device.LastScanID, &rawJSON,
 			&assetNumber, &location, &description, &webUIURL, &lockedFieldsJSON,
 			&deviceType, &sourceType, &isUSB, &initialPageCount,
 			&portName, &driverName, &isDefault, &isShared, &spoolerStatus, &usbWebUIAvailable,
@@ -1416,6 +1432,18 @@ func (s *SQLiteStore) List(ctx context.Context, filter DeviceFilter) ([]*Device,
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan device: %w", err)
 		}
+
+		// Nullable TEXT columns (may be NULL for devices that never reported these fields)
+		device.Manufacturer = manufacturer.String
+		device.Model = model.String
+		device.Hostname = hostname.String
+		device.Firmware = firmware.String
+		device.MACAddress = macAddress.String
+		device.SubnetMask = subnetMask.String
+		device.Gateway = gateway.String
+		device.DHCPServer = dhcpServer.String
+		device.DiscoveryMethod = discoveryMethod.String
+		device.WalkFilename = walkFilename.String
 
 		// Unmarshal JSON fields
 		if consumablesJSON.Valid && consumablesJSON.String != "" {
