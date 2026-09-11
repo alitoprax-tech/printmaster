@@ -13,7 +13,8 @@ PRAGMA foreign_keys = ON;
 -- ============================================================================
 
 -- Epson WF-C5790 (color inkjet MFP) - from gist data
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+-- Note: page_count/toner_levels live in metrics_raw, not devices (removed in schema migration 6->7)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'CV25P8',
     '192.168.100.108',
@@ -23,8 +24,6 @@ VALUES (
     'Printer FW',
     'B0:E4:D5:B2:A0:AF',
     '255.255.255.0',
-    765,
-    '{"toner_black":39,"toner_cyan":15,"toner_magenta":1,"toner_yellow":14}',
     '["Black Ink Supply Unit 902, 902XL, 902XXL","Cyan Ink Supply Unit 902, 902XL","Magenta Ink Supply Unit 902, 902XL","Yellow Ink Supply Unit 902, 902XL"]',
     datetime('now'),
     datetime('now', '-30 days'),
@@ -36,7 +35,7 @@ VALUES (
 );
 
 -- Kyocera ECOSYS M3655idn (mono laser MFP) - common office workhorse
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'VXF5012345',
     '192.168.100.20',
@@ -46,8 +45,6 @@ VALUES (
     '2US_S000.002.502',
     '00:C0:EE:50:12:34',
     '255.255.255.0',
-    125847,
-    '{"toner_black":68}',
     '["TK-3182 Toner"]',
     datetime('now'),
     datetime('now', '-90 days'),
@@ -59,7 +56,7 @@ VALUES (
 );
 
 -- HP LaserJet Pro M404dn (mono laser)
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'PHCBD82R4K',
     '192.168.100.30',
@@ -69,8 +66,6 @@ VALUES (
     '002.2339A',
     '3C:18:A0:B8:2R:4K',
     '255.255.255.0',
-    45231,
-    '{"toner_black":42}',
     '["HP 58A Black Original LaserJet Toner Cartridge (CF258A)"]',
     datetime('now'),
     datetime('now', '-60 days'),
@@ -82,7 +77,7 @@ VALUES (
 );
 
 -- Brother MFC-L8900CDW (color laser MFP)
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'U64180H8N123456',
     '192.168.100.40',
@@ -92,8 +87,6 @@ VALUES (
     'N',
     '00:80:77:12:34:56',
     '255.255.255.0',
-    28450,
-    '{"toner_black":85,"toner_cyan":62,"toner_magenta":71,"toner_yellow":58,"drum_black":78,"drum_cyan":81,"drum_magenta":79,"drum_yellow":80}',
     '["TN-436BK Black Toner","TN-436C Cyan Toner","TN-436M Magenta Toner","TN-436Y Yellow Toner","DR-431CL Drum Unit"]',
     datetime('now'),
     datetime('now', '-45 days'),
@@ -105,7 +98,7 @@ VALUES (
 );
 
 -- Lexmark MS621dn (mono laser) - warning state, low toner
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     '47TT812',
     '192.168.100.50',
@@ -115,8 +108,6 @@ VALUES (
     'MSNGM.076.293',
     '40:B0:34:47:TT:81',
     '255.255.255.0',
-    89234,
-    '{"toner_black":8}',
     '["56F1000 Black Toner Cartridge"]',
     '["Toner Low"]',
     datetime('now'),
@@ -129,7 +120,7 @@ VALUES (
 );
 
 -- Xerox VersaLink C405 (color laser MFP) - error state, paper jam
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'C1J012345',
     '192.168.100.60',
@@ -139,8 +130,6 @@ VALUES (
     '116.050.008.41600',
     '00:00:AA:C1:J0:12',
     '255.255.255.0',
-    52198,
-    '{"toner_black":45,"toner_cyan":32,"toner_magenta":28,"toner_yellow":51}',
     '["106R03512 Black Toner","106R03513 Cyan Toner","106R03514 Magenta Toner","106R03515 Yellow Toner"]',
     '["Paper Jam in Tray 1"]',
     datetime('now', '-2 hours'),
@@ -153,7 +142,7 @@ VALUES (
 );
 
 -- Epson ST-C8090 (large-format color inkjet)
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'X4MF012345',
     '192.168.100.70',
@@ -163,8 +152,6 @@ VALUES (
     'SC20M2',
     'E0:70:EA:C8:09:00',
     '255.255.255.0',
-    3240,
-    '{"toner_black":95,"toner_cyan":88,"toner_magenta":92,"toner_yellow":87}',
     '["T01C1 Black Ink Pack","T01C2 Cyan Ink Pack","T01C3 Magenta Ink Pack","T01C4 Yellow Ink Pack"]',
     datetime('now'),
     datetime('now', '-15 days'),
@@ -176,7 +163,7 @@ VALUES (
 );
 
 -- Kyocera ECOSYS P2040dw (mono laser, low cost)
-INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, page_count, toner_levels, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
+INSERT INTO devices (serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, consumables, last_seen, created_at, first_seen, is_saved, visible, discovery_method, raw_data)
 VALUES (
     'VXL8123456',
     '192.168.100.80',
@@ -186,8 +173,6 @@ VALUES (
     '2US_S000.002.407',
     '00:C0:EE:81:23:45',
     '255.255.255.0',
-    8234,
-    '{"toner_black":55}',
     '["TK-1172 Toner"]',
     datetime('now'),
     datetime('now', '-20 days'),
@@ -250,16 +235,9 @@ INSERT INTO scan_history (serial, created_at, ip, hostname, firmware, consumable
     ('VXF5012345', datetime('now', '-90 days'), '192.168.100.20', 'KM5012345', '2US_S000.002.502', '["TK-3182 Toner"]', 'snmp'),
     ('PHCBD82R4K', datetime('now', '-60 days'), '192.168.100.30', 'HPB82R4K', '002.2339A', '["HP 58A Black Original LaserJet Toner Cartridge (CF258A)"]', 'snmp');
 
--- ============================================================================
--- SETTINGS - Agent configuration
--- ============================================================================
-
-INSERT INTO settings (key, value, updated_at) VALUES
-    ('server_url', 'http://server:9090', datetime('now')),
-    ('server_enabled', 'true', datetime('now')),
-    ('agent_name', 'e2e-test-agent', datetime('now')),
-    ('scan_interval_minutes', '60', datetime('now')),
-    ('autoupdate_enabled', 'false', datetime('now'));
+-- Note: the agent has no 'settings' table - agent configuration is stored in
+-- config.toml / environment variables, not SQLite, so there is no seed step
+-- for it here.
 
 -- Done
 SELECT 'Agent test data loaded: 8 devices, metrics, scan history' AS status;
