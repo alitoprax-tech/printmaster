@@ -63,7 +63,8 @@ color_yellow=$'\033[33m'
 color_blue=$'\033[34m'
 
 status() {
-  local msg="$1" level="${2:-INFO}" color="$color_blue" display_level="$level"
+  local msg="$1" level="${2:-INFO}" color="$color_blue" display_level
+  display_level="$level"
   case "$level" in
     ERROR) color="$color_red" ;;
     WARN) color="$color_yellow" ;;
