@@ -20,8 +20,6 @@ type PostgresStore struct {
 	timescale *TimescaleSupport // TimescaleDB support (nil if disabled)
 }
 
-const pgSchemaVersion = 10
-
 // NewPostgresStore creates a new PostgreSQL store.
 func NewPostgresStore(cfg *config.DatabaseConfig) (*PostgresStore, error) {
 	if cfg == nil {
@@ -970,15 +968,15 @@ func (s *PostgresStore) initSchema() error {
 		return fmt.Errorf("failed to check schema version: %w", err)
 	}
 
-	if currentVersion < pgSchemaVersion {
+	if currentVersion < currentSchemaVersion {
 		_, err = s.db.Exec("INSERT INTO schema_version (version, applied_at) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
-			pgSchemaVersion, time.Now())
+			currentSchemaVersion, time.Now())
 		if err != nil {
 			return fmt.Errorf("failed to update schema version: %w", err)
 		}
 	}
 
-	logInfo("Schema initialized for PostgreSQL", "schemaVersion", pgSchemaVersion)
+	logInfo("Schema initialized for PostgreSQL", "schemaVersion", currentSchemaVersion)
 
 	return nil
 }

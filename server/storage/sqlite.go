@@ -20,8 +20,6 @@ type SQLiteStore struct {
 	*BaseStore // Embed BaseStore for common operations
 }
 
-const schemaVersion = 9
-
 // NewSQLiteStore creates a new SQLite-backed store
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// Ensure directory exists (unless in-memory)
@@ -820,7 +818,7 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("migrations failed: %w", err)
 	}
 
-	logInfo("Schema initialized for DB", "path", s.dbPath, "schemaVersion", schemaVersion)
+	logInfo("Schema initialized for DB", "path", s.dbPath, "schemaVersion", currentSchemaVersion)
 
 	return nil
 }
@@ -902,9 +900,9 @@ func (s *SQLiteStore) runMigrations() error {
 		return fmt.Errorf("failed to check schema version: %w", err)
 	}
 
-	if currentVersion < schemaVersion {
+	if currentVersion < currentSchemaVersion {
 		_, err = s.db.Exec("INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
-			schemaVersion, time.Now())
+			currentSchemaVersion, time.Now())
 		if err != nil {
 			return fmt.Errorf("failed to update schema version: %w", err)
 		}

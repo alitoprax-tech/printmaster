@@ -11,7 +11,12 @@ import (
 	_ "modernc.org/sqlite" // Ensure driver is imported for BackupAndReset
 )
 
-const targetSchemaVersion = 9
+// targetSchemaVersion is derived from schemaMigrations (defined in sqlite.go)
+// so it can never drift from the versions runMigrations() actually applies.
+// Adding a migration to schemaMigrations is the only change needed to bump it.
+func targetSchemaVersion() int {
+	return latestSchemaVersion()
+}
 
 // expectedSchema defines the target schema structure for auto-migration
 var expectedSchema = map[string][]string{
@@ -43,6 +48,7 @@ var expectedSchema = map[string][]string{
 		"web_ui_url TEXT",
 		"locked_fields TEXT",
 		"raw_data TEXT",
+		"usb_webui_available BOOLEAN DEFAULT 0",
 	},
 	"metrics_history": {
 		"id INTEGER PRIMARY KEY AUTOINCREMENT",
@@ -153,7 +159,8 @@ func (s *SQLiteStore) autoMigrate() error {
 	// Get current schema version
 	currentVersion := s.getCurrentVersion()
 
-	if currentVersion == targetSchemaVersion {
+	target := targetSchemaVersion()
+	if currentVersion == target {
 		if storageLogger != nil {
 			storageLogger.Debug("Schema is up to date", "version", currentVersion)
 		}
@@ -161,11 +168,11 @@ func (s *SQLiteStore) autoMigrate() error {
 	}
 
 	if storageLogger != nil {
-		storageLogger.Info("Schema migration needed", "current", currentVersion, "target", targetSchemaVersion)
+		storageLogger.Info("Schema migration needed", "current", currentVersion, "target", target)
 	}
 
 	// For major changes or unknown versions, offer backup and fresh start
-	if currentVersion > targetSchemaVersion || currentVersion == 0 {
+	if currentVersion > target || currentVersion == 0 {
 		if storageLogger != nil {
 			storageLogger.Warn("Schema version mismatch - database may be from newer version or corrupted")
 		}
@@ -182,13 +189,13 @@ func (s *SQLiteStore) autoMigrate() error {
 
 	// Update version
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)`,
-		targetSchemaVersion, time.Now())
+		target, time.Now())
 	if err != nil {
 		return fmt.Errorf("failed to update schema version: %w", err)
 	}
 
 	if storageLogger != nil {
-		storageLogger.Info("Schema migration completed", "version", targetSchemaVersion)
+		storageLogger.Info("Schema migration completed", "version", target)
 	}
 	return nil
 }

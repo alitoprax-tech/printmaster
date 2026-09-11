@@ -597,8 +597,8 @@ func TestPostgresStore_FreshDatabaseInitialization(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to query schema_version: %v", err)
 			}
-			if version != pgSchemaVersion {
-				t.Errorf("Schema version = %d, want %d", version, pgSchemaVersion)
+			if version != currentSchemaVersion {
+				t.Errorf("Schema version = %d, want %d", version, currentSchemaVersion)
 			}
 		})
 

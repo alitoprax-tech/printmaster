@@ -373,6 +373,36 @@ func (s *SQLiteStore) initSchema() error {
 	return nil
 }
 
+// schemaMigration is a single, ordered schema change. The list below is the
+// single source of truth for the schema version: adding a migration to this
+// slice automatically advances latestSchemaVersion() everywhere it's used
+// (runMigrations here, and the BackupAndReset staleness check in
+// migrations.go), so there's no separate constant to remember to bump.
+type schemaMigration struct {
+	version int
+	apply   func(s *SQLiteStore) error
+}
+
+var schemaMigrations = []schemaMigration{
+	{2, migrateSchemaV2},
+	{3, migrateSchemaV3},
+	{4, migrateSchemaV4},
+	{5, migrateSchemaV5},
+	{6, migrateSchemaV6},
+	{7, migrateSchemaV7},
+	{8, migrateSchemaV8},
+	{9, migrateSchemaV9},
+	{10, migrateSchemaV10},
+}
+
+// latestSchemaVersion returns the highest version defined in schemaMigrations.
+func latestSchemaVersion() int {
+	if len(schemaMigrations) == 0 {
+		return 0
+	}
+	return schemaMigrations[len(schemaMigrations)-1].version
+}
+
 // runMigrations handles schema migrations for existing databases
 func (s *SQLiteStore) runMigrations() error {
 	// Check current version
@@ -383,485 +413,15 @@ func (s *SQLiteStore) runMigrations() error {
 		currentVersion = 0
 	}
 
-	// Migration 1 -> 2: Add visible and first_seen columns
-	if currentVersion < 2 {
-		// Check if devices table exists
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// Add visible column if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN visible BOOLEAN DEFAULT 1`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add visible column: %w", err)
-			}
-
-			// Add first_seen column if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN first_seen DATETIME`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add first_seen column: %w", err)
-			}
-
-			// Populate first_seen with created_at for existing records
-			_, err = s.db.Exec(`UPDATE devices SET first_seen = created_at WHERE first_seen IS NULL`)
-			if err != nil {
-				return fmt.Errorf("failed to populate first_seen: %w", err)
-			}
+	for _, m := range schemaMigrations {
+		if currentVersion >= m.version {
+			continue
 		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (2, ?)`, time.Now())
-		if err != nil {
+		if err := m.apply(s); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)`, m.version, time.Now()); err != nil {
 			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-	}
-
-	// Migration 2 -> 3: Add asset_number, location, and web_ui_url columns
-	if currentVersion < 3 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// Add asset_number column if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN asset_number TEXT`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add asset_number column: %w", err)
-			}
-
-			// Add location column if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN location TEXT`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add location column: %w", err)
-			}
-
-			// Add web_ui_url column if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN web_ui_url TEXT`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add web_ui_url column: %w", err)
-			}
-		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (3, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-	}
-
-	// Migration 3 -> 4: Add locked_fields column for field locking
-	if currentVersion < 4 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// Add locked_fields column (JSON) if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN locked_fields TEXT`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add locked_fields column: %w", err)
-			}
-		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (4, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-	}
-
-	// Migration 4 -> 5: Add detailed impression counter fields to metrics_history
-	if currentVersion < 5 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics_history'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// Add new counter columns
-			columns := []string{
-				"fax_pages INTEGER DEFAULT 0",
-				"copy_pages INTEGER DEFAULT 0",
-				"other_pages INTEGER DEFAULT 0",
-				"copy_mono_pages INTEGER DEFAULT 0",
-				"copy_flatbed_scans INTEGER DEFAULT 0",
-				"copy_adf_scans INTEGER DEFAULT 0",
-				"fax_flatbed_scans INTEGER DEFAULT 0",
-				"fax_adf_scans INTEGER DEFAULT 0",
-				"scan_to_host_flatbed INTEGER DEFAULT 0",
-				"scan_to_host_adf INTEGER DEFAULT 0",
-				"duplex_sheets INTEGER DEFAULT 0",
-				"jam_events INTEGER DEFAULT 0",
-				"scanner_jam_events INTEGER DEFAULT 0",
-			}
-
-			for _, col := range columns {
-				_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE metrics_history ADD COLUMN %s`, col))
-				if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-					return fmt.Errorf("failed to add column %s: %w", col, err)
-				}
-			}
-		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (5, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-	}
-
-	// Migration 5 -> 6: Add description column to devices table
-	if currentVersion < 6 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// Add description column if it doesn't exist
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN description TEXT`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add description column: %w", err)
-			}
-		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (6, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-	}
-
-	// Migration 6 -> 7: Remove page_count and toner_levels from devices table
-	// These fields now live exclusively in metrics_history table
-	if currentVersion < 7 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// SQLite doesn't support DROP COLUMN directly, so we need to recreate the table
-			// First, check if columns exist
-			var hasPageCount, hasTonerLevels bool
-			rows, err := s.db.Query("PRAGMA table_info(devices)")
-			if err == nil {
-				defer rows.Close()
-				for rows.Next() {
-					var cid int
-					var name string
-					var ctype string
-					var notnull int
-					var dfltValue interface{}
-					var pk int
-					if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
-						if name == "page_count" {
-							hasPageCount = true
-						}
-						if name == "toner_levels" {
-							hasTonerLevels = true
-						}
-					}
-				}
-			}
-
-			// Only migrate if columns exist
-			if hasPageCount || hasTonerLevels {
-				// Create new table without page_count and toner_levels
-				_, err = s.db.Exec(`
-					CREATE TABLE devices_new (
-						serial TEXT PRIMARY KEY,
-						ip TEXT NOT NULL,
-						manufacturer TEXT,
-						model TEXT,
-						hostname TEXT,
-						firmware TEXT,
-						mac_address TEXT,
-						subnet_mask TEXT,
-						gateway TEXT,
-						dns_servers TEXT,
-						dhcp_server TEXT,
-						consumables TEXT,
-						status_messages TEXT,
-						last_seen DATETIME NOT NULL,
-						created_at DATETIME NOT NULL,
-						first_seen DATETIME NOT NULL,
-						is_saved BOOLEAN DEFAULT 0,
-						visible BOOLEAN DEFAULT 1,
-						discovery_method TEXT,
-						walk_filename TEXT,
-						last_scan_id INTEGER,
-						asset_number TEXT,
-						location TEXT,
-						description TEXT,
-						web_ui_url TEXT,
-						locked_fields TEXT,
-						raw_data TEXT
-					)
-				`)
-				if err != nil {
-					return fmt.Errorf("failed to create devices_new table: %w", err)
-				}
-
-				// Copy data (excluding page_count and toner_levels)
-				_, err = s.db.Exec(`
-					INSERT INTO devices_new 
-					SELECT serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, gateway, dns_servers, dhcp_server,
-					       consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, walk_filename,
-					       last_scan_id, asset_number, location, description, web_ui_url, locked_fields, raw_data
-					FROM devices
-				`)
-				if err != nil {
-					return fmt.Errorf("failed to copy data to devices_new: %w", err)
-				}
-
-				// Drop old table and rename new one
-				_, err = s.db.Exec(`DROP TABLE devices`)
-				if err != nil {
-					return fmt.Errorf("failed to drop old devices table: %w", err)
-				}
-
-				_, err = s.db.Exec(`ALTER TABLE devices_new RENAME TO devices`)
-				if err != nil {
-					return fmt.Errorf("failed to rename devices_new: %w", err)
-				}
-
-				// Recreate indexes
-				_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_is_saved ON devices(is_saved)`)
-				_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_visible ON devices(visible)`)
-				_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip)`)
-				_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen)`)
-				_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_manufacturer ON devices(manufacturer)`)
-			}
-		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (7, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-	}
-
-	// Migration 7 -> 8: Rename metrics_history to metrics_raw, add tiered aggregation tables
-	// This implements Netdata-style tiered storage: raw (7d), hourly (30d), daily (365d), monthly (forever)
-	if currentVersion < 8 {
-		var historyExists int
-		var rawExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics_history'").Scan(&historyExists)
-		if err != nil {
-			return fmt.Errorf("failed to check for metrics_history table: %w", err)
-		}
-
-		err = s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics_raw'").Scan(&rawExists)
-		if err != nil {
-			return fmt.Errorf("failed to check for metrics_raw table: %w", err)
-		}
-
-		// Only rename if metrics_history exists AND metrics_raw doesn't
-		if historyExists > 0 && rawExists == 0 {
-			// Rename existing metrics_history to metrics_raw
-			_, err = s.db.Exec(`ALTER TABLE metrics_history RENAME TO metrics_raw`)
-			if err != nil {
-				return fmt.Errorf("failed to rename metrics_history to metrics_raw: %w", err)
-			}
-
-			// Drop old indexes
-			_, _ = s.db.Exec(`DROP INDEX IF EXISTS idx_metrics_serial`)
-			_, _ = s.db.Exec(`DROP INDEX IF EXISTS idx_metrics_timestamp`)
-			_, _ = s.db.Exec(`DROP INDEX IF EXISTS idx_metrics_serial_timestamp`)
-
-			// Create new indexes for metrics_raw
-			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_raw_serial ON metrics_raw(serial)`)
-			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_raw_timestamp ON metrics_raw(timestamp)`)
-			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_raw_serial_timestamp ON metrics_raw(serial, timestamp)`)
-		} else if historyExists > 0 && rawExists > 0 {
-			// Both tables exist - this is a conflict, drop the old one
-			_, _ = s.db.Exec(`DROP TABLE IF EXISTS metrics_history`)
-		}
-
-		// Create hourly aggregation table
-		_, err = s.db.Exec(`
-			CREATE TABLE IF NOT EXISTS metrics_hourly (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				serial TEXT NOT NULL,
-				hour_start DATETIME NOT NULL,
-				sample_count INTEGER DEFAULT 0,
-				page_count_min INTEGER DEFAULT 0,
-				page_count_max INTEGER DEFAULT 0,
-				page_count_avg INTEGER DEFAULT 0,
-				color_pages_min INTEGER DEFAULT 0,
-				color_pages_max INTEGER DEFAULT 0,
-				color_pages_avg INTEGER DEFAULT 0,
-				mono_pages_min INTEGER DEFAULT 0,
-				mono_pages_max INTEGER DEFAULT 0,
-				mono_pages_avg INTEGER DEFAULT 0,
-				scan_count_min INTEGER DEFAULT 0,
-				scan_count_max INTEGER DEFAULT 0,
-				scan_count_avg INTEGER DEFAULT 0,
-				toner_levels_avg TEXT,
-				FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE,
-				UNIQUE(serial, hour_start)
-			)
-		`)
-		if err != nil {
-			return fmt.Errorf("failed to create metrics_hourly table: %w", err)
-		}
-
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_hourly_serial ON metrics_hourly(serial)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_hourly_hour_start ON metrics_hourly(hour_start)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_hourly_serial_hour ON metrics_hourly(serial, hour_start)`)
-
-		// Create daily aggregation table
-		_, err = s.db.Exec(`
-			CREATE TABLE IF NOT EXISTS metrics_daily (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				serial TEXT NOT NULL,
-				day_start DATETIME NOT NULL,
-				sample_count INTEGER DEFAULT 0,
-				page_count_min INTEGER DEFAULT 0,
-				page_count_max INTEGER DEFAULT 0,
-				page_count_avg INTEGER DEFAULT 0,
-				color_pages_min INTEGER DEFAULT 0,
-				color_pages_max INTEGER DEFAULT 0,
-				color_pages_avg INTEGER DEFAULT 0,
-				mono_pages_min INTEGER DEFAULT 0,
-				mono_pages_max INTEGER DEFAULT 0,
-				mono_pages_avg INTEGER DEFAULT 0,
-				scan_count_min INTEGER DEFAULT 0,
-				scan_count_max INTEGER DEFAULT 0,
-				scan_count_avg INTEGER DEFAULT 0,
-				toner_levels_avg TEXT,
-				FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE,
-				UNIQUE(serial, day_start)
-			)
-		`)
-		if err != nil {
-			return fmt.Errorf("failed to create metrics_daily table: %w", err)
-		}
-
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_daily_serial ON metrics_daily(serial)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_daily_day_start ON metrics_daily(day_start)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_daily_serial_day ON metrics_daily(serial, day_start)`)
-
-		// Create monthly aggregation table
-		_, err = s.db.Exec(`
-			CREATE TABLE IF NOT EXISTS metrics_monthly (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				serial TEXT NOT NULL,
-				month_start DATETIME NOT NULL,
-				sample_count INTEGER DEFAULT 0,
-				page_count_min INTEGER DEFAULT 0,
-				page_count_max INTEGER DEFAULT 0,
-				page_count_avg INTEGER DEFAULT 0,
-				color_pages_min INTEGER DEFAULT 0,
-				color_pages_max INTEGER DEFAULT 0,
-				color_pages_avg INTEGER DEFAULT 0,
-				mono_pages_min INTEGER DEFAULT 0,
-				mono_pages_max INTEGER DEFAULT 0,
-				mono_pages_avg INTEGER DEFAULT 0,
-				scan_count_min INTEGER DEFAULT 0,
-				scan_count_max INTEGER DEFAULT 0,
-				scan_count_avg INTEGER DEFAULT 0,
-				toner_levels_avg TEXT,
-				FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE,
-				UNIQUE(serial, month_start)
-			)
-		`)
-		if err != nil {
-			return fmt.Errorf("failed to create metrics_monthly table: %w", err)
-		}
-
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_monthly_serial ON metrics_monthly(serial)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_monthly_month_start ON metrics_monthly(month_start)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_monthly_serial_month ON metrics_monthly(serial, month_start)`)
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (8, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-
-		if storageLogger != nil {
-			storageLogger.Info("Applied schema migration 7->8: Tiered metrics storage (raw/hourly/daily/monthly)")
-		}
-	}
-
-	// Migration 8 -> 9: Add device classification columns and page_count_audit table
-	// This supports unified device view (network + USB/local printers)
-	if currentVersion < 9 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			// Add new device classification columns
-			columns := []struct {
-				name string
-				def  string
-			}{
-				{"device_type", "TEXT DEFAULT 'network'"},
-				{"source_type", "TEXT DEFAULT 'snmp'"},
-				{"is_usb", "BOOLEAN DEFAULT 0"},
-				{"initial_page_count", "INTEGER DEFAULT 0"},
-				{"port_name", "TEXT"},
-				{"driver_name", "TEXT"},
-				{"is_default", "BOOLEAN DEFAULT 0"},
-				{"is_shared", "BOOLEAN DEFAULT 0"},
-				{"spooler_status", "TEXT"},
-			}
-
-			for _, col := range columns {
-				_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE devices ADD COLUMN %s %s`, col.name, col.def))
-				if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-					return fmt.Errorf("failed to add %s column: %w", col.name, err)
-				}
-			}
-
-			// Set device_type and source_type for existing devices
-			_, _ = s.db.Exec(`UPDATE devices SET device_type = 'network', source_type = 'snmp' WHERE device_type IS NULL OR device_type = ''`)
-		}
-
-		// Create page_count_audit table if it doesn't exist
-		_, err = s.db.Exec(`
-			CREATE TABLE IF NOT EXISTS page_count_audit (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				serial TEXT NOT NULL,
-				old_count INTEGER DEFAULT 0,
-				new_count INTEGER DEFAULT 0,
-				change_type TEXT NOT NULL,
-				changed_by TEXT,
-				reason TEXT,
-				timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-				source_metric TEXT DEFAULT 'page_count',
-				FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE
-			)
-		`)
-		if err != nil {
-			return fmt.Errorf("failed to create page_count_audit table: %w", err)
-		}
-
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_page_count_audit_serial ON page_count_audit(serial)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_page_count_audit_timestamp ON page_count_audit(timestamp)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_page_count_audit_serial_timestamp ON page_count_audit(serial, timestamp)`)
-
-		// Add index for device_type filtering
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_device_type ON devices(device_type)`)
-		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_source_type ON devices(source_type)`)
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (9, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-
-		if storageLogger != nil {
-			storageLogger.Info("Applied schema migration 8->9: Device classification and page count audit trail")
-		}
-	}
-
-	// Migration 9 -> 10: Add usb_webui_available column for USB printer web UI detection
-	if currentVersion < 10 {
-		var tableExists int
-		err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
-		if err == nil && tableExists > 0 {
-			_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN usb_webui_available BOOLEAN DEFAULT 0`)
-			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
-				return fmt.Errorf("failed to add usb_webui_available column: %w", err)
-			}
-		}
-
-		// Record migration
-		_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (10, ?)`, time.Now())
-		if err != nil {
-			return fmt.Errorf("failed to record schema version: %w", err)
-		}
-
-		if storageLogger != nil {
-			storageLogger.Info("Applied schema migration 9->10: USB web UI availability tracking")
 		}
 	}
 
@@ -871,6 +431,442 @@ func (s *SQLiteStore) runMigrations() error {
 		return fmt.Errorf("schema repair failed: %w", err)
 	}
 
+	return nil
+}
+
+// migrateSchemaV2: Add visible and first_seen columns
+func migrateSchemaV2(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// Add visible column if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN visible BOOLEAN DEFAULT 1`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add visible column: %w", err)
+		}
+
+		// Add first_seen column if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN first_seen DATETIME`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add first_seen column: %w", err)
+		}
+
+		// Populate first_seen with created_at for existing records
+		_, err = s.db.Exec(`UPDATE devices SET first_seen = created_at WHERE first_seen IS NULL`)
+		if err != nil {
+			return fmt.Errorf("failed to populate first_seen: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateSchemaV3: Add asset_number, location, and web_ui_url columns
+func migrateSchemaV3(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// Add asset_number column if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN asset_number TEXT`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add asset_number column: %w", err)
+		}
+
+		// Add location column if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN location TEXT`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add location column: %w", err)
+		}
+
+		// Add web_ui_url column if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN web_ui_url TEXT`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add web_ui_url column: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateSchemaV4: Add locked_fields column for field locking
+func migrateSchemaV4(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// Add locked_fields column (JSON) if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN locked_fields TEXT`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add locked_fields column: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateSchemaV5: Add detailed impression counter fields to metrics_history
+func migrateSchemaV5(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics_history'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// Add new counter columns
+		columns := []string{
+			"fax_pages INTEGER DEFAULT 0",
+			"copy_pages INTEGER DEFAULT 0",
+			"other_pages INTEGER DEFAULT 0",
+			"copy_mono_pages INTEGER DEFAULT 0",
+			"copy_flatbed_scans INTEGER DEFAULT 0",
+			"copy_adf_scans INTEGER DEFAULT 0",
+			"fax_flatbed_scans INTEGER DEFAULT 0",
+			"fax_adf_scans INTEGER DEFAULT 0",
+			"scan_to_host_flatbed INTEGER DEFAULT 0",
+			"scan_to_host_adf INTEGER DEFAULT 0",
+			"duplex_sheets INTEGER DEFAULT 0",
+			"jam_events INTEGER DEFAULT 0",
+			"scanner_jam_events INTEGER DEFAULT 0",
+		}
+
+		for _, col := range columns {
+			_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE metrics_history ADD COLUMN %s`, col))
+			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("failed to add column %s: %w", col, err)
+			}
+		}
+	}
+	return nil
+}
+
+// migrateSchemaV6: Add description column to devices table
+func migrateSchemaV6(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// Add description column if it doesn't exist
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN description TEXT`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add description column: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateSchemaV7: Remove page_count and toner_levels from devices table
+// These fields now live exclusively in metrics_history table
+func migrateSchemaV7(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// SQLite doesn't support DROP COLUMN directly, so we need to recreate the table
+		// First, check if columns exist
+		var hasPageCount, hasTonerLevels bool
+		rows, err := s.db.Query("PRAGMA table_info(devices)")
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var cid int
+				var name string
+				var ctype string
+				var notnull int
+				var dfltValue interface{}
+				var pk int
+				if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
+					if name == "page_count" {
+						hasPageCount = true
+					}
+					if name == "toner_levels" {
+						hasTonerLevels = true
+					}
+				}
+			}
+		}
+
+		// Only migrate if columns exist
+		if hasPageCount || hasTonerLevels {
+			// Create new table without page_count and toner_levels
+			_, err = s.db.Exec(`
+				CREATE TABLE devices_new (
+					serial TEXT PRIMARY KEY,
+					ip TEXT NOT NULL,
+					manufacturer TEXT,
+					model TEXT,
+					hostname TEXT,
+					firmware TEXT,
+					mac_address TEXT,
+					subnet_mask TEXT,
+					gateway TEXT,
+					dns_servers TEXT,
+					dhcp_server TEXT,
+					consumables TEXT,
+					status_messages TEXT,
+					last_seen DATETIME NOT NULL,
+					created_at DATETIME NOT NULL,
+					first_seen DATETIME NOT NULL,
+					is_saved BOOLEAN DEFAULT 0,
+					visible BOOLEAN DEFAULT 1,
+					discovery_method TEXT,
+					walk_filename TEXT,
+					last_scan_id INTEGER,
+					asset_number TEXT,
+					location TEXT,
+					description TEXT,
+					web_ui_url TEXT,
+					locked_fields TEXT,
+					raw_data TEXT
+				)
+			`)
+			if err != nil {
+				return fmt.Errorf("failed to create devices_new table: %w", err)
+			}
+
+			// Copy data (excluding page_count and toner_levels)
+			_, err = s.db.Exec(`
+				INSERT INTO devices_new 
+				SELECT serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, gateway, dns_servers, dhcp_server,
+				       consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, walk_filename,
+				       last_scan_id, asset_number, location, description, web_ui_url, locked_fields, raw_data
+				FROM devices
+			`)
+			if err != nil {
+				return fmt.Errorf("failed to copy data to devices_new: %w", err)
+			}
+
+			// Drop old table and rename new one
+			_, err = s.db.Exec(`DROP TABLE devices`)
+			if err != nil {
+				return fmt.Errorf("failed to drop old devices table: %w", err)
+			}
+
+			_, err = s.db.Exec(`ALTER TABLE devices_new RENAME TO devices`)
+			if err != nil {
+				return fmt.Errorf("failed to rename devices_new: %w", err)
+			}
+
+			// Recreate indexes
+			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_is_saved ON devices(is_saved)`)
+			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_visible ON devices(visible)`)
+			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip)`)
+			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen)`)
+			_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_manufacturer ON devices(manufacturer)`)
+		}
+	}
+	return nil
+}
+
+// migrateSchemaV8: Rename metrics_history to metrics_raw, add tiered aggregation tables
+// This implements Netdata-style tiered storage: raw (7d), hourly (30d), daily (365d), monthly (forever)
+func migrateSchemaV8(s *SQLiteStore) error {
+	var historyExists int
+	var rawExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics_history'").Scan(&historyExists)
+	if err != nil {
+		return fmt.Errorf("failed to check for metrics_history table: %w", err)
+	}
+
+	err = s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics_raw'").Scan(&rawExists)
+	if err != nil {
+		return fmt.Errorf("failed to check for metrics_raw table: %w", err)
+	}
+
+	// Only rename if metrics_history exists AND metrics_raw doesn't
+	if historyExists > 0 && rawExists == 0 {
+		// Rename existing metrics_history to metrics_raw
+		_, err = s.db.Exec(`ALTER TABLE metrics_history RENAME TO metrics_raw`)
+		if err != nil {
+			return fmt.Errorf("failed to rename metrics_history to metrics_raw: %w", err)
+		}
+
+		// Drop old indexes
+		_, _ = s.db.Exec(`DROP INDEX IF EXISTS idx_metrics_serial`)
+		_, _ = s.db.Exec(`DROP INDEX IF EXISTS idx_metrics_timestamp`)
+		_, _ = s.db.Exec(`DROP INDEX IF EXISTS idx_metrics_serial_timestamp`)
+
+		// Create new indexes for metrics_raw
+		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_raw_serial ON metrics_raw(serial)`)
+		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_raw_timestamp ON metrics_raw(timestamp)`)
+		_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_raw_serial_timestamp ON metrics_raw(serial, timestamp)`)
+	} else if historyExists > 0 && rawExists > 0 {
+		// Both tables exist - this is a conflict, drop the old one
+		_, _ = s.db.Exec(`DROP TABLE IF EXISTS metrics_history`)
+	}
+
+	// Create hourly aggregation table
+	_, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS metrics_hourly (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			serial TEXT NOT NULL,
+			hour_start DATETIME NOT NULL,
+			sample_count INTEGER DEFAULT 0,
+			page_count_min INTEGER DEFAULT 0,
+			page_count_max INTEGER DEFAULT 0,
+			page_count_avg INTEGER DEFAULT 0,
+			color_pages_min INTEGER DEFAULT 0,
+			color_pages_max INTEGER DEFAULT 0,
+			color_pages_avg INTEGER DEFAULT 0,
+			mono_pages_min INTEGER DEFAULT 0,
+			mono_pages_max INTEGER DEFAULT 0,
+			mono_pages_avg INTEGER DEFAULT 0,
+			scan_count_min INTEGER DEFAULT 0,
+			scan_count_max INTEGER DEFAULT 0,
+			scan_count_avg INTEGER DEFAULT 0,
+			toner_levels_avg TEXT,
+			FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE,
+			UNIQUE(serial, hour_start)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create metrics_hourly table: %w", err)
+	}
+
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_hourly_serial ON metrics_hourly(serial)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_hourly_hour_start ON metrics_hourly(hour_start)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_hourly_serial_hour ON metrics_hourly(serial, hour_start)`)
+
+	// Create daily aggregation table
+	_, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS metrics_daily (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			serial TEXT NOT NULL,
+			day_start DATETIME NOT NULL,
+			sample_count INTEGER DEFAULT 0,
+			page_count_min INTEGER DEFAULT 0,
+			page_count_max INTEGER DEFAULT 0,
+			page_count_avg INTEGER DEFAULT 0,
+			color_pages_min INTEGER DEFAULT 0,
+			color_pages_max INTEGER DEFAULT 0,
+			color_pages_avg INTEGER DEFAULT 0,
+			mono_pages_min INTEGER DEFAULT 0,
+			mono_pages_max INTEGER DEFAULT 0,
+			mono_pages_avg INTEGER DEFAULT 0,
+			scan_count_min INTEGER DEFAULT 0,
+			scan_count_max INTEGER DEFAULT 0,
+			scan_count_avg INTEGER DEFAULT 0,
+			toner_levels_avg TEXT,
+			FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE,
+			UNIQUE(serial, day_start)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create metrics_daily table: %w", err)
+	}
+
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_daily_serial ON metrics_daily(serial)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_daily_day_start ON metrics_daily(day_start)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_daily_serial_day ON metrics_daily(serial, day_start)`)
+
+	// Create monthly aggregation table
+	_, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS metrics_monthly (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			serial TEXT NOT NULL,
+			month_start DATETIME NOT NULL,
+			sample_count INTEGER DEFAULT 0,
+			page_count_min INTEGER DEFAULT 0,
+			page_count_max INTEGER DEFAULT 0,
+			page_count_avg INTEGER DEFAULT 0,
+			color_pages_min INTEGER DEFAULT 0,
+			color_pages_max INTEGER DEFAULT 0,
+			color_pages_avg INTEGER DEFAULT 0,
+			mono_pages_min INTEGER DEFAULT 0,
+			mono_pages_max INTEGER DEFAULT 0,
+			mono_pages_avg INTEGER DEFAULT 0,
+			scan_count_min INTEGER DEFAULT 0,
+			scan_count_max INTEGER DEFAULT 0,
+			scan_count_avg INTEGER DEFAULT 0,
+			toner_levels_avg TEXT,
+			FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE,
+			UNIQUE(serial, month_start)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create metrics_monthly table: %w", err)
+	}
+
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_monthly_serial ON metrics_monthly(serial)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_monthly_month_start ON metrics_monthly(month_start)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_metrics_monthly_serial_month ON metrics_monthly(serial, month_start)`)
+
+	if storageLogger != nil {
+		storageLogger.Info("Applied schema migration 7->8: Tiered metrics storage (raw/hourly/daily/monthly)")
+	}
+	return nil
+}
+
+// migrateSchemaV9: Add device classification columns and page_count_audit table
+// This supports unified device view (network + USB/local printers)
+func migrateSchemaV9(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		// Add new device classification columns
+		columns := []struct {
+			name string
+			def  string
+		}{
+			{"device_type", "TEXT DEFAULT 'network'"},
+			{"source_type", "TEXT DEFAULT 'snmp'"},
+			{"is_usb", "BOOLEAN DEFAULT 0"},
+			{"initial_page_count", "INTEGER DEFAULT 0"},
+			{"port_name", "TEXT"},
+			{"driver_name", "TEXT"},
+			{"is_default", "BOOLEAN DEFAULT 0"},
+			{"is_shared", "BOOLEAN DEFAULT 0"},
+			{"spooler_status", "TEXT"},
+		}
+
+		for _, col := range columns {
+			_, err = s.db.Exec(fmt.Sprintf(`ALTER TABLE devices ADD COLUMN %s %s`, col.name, col.def))
+			if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("failed to add %s column: %w", col.name, err)
+			}
+		}
+
+		// Set device_type and source_type for existing devices
+		_, _ = s.db.Exec(`UPDATE devices SET device_type = 'network', source_type = 'snmp' WHERE device_type IS NULL OR device_type = ''`)
+	}
+
+	// Create page_count_audit table if it doesn't exist
+	_, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS page_count_audit (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			serial TEXT NOT NULL,
+			old_count INTEGER DEFAULT 0,
+			new_count INTEGER DEFAULT 0,
+			change_type TEXT NOT NULL,
+			changed_by TEXT,
+			reason TEXT,
+			timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			source_metric TEXT DEFAULT 'page_count',
+			FOREIGN KEY (serial) REFERENCES devices(serial) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create page_count_audit table: %w", err)
+	}
+
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_page_count_audit_serial ON page_count_audit(serial)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_page_count_audit_timestamp ON page_count_audit(timestamp)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_page_count_audit_serial_timestamp ON page_count_audit(serial, timestamp)`)
+
+	// Add index for device_type filtering
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_device_type ON devices(device_type)`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_source_type ON devices(source_type)`)
+
+	if storageLogger != nil {
+		storageLogger.Info("Applied schema migration 8->9: Device classification and page count audit trail")
+	}
+	return nil
+}
+
+// migrateSchemaV10: Add usb_webui_available column for USB printer web UI detection
+func migrateSchemaV10(s *SQLiteStore) error {
+	var tableExists int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'").Scan(&tableExists)
+	if err == nil && tableExists > 0 {
+		_, err = s.db.Exec(`ALTER TABLE devices ADD COLUMN usb_webui_available BOOLEAN DEFAULT 0`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("failed to add usb_webui_available column: %w", err)
+		}
+	}
+
+	if storageLogger != nil {
+		storageLogger.Info("Applied schema migration 9->10: USB web UI availability tracking")
+	}
 	return nil
 }
 
