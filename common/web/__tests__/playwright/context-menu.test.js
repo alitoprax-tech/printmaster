@@ -238,6 +238,14 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
       close() { }
     };
   });
+  // Disable CSS animations/transitions so modal open/slide-in animations don't
+  // leave elements in a transient "unstable" state for Playwright's actionability
+  // checks (this caused intermittent click timeouts on WebKit).
+  await page.addInitScript(() => {
+    const style = document.createElement('style');
+    style.textContent = '*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; transition-duration: 0s !important; transition-delay: 0s !important; }';
+    document.documentElement.appendChild(style);
+  });
   await page.route('**/api/**', createApiHandler(apiCalls));
 
   // Load app once
