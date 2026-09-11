@@ -54,6 +54,7 @@ type Logger struct {
 	component       string // component name for log filename (agent, server, etc.)
 	currentFile     *os.File
 	currentFilePath string // path to current log file for rotation
+	currentFileSize int64  // tracked size of current log file, avoids fsync per write
 	buffer          []LogEntry
 	maxBufferSize   int
 	diagnostics     map[string]bool
@@ -362,12 +363,17 @@ func (l *Logger) writeToFile(entry LogEntry) {
 		}
 		l.currentFile = f
 		l.currentFilePath = filename
+		if stat, err := f.Stat(); err == nil {
+			l.currentFileSize = stat.Size()
+		}
 	}
 
 	// Format and write entry
-	line := formatLogEntry(entry)
-	l.currentFile.WriteString(line + "\n")
-	l.currentFile.Sync() // Flush to disk for accurate size checks
+	line := formatLogEntry(entry) + "\n"
+	n, err := l.currentFile.WriteString(line)
+	if err == nil {
+		l.currentFileSize += int64(n)
+	}
 
 	// Check if we need to rotate AFTER writing
 	if l.shouldRotate() {
@@ -397,14 +403,11 @@ func (l *Logger) shouldRotate() bool {
 		return false
 	}
 
-	// Check file size
+	// Check file size using tracked size (avoids fsync/stat on every write)
 	if l.rotationPolicy.MaxSizeMB > 0 {
-		if stat, err := l.currentFile.Stat(); err == nil {
-			sizeBytes := stat.Size()
-			maxBytes := int64(l.rotationPolicy.MaxSizeMB) * 1024 * 1024
-			if sizeBytes >= maxBytes {
-				return true
-			}
+		maxBytes := int64(l.rotationPolicy.MaxSizeMB) * 1024 * 1024
+		if l.currentFileSize >= maxBytes {
+			return true
 		}
 	}
 
@@ -426,6 +429,7 @@ func (l *Logger) rotate() {
 			backupPath := filepath.Join(l.logDir, fmt.Sprintf("%s_%s.log", l.component, timestamp))
 			os.Rename(l.currentFilePath, backupPath)
 		}
+		l.currentFileSize = 0
 	}
 
 	// Clean up old files
