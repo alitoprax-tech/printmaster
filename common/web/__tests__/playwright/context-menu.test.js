@@ -201,6 +201,10 @@ function isMobileViewport(page) {
 
 async function openContextMenu(page, target, contextMenu) {
   for (let attempt = 0; attempt < 3; attempt++) {
+    // Give any previous menu's outside-click listener (registered via a 10ms
+    // setTimeout in showContextMenu) time to fully detach before reopening,
+    // otherwise the reopened menu can be torn down/rebuilt out from under us.
+    await page.waitForTimeout(50);
     await target.click({ button: 'right' });
     try {
       await expect(contextMenu).toBeVisible({ timeout: 2000 });
@@ -210,6 +214,21 @@ async function openContextMenu(page, target, contextMenu) {
       if (attempt === 2) throw error;
       await page.keyboard.press('Escape');
       await page.waitForTimeout(50);
+    }
+  }
+}
+
+// Opens the context menu and clicks a menu item, retrying the whole open+click
+// sequence if the menu gets torn down/rebuilt between opening and clicking
+// (observed intermittently as "element was detached from the DOM, retrying").
+async function openContextMenuAndClickAction(page, target, contextMenu, action) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await openContextMenu(page, target, contextMenu);
+    try {
+      await contextMenu.locator(`[data-action="${action}"]`).click({ timeout: 5000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
     }
   }
 }
@@ -309,8 +328,6 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
   await expect(contextMenu).not.toBeVisible({ timeout: 2000 });
 
   // --- Test 4: Copy serial shows toast ---
-  // Wait for outside-click listener cleanup (showContextMenu registers it with a 10ms setTimeout)
-  await page.waitForTimeout(50);
   await openContextMenu(page, deviceElement, contextMenu);
   await contextMenu.locator('[data-action="copy-serial"]').click();
 
@@ -328,8 +345,7 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
   await page.waitForFunction(() => document.querySelectorAll('.toast').length === 0, { timeout: 8000 });
 
   // --- Test 6: Delete device shows confirmation modal ---
-  await openContextMenu(page, deviceElement, contextMenu);
-  await contextMenu.locator('[data-action="delete-device"]').click();
+  await openContextMenuAndClickAction(page, deviceElement, contextMenu, 'delete-device');
 
   const modal = page.locator('.modal-overlay:visible');
   await expect(modal).toBeVisible({ timeout: 5000 });
@@ -354,8 +370,7 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
   expect(apiCalls.filter(c => c.url.includes('/delete'))).toHaveLength(0);
 
   // --- Test 9: Delete sends correct API request ---
-  await openContextMenu(page, deviceElement, contextMenu);
-  await contextMenu.locator('[data-action="delete-device"]').click();
+  await openContextMenuAndClickAction(page, deviceElement, contextMenu, 'delete-device');
   await expect(modal).toBeVisible({ timeout: 5000 });
 
   // Check both options
