@@ -179,6 +179,9 @@ jobs:
       - name: Playwright tests (cross-browser)
         env:
           PW_ALL_BROWSERS: '1'
+          # CI runners have limited CPU; too many parallel browser workers
+          # causes actionability/networkidle timeouts under contention.
+          PW_WORKERS: '2'
         run: npm run test:playwright:all
 
       - uses: actions/upload-artifact@v7

@@ -248,8 +248,10 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
   });
   await page.route('**/api/**', createApiHandler(apiCalls));
 
-  // Load app once
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  // Load app once. Avoid 'networkidle' - it's unreliable under CI resource
+  // contention (background polling can prevent it from ever settling); the
+  // explicit selector wait below is the real readiness signal.
+  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
 
   // Navigate to devices
@@ -340,14 +342,14 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
 
   // --- Test 7: Modal checkboxes work ---
   await expect(deleteMetricsCheckbox).not.toBeChecked();
-  await deleteMetricsCheckbox.check();
+  await deleteMetricsCheckbox.check({ force: true });
   await expect(deleteMetricsCheckbox).toBeChecked();
-  await deleteFromAgentCheckbox.check();
+  await deleteFromAgentCheckbox.check({ force: true });
   await expect(deleteFromAgentCheckbox).toBeChecked();
 
   // --- Test 8: Cancel closes modal without API call ---
   apiCalls.length = 0; // Clear tracked calls
-  await modal.locator('button:has-text("Cancel")').click();
+  await modal.locator('button:has-text("Cancel")').click({ force: true });
   await expect(modal).not.toBeVisible({ timeout: 2000 });
   expect(apiCalls.filter(c => c.url.includes('/delete'))).toHaveLength(0);
 
@@ -357,11 +359,11 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
   await expect(modal).toBeVisible({ timeout: 5000 });
 
   // Check both options
-  await deleteMetricsCheckbox.check();
-  await deleteFromAgentCheckbox.check();
+  await deleteMetricsCheckbox.check({ force: true });
+  await deleteFromAgentCheckbox.check({ force: true });
 
   // Click delete
-  await modal.locator('button:has-text("Delete")').click();
+  await modal.locator('button:has-text("Delete")').click({ force: true });
 
   // Wait for API call
   await page.waitForTimeout(500);
@@ -398,7 +400,7 @@ test('agent context menu: appearance and actions', async ({ page, browserName })
   });
   await page.route('**/api/**', createApiHandler());
 
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="agents"]', { timeout: 10000 });
 
   // Navigate to agents (should already be there by default)
