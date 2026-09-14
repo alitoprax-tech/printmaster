@@ -4772,8 +4772,19 @@ func handleAgentProxy(w http.ResponseWriter, r *http.Request) {
 
 	// TODO: Could add web_ui_port to agent metadata if needed
 
+	// Full discovery scans (SNMP walks across a whole subnet) can easily run
+	// past the default 30s proxy timeout, causing the request to silently
+	// time out with no feedback in the agent UI. Use a longer timeout for
+	// these known slow endpoints, matching the timeout used for report proxying.
+	requestPath := strings.SplitN(strings.TrimPrefix(targetPath, "/"), "?", 2)[0]
+	proxyTimeout := 30 * time.Second
+	switch requestPath {
+	case "discover", "discover_now":
+		proxyTimeout = 120 * time.Second
+	}
+
 	// Proxy the request through WebSocket
-	proxyThroughWebSocket(w, r, agentID, targetURL)
+	proxyThroughWebSocketWithTimeout(w, r, agentID, targetURL, proxyTimeout)
 }
 
 // handleDeviceProxy proxies HTTP requests to device web UIs through agent WebSocket
