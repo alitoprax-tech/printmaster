@@ -7753,6 +7753,37 @@ window.top.location.href = '/proxy/%s/';
 				return
 			}
 
+			// Discovery/SNMP/Features/Spooler are fleet-managed sections. When the
+			// agent has an active server-managed settings snapshot, reject attempts
+			// to change them here instead of silently persisting values that
+			// loadUnifiedSettings() will ignore on the next read (which previously
+			// made saves look successful but have no lasting effect).
+			if settingsManager != nil && settingsManager.HasManagedSnapshot() {
+				var lockedSections []string
+				if req.Discovery != nil {
+					lockedSections = append(lockedSections, "discovery")
+				}
+				if req.SNMP != nil {
+					lockedSections = append(lockedSections, "snmp")
+				}
+				if req.Features != nil {
+					lockedSections = append(lockedSections, "features")
+				}
+				if req.Spooler != nil {
+					lockedSections = append(lockedSections, "spooler")
+				}
+				if len(lockedSections) > 0 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusConflict)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"error":       "cannot modify server-managed settings",
+						"locked_keys": lockedSections,
+						"reason":      "These sections are managed by the connected server and cannot be edited locally",
+					})
+					return
+				}
+			}
+
 			if req.Reset {
 				_ = agentConfigStore.SetConfigValue("discovery_settings", map[string]interface{}{})
 				_ = agentConfigStore.SetConfigValue("settings", map[string]interface{}{})
