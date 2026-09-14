@@ -3616,22 +3616,34 @@ document.addEventListener('DOMContentLoaded', async function () {
         hamburger.addEventListener('click', toggleMobileNav);
     }
 
+    const runDiscoverNow = function (btn) {
+        const originalText = btn ? btn.textContent : null;
+        if (btn) { btn.disabled = true; btn.textContent = 'Discovering...'; }
+        window.__pm_shared.showToast('Discovery scan started...', 'info');
+        fetch("/discover", { method: "POST" }).then(async (r) => {
+            if (!r.ok) {
+                const t = await r.text().catch(() => r.statusText);
+                window.__pm_shared.showToast('Discovery failed: ' + t, 'error');
+                return;
+            }
+            window.__pm_shared.showToast('Discovery scan complete', 'success');
+            updatePrinters();
+        }).catch(e => {
+            window.__pm_shared.error('Discover Now failed', e);
+            window.__pm_shared.showToast('Discovery failed: ' + e.message, 'error');
+        }).finally(() => {
+            if (btn) { btn.disabled = false; btn.textContent = originalText; }
+        });
+    };
+
     const discoverBtn = document.getElementById('discover_now_btn');
     if (discoverBtn) {
-        discoverBtn.addEventListener('click', function () {
-            fetch("/discover", { method: "POST" }).then(() => {
-                setTimeout(updatePrinters, 500);
-            });
-        });
+        discoverBtn.addEventListener('click', function () { runDiscoverNow(discoverBtn); });
     }
 
     const discoverSettingsBtn = document.getElementById('discover_now_settings_btn');
     if (discoverSettingsBtn) {
-        discoverSettingsBtn.addEventListener('click', function () {
-            fetch("/discover", { method: "POST" }).then(() => {
-                setTimeout(updatePrinters, 500);
-            });
-        });
+        discoverSettingsBtn.addEventListener('click', function () { runDiscoverNow(discoverSettingsBtn); });
     }
 
     // Immediate visibility handlers for "Show Anyway" containers (no save, just show/hide)
