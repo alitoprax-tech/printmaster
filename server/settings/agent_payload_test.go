@@ -49,7 +49,7 @@ func TestBuildAgentSnapshotStripsAgentLocalFields(t *testing.T) {
 	if snapshot.Version == "" {
 		t.Fatalf("expected settings version to be set")
 	}
-	wantVersion, err := pmsettings.ComputeSettingsVersion(snapshot.SchemaVersion, snapshot.UpdatedAt, snapshot.Settings)
+	wantVersion, err := pmsettings.ComputeSettingsVersionWithManagedSections(snapshot.SchemaVersion, snapshot.UpdatedAt, snapshot.Settings, snapshot.ManagedSections)
 	if err != nil {
 		t.Fatalf("compute expected version failed: %v", err)
 	}

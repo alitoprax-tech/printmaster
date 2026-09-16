@@ -64,7 +64,7 @@ func agentSnapshotFromSnapshot(snapshot Snapshot) (AgentSnapshot, error) {
 	if schemaVersion == "" {
 		schemaVersion = pmsettings.SchemaVersion
 	}
-	version, err := pmsettings.ComputeSettingsVersion(schemaVersion, snapshot.UpdatedAt, settingsCopy)
+	version, err := pmsettings.ComputeSettingsVersionWithManagedSections(schemaVersion, snapshot.UpdatedAt, settingsCopy, snapshot.ManagedSections)
 	if err != nil {
 		return AgentSnapshot{}, err
 	}
