@@ -7782,17 +7782,21 @@ window.top.location.href = '/proxy/%s/';
 			// loadUnifiedSettings() will ignore on the next read (which previously
 			// made saves look successful but have no lasting effect).
 			if settingsManager != nil && settingsManager.HasManagedSnapshot() {
+				managedSections := make(map[string]bool)
+				for _, section := range settingsManager.ManagedSections() {
+					managedSections[section] = true
+				}
 				var lockedSections []string
-				if req.Discovery != nil {
+				if req.Discovery != nil && managedSections["discovery"] {
 					lockedSections = append(lockedSections, "discovery")
 				}
-				if req.SNMP != nil {
+				if req.SNMP != nil && managedSections["snmp"] {
 					lockedSections = append(lockedSections, "snmp")
 				}
-				if req.Features != nil {
+				if req.Features != nil && managedSections["features"] {
 					lockedSections = append(lockedSections, "features")
 				}
-				if req.Spooler != nil {
+				if req.Spooler != nil && managedSections["spooler"] {
 					lockedSections = append(lockedSections, "spooler")
 				}
 				if len(lockedSections) > 0 {

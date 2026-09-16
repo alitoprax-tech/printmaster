@@ -13684,8 +13684,8 @@ const settingsUIState = {
     globalDirty: false,
     globalSettingsDirty: false,
     // Managed sections control (which categories are server-managed)
-    managedSections: new Set(['discovery', 'snmp', 'features']),
-    originalManagedSections: new Set(['discovery', 'snmp', 'features']),
+    managedSections: new Set(['discovery', 'snmp', 'features', 'spooler']),
+    originalManagedSections: new Set(['discovery', 'snmp', 'features', 'spooler']),
     managedSectionsDirty: false,
     tenantList: [],
     selectedTenantId: '',
@@ -14056,7 +14056,7 @@ async function loadGlobalSettingsSnapshot() {
     // Sync managed sections from snapshot
     const managedArr = (snapshot && Array.isArray(snapshot.managed_sections))
         ? snapshot.managed_sections
-        : ['discovery', 'snmp', 'features'];
+        : ['discovery', 'snmp', 'features', 'spooler'];
     settingsUIState.managedSections = new Set(managedArr);
     settingsUIState.originalManagedSections = new Set(managedArr);
     settingsUIState.managedSectionsDirty = false;
