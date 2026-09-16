@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 var (
@@ -38,6 +40,30 @@ func ensureLogDir() string {
 	return logDir
 }
 
+// sanitizeLogMessage strips/escapes control characters (e.g. newlines) so a
+// single log line can't be used to forge additional log entries.
+func sanitizeLogMessage(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			switch r {
+			case '\n':
+				b.WriteString("\\n")
+			case '\r':
+				b.WriteString("\\r")
+			case '\t':
+				b.WriteString("\\t")
+			default:
+				fmt.Fprintf(&b, "\\u%04x", r)
+			}
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func writeLine(level string, msg string) {
 	// If an external logger is configured, prefer it
 	if extLogger != nil {
@@ -54,7 +80,7 @@ func writeLine(level string, msg string) {
 		return
 	}
 	ts := time.Now().Format(time.RFC3339)
-	line := fmt.Sprintf("%s [%s] %s", ts, level, msg)
+	line := fmt.Sprintf("%s [%s] %s", ts, level, sanitizeLogMessage(msg))
 	logMu.Lock()
 	defer logMu.Unlock()
 	// stdout for convenience
