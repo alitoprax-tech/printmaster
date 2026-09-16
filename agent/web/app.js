@@ -127,6 +127,23 @@ function onServerStatusChanged(status) {
         cachedServerInfo.tenant_id = status.tenant_id;
     }
     updateHeaderInfoBar();
+    const connected = deriveServerConnectionMode(status) !== 'disconnected';
+    const reloadButton = document.getElementById('reload_server_settings_btn');
+    if (reloadButton) reloadButton.style.display = connected ? 'inline-block' : 'none';
+}
+
+async function reloadServerSettings(button) {
+    if (button) button.disabled = true;
+    try {
+        const response = await fetch('/settings/reload-server', { method: 'POST' });
+        if (!response.ok) throw new Error(await response.text() || response.statusText);
+        await loadSettings();
+        window.__pm_shared.showToast('Settings reloaded from server', 'success', 2500);
+    } catch (error) {
+        window.__pm_shared.showToast('Failed to reload server settings: ' + error.message, 'error', 4000);
+    } finally {
+        if (button) button.disabled = false;
+    }
 }
 
 function getAgentUIState(key, fallback) {
@@ -5928,6 +5945,10 @@ function initServerConnectionControls() {
         if (unjoinBtn) {
             unjoinBtn.addEventListener('click', handleServerUnjoin);
         }
+        const reloadSettingsBtn = document.getElementById('server_info_reload_settings_btn');
+        if (reloadSettingsBtn) reloadSettingsBtn.addEventListener('click', () => reloadServerSettings(reloadSettingsBtn));
+        const settingsReloadBtn = document.getElementById('reload_server_settings_btn');
+        if (settingsReloadBtn) settingsReloadBtn.addEventListener('click', () => reloadServerSettings(settingsReloadBtn));
 
         refreshServerConnectionUI();
     } catch (e) {

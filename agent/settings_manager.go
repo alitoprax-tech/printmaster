@@ -17,6 +17,7 @@ type serverManagedSettings struct {
 	Version       string              `json:"version"`
 	SchemaVersion string              `json:"schema_version"`
 	UpdatedAt     time.Time           `json:"updated_at"`
+	ManagedSections []string          `json:"managed_sections,omitempty"`
 	Settings      pmsettings.Settings `json:"settings"`
 }
 
@@ -71,6 +72,18 @@ func (m *SettingsManager) HasManagedSnapshot() bool {
 	return m.managed != nil
 }
 
+func (m *SettingsManager) ManagedSections() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.managed == nil {
+		return nil
+	}
+	return append([]string(nil), m.managed.ManagedSections...)
+}
+
 func (m *SettingsManager) baseSettings() (pmsettings.Settings, bool) {
 	if m == nil {
 		return pmsettings.DefaultSettings(), false
@@ -94,6 +107,7 @@ func (m *SettingsManager) ApplyServerSnapshot(snapshot *agent.SettingsSnapshot) 
 		Version:       snapshot.Version,
 		SchemaVersion: snapshot.SchemaVersion,
 		UpdatedAt:     snapshot.UpdatedAt,
+		ManagedSections: append([]string(nil), snapshot.ManagedSections...),
 		Settings:      snapshot.Settings,
 	}
 	pmsettings.Sanitize(&payload.Settings)

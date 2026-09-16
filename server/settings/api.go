@@ -184,7 +184,7 @@ func (api *API) handleGlobal(w http.ResponseWriter, r *http.Request) {
 		// Decode wrapper struct that includes both settings and managed_sections
 		var wrapper struct {
 			pmsettings.Settings
-			ManagedSections []string `json:"managed_sections,omitempty"`
+			ManagedSections *[]string `json:"managed_sections,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&wrapper); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
@@ -218,7 +218,12 @@ func (api *API) handleGlobal(w http.ResponseWriter, r *http.Request) {
 		actor := api.actorLabel(r)
 
 		// Validate and normalize managed sections
-		managedSections := normalizeManagedSections(wrapper.ManagedSections)
+		var managedSections []string
+		if wrapper.ManagedSections == nil {
+			managedSections = normalizeManagedSections(nil)
+		} else {
+			managedSections = normalizeManagedSections(*wrapper.ManagedSections)
+		}
 
 		rec := &storage.SettingsRecord{
 			SchemaVersion:   pmsettings.SchemaVersion,
@@ -749,8 +754,7 @@ var ValidManagedSections = map[string]bool{
 // If empty or nil, returns all sections enabled by default.
 func normalizeManagedSections(sections []string) []string {
 	if len(sections) == 0 {
-		// Default: all sections managed
-		return []string{"discovery", "snmp", "features"}
+		return []string{}
 	}
 	// Filter to only valid sections
 	result := make([]string, 0, len(sections))

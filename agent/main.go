@@ -7708,6 +7708,29 @@ window.top.location.href = '/proxy/%s/';
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
+	// Request the current server-managed settings immediately.
+	http.HandleFunc("/settings/reload-server", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		uploadWorkerMu.RLock()
+		worker := uploadWorker
+		uploadWorkerMu.RUnlock()
+		if worker == nil {
+			http.Error(w, "server connection unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		if err := worker.ReloadSettings(ctx); err != nil {
+			http.Error(w, "failed to reload server settings: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
+	})
+
 	// Unified settings endpoint to get/save all settings at once
 	http.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
 		if agentConfigStore == nil {
@@ -7732,7 +7755,7 @@ window.top.location.href = '/proxy/%s/';
 			}
 			if isServerManaged {
 				// When server-managed, discovery/snmp/features/spooler are locked (logging/web are local)
-				resp["managed_sections"] = []string{"discovery", "snmp", "features", "spooler"}
+				resp["managed_sections"] = settingsManager.ManagedSections()
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(resp)

@@ -48,11 +48,11 @@ func (r *Resolver) ResolveGlobal(ctx context.Context) (Snapshot, error) {
 	if rec == nil {
 		defaults := pmsettings.DefaultSettings()
 		pmsettings.Sanitize(&defaults)
-		// Default: all sections managed when no record exists
+		// Default: all fleet-managed sections managed when no record exists.
 		return Snapshot{
 			SchemaVersion:   pmsettings.SchemaVersion,
 			Settings:        defaults,
-			ManagedSections: []string{"discovery", "snmp", "features"},
+			ManagedSections: []string{"discovery", "snmp", "features", "spooler"},
 		}, nil
 	}
 	settings := rec.Settings
@@ -61,11 +61,8 @@ func (r *Resolver) ResolveGlobal(ctx context.Context) (Snapshot, error) {
 	if strings.TrimSpace(version) == "" {
 		version = pmsettings.SchemaVersion
 	}
-	// Use stored managed sections or default to all sections
+	// An empty stored list is intentional: it means no sections are managed.
 	managedSections := rec.ManagedSections
-	if len(managedSections) == 0 {
-		managedSections = []string{"discovery", "snmp", "features"}
-	}
 	return Snapshot{
 		SchemaVersion:   version,
 		Settings:        settings,
@@ -229,9 +226,6 @@ func normalizeSectionList(sections []string) []string {
 func allowedAgentOverrideSections(managedSections, enforcedSections []string) map[string]bool {
 	allowed := make(map[string]bool)
 	managed := normalizeSectionList(managedSections)
-	if len(managed) == 0 {
-		managed = []string{"discovery", "snmp", "features"}
-	}
 	for _, s := range managed {
 		allowed[s] = true
 	}

@@ -264,7 +264,10 @@
                 <div class="panel">
                     <h4 style="margin-top:0;color:var(--highlight)">Quick Actions</h4>
                     <div style="display:flex;flex-direction:column;gap:12px;">
-                        <button class="primary" id="discover_now_settings_btn" style="width:100%;">Discover Now</button>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                            <button class="primary" id="discover_now_settings_btn" style="flex:1;min-width:160px;">Discover Now</button>
+                            <button class="modal-button modal-button-secondary" id="reload_server_settings_btn" style="display:none;flex:1;min-width:160px;">Reload from Server</button>
+                        </div>
                         <div style="color:var(--muted);font-size:12px;">
                             Manually trigger a discovery scan with current settings.
                         </div>
@@ -1075,6 +1078,7 @@
                 </div>
             </div>
             <div class="server-modal-actions">
+                <button id="server_info_reload_settings_btn" class="modal-button modal-button-secondary">Reload Settings</button>
                 <button id="server_info_rejoin_btn" class="modal-button modal-button-secondary">Rejoin with new token</button>
                 <button id="server_info_unjoin_btn" class="modal-button modal-button-danger">Disconnect from Server</button>
                 <button id="server_info_close_btn" class="modal-button">Close</button>

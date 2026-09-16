@@ -157,6 +157,20 @@ func (w *UploadWorker) handleHeartbeatSettings(result *agent.HeartbeatResult) {
 	applyEffectiveSettingsSnapshot(effective)
 }
 
+// ReloadSettings requests the current managed settings immediately.
+// HTTP is used because WebSocket heartbeats are fire-and-forget.
+func (w *UploadWorker) ReloadSettings(ctx context.Context) error {
+	if w == nil || w.client == nil {
+		return fmt.Errorf("upload worker unavailable")
+	}
+	result, err := w.client.HeartbeatWithVersion(ctx, w.currentSettingsVersion(), w.versionInfo)
+	if err != nil {
+		return err
+	}
+	w.handleHeartbeatSettings(result)
+	return nil
+}
+
 // UploadWorkerConfig contains configuration for the upload worker
 type UploadWorkerConfig struct {
 	HeartbeatInterval time.Duration
@@ -485,6 +499,11 @@ func (w *UploadWorker) sendHeartbeat() {
 			w.logger.Warn("WebSocket heartbeat failed, falling back to HTTP", "error", err)
 			// Fall through to HTTP heartbeat
 		} else {
+			// WebSocket heartbeats do not return snapshots, so mirror the heartbeat
+			// over HTTP to apply a changed server snapshot immediately.
+			if result, heartbeatErr := w.client.HeartbeatWithVersion(ctx, w.currentSettingsVersion(), w.versionInfo); heartbeatErr == nil {
+				w.handleHeartbeatSettings(result)
+			}
 			w.mu.Lock()
 			w.lastHeartbeat = time.Now()
 			w.mu.Unlock()

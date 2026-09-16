@@ -40,6 +40,7 @@ type SettingsSnapshot struct {
 	Version       string              `json:"version"`
 	SchemaVersion string              `json:"schema_version"`
 	UpdatedAt     time.Time           `json:"updated_at"`
+	ManagedSections []string          `json:"managed_sections,omitempty"`
 	Settings      pmsettings.Settings `json:"settings"`
 }
 
