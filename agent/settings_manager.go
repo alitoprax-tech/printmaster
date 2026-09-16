@@ -14,11 +14,11 @@ import (
 const serverManagedSettingsKey = "server_managed_settings"
 
 type serverManagedSettings struct {
-	Version       string              `json:"version"`
-	SchemaVersion string              `json:"schema_version"`
-	UpdatedAt     time.Time           `json:"updated_at"`
-	ManagedSections []string          `json:"managed_sections,omitempty"`
-	Settings      pmsettings.Settings `json:"settings"`
+	Version         string              `json:"version"`
+	SchemaVersion   string              `json:"schema_version"`
+	UpdatedAt       time.Time           `json:"updated_at"`
+	ManagedSections []string            `json:"managed_sections,omitempty"`
+	Settings        pmsettings.Settings `json:"settings"`
 }
 
 // SettingsManager tracks server-managed snapshots and composes effective configs.
@@ -104,13 +104,16 @@ func (m *SettingsManager) ApplyServerSnapshot(snapshot *agent.SettingsSnapshot) 
 		return pmsettings.Settings{}, fmt.Errorf("invalid snapshot")
 	}
 	payload := serverManagedSettings{
-		Version:       snapshot.Version,
-		SchemaVersion: snapshot.SchemaVersion,
-		UpdatedAt:     snapshot.UpdatedAt,
+		Version:         snapshot.Version,
+		SchemaVersion:   snapshot.SchemaVersion,
+		UpdatedAt:       snapshot.UpdatedAt,
 		ManagedSections: append([]string(nil), snapshot.ManagedSections...),
-		Settings:      snapshot.Settings,
+		Settings:        snapshot.Settings,
 	}
 	pmsettings.Sanitize(&payload.Settings)
+	if snapshot.ManagedSections == nil {
+		payload.ManagedSections = []string{"discovery", "snmp", "features", "spooler"}
+	}
 	if err := m.store.SetConfigValue(serverManagedSettingsKey, payload); err != nil {
 		return pmsettings.Settings{}, err
 	}

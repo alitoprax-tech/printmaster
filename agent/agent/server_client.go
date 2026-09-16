@@ -37,11 +37,11 @@ type ServerClient struct {
 
 // SettingsSnapshot mirrors the server's managed settings payload.
 type SettingsSnapshot struct {
-	Version       string              `json:"version"`
-	SchemaVersion string              `json:"schema_version"`
-	UpdatedAt     time.Time           `json:"updated_at"`
-	ManagedSections []string          `json:"managed_sections,omitempty"`
-	Settings      pmsettings.Settings `json:"settings"`
+	Version         string              `json:"version"`
+	SchemaVersion   string              `json:"schema_version"`
+	UpdatedAt       time.Time           `json:"updated_at"`
+	ManagedSections []string            `json:"managed_sections"`
+	Settings        pmsettings.Settings `json:"settings"`
 }
 
 // HeartbeatResult captures metadata returned from a heartbeat call.

@@ -42,15 +42,15 @@ func ComputeSettingsVersion(schemaVersion string, updatedAt time.Time, cfg Setti
 // sync token so metadata-only fleet changes are delivered to agents.
 func ComputeSettingsVersionWithManagedSections(schemaVersion string, updatedAt time.Time, cfg Settings, managedSections []string) (string, error) {
 	material := struct {
-		SchemaVersion string    `json:"schema_version"`
-		UpdatedAt     time.Time `json:"updated_at"`
-		ManagedSections []string `json:"managed_sections,omitempty"`
-		Settings      Settings  `json:"settings"`
+		SchemaVersion   string    `json:"schema_version"`
+		UpdatedAt       time.Time `json:"updated_at"`
+		ManagedSections []string  `json:"managed_sections,omitempty"`
+		Settings        Settings  `json:"settings"`
 	}{
-		SchemaVersion: schemaVersion,
-		UpdatedAt:     updatedAt.UTC(),
+		SchemaVersion:   schemaVersion,
+		UpdatedAt:       updatedAt.UTC(),
 		ManagedSections: managedSections,
-		Settings:      cfg,
+		Settings:        cfg,
 	}
 	b, err := json.Marshal(material)
 	if err != nil {

@@ -15,7 +15,7 @@ type AgentSnapshot struct {
 	SchemaVersion   string              `json:"schema_version"`
 	UpdatedAt       time.Time           `json:"updated_at"`
 	Settings        pmsettings.Settings `json:"settings"`
-	ManagedSections []string            `json:"managed_sections,omitempty"` // e.g. ["discovery", "snmp", "features"]
+	ManagedSections []string            `json:"managed_sections"` // e.g. ["discovery", "snmp", "features"]
 }
 
 // BuildAgentSnapshot resolves the appropriate settings for an agent and rewrites the
