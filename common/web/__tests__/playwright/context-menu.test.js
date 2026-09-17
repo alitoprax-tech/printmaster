@@ -199,13 +199,13 @@ function isMobileViewport(page) {
   return size && size.width < 768;
 }
 
-async function openContextMenu(page, target, contextMenu) {
+async function openContextMenu(page, target, contextMenu, { force = false } = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     // Give any previous menu's outside-click listener (registered via a 10ms
     // setTimeout in showContextMenu) time to fully detach before reopening,
     // otherwise the reopened menu can be torn down/rebuilt out from under us.
     await page.waitForTimeout(50);
-    await target.click({ button: 'right' });
+    await target.click({ button: 'right', force });
     try {
       await expect(contextMenu).toBeVisible({ timeout: 2000 });
       await expect(contextMenu.locator('.pm-context-menu-item').first()).toBeVisible({ timeout: 2000 });
@@ -226,6 +226,24 @@ async function openContextMenuAndClickAction(page, target, contextMenu, action) 
     await openContextMenu(page, target, contextMenu);
     try {
       await contextMenu.locator(`[data-action="${action}"]`).click({ timeout: 5000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
+}
+
+// Opens the context menu and asserts each of `actions` is visible, retrying
+// the whole open+verify sequence if the menu gets torn down between opening
+// and checking a later item (the same class of race openContextMenuAndClickAction
+// guards against - only the first item is guaranteed checked by openContextMenu).
+async function openContextMenuAndVerifyItems(page, target, contextMenu, actions, options) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await openContextMenu(page, target, contextMenu, options);
+    try {
+      for (const action of actions) {
+        await expect(contextMenu.locator(`[data-action="${action}"]`)).toBeVisible({ timeout: 2000 });
+      }
       return;
     } catch (error) {
       if (attempt === 2) throw error;
@@ -304,12 +322,11 @@ test('device context menu: appearance, actions, delete flow', async ({ page, bro
   const deviceElement = page.locator('.saved-device-card[data-serial="ABC123"], .device-card[data-serial="ABC123"], tr[data-serial="ABC123"]').first();
 
   const contextMenu = page.locator('.pm-context-menu');
-  await openContextMenu(page, deviceElement, contextMenu);
-
-  // Verify menu items exist (increase timeout for stability)
-  await expect(contextMenu.locator('[data-action="show-printer-details"]')).toBeVisible({ timeout: 5000 });
-  await expect(contextMenu.locator('[data-action="copy-serial"]')).toBeVisible({ timeout: 5000 });
-  await expect(contextMenu.locator('[data-action="delete-device"]')).toBeVisible({ timeout: 5000 });
+  await openContextMenuAndVerifyItems(page, deviceElement, contextMenu, [
+    'show-printer-details',
+    'copy-serial',
+    'delete-device',
+  ]);
 
   // Verify delete has danger styling
   const deleteItem = contextMenu.locator('[data-action="delete-device"]');
@@ -438,25 +455,12 @@ test('agent context menu: appearance and actions', async ({ page, browserName })
   await expect(agentElement).toBeVisible();
 
   // --- Test 1: Context menu appears ---
-  // Retry right-click if context menu doesn't appear (handles timing edge cases)
   const contextMenu = page.locator('.pm-context-menu');
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await agentElement.click({ button: 'right', force: true });
-    try {
-      await expect(contextMenu).toBeVisible({ timeout: 2000 });
-      break;
-    } catch (e) {
-      if (attempt === 2) throw e;
-      // Close any partial menu and retry
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(50);
-    }
-  }
-
-  // Verify agent menu items
-  await expect(contextMenu.locator('[data-action="view-agent"]')).toBeVisible();
-  await expect(contextMenu.locator('[data-action="copy-agent-id"]')).toBeVisible();
-  await expect(contextMenu.locator('[data-action="delete-agent"]')).toBeVisible();
+  await openContextMenuAndVerifyItems(page, agentElement, contextMenu, [
+    'view-agent',
+    'copy-agent-id',
+    'delete-agent',
+  ], { force: true });
 
   // Verify delete has danger styling
   await expect(contextMenu.locator('[data-action="delete-agent"]')).toHaveClass(/danger/);
