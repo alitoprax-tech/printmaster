@@ -51,7 +51,37 @@
 
     let tenantLookupInitialized = false;
 
+    // Only allow navigation to same-page-relative paths or http(s) URLs (e.g. an
+    // agent's own web UI, which legitimately lives on a different origin). This
+    // blocks javascript:/data:/vbscript: URIs, which would otherwise execute
+    // arbitrary script when assigned to window.location (DOM XSS), and rejects
+    // control characters some browsers normalize into protocol-relative URLs
+    // (open redirect), e.g. "/\t/evil.com" -> "//evil.com".
+    function isSafeNavigationTarget(target){
+        if(typeof target !== 'string' || target === ''){
+            return false;
+        }
+        for(let i = 0; i < target.length; i++){
+            const code = target.charCodeAt(i);
+            if(code <= 0x1f || code === 0x7f){
+                return false;
+            }
+        }
+        if(target.startsWith('/') && !target.startsWith('//') && !target.startsWith('/\\')){
+            return true;
+        }
+        try{
+            const parsed = new URL(target, window.location.origin);
+            return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+        }catch(e){
+            return false;
+        }
+    }
+
     function navigateTo(target){
+        if(!isSafeNavigationTarget(target)){
+            target = '/';
+        }
         if(typeof window.__pmLoginNavigate === 'function'){
             window.__pmLoginNavigate(target);
             return;
