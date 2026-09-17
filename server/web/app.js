@@ -10442,7 +10442,7 @@ function renderAgentStatusBadge(meta) {
 function findAgentCardElement(agentId) {
     const cards = document.getElementById('agents_cards');
     if (!cards) return null;
-    const safeId = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(agentId || '') : String(agentId || '').replace(/"/g, '\"');
+    const safeId = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(agentId || '') : String(agentId || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     return cards.querySelector(`[data-agent-id="${safeId}"]`);
 }
 
@@ -15935,8 +15935,11 @@ function hasOverride(pathParts) {
     return true;
 }
 
+// Keys that would let a crafted path reach/mutate Object.prototype (prototype pollution).
+const UNSAFE_PATH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function pathToArray(path) {
-    return (path || '').split('.');
+    return (path || '').split('.').filter(key => !UNSAFE_PATH_KEYS.has(key));
 }
 
 function readNested(obj, parts) {
@@ -15951,6 +15954,7 @@ function readNested(obj, parts) {
 function setNestedValue(obj, path, value) {
     if (!obj) return;
     const parts = pathToArray(path);
+    if (parts.length === 0) return;
     let cursor = obj;
     for (let i = 0; i < parts.length - 1; i++) {
         const key = parts[i];

@@ -968,7 +968,9 @@ async function deleteSavedDevice(serial) {
         // animation; wait for animationend before updating the UI.
         try {
             // Try to find by explicit data-serial or fallback to data-device-key
-            const esc = (s) => (s || '').replace(/"/g, '\\"').replace(/\\/g, '\\\\');
+            // Escape backslashes before quotes, otherwise the backslash inserted
+            // to escape a quote would itself get re-escaped by the next replace.
+            const esc = (s) => (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
             let card = document.querySelector('.saved-device-card[data-serial="' + esc(serial) + '"]');
             if (!card) card = document.querySelector('.saved-device-card[data-device-key="' + esc(serial) + '"]');
             if (card) {
