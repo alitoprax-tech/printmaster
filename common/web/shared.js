@@ -1491,7 +1491,7 @@ window.showMetricsModal = async function (opts = {}) {
             contentEl.innerHTML = html;
         } catch (err) {
             window.__pm_shared.error('Metrics fetch failed', err);
-            contentEl.innerHTML = `<div style="color:var(--error);">Failed to load metrics: ${err.message || err}</div>`;
+            contentEl.innerHTML = `<div style="color:var(--error);">Failed to load metrics: ${typeof escapeHtml === 'function' ? escapeHtml(err.message || err) : String(err.message || err)}</div>`;
         }
     }
 

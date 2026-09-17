@@ -1586,7 +1586,7 @@ async function loadSessions() {
         const sessions = await fetchJSON('/api/v1/sessions');
         renderSessions(sessions || []);
     } catch (err) {
-        container.innerHTML = `<div style="color:var(--danger);">Failed to load sessions: ${err.message || err}</div>`;
+        container.innerHTML = `<div style="color:var(--danger);">Failed to load sessions: ${escapeHtml(err.message || err)}</div>`;
     }
 }
 
@@ -5447,7 +5447,7 @@ async function loadDashboard() {
                 <div class="dashboard-empty">
                     <div class="dashboard-empty-icon">⚠️</div>
                     <div>Failed to load dashboard data</div>
-                    <div class="muted-text">${err.message || err}</div>
+                    <div class="muted-text">${escapeHtml(err.message || err)}</div>
                 </div>
             `;
         }
@@ -7824,7 +7824,7 @@ async function loadUsers() {
         const users = await r.json();
         renderUsers(users);
     } catch (err) {
-        el.innerHTML = '<div style="color:var(--danger)">Error loading users: ' + (err.message || err) + '</div>';
+        el.innerHTML = '<div style="color:var(--danger)">Error loading users: ' + escapeHtml(err.message || err) + '</div>';
     }
 }
 
@@ -8524,7 +8524,7 @@ async function loadTenants() {
 
         notifyManagedSettingsTenantDirectory(data);
     } catch (err) {
-        el.innerHTML = '<div style="color:var(--danger)">Error loading tenants: ' + (err.message || err) + '</div>';
+        el.innerHTML = '<div style="color:var(--danger)">Error loading tenants: ' + escapeHtml(err.message || err) + '</div>';
     }
 }
 
@@ -10883,7 +10883,7 @@ async function viewAgentDetails(agentId) {
     } catch (error) {
         window.__pm_shared.error('Failed to load agent details:', error);
         const body = document.getElementById('agent_details_body');
-        body.innerHTML = `<div style="color:var(--error);text-align:center;padding:40px;">Failed to load agent details: ${error.message}</div>`;
+        body.innerHTML = `<div style="color:var(--error);text-align:center;padding:40px;">Failed to load agent details: ${escapeHtml(error.message)}</div>`;
         window.__pm_shared.showToast('Failed to load agent details', 'error');
     }
 }
@@ -14105,7 +14105,7 @@ async function loadAgentUpdatePolicyForUpdatesTab() {
             renderAgentUpdatePolicyInUpdatesTab(root, false, DEFAULT_UPDATE_POLICY_SPEC);
             return;
         }
-        root.innerHTML = `<div style="color:var(--danger);">Failed to load agent update policy: ${err.message || err}</div>`;
+        root.innerHTML = `<div style="color:var(--danger);">Failed to load agent update policy: ${escapeHtml(err.message || err)}</div>`;
     }
 }
 
