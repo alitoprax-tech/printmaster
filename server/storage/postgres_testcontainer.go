@@ -10,6 +10,7 @@ import (
 
 	"printmaster/common/config"
 
+	"github.com/moby/moby/client"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -102,7 +103,7 @@ func SkipIfNoDocker(t *testing.T) {
 	defer provider.Close()
 
 	// Try to ping Docker
-	_, err = provider.Client().Ping(ctx)
+	_, err = provider.Client().Ping(ctx, client.PingOptions{})
 	if err != nil {
 		t.Skipf("Docker not responding, skipping integration test: %v", err)
 	}
