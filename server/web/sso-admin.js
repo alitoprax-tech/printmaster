@@ -265,8 +265,13 @@
             return 'generic';
         }
         const issuer = provider.issuer || '';
-        if (/login\.microsoftonline\.com\/[^\s]+/i.test(issuer)) {
-            return 'entra';
+        try {
+            const host = new URL(issuer).hostname.toLowerCase();
+            if (host === 'login.microsoftonline.com' || host.endsWith('.login.microsoftonline.com')) {
+                return 'entra';
+            }
+        } catch (e) {
+            // Not a valid absolute URL; fall through to generic.
         }
         return 'generic';
     }
