@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"log"
@@ -5409,34 +5410,39 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 func injectProxyMetaAndBase(body []byte, proxyBase string, agentID string, targetURL string) []byte {
 	bodyStr := string(body)
 
+	// HTML-escape values before embedding into markup; proxyBase/agentID can
+	// contain attacker-influenced characters (e.g. a malicious agent's self-
+	// reported ID), so this prevents attribute/tag breakout (XSS).
+	escapedProxyBase := html.EscapeString(proxyBase)
+
 	// Replace absolute origin occurrences (http(s)://host:port) and protocol-relative //host:port
 	if u, err := url.Parse(targetURL); err == nil {
 		origin := u.Scheme + "://" + u.Host
-		bodyStr = strings.ReplaceAll(bodyStr, origin, proxyBase)
+		bodyStr = strings.ReplaceAll(bodyStr, origin, escapedProxyBase)
 		protoRel := "//" + u.Host
-		bodyStr = strings.ReplaceAll(bodyStr, protoRel, proxyBase)
+		bodyStr = strings.ReplaceAll(bodyStr, protoRel, escapedProxyBase)
 	}
 
 	// Rewrite common root-absolute attributes so they route through the proxy.
 	// Do this before injecting our own <base> so we don't accidentally rewrite the
 	// base href we add (which would cause duplicated proxy prefixes).
-	bodyStr = strings.ReplaceAll(bodyStr, `src="/`, "src=\""+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `src='/`, "src='"+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `href="/`, "href=\""+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `href='/`, "href='"+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `action="/`, "action=\""+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `action='/`, "action='"+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `data-src="/`, "data-src=\""+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `data-src='/`, "data-src='"+proxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `src="/`, "src=\""+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `src='/`, "src='"+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `href="/`, "href=\""+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `href='/`, "href='"+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `action="/`, "action=\""+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `action='/`, "action='"+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `data-src="/`, "data-src=\""+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `data-src='/`, "data-src='"+escapedProxyBase)
 	// Inline CSS url() patterns
-	bodyStr = strings.ReplaceAll(bodyStr, `url("/`, "url(\""+proxyBase)
-	bodyStr = strings.ReplaceAll(bodyStr, `url('/`, "url('"+proxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `url("/`, "url(\""+escapedProxyBase)
+	bodyStr = strings.ReplaceAll(bodyStr, `url('/`, "url('"+escapedProxyBase)
 
 	// Rewrite relative paths with ../ to absolute proxy paths.
 	// Many printer web UIs (e.g., Epson at /PRESENTATION/ADVANCED/COMMON/TOP)
 	// use paths like ../INFO_PRTINFO/TOP which resolve relative to the current
 	// page location. We need to properly resolve these against the target URL.
-	bodyStr = rewriteParentRelativePaths(bodyStr, proxyBase, targetURL)
+	bodyStr = rewriteParentRelativePaths(bodyStr, escapedProxyBase, targetURL)
 
 	// NOTE: fetch/XHR URL rewriting is now handled by shared.js which intercepts
 	// these calls at runtime and prefixes URLs based on the <base> element.
@@ -5452,8 +5458,8 @@ func injectProxyMetaAndBase(body []byte, proxyBase string, agentID string, targe
 	// Inject meta tags and <base>. The fetch/XHR interception is now handled
 	// by shared.js which detects the <base> element and prefixes URLs automatically.
 	// This is much cleaner than injecting inline scripts.
-	metaTag := `<meta http-equiv="X-PrintMaster-Proxied" content="true"><meta http-equiv="X-PrintMaster-Agent-ID" content="` + agentID + `">` +
-		`<base href="` + proxyBase + `">`
+	metaTag := `<meta http-equiv="X-PrintMaster-Proxied" content="true"><meta http-equiv="X-PrintMaster-Agent-ID" content="` + html.EscapeString(agentID) + `">` +
+		`<base href="` + escapedProxyBase + `">`
 
 	bodyStr = bodyStr[:insertPos] + metaTag + bodyStr[insertPos:]
 

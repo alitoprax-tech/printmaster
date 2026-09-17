@@ -27,6 +27,23 @@ func TestInjectProxyMetaAndBase(t *testing.T) {
 	}
 }
 
+func TestInjectProxyMetaAndBaseEscapesAgentID(t *testing.T) {
+	sample := `<!doctype html><html><head><title>Agent UI</title></head><body></body></html>`
+	agentID := `"><script>alert(1)</script>`
+	targetURL := "http://127.0.0.1:8080/"
+	proxyBase := "/api/v1/proxy/agent/" + agentID + "/"
+
+	out := injectProxyMetaAndBase([]byte(sample), proxyBase, agentID, targetURL)
+	s := string(out)
+
+	if contains(s, "<script>alert(1)</script>") {
+		t.Fatalf("agent ID was not HTML-escaped, XSS possible: %s", s)
+	}
+	if contains(s, `content=""><script>`) {
+		t.Fatalf("agent ID broke out of the meta tag attribute: %s", s)
+	}
+}
+
 // contains is a tiny helper to avoid importing strings in the test body
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool { return (len(s) >= len(sub) && indexOf(s, sub) >= 0) })()
