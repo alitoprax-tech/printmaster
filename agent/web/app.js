@@ -1638,7 +1638,7 @@ async function deleteSavedDevice(serial) {
         window.__pm_shared.showToast('Device deleted successfully', 'success');
         // Animate removal of the saved-device card to avoid an abrupt snap.
         try {
-            const card = document.querySelector('.saved-device-card[data-serial="' + (serial || '') + '"]') || document.querySelector('.saved-device-card[data-device-key="' + (serial || '') + '"]');
+            const card = document.querySelector('.saved-device-card[data-serial="' + serial + '"]') || document.querySelector('.saved-device-card[data-device-key="' + serial + '"]');
             if (card) {
                 card.classList.add('removing');
                 let handled = false;

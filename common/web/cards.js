@@ -122,7 +122,7 @@
     function renderSavedCard(item) {
         const device = (item && item.printer_info) || {};
         const serial = item && item.serial ? item.serial : '';
-    const toners = buildTonerLevels(device) || {};
+    const toners = buildTonerLevels(device);
         const lifeCount = device.page_count || device.total_mono_impressions || 0;
 
         const graphId = 'usage-graph-' + (serial || (device.ip||'')).toString().replace(/[^a-zA-Z0-9]/g,'_');
@@ -192,7 +192,7 @@
             const pct = isNaN(v) ? '' : Math.max(0, Math.min(100, v));
 
             // Determine color based on supply type and level
-            let color = '#6c6';
+            let color;
             let icon = '';
 
             // Toner colors
@@ -850,8 +850,8 @@
         // Consumables (render as its own card). If we don't have explicit
         // consumable information yet, include a placeholder `printer_consumables_card`
         // which can later be populated from the latest metrics snapshot.
-        const tonerLevels = buildTonerLevels(p) || {};
-        if (tonerLevels && Object.keys(tonerLevels).length > 0) {
+        const tonerLevels = buildTonerLevels(p);
+        if (Object.keys(tonerLevels).length > 0) {
             // Render the consumables card with an explicit id so we can
             // detect it later and avoid duplicate insertions.
             html += '<div id="printer_consumables_card_actual">' + renderInfoCard('Consumables', renderConsumablesSection(tonerLevels)) + '</div>';

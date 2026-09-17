@@ -708,7 +708,7 @@
         if (!slug) {
             return;
         }
-        let confirmed = true;
+        let confirmed;
         if (window.__pm_shared && typeof window.__pm_shared.showConfirm === 'function') {
             confirmed = await window.__pm_shared.showConfirm('Delete identity provider "' + slug + '"? Users will no longer be able to sign in with this provider.', 'Delete Provider', true);
         } else {

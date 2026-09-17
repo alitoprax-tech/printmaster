@@ -88,7 +88,10 @@ window.__pm_shared = window.__pm_shared || {};
                     }
                 }
             } catch (e) { /* fail safe - just use original */ }
-            return originalFetch.apply(this, arguments);
+            // Call explicitly with (possibly rewritten) input/init rather than
+            // the original `arguments` object, which only reflects reassigned
+            // parameters in non-strict mode (fragile/implicit behavior).
+            return originalFetch.call(this, input, init);
         };
 
         // Also intercept XMLHttpRequest for older code patterns
