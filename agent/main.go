@@ -440,6 +440,30 @@ func requestIsHTTPS(r *http.Request) bool {
 	return proto == "https"
 }
 
+// isSafeReturnPath validates that a "return_to" redirect target is a local,
+// same-origin path (prevents open-redirect attacks). It rejects absolute
+// URLs, protocol-relative URLs (//host or /\host), and control characters
+// (tab/CR/LF/etc.) that some browsers strip or normalize before navigating,
+// which could otherwise be used to smuggle "//host" past a naive prefix check
+// (e.g. "/\t/evil.com" is stripped to "//evil.com" by some browsers).
+func isSafeReturnPath(p string) bool {
+	if p == "" || !strings.HasPrefix(p, "/") {
+		return false
+	}
+	if strings.HasPrefix(p, "//") || strings.HasPrefix(p, "/\\") {
+		return false
+	}
+	if strings.Contains(p, "://") {
+		return false
+	}
+	for _, r := range p {
+		if r <= 0x1f || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // handleHealth responds with a simple JSON payload indicating the agent is alive.
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -706,13 +730,7 @@ func (a *agentAuthManager) handleAuthCallback(w http.ResponseWriter, r *http.Req
 	// Get the callback token from query params
 	token := strings.TrimSpace(r.URL.Query().Get("token"))
 	returnTo := strings.TrimSpace(r.URL.Query().Get("return_to"))
-	if returnTo == "" {
-		returnTo = "/"
-	}
-
-	// Validate return_to is a safe path (prevent open redirect attacks)
-	// Must start with "/" but not "//" or "/\" to prevent protocol-relative URLs
-	if !strings.HasPrefix(returnTo, "/") || strings.HasPrefix(returnTo, "//") || strings.HasPrefix(returnTo, "/\\") {
+	if returnTo == "" || !isSafeReturnPath(returnTo) {
 		returnTo = "/"
 	}
 
