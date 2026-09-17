@@ -189,6 +189,10 @@ func TestFleetUpdatePolicyLifecycle(t *testing.T) {
 
 	ctx := context.Background()
 
+	if err := s.CreateTenant(ctx, &Tenant{ID: "tenant-policy", Name: "Policy Tenant"}); err != nil {
+		t.Fatalf("CreateTenant: %v", err)
+	}
+
 	// Create a fleet update policy
 	policy := &FleetUpdatePolicy{
 		TenantID: "tenant-policy",
@@ -257,6 +261,12 @@ func TestListFleetUpdatePolicies(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+
+	for _, tenantID := range []string{"tenant-1", "tenant-2", "tenant-3"} {
+		if err := s.CreateTenant(ctx, &Tenant{ID: tenantID, Name: "Policy Tenant " + tenantID}); err != nil {
+			t.Fatalf("CreateTenant %s: %v", tenantID, err)
+		}
+	}
 
 	// Create multiple policies
 	for i := 1; i <= 3; i++ {

@@ -163,6 +163,20 @@ func TestDeviceLifecycle(t *testing.T) {
 
 	ctx := context.Background()
 
+	if err := s.RegisterAgent(ctx, &Agent{
+		AgentID:         "agent-1",
+		Name:            "Test Agent",
+		Hostname:        "test-host",
+		IP:              "192.168.1.10",
+		Platform:        "linux",
+		Version:         "1.0.0",
+		ProtocolVersion: "1",
+		Token:           "agent-1-token",
+		Status:          "active",
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
 	// Upsert a device
 	device := &Device{
 		AgentID: "agent-1",
@@ -238,6 +252,20 @@ func TestDeviceWithRawData(t *testing.T) {
 
 	ctx := context.Background()
 
+	if err := s.RegisterAgent(ctx, &Agent{
+		AgentID:         "agent-1",
+		Name:            "Raw Data Agent",
+		Hostname:        "raw-host",
+		IP:              "192.168.1.11",
+		Platform:        "linux",
+		Version:         "1.0.0",
+		ProtocolVersion: "1",
+		Token:           "agent-raw-token",
+		Status:          "active",
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+
 	device := &Device{
 		AgentID: "agent-1",
 	}
@@ -277,6 +305,22 @@ func TestMultipleDevicesByAgent(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+
+	for _, agentID := range []string{"agent-1", "agent-2"} {
+		if err := s.RegisterAgent(ctx, &Agent{
+			AgentID:         agentID,
+			Name:            agentID,
+			Hostname:        agentID + "-host",
+			IP:              "192.168.1." + string(rune('1'+len(agentID))),
+			Platform:        "linux",
+			Version:         "1.0.0",
+			ProtocolVersion: "1",
+			Token:           agentID + "-token",
+			Status:          "active",
+		}); err != nil {
+			t.Fatalf("RegisterAgent %s: %v", agentID, err)
+		}
+	}
 
 	// Create devices for agent-1
 	for i := 0; i < 3; i++ {
@@ -341,6 +385,20 @@ func TestMetricsLifecycle(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+
+	if err := s.RegisterAgent(ctx, &Agent{
+		AgentID:         "agent-1",
+		Name:            "Metrics Agent",
+		Hostname:        "metrics-host",
+		IP:              "192.168.1.12",
+		Platform:        "linux",
+		Version:         "1.0.0",
+		ProtocolVersion: "1",
+		Token:           "agent-metrics-token",
+		Status:          "active",
+	}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
 
 	// First create a device (metrics are linked to devices by serial)
 	device := &Device{
@@ -862,6 +920,10 @@ func TestDatabaseStats(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+
+	if err := s.RegisterAgent(ctx, &Agent{AgentID: "stats-agent", Name: "Stats Agent", Token: "stats-token", Status: "active"}); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
 
 	// Add some data
 	agent := &Agent{AgentID: "stats-agent", Name: "Stats Agent", Token: "stats-token", Status: "active"}
