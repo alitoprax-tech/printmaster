@@ -8799,11 +8799,17 @@ async function fetchAgentsForTenant(tenantId) {
 }
 
 function renderSitesTree(tenantId, sites, agents) {
+    // Escape a value for safe interpolation inside a single-quoted attribute
+    // JS string literal (e.g. onclick="fn('${...}')"). Escape backslashes
+    // before quotes, otherwise the backslash inserted to escape a quote would
+    // itself be re-escaped.
+    const escapeAttrJsString = (s) => String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
     if (sites.length === 0 && agents.length === 0) {
         return `
             <div class="sites-tree-empty">
                 <span>No sites configured.</span>
-                <button class="btn btn-xs btn-primary" onclick="openSiteModal('${tenantId}', null)">+ Add Site</button>
+                <button class="btn btn-xs btn-primary" onclick="openSiteModal('${escapeAttrJsString(tenantId)}', null)">+ Add Site</button>
             </div>
         `;
     }
@@ -8825,9 +8831,11 @@ function renderSitesTree(tenantId, sites, agents) {
 
     let html = '<div class="sites-tree">';
 
+    const escapedTenantId = escapeAttrJsString(tenantId);
+
     // Toolbar
     html += `<div class="sites-tree-toolbar">
-        <button class="btn btn-xs btn-primary" onclick="openSiteModal('${tenantId}', null)">+ Add Site</button>
+        <button class="btn btn-xs btn-primary" onclick="openSiteModal('${escapedTenantId}', null)">+ Add Site</button>
     </div>`;
 
     // Sites with their agents
@@ -8835,6 +8843,7 @@ function renderSitesTree(tenantId, sites, agents) {
         const siteAgentList = siteAgents[site.id] || [];
         // Escape backslashes first, then single quotes to prevent injection via \'
         const escapedSiteName = escapeHtml(site.name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const escapedSiteId = escapeAttrJsString(site.id);
         html += `
             <div class="site-node" data-site-id="${site.id}">
                 <div class="site-header">
@@ -8842,8 +8851,8 @@ function renderSitesTree(tenantId, sites, agents) {
                     <span class="site-name">${escapeHtml(site.name)}</span>
                     <span class="site-meta">${siteAgentList.length} agents, ${site.device_count || 0} devices</span>
                     <div class="site-actions">
-                        <button class="btn btn-xs" onclick="openSiteModal('${tenantId}', '${site.id}')">Edit</button>
-                        <button class="btn btn-xs btn-danger" onclick="deleteSiteInline('${tenantId}', '${site.id}', '${escapedSiteName}')">×</button>
+                        <button class="btn btn-xs" onclick="openSiteModal('${escapedTenantId}', '${escapedSiteId}')">Edit</button>
+                        <button class="btn btn-xs btn-danger" onclick="deleteSiteInline('${escapedTenantId}', '${escapedSiteId}', '${escapedSiteName}')">×</button>
                     </div>
                 </div>
                 <div class="site-agents">

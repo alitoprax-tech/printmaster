@@ -1135,7 +1135,7 @@
                         const label = d.field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
                         diffHtml += '<div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:6px;background:rgba(0,0,0,0.1);border-radius:4px">';
                         diffHtml += '<div><div style="color:var(--muted);font-size:11px;text-transform:uppercase">' + label + '</div>';
-                        diffHtml += '<div style="font-size:12px"><span style="color:var(--muted);text-decoration:line-through">' + (d.current || '<i>empty</i>') + '</span> → <span style="color:var(--highlight)">' + d.proposed + '</span></div></div>';
+                        diffHtml += '<div style="font-size:12px"><span style="color:var(--muted);text-decoration:line-through">' + (d.current ? escapeHtmlCards(d.current) : '<i>empty</i>') + '</span> → <span style="color:var(--highlight)">' + escapeHtmlCards(d.proposed) + '</span></div></div>';
                         diffHtml += '<button class="apply-single-btn" data-field="' + d.field + '" data-value="' + String(d.proposed).replace(/"/g, '&quot;') + '" style="font-size:11px;padding:4px 8px">Apply</button>';
                         diffHtml += '</div>';
                     });
@@ -1175,7 +1175,7 @@
                                     // Update display
                                     const displayEl = document.getElementById('field_' + field + '_display');
                                     if (displayEl) {
-                                        displayEl.innerHTML = value || '<span style="color:var(--muted);font-style:italic">Not set</span>';
+                                        displayEl.innerHTML = value ? escapeHtmlCards(value) : '<span style="color:var(--muted);font-style:italic">Not set</span>';
                                     }
                                     p[field] = value;
                                     window.__pm_shared.showToast(field.replace(/_/g, ' ') + ' updated', 'success');
