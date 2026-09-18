@@ -2969,6 +2969,7 @@ func (s *BaseStore) UpsertGlobalSettings(ctx context.Context, rec *SettingsRecor
 	if rec.UpdatedBy == "" {
 		rec.UpdatedBy = "system"
 	}
+	rec.UpdatedAt = time.Now().UTC()
 
 	query := `
 		INSERT INTO settings_global (id, schema_version, payload, updated_at, updated_by)
@@ -2979,7 +2980,7 @@ func (s *BaseStore) UpsertGlobalSettings(ctx context.Context, rec *SettingsRecor
 			updated_at = excluded.updated_at,
 			updated_by = excluded.updated_by
 	`
-	_, err = s.execContext(ctx, query, rec.SchemaVersion, string(payload), time.Now().UTC(), rec.UpdatedBy)
+	_, err = s.execContext(ctx, query, rec.SchemaVersion, string(payload), rec.UpdatedAt, rec.UpdatedBy)
 	return err
 }
 
@@ -3063,6 +3064,7 @@ func (s *BaseStore) UpsertTenantSettings(ctx context.Context, rec *TenantSetting
 	if rec.UpdatedBy == "" {
 		rec.UpdatedBy = "system"
 	}
+	rec.UpdatedAt = time.Now().UTC()
 
 	query := `
 		INSERT INTO settings_tenant (tenant_id, schema_version, payload, updated_at, updated_by)
@@ -3073,7 +3075,7 @@ func (s *BaseStore) UpsertTenantSettings(ctx context.Context, rec *TenantSetting
 			updated_at = excluded.updated_at,
 			updated_by = excluded.updated_by
 	`
-	_, err = s.execContext(ctx, query, rec.TenantID, rec.SchemaVersion, string(payload), time.Now().UTC(), rec.UpdatedBy)
+	_, err = s.execContext(ctx, query, rec.TenantID, rec.SchemaVersion, string(payload), rec.UpdatedAt, rec.UpdatedBy)
 	return err
 }
 
@@ -3226,6 +3228,7 @@ func (s *BaseStore) UpsertAgentSettings(ctx context.Context, rec *AgentSettingsR
 	if rec.UpdatedBy == "" {
 		rec.UpdatedBy = "system"
 	}
+	rec.UpdatedAt = time.Now().UTC()
 
 	query := `
 		INSERT INTO settings_agent_override (agent_id, schema_version, payload, updated_at, updated_by)
@@ -3236,7 +3239,7 @@ func (s *BaseStore) UpsertAgentSettings(ctx context.Context, rec *AgentSettingsR
 			updated_at = excluded.updated_at,
 			updated_by = excluded.updated_by
 	`
-	_, err = s.execContext(ctx, query, rec.AgentID, rec.SchemaVersion, string(payload), time.Now().UTC(), rec.UpdatedBy)
+	_, err = s.execContext(ctx, query, rec.AgentID, rec.SchemaVersion, string(payload), rec.UpdatedAt, rec.UpdatedBy)
 	return err
 }
 

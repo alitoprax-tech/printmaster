@@ -15416,6 +15416,10 @@ function updateTenantDraft(path, value) {
 }
 
 function updateAgentDraft(path, value) {
+    const section = String(path || '').split('.')[0];
+    if (settingsUIState.agentEnforcedSections && settingsUIState.agentEnforcedSections.has(section)) {
+        return;
+    }
     if (!settingsUIState.agentDraft) {
         const baseSettings = getSettingsPayload(settingsUIState.agentBaseSnapshot) || {};
         settingsUIState.agentDraft = cloneSettings(baseSettings);
@@ -15626,6 +15630,9 @@ async function saveAgentSettings() {
         return;
     }
     const overrides = cloneSettings(settingsUIState.agentOverridesDraft);
+    (settingsUIState.agentEnforcedSections || new Set()).forEach(section => {
+        delete overrides[section];
+    });
     const hasOverrides = flattenOverrides(overrides).length > 0;
     if (!hasOverrides) {
         try {

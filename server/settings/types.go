@@ -21,7 +21,7 @@ type TenantSnapshot struct {
 	Overrides          map[string]interface{} `json:"overrides"`
 	OverridePaths      []string               `json:"override_paths"`
 	EnforcedSections   []string               `json:"enforced_sections,omitempty"`
-	OverridesUpdatedAt time.Time              `json:"overrides_updated_at,omitempty"`
+	OverridesUpdatedAt *time.Time             `json:"overrides_updated_at,omitempty"`
 	OverridesUpdatedBy string                 `json:"overrides_updated_by,omitempty"`
 }
 
@@ -33,6 +33,6 @@ type AgentSettingsSnapshot struct {
 	Overrides          map[string]interface{} `json:"overrides"`
 	OverridePaths      []string               `json:"override_paths"`
 	EnforcedSections   []string               `json:"enforced_sections,omitempty"`
-	OverridesUpdatedAt time.Time              `json:"overrides_updated_at,omitempty"`
+	OverridesUpdatedAt *time.Time             `json:"overrides_updated_at,omitempty"`
 	OverridesUpdatedBy string                 `json:"overrides_updated_by,omitempty"`
 }

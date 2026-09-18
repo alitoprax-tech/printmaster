@@ -110,7 +110,8 @@ func (r *Resolver) ResolveForTenant(ctx context.Context, tenantID string) (Tenan
 	snapshot.Overrides = cloneMap(rec.Overrides)
 	snapshot.OverridePaths = collectOverridePaths(rec.Overrides)
 	if !rec.UpdatedAt.IsZero() {
-		snapshot.OverridesUpdatedAt = rec.UpdatedAt
+		updatedAt := rec.UpdatedAt
+		snapshot.OverridesUpdatedAt = &updatedAt
 		snapshot.UpdatedAt = rec.UpdatedAt
 	}
 	if strings.TrimSpace(rec.UpdatedBy) != "" {
@@ -190,7 +191,8 @@ func (r *Resolver) ResolveForAgent(ctx context.Context, agentID string) (AgentSe
 	snap.Overrides = cloneMap(filtered)
 	snap.OverridePaths = collectOverridePaths(filtered)
 	if !rec.UpdatedAt.IsZero() {
-		snap.OverridesUpdatedAt = rec.UpdatedAt
+		updatedAt := rec.UpdatedAt
+		snap.OverridesUpdatedAt = &updatedAt
 		if snap.UpdatedAt.IsZero() || rec.UpdatedAt.After(snap.UpdatedAt) {
 			snap.UpdatedAt = rec.UpdatedAt
 		}
