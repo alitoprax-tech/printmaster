@@ -46,16 +46,16 @@ func (s *SQLiteStore) DownsampleRawToHourly(ctx context.Context, olderThan time.
 			COUNT(*) as sample_count,
 			MIN(page_count) as page_count_min,
 			MAX(page_count) as page_count_max,
-			AVG(page_count) as page_count_avg,
+			CAST(AVG(page_count) AS INTEGER) as page_count_avg,
 			MIN(color_pages) as color_min,
 			MAX(color_pages) as color_max,
-			AVG(color_pages) as color_avg,
+			CAST(AVG(color_pages) AS INTEGER) as color_avg,
 			MIN(mono_pages) as mono_min,
 			MAX(mono_pages) as mono_max,
-			AVG(mono_pages) as mono_avg,
+			CAST(AVG(mono_pages) AS INTEGER) as mono_avg,
 			MIN(scan_count) as scan_min,
 			MAX(scan_count) as scan_max,
-			AVG(scan_count) as scan_avg,
+			CAST(AVG(scan_count) AS INTEGER) as scan_avg,
 			GROUP_CONCAT(toner_levels) as toner_samples
 		FROM metrics_raw
 		WHERE timestamp < ?
@@ -176,16 +176,16 @@ func (s *SQLiteStore) DownsampleHourlyToDaily(ctx context.Context, olderThan tim
 			SUM(sample_count) as sample_count,
 			MIN(page_count_min) as page_count_min,
 			MAX(page_count_max) as page_count_max,
-			AVG(page_count_avg) as page_count_avg,
+			CAST(AVG(page_count_avg) AS INTEGER) as page_count_avg,
 			MIN(color_pages_min) as color_min,
 			MAX(color_pages_max) as color_max,
-			AVG(color_pages_avg) as color_avg,
+			CAST(AVG(color_pages_avg) AS INTEGER) as color_avg,
 			MIN(mono_pages_min) as mono_min,
 			MAX(mono_pages_max) as mono_max,
-			AVG(mono_pages_avg) as mono_avg,
+			CAST(AVG(mono_pages_avg) AS INTEGER) as mono_avg,
 			MIN(scan_count_min) as scan_min,
 			MAX(scan_count_max) as scan_max,
-			AVG(scan_count_avg) as scan_avg,
+			CAST(AVG(scan_count_avg) AS INTEGER) as scan_avg,
 			GROUP_CONCAT(toner_levels_avg) as toner_samples
 		FROM metrics_hourly
 		WHERE hour_start < ?
@@ -303,16 +303,16 @@ func (s *SQLiteStore) DownsampleDailyToMonthly(ctx context.Context, olderThan ti
 			SUM(sample_count) as sample_count,
 			MIN(page_count_min) as page_count_min,
 			MAX(page_count_max) as page_count_max,
-			AVG(page_count_avg) as page_count_avg,
+			CAST(AVG(page_count_avg) AS INTEGER) as page_count_avg,
 			MIN(color_pages_min) as color_min,
 			MAX(color_pages_max) as color_max,
-			AVG(color_pages_avg) as color_avg,
+			CAST(AVG(color_pages_avg) AS INTEGER) as color_avg,
 			MIN(mono_pages_min) as mono_min,
 			MAX(mono_pages_max) as mono_max,
-			AVG(mono_pages_avg) as mono_avg,
+			CAST(AVG(mono_pages_avg) AS INTEGER) as mono_avg,
 			MIN(scan_count_min) as scan_min,
 			MAX(scan_count_max) as scan_max,
-			AVG(scan_count_avg) as scan_avg,
+			CAST(AVG(scan_count_avg) AS INTEGER) as scan_avg,
 			GROUP_CONCAT(toner_levels_avg) as toner_samples
 		FROM metrics_daily
 		WHERE day_start < ?
