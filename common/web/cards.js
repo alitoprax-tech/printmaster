@@ -351,63 +351,63 @@
             // If object already has explicit structured toners, use it
             // Check toner_levels (server enriched), toners, and toner
             const explicit = p && (p.toner_levels || p.toners || p.toner);
+            // If latest metrics snapshot contains structured toners, prefer that
+            const latestStructured = latest && (latest.toner_levels || latest.toners || latest.toner) ? (latest.toner_levels || latest.toners || latest.toner) : null;
+
             if (explicit && Object.keys(explicit).length > 0) {
                 // Copy through
                 Object.entries(explicit).forEach(([k, v]) => { out[k] = v; });
-                return out;
-            }
-
-            // If latest metrics snapshot contains structured toners, prefer that
-            const latestStructured = latest && (latest.toner_levels || latest.toners || latest.toner) ? (latest.toner_levels || latest.toners || latest.toner) : null;
-            if (latestStructured && Object.keys(latestStructured).length > 0) {
+            } else if (latestStructured && Object.keys(latestStructured).length > 0) {
                 Object.entries(latestStructured).forEach(([k, v]) => { out[k] = v; });
-                return out;
-            }
+            } else {
+                // Fall back to legacy raw_data keys on p.raw_data (toner_level_black etc.)
+                const raw = (p && (p.raw_data || p.raw || p.metrics)) || {};
+                // Helper to pick numeric value if present
+                const pick = (keys) => {
+                    for (const k of keys) {
+                        if (raw[k] !== undefined && raw[k] !== null) return raw[k];
+                        if (latest && latest[k] !== undefined && latest[k] !== null) return latest[k];
+                        if (p && p[k] !== undefined && p[k] !== null) return p[k];
+                    }
+                    return undefined;
+                };
 
-            // Fall back to legacy raw_data keys on p.raw_data (toner_level_black etc.)
-            const raw = (p && (p.raw_data || p.raw || p.metrics)) || {};
-            // Helper to pick numeric value if present
-            const pick = (keys) => {
-                for (const k of keys) {
-                    if (raw[k] !== undefined && raw[k] !== null) return raw[k];
-                    if (latest && latest[k] !== undefined && latest[k] !== null) return latest[k];
-                    if (p && p[k] !== undefined && p[k] !== null) return p[k];
+                const mappings = [
+                    { name: 'Black', keys: ['toner_level_black', 'toner_level_k', 'toner_level_1', 'black_level', 'black_toner'] , descKeys: ['toner_desc_black', 'toner_desc_k', 'toner_desc_1', 'toner_desc'] },
+                    { name: 'Cyan', keys: ['toner_level_cyan', 'toner_level_c', 'toner_level_2', 'cyan_level'], descKeys: ['toner_desc_cyan'] },
+                    { name: 'Magenta', keys: ['toner_level_magenta', 'toner_level_m', 'toner_level_3', 'magenta_level'], descKeys: ['toner_desc_magenta'] },
+                    { name: 'Yellow', keys: ['toner_level_yellow', 'toner_level_y', 'toner_level_4', 'yellow_level'], descKeys: ['toner_desc_yellow'] },
+                ];
+
+                for (const m of mappings) {
+                    const val = pick(m.keys);
+                    if (val !== undefined) {
+                        out[m.name] = val;
+                        continue;
+                    }
+                    // If no numeric level, try to provide a descriptive name from descKeys
+                    const desc = pick(m.descKeys);
+                    if (desc) out[m.name] = desc;
                 }
-                return undefined;
-            };
 
-            const mappings = [
-                { name: 'Black', keys: ['toner_level_black', 'toner_level_k', 'toner_level_1', 'black_level', 'black_toner'] , descKeys: ['toner_desc_black', 'toner_desc_k', 'toner_desc_1', 'toner_desc'] },
-                { name: 'Cyan', keys: ['toner_level_cyan', 'toner_level_c', 'toner_level_2', 'cyan_level'], descKeys: ['toner_desc_cyan'] },
-                { name: 'Magenta', keys: ['toner_level_magenta', 'toner_level_m', 'toner_level_3', 'magenta_level'], descKeys: ['toner_desc_magenta'] },
-                { name: 'Yellow', keys: ['toner_level_yellow', 'toner_level_y', 'toner_level_4', 'yellow_level'], descKeys: ['toner_desc_yellow'] },
-            ];
-
-            for (const m of mappings) {
-                const val = pick(m.keys);
-                if (val !== undefined) {
-                    out[m.name] = val;
-                    continue;
-                }
-                // If no numeric level, try to provide a descriptive name from descKeys
-                const desc = pick(m.descKeys);
-                if (desc) out[m.name] = desc;
-            }
-
-            // As a last resort, scan raw for any keys that look like 'toner' or 'cartridge'
-            if (Object.keys(out).length === 0) {
-                for (const [k, v] of Object.entries(raw)) {
-                    if (!k) continue;
-                    const lk = k.toLowerCase();
-                    if (lk.includes('toner') || lk.includes('cartridge') || lk.includes('supply')) {
-                        // Use a cleaned-up key name
-                        const pretty = k.replace(/_/g, ' ').replace(/toner level/i, '').trim() || k;
-                        out[pretty] = v;
+                // As a last resort, scan raw for any keys that look like 'toner' or 'cartridge'
+                if (Object.keys(out).length === 0) {
+                    for (const [k, v] of Object.entries(raw)) {
+                        if (!k) continue;
+                        const lk = k.toLowerCase();
+                        if (lk.includes('toner') || lk.includes('cartridge') || lk.includes('supply')) {
+                            // Use a cleaned-up key name
+                            const pretty = k.replace(/_/g, ' ').replace(/toner level/i, '').trim() || k;
+                            out[pretty] = v;
+                        }
                     }
                 }
             }
 
             // Post-process: only include consumables the device actually has.
+            // Applies regardless of which source populated `out` above, so
+            // mono devices never show phantom CMY entries even when an
+            // explicit toner_levels/toners map (still) contains them.
             // Priority: explicit `p.consumables` list if present; otherwise infer
             // from device metrics (color pages) and raw values.
             if (p) {
