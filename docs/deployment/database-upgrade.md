@@ -24,12 +24,34 @@ The commands below assume the database service is named `db`, the database is
 named `printmaster`, and the credentials match your Compose file.
 
 1. Check the current database and create logical backups while the old service
-   is running:
+    is running. Record the TimescaleDB extension version:
 
 ```bash
+docker compose exec -T db psql -U printmaster -d printmaster \
+   -c "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';"
 docker compose exec -T db pg_dump -U printmaster -d printmaster -Fc > printmaster-pg15.dump
 docker compose exec -T db pg_dumpall -U printmaster --globals-only > printmaster-globals.sql
 ```
+
+The source and target must use the same TimescaleDB extension version during
+the dump/restore. For example, if the source reports `2.28.1` but the PG18
+image reports `2.30.1`, do not restore yet. First update the old PG15 image to
+the image containing the target extension version, then update the extension
+on the PG15 database and take fresh dumps:
+
+```bash
+# Run these against the original PG15 data directory, not database-18.
+docker compose pull db
+docker compose up -d db
+docker compose exec -T db psql -U printmaster -d printmaster \
+   -c "ALTER EXTENSION timescaledb UPDATE;"
+docker compose exec -T db psql -U printmaster -d printmaster \
+   -c "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';"
+```
+
+Proceed only when the PG15 source version matches the PG18 target version.
+Take new dump files after the extension update; do not reuse a dump created
+with the older extension catalog.
 
 2. Stop the application and database, but do not remove volumes:
 
@@ -51,8 +73,9 @@ docker compose ps db
 ```
 
 5. Prepare a clean database and enable TimescaleDB. If a previous restore was
-    attempted, do not retry over it: drop and recreate the target database
-    first. The Compose-created `printmaster` role already exists.
+   attempted, do not retry over it: discard the failed `database-18` directory,
+   create a new empty one, and start PG18 again. The Compose-created
+   `printmaster` role already exists.
 
 ```bash
 docker compose exec -T db psql -U printmaster -d postgres \
@@ -81,6 +104,11 @@ The restore command must finish without `errors ignored on restore`. Errors
 such as `chunk not found` indicate an incomplete restore; drop and recreate the
 target database and repeat the sequence above. Never proceed to production
 verification after a non-zero restore result.
+
+If `timescaledb_post_restore()` reports a catalog version mismatch, the source
+dump and target image use different TimescaleDB versions. Upgrade the source
+extension, create a fresh dump, reset the target, and repeat the restore.
+Changing only the PostgreSQL image is not sufficient.
 
 If additional global objects are needed, restore them separately as a database
 superuser and resolve any already-exists messages for the Compose-created role:
