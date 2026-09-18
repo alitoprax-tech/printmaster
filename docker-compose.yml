@@ -55,7 +55,8 @@ services:
       POSTGRES_PASSWORD: changeme
       POSTGRES_DB: printmaster
     volumes:
-      - db-data:/var/lib/postgresql/data
+      # PG18 images use /var/lib/postgresql as the data root.
+      - db-data:/var/lib/postgresql
     ports:
       - "5432:5432"
     healthcheck:

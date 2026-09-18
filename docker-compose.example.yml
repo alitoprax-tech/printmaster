@@ -53,7 +53,8 @@ services:
       POSTGRES_PASSWORD: ${DB_PASS}
       POSTGRES_DB: ${DB_NAME}
     volumes:
-      - ${ROOT_PATH}/server/database:/var/lib/postgresql/data
+      # PG18 images use /var/lib/postgresql as the data root.
+      - ${ROOT_PATH}/server/database:/var/lib/postgresql
     command: ["postgres", "-c", "shared_preload_libraries=timescaledb"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]

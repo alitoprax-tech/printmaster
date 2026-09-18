@@ -7,9 +7,13 @@ standard `pgx` driver and TimescaleDB APIs.
 ## Important warning
 
 Changing `latest-pg15` to `latest-pg18` while keeping the existing
-`/var/lib/postgresql/data` volume will not perform a PostgreSQL major upgrade.
+`/var/lib/postgresql` volume will not perform a PostgreSQL major upgrade.
 PostgreSQL 15 and 18 use incompatible data-directory formats. The container
 will normally refuse to start, and deleting the volume would destroy data.
+
+For PG18, mount the volume at `/var/lib/postgresql`, not
+`/var/lib/postgresql/data`. The PG18 image manages its version-specific data
+directory below that root.
 
 Make a tested backup before starting. Keep the old volume until the new
 database has been verified.
@@ -36,7 +40,8 @@ docker compose stop server db
 3. Change the database image to
    `timescale/timescaledb:latest-pg18` and change the database volume or host
    directory to a new, empty location. For the named-volume example, use a new
-   volume name such as `printmaster_db_data_pg18`.
+   volume name such as `printmaster_db_data_pg18`. Mount it at
+   `/var/lib/postgresql`, not `/var/lib/postgresql/data`.
 
 4. Start only the new database and wait for it to become healthy:
 
@@ -45,15 +50,37 @@ docker compose up -d db
 docker compose ps db
 ```
 
-5. Restore the database dump. The TimescaleDB extension is available in the
-   new image; PrintMaster will initialize its extension objects when the
-   server connects. The Compose-created `printmaster` role already exists, so
-   restore `printmaster-globals.sql` only if you have additional roles or
-   tablespaces to migrate.
+5. Prepare a clean database and enable TimescaleDB. If a previous restore was
+    attempted, do not retry over it: drop and recreate the target database
+    first. The Compose-created `printmaster` role already exists.
 
 ```bash
-docker compose exec -T db pg_restore -U printmaster -d printmaster --clean --if-exists < printmaster-pg15.dump
+docker compose exec -T db psql -U printmaster -d postgres \
+   -c "DROP DATABASE IF EXISTS printmaster;"
+docker compose exec -T db psql -U printmaster -d postgres \
+   -c "CREATE DATABASE printmaster OWNER printmaster;"
+docker compose exec -T db psql -U printmaster -d printmaster \
+   -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"
 ```
+
+6. Put TimescaleDB into restore mode, restore the complete custom-format dump,
+    then leave restore mode. These hooks are important when the dump contains
+    compressed hypertable chunks. Do not use `--data-only` and do not ignore
+    restore errors.
+
+```bash
+docker compose exec -T db psql -U printmaster -d printmaster \
+   -c "SELECT timescaledb_pre_restore();"
+docker compose exec -T db pg_restore --no-owner --no-privileges \
+   -U printmaster -d printmaster < printmaster-pg15.dump
+docker compose exec -T db psql -U printmaster -d printmaster \
+   -c "SELECT timescaledb_post_restore();"
+```
+
+The restore command must finish without `errors ignored on restore`. Errors
+such as `chunk not found` indicate an incomplete restore; drop and recreate the
+target database and repeat the sequence above. Never proceed to production
+verification after a non-zero restore result.
 
 If additional global objects are needed, restore them separately as a database
 superuser and resolve any already-exists messages for the Compose-created role:
@@ -62,7 +89,7 @@ superuser and resolve any already-exists messages for the Compose-created role:
 docker compose exec -T db psql -U printmaster -d postgres < printmaster-globals.sql
 ```
 
-6. Start PrintMaster and verify login, agents, devices, metrics, hypertables,
+7. Start PrintMaster and verify login, agents, devices, metrics, hypertables,
    and scheduled jobs before retiring the old volume:
 
 ```bash

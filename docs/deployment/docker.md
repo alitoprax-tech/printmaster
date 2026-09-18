@@ -180,6 +180,13 @@ server {
 | `/var/lib/printmaster/server` | Database and config |
 | `/var/log/printmaster/server` | Log files |
 
+The TimescaleDB PostgreSQL 18 Compose image mounts its database volume at
+`/var/lib/postgresql`. Do not change this to `/var/lib/postgresql/data`; that
+older mount layout can prevent the PG18 image from finding its data directory.
+
+For PostgreSQL major-version migrations and TimescaleDB restore hooks, see
+[PostgreSQL and TimescaleDB Upgrades](database-upgrade.md).
+
 ### Backup
 
 ```bash
