@@ -12700,7 +12700,7 @@ function renderDeviceTable(devices, append = false) {
                     ${renderDeviceStatusBadge(meta.status)}
                 </td>
                 <td>
-                    ${meta.tonerData && meta.tonerData.length > 0 ? renderTonerBars(meta.tonerData) : '<span class="muted-text">—</span>'}
+                    ${renderTonerBars(meta.tonerData)}
                 </td>
                 <td>${escapeHtml(meta.agentName || 'Unassigned')}</td>
                 <td>${escapeHtml(tenantLabel)}</td>
@@ -12877,107 +12877,16 @@ function renderDeviceConsumableBadge(consumableMeta) {
 }
 
 // Map toner names to CSS colors
-const TONER_COLORS = {
-    'toner_black': '#1a1a1a',
-    'toner_cyan': '#00bcd4',
-    'toner_magenta': '#e91e63',
-    'toner_yellow': '#ffc107',
-    'toner_photo_black': '#333',
-    'toner_matte_black': '#444',
-    'toner_light_cyan': '#4dd0e1',
-    'toner_light_magenta': '#f48fb1',
-    'toner_gray': '#9e9e9e',
-    'toner_light_gray': '#bdbdbd',
-    'toner_orange': '#ff9800',
-    'toner_green': '#4caf50',
-    'toner_red': '#f44336',
-    'toner_blue': '#2196f3',
-    'black': '#1a1a1a',
-    'cyan': '#00bcd4',
-    'magenta': '#e91e63',
-    'yellow': '#ffc107',
-    'photo_black': '#333',
-    'photo black': '#333',
-    'matte_black': '#444',
-    'matte black': '#444',
-    'light_cyan': '#4dd0e1',
-    'light cyan': '#4dd0e1',
-    'light_magenta': '#f48fb1',
-    'light magenta': '#f48fb1',
-    'gray': '#9e9e9e',
-    'light_gray': '#bdbdbd',
-    'light gray': '#bdbdbd',
-    'orange': '#ff9800',
-    'green': '#4caf50',
-    'red': '#f44336',
-    'blue': '#2196f3',
-};
-
-function getTonerColor(name) {
-    const key = (name || '').toLowerCase().replace(/[^a-z_]/g, '_');
-    if (TONER_COLORS[key]) return TONER_COLORS[key];
-    // Try partial match
-    for (const [k, v] of Object.entries(TONER_COLORS)) {
-        if (key.includes(k) || k.includes(key)) return v;
-    }
-    // Default gray for unknown
-    return '#757575';
-}
-
-// Ink/toner color keywords - only these appear in mini consumable bars
-const INK_COLOR_KEYWORDS = ['black', 'cyan', 'magenta', 'yellow', 'photo', 'matte', 'light', 'gray', 'grey', 'red', 'blue', 'green', 'orange', 'violet'];
-// Maintenance/non-ink keywords to exclude from mini bars
-const NON_INK_KEYWORDS = ['drum', 'belt', 'waste', 'fuser', 'maintenance', 'kit', 'transfer', 'opc', 'developer', 'roller', 'unit'];
-
-function isInkOrToner(name) {
-    const lower = (name || '').toLowerCase();
-    // Exclude if it matches a maintenance keyword
-    for (const kw of NON_INK_KEYWORDS) {
-        if (lower.includes(kw)) return false;
-    }
-    // Include if it matches an ink/toner color keyword
-    for (const kw of INK_COLOR_KEYWORDS) {
-        if (lower.includes(kw)) return true;
-    }
-    // Also include if it contains 'toner' or 'ink' without maintenance keywords
-    if (lower.includes('toner') || lower.includes('ink')) return true;
-    return false;
-}
-
+// Toner color mapping, ink/toner filtering, and toner-bar rendering now live
+// in common/web/cards.js (window.__pm_shared_cards.getDeviceTonerBarData /
+// renderTonerBars) so agent and server share identical coloring and
+// mono/color filtering behavior.
 function getDeviceTonerData(device) {
-    const source = device.toner_levels || device.toner || device.consumables || device.supplies;
-    if (!source || typeof source !== 'object' || Array.isArray(source)) return [];
-    const entries = [];
-    for (const [name, value] of Object.entries(source)) {
-        // Only include actual ink/toner colors, not drums, belts, waste, etc.
-        if (!isInkOrToner(name)) continue;
-        const level = normalizePercentage(value);
-        if (typeof level === 'number') {
-            entries.push({ name, level, color: getTonerColor(name) });
-        }
-    }
-    // Sort by color order: black, cyan, magenta, yellow, then rest
-    const order = ['black', 'cyan', 'magenta', 'yellow'];
-    entries.sort((a, b) => {
-        const aKey = a.name.toLowerCase();
-        const bKey = b.name.toLowerCase();
-        const aIdx = order.findIndex(c => aKey.includes(c));
-        const bIdx = order.findIndex(c => bKey.includes(c));
-        if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
-        if (aIdx !== -1) return -1;
-        if (bIdx !== -1) return 1;
-        return aKey.localeCompare(bKey);
-    });
-    return entries;
+    return window.__pm_shared_cards.getDeviceTonerBarData(device);
 }
 
 function renderTonerBars(tonerData) {
-    if (!tonerData || tonerData.length === 0) return '';
-    const bars = tonerData.map(t => {
-        const levelClass = t.level <= 10 ? 'critical' : t.level <= 25 ? 'low' : '';
-        return `<div class="toner-bar ${levelClass}" title="${escapeHtml(t.name)}: ${t.level}%" style="--toner-color: ${t.color}; --toner-level: ${t.level}%"></div>`;
-    }).join('');
-    return `<div class="toner-bars">${bars}</div>`;
+    return window.__pm_shared_cards.renderTonerBars(tonerData);
 }
 
 function renderDevicesStats() {
@@ -13342,27 +13251,7 @@ function classifyConsumableBand(device, tonerLevels) {
 }
 
 function getDeviceConsumableLevels(device) {
-    const values = [];
-    const source = device.toner_levels || device.toner || device.consumables || device.supplies;
-    if (source && typeof source === 'object' && !Array.isArray(source)) {
-        // Only include actual ink/toner levels, not drums, belts, waste, etc.
-        for (const [name, value] of Object.entries(source)) {
-            if (!isInkOrToner(name)) continue;
-            const num = normalizePercentage(value);
-            if (typeof num === 'number') {
-                values.push(num);
-            }
-        }
-    }
-    return values;
-}
-
-function normalizePercentage(value) {
-    if (value === null || value === undefined) return null;
-    const num = Number(value);
-    if (!Number.isFinite(num)) return null;
-    const clamped = Math.max(0, Math.min(100, num));
-    return Math.round(clamped);
+    return window.__pm_shared_cards.getDeviceTonerBarData(device).map(t => t.level);
 }
 
 function bandForPercentage(value) {

@@ -232,6 +232,98 @@
         }
     }
 
+    // Map of toner/ink color names to CSS colors, used by the compact
+    // per-color "toner bar" indicators shown in device lists/tables.
+    const TONER_COLORS = {
+        'black': '#1a1a1a',
+        'cyan': '#00bcd4',
+        'magenta': '#e91e63',
+        'yellow': '#ffc107',
+        'photo_black': '#333',
+        'matte_black': '#444',
+        'light_cyan': '#4dd0e1',
+        'light_magenta': '#f48fb1',
+        'gray': '#9e9e9e',
+        'light_gray': '#bdbdbd',
+        'orange': '#ff9800',
+        'green': '#4caf50',
+        'red': '#f44336',
+        'blue': '#2196f3',
+    };
+
+    function getTonerColor(name) {
+        const key = (name || '').toLowerCase().replace(/[^a-z_]/g, '_');
+        if (TONER_COLORS[key]) return TONER_COLORS[key];
+        // Try partial match
+        for (const [k, v] of Object.entries(TONER_COLORS)) {
+            if (key.includes(k) || k.includes(key)) return v;
+        }
+        // Default gray for unknown
+        return '#757575';
+    }
+
+    // Ink/toner color keywords - only these appear in the compact toner bars
+    const INK_COLOR_KEYWORDS = ['black', 'cyan', 'magenta', 'yellow', 'photo', 'matte', 'light', 'gray', 'grey', 'red', 'blue', 'green', 'orange', 'violet'];
+    // Maintenance/non-ink keywords to exclude from toner bars
+    const NON_INK_KEYWORDS = ['drum', 'belt', 'waste', 'fuser', 'maintenance', 'kit', 'transfer', 'opc', 'developer', 'roller', 'unit'];
+
+    function isInkOrToner(name) {
+        const lower = (name || '').toLowerCase();
+        for (const kw of NON_INK_KEYWORDS) {
+            if (lower.includes(kw)) return false;
+        }
+        for (const kw of INK_COLOR_KEYWORDS) {
+            if (lower.includes(kw)) return true;
+        }
+        if (lower.includes('toner') || lower.includes('ink')) return true;
+        return false;
+    }
+
+    function normalizeTonerLevel(value) {
+        if (value === null || value === undefined || value === '') return null;
+        const num = Number(value);
+        if (!Number.isFinite(num)) return null;
+        return Math.max(0, Math.min(100, Math.round(num)));
+    }
+
+    // Build the compact per-color toner bar dataset for a device/printer_info
+    // object (and optional latest metrics snapshot). Reuses buildTonerLevels()
+    // for source resolution and mono/color filtering, then narrows to actual
+    // ink/toner entries with numeric levels, sorted K/C/M/Y first.
+    function getDeviceTonerBarData(p, latest) {
+        const levels = buildTonerLevels(p, latest);
+        const order = ['black', 'cyan', 'magenta', 'yellow'];
+        const entries = [];
+        for (const [name, value] of Object.entries(levels)) {
+            if (!isInkOrToner(name)) continue;
+            const level = normalizeTonerLevel(value);
+            if (level === null) continue;
+            entries.push({ name, level, color: getTonerColor(name) });
+        }
+        entries.sort((a, b) => {
+            const aKey = a.name.toLowerCase();
+            const bKey = b.name.toLowerCase();
+            const aIdx = order.findIndex(c => aKey.includes(c));
+            const bIdx = order.findIndex(c => bKey.includes(c));
+            if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+            if (aIdx !== -1) return -1;
+            if (bIdx !== -1) return 1;
+            return aKey.localeCompare(bKey);
+        });
+        return entries;
+    }
+
+    // Render the compact per-color toner bars (used in device list/table rows).
+    // Accepts the array produced by getDeviceTonerBarData().
+    function renderTonerBars(tonerData) {
+        if (!tonerData || tonerData.length === 0) return '<span class="muted-text">—</span>';
+        const bars = tonerData.map(t => {
+            const levelClass = t.level <= 10 ? 'critical' : t.level <= 25 ? 'low' : '';
+            return '<div class="toner-bar ' + levelClass + '" title="' + escapeHtmlCards(t.name) + ': ' + t.level + '%" style="--toner-color: ' + t.color + '; --toner-level: ' + t.level + '%"></div>';
+        }).join('');
+        return '<div class="toner-bars">' + bars + '</div>';
+    }
+
     // Render a full consumables section given a map of toner/supply levels
     // Reused by saved cards and the details modal to avoid duplicated markup.
     function renderConsumablesSection(tonerLevels) {
@@ -450,6 +542,10 @@
     window.__pm_shared_cards.buildTonerLevels = buildTonerLevels;
     window.__pm_shared_cards.checkDatabaseRotationWarning = checkDatabaseRotationWarning;
     window.__pm_shared_cards.renderCapabilities = renderCapabilities;
+    window.__pm_shared_cards.getTonerColor = getTonerColor;
+    window.__pm_shared_cards.isInkOrToner = isInkOrToner;
+    window.__pm_shared_cards.getDeviceTonerBarData = getDeviceTonerBarData;
+    window.__pm_shared_cards.renderTonerBars = renderTonerBars;
 
     // Attach delegated click handler for copyable elements that use data-copy.
     // Await shared.ready so shared utilities (copyToClipboard, showToast) are

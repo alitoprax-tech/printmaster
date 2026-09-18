@@ -2043,49 +2043,6 @@ input[type="checkbox"]:indeterminate::before {
   min-width: 0;
 }
 
-/* Toner levels bar */
-.toner-bar-container {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.toner-bar-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-}
-
-.toner-bar-label {
-  min-width: 60px;
-  color: var(--muted);
-}
-
-.toner-bar {
-  flex: 1;
-  height: 16px;
-  background: rgba(0, 0, 0, 0.3);
-  border-radius: 8px;
-  overflow: hidden;
-  position: relative;
-  border: 1px solid rgba(0, 75, 86, 0.5);
-}
-
-.toner-bar-fill {
-  height: 100%;
-  transition: width 0.3s ease;
-  border-radius: 7px;
-}
-
-.toner-bar-text {
-  min-width: 40px;
-  text-align: right;
-  font-family: monospace;
-  color: var(--text);
-}
-
 /* Usage graph - SVG line chart with 3D feel */
 .usage-graph-container {
   width: 100%;
@@ -4292,50 +4249,7 @@ select:hover {
   font-family: monospace;
 }
 
-/* Toner level bars - compact vertical progress indicators (matches server UI) */
-.toner-bars {
-  display: inline-flex;
-  gap: 3px;
-  align-items: flex-end;
-  height: 20px;
-  padding: 2px 4px;
-  background: rgba(0, 0, 0, 0.2);
-  border-radius: 4px;
-}
-
-.toner-bar {
-  width: 6px;
-  height: 100%;
-  border-radius: 2px;
-  position: relative;
-  background: rgba(255, 255, 255, 0.1);
-  overflow: hidden;
-}
-
-.toner-bar::after {
-  content: '';
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: var(--toner-level, 0%);
-  background: var(--toner-color, #757575);
-  border-radius: 2px;
-  transition: height 0.3s ease;
-}
-
-.toner-bar.critical::after {
-  animation: toner-pulse 1.5s ease-in-out infinite;
-}
-
-.toner-bar.low::after {
-  opacity: 0.85;
-}
-
-@keyframes toner-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
+/* Toner level bars now live in common/web/shared.css (.toner-bars/.toner-bar) */
 
 /* ============================================
    COMPACT CARD GRID - For Discovered Devices
