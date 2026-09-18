@@ -31,10 +31,12 @@ services:
   # PrintMaster auto-detects TimescaleDB and enables these features automatically.
   # Replace credentials and tune performance for production use.
   db:
-    image: timescale/timescaledb:latest-pg15
+    # New deployments use PostgreSQL 18. Do not use this tag for an existing
+    # PostgreSQL 15 data directory; follow docs/deployment/database-upgrade.md.
+    image: timescale/timescaledb:latest-pg18
     # --- Plain PostgreSQL Alternative ---
     # If you prefer standard PostgreSQL without time-series features, use:
-    #   image: postgres:15-alpine
+    #   image: postgres:18-alpine
     # You'll miss out on:
     #   - Automatic metrics compression (uses ~5x more disk space)
     #   - Faster time-range queries on large datasets

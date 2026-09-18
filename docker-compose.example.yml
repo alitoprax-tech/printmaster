@@ -39,10 +39,12 @@
 # To reset: stop containers, delete server data volume, restart with new password.
 
 services:
-  # PostgreSQL Database
+  # TimescaleDB (PostgreSQL 18) Database
   # Replace credentials and tune performance for production use.
   db:
-    image: postgres:15-alpine
+    # New deployments use PostgreSQL 18. Existing database volumes require
+    # the migration procedure in docs/deployment/database-upgrade.md.
+    image: timescale/timescaledb:latest-pg18
     restart: unless-stopped
     container_name: ${DB_HOST}
     environment:
@@ -52,6 +54,7 @@ services:
       POSTGRES_DB: ${DB_NAME}
     volumes:
       - ${ROOT_PATH}/server/database:/var/lib/postgresql/data
+    command: ["postgres", "-c", "shared_preload_libraries=timescaledb"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
       interval: 10s

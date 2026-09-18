@@ -31,7 +31,7 @@ func NewPostgresTestContainer(t *testing.T) (*PostgresTestContainer, func()) {
 	ctx := context.Background()
 
 	pgContainer, err := postgres.Run(ctx,
-		"postgres:16-alpine",
+		"postgres:18-alpine",
 		postgres.WithDatabase("printmaster_test"),
 		postgres.WithUsername("testuser"),
 		postgres.WithPassword("testpass"),
@@ -144,9 +144,9 @@ func NewTimescaleDBTestContainer(t *testing.T) (*TimescaleDBTestContainer, func(
 
 	ctx := context.Background()
 
-	// Use the official TimescaleDB image with PostgreSQL 16
+	// Use the official TimescaleDB image with PostgreSQL 18
 	pgContainer, err := postgres.Run(ctx,
-		"timescale/timescaledb:latest-pg16",
+		"timescale/timescaledb:latest-pg18",
 		postgres.WithDatabase("printmaster_test"),
 		postgres.WithUsername("testuser"),
 		postgres.WithPassword("testpass"),

@@ -227,6 +227,16 @@ docker compose up -d
 docker logs printmaster-server | head -5
 ```
 
+## PostgreSQL and TimescaleDB upgrades
+
+The repository Compose examples use `timescale/timescaledb:latest-pg18` for
+new deployments. Changing a PostgreSQL major version while reusing an existing
+database volume is not a valid upgrade and can make the database refuse to
+start. Never delete the old volume as a workaround.
+
+For the required backup, new-volume migration, and verification steps, see
+[PostgreSQL and TimescaleDB Upgrades](database-upgrade.md).
+
 ---
 
 ## Agent in Docker

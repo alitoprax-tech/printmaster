@@ -29,6 +29,7 @@ Cross-platform printer/copier fleet management for MSPs, MPS providers, and IT d
 | Document | Description |
 |----------|-------------|
 | [Docker Deployment](deployment/docker.md) | Docker and Docker Compose setup |
+| [Database Upgrade](deployment/database-upgrade.md) | PostgreSQL and TimescaleDB upgrade procedure |
 | [Unraid Deployment](deployment/unraid.md) | Unraid-specific installation |
 
 ---
