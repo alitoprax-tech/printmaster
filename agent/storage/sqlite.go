@@ -45,15 +45,27 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	return NewSQLiteStoreWithConfig(dbPath, nil)
 }
 
-// NewSQLiteStoreWithConfig creates a new SQLite-based device store with optional config store
-// for tracking rotation events. If configStore is provided, rotation events will set a flag
-// that the UI can use to warn users.
-func NewSQLiteStoreWithConfig(dbPath string, configStore AgentConfigStore) (*SQLiteStore, error) {
-	if dbPath == "" {
-		dbPath = ":memory:"
+// openSQLiteDB opens a pooled *sql.DB with pragmas applied via the DSN.
+//
+// Pragmas must be passed in the DSN (not via db.Exec after opening) because
+// *sql.DB pools multiple physical connections: a PRAGMA applied with db.Exec
+// only affects whichever single connection happened to be borrowed for that
+// call. Any additional connections the pool opens later (MaxOpenConns > 1)
+// would fall back to SQLite's defaults - journal_mode=DELETE and
+// busy_timeout=0 - which fail instantly on lock contention instead of
+// waiting, causing intermittent "database is locked" errors under
+// concurrent access. Encoding the pragmas in the DSN applies them to every
+// connection the pool opens.
+func openSQLiteDB(dbPath string) (*sql.DB, error) {
+	const busyTimeoutMS = 30000
+	connStr := dbPath
+	if dbPath != ":memory:" {
+		connStr += fmt.Sprintf("?_busy_timeout=%d&_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_foreign_keys=ON&_txlock=immediate", busyTimeoutMS)
+	} else {
+		connStr += fmt.Sprintf("?_busy_timeout=%d&_foreign_keys=ON", busyTimeoutMS)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -66,20 +78,20 @@ func NewSQLiteStoreWithConfig(dbPath string, configStore AgentConfigStore) (*SQL
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(30 * time.Minute)
+	return db, nil
+}
 
-	// Enable foreign keys and set pragmas for better performance
-	pragmas := []string{
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA busy_timeout = 30000", // 30 second timeout for busy retries
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
-		"PRAGMA cache_size = -64000", // 64MB cache
+// NewSQLiteStoreWithConfig creates a new SQLite-based device store with optional config store
+// for tracking rotation events. If configStore is provided, rotation events will set a flag
+// that the UI can use to warn users.
+func NewSQLiteStoreWithConfig(dbPath string, configStore AgentConfigStore) (*SQLiteStore, error) {
+	if dbPath == "" {
+		dbPath = ":memory:"
 	}
-	for _, pragma := range pragmas {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to set pragma: %w", err)
-		}
+
+	db, err := openSQLiteDB(dbPath)
+	if err != nil {
+		return nil, err
 	}
 
 	store := &SQLiteStore{

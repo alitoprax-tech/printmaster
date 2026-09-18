@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -399,7 +398,7 @@ func (s *SQLiteStore) BackupAndReset() error {
 	dbPath := s.dbPath
 	if dbPath == ":memory:" {
 		// Can't backup in-memory database, just reset
-		db, err := sql.Open("sqlite", dbPath)
+		db, err := openSQLiteDB(dbPath)
 		if err != nil {
 			return fmt.Errorf("failed to open fresh database: %w", err)
 		}
@@ -422,7 +421,7 @@ func (s *SQLiteStore) BackupAndReset() error {
 	}
 
 	// Open fresh database
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openSQLiteDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open fresh database: %w", err)
 	}

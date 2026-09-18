@@ -34,7 +34,7 @@ type SQLiteAgentConfig struct {
 
 // NewAgentConfigStore creates a new AgentConfigStore with SQLite backend
 func NewAgentConfigStore(dbPath string) (AgentConfigStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openSQLiteDB(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open agent config database: %w", err)
 	}
