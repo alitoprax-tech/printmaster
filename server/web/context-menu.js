@@ -11,6 +11,18 @@
     // Track active menu for cleanup
     let activeMenu = null;
 
+    // agentsVM/devicesVM are top-level `const` in app.js, so they are never
+    // attached to `window` - only bare identifiers work here (both scripts
+    // share the page's global lexical scope). Looking them up via
+    // window.agentsVM/window.devicesVM silently returned undefined, which
+    // made every agent look disconnected/unselectable in this menu.
+    function getAgentsVM() {
+        return typeof agentsVM !== 'undefined' ? agentsVM : null;
+    }
+    function getDevicesVM() {
+        return typeof devicesVM !== 'undefined' ? devicesVM : null;
+    }
+
     /**
      * Context menu configuration for agents
      */
@@ -412,9 +424,10 @@
         }
 
         // Clear selection and refresh
-        if (window.agentsVM?.selection) {
-            window.agentsVM.selection.selectedIds.clear();
-            window.agentsVM.selection.lastSelected = null;
+        const agentsVMRef = getAgentsVM();
+        if (agentsVMRef?.selection) {
+            agentsVMRef.selection.selectedIds.clear();
+            agentsVMRef.selection.lastSelected = null;
         }
 
         // Refresh agents list
@@ -466,9 +479,10 @@
         }
 
         // Clear selection and refresh
-        if (window.devicesVM?.selection) {
-            window.devicesVM.selection.selectedIds.clear();
-            window.devicesVM.selection.lastSelected = null;
+        const devicesVMRef = getDevicesVM();
+        if (devicesVMRef?.selection) {
+            devicesVMRef.selection.selectedIds.clear();
+            devicesVMRef.selection.lastSelected = null;
         }
 
         // Refresh devices list
@@ -578,7 +592,7 @@
             const meta = agent?.__meta || {};
 
             // Check for multi-selection
-            const selection = window.agentsVM?.selection;
+            const selection = getAgentsVM()?.selection;
             const selectedIds = selection?.selectedIds || new Set();
             const isMultiSelect = selectedIds.size > 1 && selectedIds.has(agentId);
 
@@ -629,7 +643,7 @@
             const device = getDeviceBySerial(serial);
 
             // Check for multi-selection
-            const selection = window.devicesVM?.selection;
+            const selection = getDevicesVM()?.selection;
             const selectedIds = selection?.selectedIds || new Set();
             const isMultiSelect = selectedIds.size > 1 && selectedIds.has(deviceId);
 
@@ -673,8 +687,9 @@
      */
     function getAgentById(agentId) {
         try {
-            if (window.agentsVM && Array.isArray(window.agentsVM.items)) {
-                return window.agentsVM.items.find(a => a.agent_id === agentId);
+            const vm = getAgentsVM();
+            if (vm && Array.isArray(vm.items)) {
+                return vm.items.find(a => a.agent_id === agentId);
             }
         } catch (e) {}
         return null;
@@ -696,9 +711,10 @@
      */
     function hasAgentUpdate(agentId) {
         try {
-            if (window.agentsVM) {
+            const vm = getAgentsVM();
+            if (vm) {
                 const agent = getAgentById(agentId);
-                const latestVersion = window.agentsVM.latestVersion;
+                const latestVersion = vm.latestVersion;
                 const currentVersion = agent?.version;
                 if (latestVersion && currentVersion && currentVersion !== latestVersion) {
                     // Simple version comparison
@@ -714,8 +730,9 @@
      */
     function getDeviceBySerial(serial) {
         try {
-            if (window.devicesVM && Array.isArray(window.devicesVM.items)) {
-                return window.devicesVM.items.find(d => d.serial === serial);
+            const vm = getDevicesVM();
+            if (vm && Array.isArray(vm.items)) {
+                return vm.items.find(d => d.serial === serial);
             }
         } catch (e) {}
         return null;
