@@ -6138,8 +6138,10 @@ func runInteractive(ctx context.Context, configFlag string) {
 			}
 		}
 
-		// Create reverse proxy
-		rproxy := httputil.NewSingleHostReverseProxy(target)
+		// Create reverse proxy. Director is intentionally left unset because
+		// the Rewrite hook below (set after credential/session setup) fully
+		// replaces it - ReverseProxy panics if both Director and Rewrite are set.
+		rproxy := &httputil.ReverseProxy{}
 
 		// Handle form-based login if configured (skip for static resources)
 		var sessionJar http.CookieJar
