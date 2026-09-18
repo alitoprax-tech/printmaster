@@ -153,18 +153,29 @@
                 return;
             }
 
-            // Check item visibility conditions
-            if (item.requiresWs && !context.hasWsConnection) return;
+            // Check item visibility conditions - these hide items that are not
+            // applicable at all (as opposed to situationally unavailable).
             if (item.requiresUpdate && !context.hasUpdate) return;
             if (item.requiresAccess && !context.hasAccess) return;
             if (item.requiresSerial && !context.serial) return;
 
+            // Situational unavailability (e.g. agent not connected via
+            // WebSocket) keeps the item visible but disabled, matching the
+            // agent details modal's treatment of the same actions.
+            let isDisabled = !!item.disabled;
+            let disabledTitle = item.disabledTitle || '';
+            if (item.requiresWs && !context.hasWsConnection) {
+                isDisabled = true;
+                disabledTitle = disabledTitle || 'Requires active WebSocket connection';
+            }
+
             const menuItem = document.createElement('button');
             menuItem.className = 'pm-context-menu-item';
             if (item.danger) menuItem.classList.add('danger');
-            if (item.disabled) {
+            if (isDisabled) {
                 menuItem.classList.add('disabled');
                 menuItem.disabled = true;
+                menuItem.title = disabledTitle;
             }
             menuItem.setAttribute('role', 'menuitem');
             menuItem.setAttribute('data-action', item.action);
@@ -182,7 +193,7 @@
             `;
 
             // Handle click (skip for disabled items)
-            if (!item.disabled) {
+            if (!isDisabled) {
                 menuItem.addEventListener('click', () => {
                     handleMenuAction(item.action, context);
                     closeContextMenu();
