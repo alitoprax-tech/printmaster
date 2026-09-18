@@ -772,43 +772,17 @@ async function saveAllDiscovered(evt) {
         window.__pm_saveAllInProgress = true;
         if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
 
-        // Load discovered devices and saved devices in parallel
-        const [dresp, sresp] = await Promise.all([
-            fetch('/devices/discovered?include_known=false'),
-            fetch('/devices/list')
-        ]);
-
-        if (!dresp.ok) throw new Error('failed to fetch discovered devices');
-        const discovered = await dresp.json();
-        const saved = (sresp.ok ? await sresp.json() : []) || [];
-
-        const savedSerials = new Set(saved.map(i => i.serial).filter(Boolean));
-        const savedIPs = new Set(saved.map(i => (i.printer_info && (i.printer_info.ip || i.printer_info.IP)) || '').filter(Boolean));
-
-        // Process saves in controlled concurrency batches to avoid overloading
-        const toSave = [];
-        for (const p of (discovered || [])) {
-            const info = p.printer_info || p || {};
-            const ip = info.ip || info.IP || '';
-            const serial = p.serial || '';
-            const isSaved = (serial && savedSerials.has(serial)) || (ip && savedIPs.has(ip));
-            if (isSaved) continue;
-            toSave.push(ip || serial);
+        // Mark all visible, unsaved devices as saved in a single server-side transaction.
+        // (Previously this fired one concurrent /devices/save request per device, which
+        // could overwhelm SQLite with parallel writers and trigger SQLITE_BUSY errors.)
+        const resp = await fetch('/devices/save/all', { method: 'POST' });
+        if (!resp.ok) {
+            let txt = '';
+            try { txt = await resp.text(); } catch (e) { txt = resp.statusText || 'unknown'; }
+            throw new Error('Failed to save all devices: ' + txt + ' (status ' + resp.status + ')');
         }
-
-        const CONCURRENCY = 6;
-        let savedCount = 0;
-        for (let i = 0; i < toSave.length; i += CONCURRENCY) {
-            const batch = toSave.slice(i, i + CONCURRENCY);
-            const promises = batch.map(target => {
-                return window.__pm_shared.saveDiscoveredDevice(target, false, false).then(() => { savedCount++; }).catch(e => {
-                    try { window.__pm_shared && window.__pm_shared.debug && window.__pm_shared.debug('saveAllDiscovered: item save failed', target, e); } catch (er) {}
-                });
-            });
-            await Promise.all(promises);
-            // small delay to allow UI and SSE to settle
-            await new Promise(res => setTimeout(res, 120));
-        }
+        const result = await resp.json();
+        const savedCount = (result && result.count) || 0;
 
         if (savedCount > 0) {
             window.__pm_shared && window.__pm_shared.showToast && window.__pm_shared.showToast('Saved ' + savedCount + ' devices', 'success', 2000);
