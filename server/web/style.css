@@ -3884,6 +3884,7 @@ select:focus {
 .metric-chart-canvas {
   opacity: 1;
   transition: opacity 0.3s ease-in-out;
+  cursor: crosshair;
 }
 
 .metric-chart-card.data-loading .metric-chart-canvas {

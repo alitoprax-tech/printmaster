@@ -43,6 +43,194 @@ function createTimeFormatter(timeRangeMs) {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Cross-chart hover/pin crosshair (Netdata-style)
+// ---------------------------------------------------------------------------
+// One shared state object drives a synced vertical reference line across every
+// chart rendered on the metrics tab. Hovering any chart broadcasts the hovered
+// timestamp to all charts; clicking "pins" the line at a timestamp so it stays
+// put (even while the page is scrolled) until clicked again.
+window.__pmCrosshairState = window.__pmCrosshairState || { hoverTime: null, pinnedTime: null };
+
+// canvas.id -> { minTime, maxTime, padding, width, height, canvasWidth }
+const __pmChartGeometry = new Map();
+// canvas.id -> { type: 'single'|'dual', args }, used to redraw a chart in place
+const __pmChartRegistry = new Map();
+let __pmCrosshairRedrawScheduled = false;
+
+function pmRegisterChartRedraw(id, type, args) {
+    __pmChartRegistry.set(id, { type, args });
+}
+
+function pmScheduleCrosshairRedraw() {
+    if (__pmCrosshairRedrawScheduled) return;
+    __pmCrosshairRedrawScheduled = true;
+    requestAnimationFrame(() => {
+        __pmCrosshairRedrawScheduled = false;
+        __pmChartRegistry.forEach((entry, id) => {
+            const canvas = document.getElementById(id);
+            if (!canvas) {
+                __pmChartRegistry.delete(id);
+                __pmChartGeometry.delete(id);
+                return;
+            }
+            if (entry.type === 'dual') {
+                drawFleetChartDualAxis(canvas, entry.args.rateSeriesList, entry.args.cumulativeSeriesList, entry.args.options);
+            } else {
+                drawFleetChart(canvas, entry.args.seriesList, entry.args.options);
+            }
+        });
+    });
+}
+
+function pmTimeFromCanvasX(geometry, clientX, canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const xPix = Math.min(Math.max(clientX - rect.left, geometry.padding.left), geometry.padding.left + geometry.width);
+    return geometry.minTime + ((xPix - geometry.padding.left) / Math.max(1, geometry.width)) * (geometry.maxTime - geometry.minTime);
+}
+
+function pmNearestPoint(points, time) {
+    if (!Array.isArray(points) || points.length === 0) return null;
+    let best = points[0];
+    let bestDiff = Math.abs(points[0].time - time);
+    for (let i = 1; i < points.length; i++) {
+        const diff = Math.abs(points[i].time - time);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = points[i];
+        }
+    }
+    return best;
+}
+
+function pmDrawRoundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+}
+
+function pmDrawCrosshairTooltip(ctx, x, time, seriesGroups, formatY, canvasWidth, topY, pinned) {
+    const rows = (seriesGroups || [])
+        .filter(s => s.label && Array.isArray(s.points) && s.points.length > 0)
+        .map(s => {
+            const pt = pmNearestPoint(s.points, time);
+            return pt ? { label: s.label, color: s.color || '#7dd3fc', value: formatY(pt.value) } : null;
+        })
+        .filter(Boolean);
+
+    const timeLine = (pinned ? '📌 ' : '') + new Date(time).toLocaleString();
+    ctx.font = '10px sans-serif';
+    const padBox = 6;
+    const lineHeight = 14;
+    const swatchGap = 12;
+    const widths = [ctx.measureText(timeLine).width, ...rows.map(r => ctx.measureText(r.label + ': ' + r.value).width + swatchGap)];
+    const boxWidth = Math.max(...widths) + padBox * 2;
+    const boxHeight = (rows.length + 1) * lineHeight + padBox * 2 - 4;
+
+    let boxX = x + 8;
+    if (boxX + boxWidth > canvasWidth - 4) boxX = x - boxWidth - 8;
+    const boxY = topY;
+
+    ctx.save();
+    ctx.fillStyle = pinned ? 'rgba(20,30,40,0.94)' : 'rgba(20,30,40,0.78)';
+    ctx.strokeStyle = pinned ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    pmDrawRoundRect(ctx, boxX, boxY, boxWidth, boxHeight, 4);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(timeLine, boxX + padBox, boxY + padBox + 9);
+    rows.forEach((row, i) => {
+        const ly = boxY + padBox + 9 + (i + 1) * lineHeight;
+        ctx.fillStyle = row.color;
+        ctx.fillRect(boxX + padBox, ly - 8, 8, 8);
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.fillText(row.label + ': ' + row.value, boxX + padBox + swatchGap, ly);
+    });
+    ctx.restore();
+}
+
+/**
+ * Draw the synced hover/pinned vertical reference line + per-chart tooltip.
+ * Called at the end of every chart draw function so state stays in sync.
+ */
+function drawChartCrosshair(ctx, canvasId, geometry, seriesGroups, formatY) {
+    __pmChartGeometry.set(canvasId, geometry);
+    const state = window.__pmCrosshairState;
+    const { minTime, maxTime, padding, width, height, canvasWidth } = geometry;
+    const timeToX = (t) => padding.left + ((t - minTime) / Math.max(1, maxTime - minTime)) * width;
+
+    const drawLine = (time, color, lineWidth, dash) => {
+        if (time == null || time < minTime || time > maxTime) return null;
+        const x = timeToX(time);
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        if (dash) ctx.setLineDash(dash);
+        ctx.beginPath();
+        ctx.moveTo(x, padding.top);
+        ctx.lineTo(x, padding.top + height);
+        ctx.stroke();
+        ctx.restore();
+        return x;
+    };
+
+    const pinnedX = drawLine(state.pinnedTime, 'rgba(255,255,255,0.55)', 1.5);
+    const hoverX = state.hoverTime !== state.pinnedTime
+        ? drawLine(state.hoverTime, 'rgba(255,255,255,0.35)', 1, [4, 3])
+        : null;
+
+    if (pinnedX != null) pmDrawCrosshairTooltip(ctx, pinnedX, state.pinnedTime, seriesGroups, formatY, canvasWidth, padding.top + 2, true);
+    if (hoverX != null) pmDrawCrosshairTooltip(ctx, hoverX, state.hoverTime, seriesGroups, formatY, canvasWidth, padding.top + 2, false);
+}
+
+// Delegated pointer handling: any element with class `metric-chart-canvas` participates.
+// Hovering broadcasts hoverTime to all charts; moving off a chart clears the live hover
+// (but leaves a pinned line alone). Clicking toggles a pinned line at that timestamp.
+if (typeof document !== 'undefined' && !window.__pmCrosshairWired) {
+    window.__pmCrosshairWired = true;
+
+    document.addEventListener('mousemove', (e) => {
+        const canvas = e.target.closest && e.target.closest('.metric-chart-canvas');
+        const state = window.__pmCrosshairState;
+        if (!canvas) {
+            if (state.hoverTime != null) {
+                state.hoverTime = null;
+                pmScheduleCrosshairRedraw();
+            }
+            return;
+        }
+        const geometry = __pmChartGeometry.get(canvas.id);
+        if (!geometry) return;
+        state.hoverTime = pmTimeFromCanvasX(geometry, e.clientX, canvas);
+        pmScheduleCrosshairRedraw();
+    });
+
+    document.addEventListener('mouseleave', () => {
+        const state = window.__pmCrosshairState;
+        if (state.hoverTime != null) {
+            state.hoverTime = null;
+            pmScheduleCrosshairRedraw();
+        }
+    }, true);
+
+    document.addEventListener('click', (e) => {
+        const canvas = e.target.closest && e.target.closest('.metric-chart-canvas');
+        if (!canvas) return;
+        const geometry = __pmChartGeometry.get(canvas.id);
+        if (!geometry) return;
+        const state = window.__pmCrosshairState;
+        state.pinnedTime = state.pinnedTime != null ? null : pmTimeFromCanvasX(geometry, e.clientX, canvas);
+        pmScheduleCrosshairRedraw();
+    });
+}
+
 /**
  * Draw X-axis time labels on a chart
  * @param {CanvasRenderingContext2D} ctx - Canvas context
@@ -96,6 +284,8 @@ function drawFleetChart(canvas, seriesList, options) {
         ctx.fillStyle = 'rgba(255,255,255,0.6)';
         ctx.font = '12px sans-serif';
         ctx.fillText('No data', 12, canvasHeight / 2);
+        __pmChartRegistry.delete(canvas.id);
+        __pmChartGeometry.delete(canvas.id);
         return;
     }
 
@@ -205,6 +395,11 @@ function drawFleetChart(canvas, seriesList, options) {
             }
         });
     }
+
+    if (canvas.id) {
+        pmRegisterChartRedraw(canvas.id, 'single', { seriesList, options });
+        drawChartCrosshair(ctx, canvas.id, { minTime, maxTime, padding, width, height, canvasWidth }, seriesList, formatY);
+    }
 }
 
 /**
@@ -237,6 +432,8 @@ function drawFleetChartDualAxis(canvas, rateSeriesList, cumulativeSeriesList, op
         ctx.fillStyle = 'rgba(255,255,255,0.6)';
         ctx.font = '12px sans-serif';
         ctx.fillText('No data', 12, canvasHeight / 2);
+        __pmChartRegistry.delete(canvas.id);
+        __pmChartGeometry.delete(canvas.id);
         return;
     }
 
@@ -379,6 +576,11 @@ function drawFleetChartDualAxis(canvas, rateSeriesList, cumulativeSeriesList, op
         ctx.setLineDash([]);
         ctx.fillStyle = 'rgba(255,255,255,0.5)';
         ctx.fillText('Cumulative →', legendX + 15, legendY);
+    }
+
+    if (canvas.id) {
+        pmRegisterChartRedraw(canvas.id, 'dual', { rateSeriesList, cumulativeSeriesList, options });
+        drawChartCrosshair(ctx, canvas.id, { minTime, maxTime, padding, width, height, canvasWidth }, [...rateSeriesList, ...cumulativeSeriesList], formatY);
     }
 }
 
