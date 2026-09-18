@@ -100,6 +100,65 @@ func basicAuth(userpass string) string {
 	return base64.StdEncoding.EncodeToString([]byte(userpass))
 }
 
+// rewriteExistingBaseTag finds a device-supplied <base href="..."> tag and
+// rewrites it to stay under proxyPrefix. Some vendor UIs (e.g. Kyocera
+// Command Center RX) ship their own <base href="/"> so relative asset
+// requests always resolve from the device's web root; left untouched, those
+// requests escape the proxy prefix and hit the server's own top-level routes
+// (404s / X-Frame-Options-blocked root page) instead of the printer. Returns
+// the rewritten content and whether a tag was found and modified.
+func rewriteExistingBaseTag(content, proxyPrefix, targetHost string) (string, bool) {
+	contentLower := strings.ToLower(content)
+	baseIdx := strings.Index(contentLower, "<base")
+	if baseIdx == -1 {
+		return content, false
+	}
+	tagEnd := strings.Index(content[baseIdx:], ">")
+	if tagEnd == -1 {
+		return content, false
+	}
+	tagEnd += baseIdx + 1 // position just after '>'
+	tag := content[baseIdx:tagEnd]
+	tagLower := strings.ToLower(tag)
+
+	quote := byte('"')
+	hrefIdx := strings.Index(tagLower, `href="`)
+	if hrefIdx == -1 {
+		hrefIdx = strings.Index(tagLower, `href='`)
+		quote = '\''
+	}
+	if hrefIdx == -1 {
+		return content, false
+	}
+	valueStart := hrefIdx + len(`href="`)
+	valueEnd := strings.IndexByte(tag[valueStart:], quote)
+	if valueEnd == -1 {
+		return content, false
+	}
+	valueEnd += valueStart
+	href := tag[valueStart:valueEnd]
+
+	// Strip scheme+host if the href is a full same-host URL
+	hrefPath := href
+	if u, err := url.Parse(href); err == nil && u.Host != "" {
+		if !strings.EqualFold(u.Host, targetHost) {
+			return content, false // different host, leave alone
+		}
+		hrefPath = u.Path
+		if hrefPath == "" {
+			hrefPath = "/"
+		}
+	}
+
+	if !strings.HasPrefix(hrefPath, "/") || strings.HasPrefix(hrefPath, proxyPrefix) {
+		return content, false // relative or already rewritten
+	}
+
+	newHref := proxyPrefix + hrefPath
+	newTag := tag[:valueStart] + newHref + tag[valueEnd:]
+	return content[:baseIdx] + newTag + content[tagEnd:], true
+}
+
 // Global session cache for form-based logins
 var proxySessionCache = proxy.NewSessionCache()
 
@@ -6509,26 +6568,30 @@ window.top.location.href = '/proxy/%s/';
 				// Add base tag to HTML to help resolve relative URLs
 				// IMPORTANT: base must reflect the directory of the UPSTREAM request path
 				// (not our incoming /proxy/<serial>/... path) to avoid duplicating the proxy prefix.
-				if isHTML && !strings.Contains(strings.ToLower(content), "<base") {
-					// Use the upstream request path from the reverse proxy response
-					upstreamPath := "/"
-					if resp != nil && resp.Request != nil && resp.Request.URL != nil {
-						upstreamPath = resp.Request.URL.Path
-					}
-					dir := path.Dir(upstreamPath)
-					if !strings.HasSuffix(dir, "/") {
-						dir += "/"
-					}
-					baseHref := proxyPrefix + dir
-					baseTag := "<base href=\"" + baseHref + "\">"
-					contentLower := strings.ToLower(content)
-					if idx := strings.Index(contentLower, "<head>"); idx != -1 {
-						content = content[:idx+6] + baseTag + content[idx+6:]
-					} else if idx := strings.Index(contentLower, "<head "); idx != -1 {
-						// Find end of <head ...> tag
-						if endIdx := strings.Index(content[idx:], ">"); endIdx != -1 {
-							insertPos := idx + endIdx + 1
-							content = content[:insertPos] + baseTag + content[insertPos:]
+				if isHTML {
+					if rewritten, ok := rewriteExistingBaseTag(content, proxyPrefix, target.Host); ok {
+						content = rewritten
+					} else if !strings.Contains(strings.ToLower(content), "<base") {
+						// Use the upstream request path from the reverse proxy response
+						upstreamPath := "/"
+						if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+							upstreamPath = resp.Request.URL.Path
+						}
+						dir := path.Dir(upstreamPath)
+						if !strings.HasSuffix(dir, "/") {
+							dir += "/"
+						}
+						baseHref := proxyPrefix + dir
+						baseTag := "<base href=\"" + baseHref + "\">"
+						contentLower := strings.ToLower(content)
+						if idx := strings.Index(contentLower, "<head>"); idx != -1 {
+							content = content[:idx+6] + baseTag + content[idx+6:]
+						} else if idx := strings.Index(contentLower, "<head "); idx != -1 {
+							// Find end of <head ...> tag
+							if endIdx := strings.Index(content[idx:], ">"); endIdx != -1 {
+								insertPos := idx + endIdx + 1
+								content = content[:insertPos] + baseTag + content[insertPos:]
+							}
 						}
 					}
 				}
