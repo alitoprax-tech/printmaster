@@ -963,6 +963,48 @@ func TestParseDeviceProxyPath(t *testing.T) {
 	}
 }
 
+func TestRecoverDeviceProxyResourcePath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		path     string
+		referer  string
+		wantPath string
+		ok       bool
+	}{
+		{
+			name:     "Kyocera asset missing serial",
+			path:     "/api/v1/proxy/device/js/ssrc/base.js",
+			referer:  "https://printmaster.example/api/v1/proxy/device/RH28Y00024/",
+			wantPath: "/api/v1/proxy/device/RH28Y00024/js/ssrc/base.js",
+			ok:       true,
+		},
+		{
+			name:    "non-resource path is not repaired",
+			path:    "/api/v1/proxy/device/RH28Y00024/js/ssrc/base.js",
+			referer: "https://printmaster.example/api/v1/proxy/device/RH28Y00024/",
+		},
+		{
+			name:    "unscoped referer is not trusted",
+			path:    "/api/v1/proxy/device/js/ssrc/base.js",
+			referer: "https://printmaster.example/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			req.Header.Set("Referer", tt.referer)
+
+			gotPath, gotOK := recoverDeviceProxyResourcePath(req)
+			if gotOK != tt.ok || gotPath != tt.wantPath {
+				t.Fatalf("recoverDeviceProxyResourcePath() = (%q, %t), want (%q, %t)", gotPath, gotOK, tt.wantPath, tt.ok)
+			}
+		})
+	}
+}
+
 func TestAgentRegistrationWithMetadata(t *testing.T) {
 	// Test for agent registration with metadata
 	// Test that new metadata fields are properly stored
@@ -989,7 +1031,7 @@ func TestAgentRegistrationWithMetadata(t *testing.T) {
 		"ip":               "192.168.1.200",
 		"platform":         "linux",
 		"os_version":       "Ubuntu 22.04",
-			"go_version":       "go1.27.0",
+		"go_version":       "go1.27.0",
 		"architecture":     "amd64",
 		"num_cpu":          8,
 		"total_memory_mb":  16384,

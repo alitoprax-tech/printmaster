@@ -4790,6 +4790,11 @@ func handleAgentProxy(w http.ResponseWriter, r *http.Request) {
 
 // handleDeviceProxy proxies HTTP requests to device web UIs through agent WebSocket
 func handleDeviceProxy(w http.ResponseWriter, r *http.Request) {
+	if correctedPath, ok := recoverDeviceProxyResourcePath(r); ok {
+		http.Redirect(w, r, correctedPath, http.StatusFound)
+		return
+	}
+
 	serial, targetPath, err := parseDeviceProxyPath(r.URL.Path, "/api/v1/proxy/device/")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -4798,6 +4803,47 @@ func handleDeviceProxy(w http.ResponseWriter, r *http.Request) {
 
 	targetPath = appendQueryToPath(targetPath, r.URL.RawQuery)
 	proxyDeviceRequest(w, r, serial, targetPath)
+}
+
+// recoverDeviceProxyResourcePath restores a device serial that a printer UI
+// omitted from a root-relative asset request. The Referer remains serial-scoped.
+func recoverDeviceProxyResourcePath(r *http.Request) (string, bool) {
+	const prefix = "/api/v1/proxy/device/"
+	resourcePath := strings.TrimPrefix(r.URL.Path, prefix)
+	if resourcePath == r.URL.Path {
+		return "", false
+	}
+
+	parts := strings.SplitN(resourcePath, "/", 2)
+	if len(parts) != 2 || !isProxyResourceDirectory(parts[0]) {
+		return "", false
+	}
+
+	referer, err := url.Parse(r.Referer())
+	if err != nil || !strings.HasPrefix(referer.Path, prefix) {
+		return "", false
+	}
+
+	refererPath := strings.TrimPrefix(referer.Path, prefix)
+	refererParts := strings.SplitN(refererPath, "/", 2)
+	if refererParts[0] == "" || isProxyResourceDirectory(refererParts[0]) {
+		return "", false
+	}
+
+	correctedPath := prefix + refererParts[0] + "/" + resourcePath
+	if r.URL.RawQuery != "" {
+		correctedPath += "?" + r.URL.RawQuery
+	}
+	return correctedPath, true
+}
+
+func isProxyResourceDirectory(segment string) bool {
+	switch strings.ToLower(segment) {
+	case "js", "css", "images", "strings", "lib", "fonts", "assets", "static", "startwlm", "wlmeng":
+		return true
+	default:
+		return false
+	}
 }
 
 // handleLegacyDeviceProxy keeps historical /proxy/{serial}/ URLs working by routing
