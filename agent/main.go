@@ -159,6 +159,11 @@ func rewriteExistingBaseTag(content, proxyPrefix, targetHost string) (string, bo
 	return content[:baseIdx] + newTag + content[tagEnd:], true
 }
 
+func isKyoceraModelScript(targetPath string) bool {
+	path := strings.ToLower(targetPath)
+	return strings.HasPrefix(path, "/js/jssrc/model/") && strings.HasSuffix(path, ".model.htm")
+}
+
 // Global session cache for form-based logins
 var proxySessionCache = proxy.NewSessionCache()
 
@@ -6453,6 +6458,10 @@ window.top.location.href = '/proxy/%s/';
 
 		// Modify response to rewrite URLs in content and headers
 		rproxy.ModifyResponse = func(resp *http.Response) error {
+			if isKyoceraModelScript(targetPath) {
+				resp.Header.Set("Content-Type", "application/javascript")
+			}
+
 			// Rewrite Set-Cookie headers to include the proxy path
 			// This ensures the browser stores cookies and includes them in iframe requests
 			if cookies := resp.Cookies(); len(cookies) > 0 {
