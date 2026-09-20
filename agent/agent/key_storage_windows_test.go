@@ -389,6 +389,16 @@ func TestCNGServiceACLDescriptorContainsOnlyRequiredPrincipals(t *testing.T) {
 		t.Fatal(err)
 	}
 	descriptor := unsafe.Slice((*byte)(unsafe.Pointer(sd)), sd.Length())
+	systemSID, err := windows.StringToSid("S-1-5-18")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSID, err := windows.StringToSid("S-1-5-32-544")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCNGDACLContains(t, descriptor, systemSID)
+	assertCNGDACLContains(t, descriptor, adminSID)
 	assertCNGDACLContains(t, descriptor, serviceSID)
 	assertCNGDACLExcludesBroadPrincipals(t, descriptor)
 	if !strings.Contains(sd.String(), "SY") || !strings.Contains(sd.String(), "BA") {
