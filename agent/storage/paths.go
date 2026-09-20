@@ -43,9 +43,10 @@ func GetDataDir(appName string) (string, error) {
 	dataDir := filepath.Join(baseDir, appName)
 
 	// Create directory if it doesn't exist
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return "", err
 	}
+	_ = os.Chmod(dataDir, 0700)
 
 	return dataDir, nil
 }

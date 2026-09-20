@@ -647,16 +647,15 @@ $compatibilityNote
 
 #### Docker (Recommended)
 ``````bash
-# Pull the latest image (supports amd64, arm64, arm/v7)
+# Pull the exact release image (supports amd64, arm64, arm/v7)
 docker pull ghcr.io/mstrhakr/printmaster-${Component}:${Version}
-docker pull ghcr.io/mstrhakr/printmaster-${Component}:latest
 
 # Run the container
 docker run -d \
   --name printmaster-${Component} \
   -p 9090:9090 \
   -v printmaster-data:/var/lib/printmaster/${Component} \
-  ghcr.io/mstrhakr/printmaster-${Component}:latest
+  ghcr.io/mstrhakr/printmaster-${Component}:${Version}
 ``````
 
 #### Binary Installation

@@ -221,7 +221,7 @@ func (c *SNMPClient) Get(oids []string) (*gosnmp.SnmpPacket, error) {
     // Build SNMP GetRequest using gosnmp
     snmpReq := &gosnmp.SnmpPacket{
         Version:   gosnmp.Version2c,
-        Community: "public",
+        Community: "replace-with-site-secret",
         PDUType:   gosnmp.GetRequest,
         RequestID: rand.Uint32(),
         Variables: makeVarBinds(oids),

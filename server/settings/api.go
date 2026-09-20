@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	pmsettings "printmaster/common/settings"
+	webutil "printmaster/common/web"
 	authz "printmaster/server/authz"
 	"printmaster/server/storage"
 	"printmaster/server/tenancy"
@@ -21,6 +22,7 @@ type APIOptions struct {
 	AuthMiddleware    func(http.HandlerFunc) http.HandlerFunc
 	Authorizer        func(*http.Request, authz.Action, authz.ResourceRef) error
 	ActorResolver     func(*http.Request) string
+	IsAdmin           func(*http.Request) bool
 	AuditLogger       func(*http.Request, *storage.AuditEntry)
 	LockedKeysChecker func() map[string]bool // Returns map of keys locked by env vars
 }
@@ -39,6 +41,7 @@ type API struct {
 	authWrap          func(http.HandlerFunc) http.HandlerFunc
 	authorizer        func(*http.Request, authz.Action, authz.ResourceRef) error
 	actorResolver     func(*http.Request) string
+	isAdmin           func(*http.Request) bool
 	auditLogger       func(*http.Request, *storage.AuditEntry)
 	lockedKeysChecker func() map[string]bool
 }
@@ -62,9 +65,81 @@ func NewAPI(store Store, resolver *Resolver, opts APIOptions) (*API, error) {
 		authWrap:          opts.AuthMiddleware,
 		authorizer:        opts.Authorizer,
 		actorResolver:     opts.ActorResolver,
+		isAdmin:           opts.IsAdmin,
 		auditLogger:       opts.AuditLogger,
 		lockedKeysChecker: opts.LockedKeysChecker,
 	}, nil
+}
+
+// redactSnapshotForCaller removes fleet credentials from responses sent to
+// tenant operators/viewers.  The resolver still returns the real values to
+// agents internally; only the browser-facing settings API is redacted.
+func (api *API) redactSnapshotForCaller(r *http.Request, snapshot interface{}) interface{} {
+	if api.isAdmin != nil && api.isAdmin(r) {
+		return snapshot
+	}
+	return redactSnapshot(snapshot)
+}
+
+func redactSnapshot(snapshot interface{}) interface{} {
+	switch value := snapshot.(type) {
+	case Snapshot:
+		pmsettings.RedactSecrets(&value.Settings)
+		return value
+	case *Snapshot:
+		if value == nil {
+			return value
+		}
+		copy := *value
+		pmsettings.RedactSecrets(&copy.Settings)
+		return &copy
+	case TenantSnapshot:
+		pmsettings.RedactSecrets(&value.Settings)
+		redactMapSecrets(value.Overrides)
+		return value
+	case *TenantSnapshot:
+		if value == nil {
+			return value
+		}
+		copy := *value
+		pmsettings.RedactSecrets(&copy.Settings)
+		copy.Overrides = cloneMap(copy.Overrides)
+		redactMapSecrets(copy.Overrides)
+		return &copy
+	case AgentSettingsSnapshot:
+		pmsettings.RedactSecrets(&value.Settings)
+		redactMapSecrets(value.Overrides)
+		return value
+	case *AgentSettingsSnapshot:
+		if value == nil {
+			return value
+		}
+		copy := *value
+		pmsettings.RedactSecrets(&copy.Settings)
+		copy.Overrides = cloneMap(copy.Overrides)
+		redactMapSecrets(copy.Overrides)
+		return &copy
+	default:
+		return snapshot
+	}
+}
+
+func redactMapSecrets(values map[string]interface{}) {
+	for key, raw := range values {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		switch lower {
+		case "community", "auth_password", "priv_password", "password", "pass", "secret", "token":
+			values[key] = ""
+		case "map[string]interface{}":
+			if nested, ok := raw.(map[string]interface{}); ok {
+				redactMapSecrets(nested)
+			}
+		default:
+			if nested, ok := raw.(map[string]interface{}); ok {
+				redactMapSecrets(nested)
+			}
+		}
+	}
 }
 
 // RegisterRoutes wires the HTTP handlers onto the mux based on the provided config.
@@ -168,7 +243,7 @@ func (api *API) handleSchema(w http.ResponseWriter, r *http.Request) {
 func (api *API) handleGlobal(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		if !api.authorize(w, r, authz.ActionSettingsFleetRead, authz.ResourceRef{}) {
+		if !api.authorize(w, r, authz.ActionSettingsFleetGlobalRead, authz.ResourceRef{}) {
 			return
 		}
 		snap, err := api.resolver.ResolveGlobal(r.Context())
@@ -176,9 +251,9 @@ func (api *API) handleGlobal(w http.ResponseWriter, r *http.Request) {
 			writeStoreError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, snap)
+		writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 	case http.MethodPut:
-		if !api.authorize(w, r, authz.ActionSettingsFleetWrite, authz.ResourceRef{}) {
+		if !api.authorize(w, r, authz.ActionSettingsFleetGlobalWrite, authz.ResourceRef{}) {
 			return
 		}
 		// Decode wrapper struct that includes both settings and managed_sections
@@ -186,7 +261,7 @@ func (api *API) handleGlobal(w http.ResponseWriter, r *http.Request) {
 			pmsettings.Settings
 			ManagedSections *[]string `json:"managed_sections,omitempty"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&wrapper); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &wrapper, 1<<20); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
@@ -240,7 +315,7 @@ func (api *API) handleGlobal(w http.ResponseWriter, r *http.Request) {
 			writeStoreError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, snap)
+		writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 		api.audit(r, &storage.AuditEntry{
 			Action:     "settings.global.update",
 			TargetType: "settings",
@@ -346,9 +421,14 @@ func (api *API) handleAgentSettings(w http.ResponseWriter, r *http.Request, agen
 	if strings.TrimSpace(agent.TenantID) != "" {
 		resource = authz.ResourceRef{TenantIDs: []string{agent.TenantID}}
 	}
+	globalAgent := strings.TrimSpace(agent.TenantID) == ""
 	switch r.Method {
 	case http.MethodGet:
-		if !api.authorize(w, r, authz.ActionSettingsFleetRead, resource) {
+		action := authz.ActionSettingsFleetRead
+		if globalAgent {
+			action = authz.ActionSettingsFleetGlobalRead
+		}
+		if !api.authorize(w, r, action, resource) {
 			return
 		}
 		snap, err := api.resolver.ResolveForAgent(r.Context(), agentID)
@@ -356,14 +436,22 @@ func (api *API) handleAgentSettings(w http.ResponseWriter, r *http.Request, agen
 			writeStoreError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, snap)
+		writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 	case http.MethodPut:
-		if !api.authorize(w, r, authz.ActionSettingsFleetWrite, resource) {
+		action := authz.ActionSettingsFleetWrite
+		if globalAgent {
+			action = authz.ActionSettingsFleetGlobalWrite
+		}
+		if !api.authorize(w, r, action, resource) {
 			return
 		}
 		api.saveAgentOverrides(w, r, agent)
 	case http.MethodDelete:
-		if !api.authorize(w, r, authz.ActionSettingsFleetWrite, resource) {
+		action := authz.ActionSettingsFleetWrite
+		if globalAgent {
+			action = authz.ActionSettingsFleetGlobalWrite
+		}
+		if !api.authorize(w, r, action, resource) {
 			return
 		}
 		if err := api.store.DeleteAgentSettings(r.Context(), agentID); err != nil {
@@ -382,7 +470,7 @@ func (api *API) handleAgentSettings(w http.ResponseWriter, r *http.Request, agen
 			writeStoreError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, snap)
+		writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -402,7 +490,7 @@ func (api *API) writeTenantSnapshot(w http.ResponseWriter, r *http.Request, tena
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snap)
+	writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 }
 
 func (api *API) saveTenantOverrides(w http.ResponseWriter, r *http.Request, tenantID string) {
@@ -415,7 +503,7 @@ func (api *API) saveTenantOverrides(w http.ResponseWriter, r *http.Request, tena
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &body, 1<<20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -524,7 +612,7 @@ func (api *API) saveTenantOverrides(w http.ResponseWriter, r *http.Request, tena
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snap)
+	writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 }
 
 func (api *API) saveAgentOverrides(w http.ResponseWriter, r *http.Request, agent *storage.Agent) {
@@ -539,7 +627,7 @@ func (api *API) saveAgentOverrides(w http.ResponseWriter, r *http.Request, agent
 	}
 
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &body, 1<<20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -664,7 +752,7 @@ func (api *API) saveAgentOverrides(w http.ResponseWriter, r *http.Request, agent
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snap)
+	writeJSON(w, http.StatusOK, api.redactSnapshotForCaller(r, snap))
 }
 
 func (api *API) ensureTenantExists(ctx context.Context, tenantID string) error {

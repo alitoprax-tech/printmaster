@@ -162,6 +162,9 @@ func TestDeviceLifecycle(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	if err := s.RegisterAgent(ctx, &Agent{AgentID: "agent-1", Token: "test-agent-1"}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.RegisterAgent(ctx, &Agent{
 		AgentID:         "agent-1",
@@ -251,6 +254,9 @@ func TestDeviceWithRawData(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	if err := s.RegisterAgent(ctx, &Agent{AgentID: "agent-1", Token: "test-agent-1"}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.RegisterAgent(ctx, &Agent{
 		AgentID:         "agent-1",
@@ -305,6 +311,12 @@ func TestMultipleDevicesByAgent(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	if err := s.RegisterAgent(ctx, &Agent{AgentID: "agent-1", Token: "test-agent-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegisterAgent(ctx, &Agent{AgentID: "agent-2", Token: "test-agent-2"}); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, agentID := range []string{"agent-1", "agent-2"} {
 		if err := s.RegisterAgent(ctx, &Agent{
@@ -385,6 +397,9 @@ func TestMetricsLifecycle(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	if err := s.RegisterAgent(ctx, &Agent{AgentID: "agent-1", Token: "test-agent-1"}); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.RegisterAgent(ctx, &Agent{
 		AgentID:         "agent-1",

@@ -3,6 +3,9 @@ package vendor
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
+	"unicode/utf8"
 
 	"printmaster/agent/featureflags"
 	"printmaster/common/logger"
@@ -249,12 +252,20 @@ func FetchEpsonRemoteMetricsWithIP(ctx context.Context, ip string, timeoutSecond
 		return nil
 	}
 
+	community, err := configuredEpsonRemoteCommunity()
+	if err != nil {
+		if logger.Global != nil {
+			logger.Global.Warn("Epson remote: refusing unsafe SNMP configuration", "ip", ip, "error", err)
+		}
+		return nil
+	}
+
 	if logger.Global != nil {
 		logger.Global.TraceTag("epson_remote", "Epson remote: creating vendor SNMP client", "ip", ip, "timeout_s", timeoutSeconds)
 	}
 
 	// Create our own SNMP client
-	client, err := NewVendorSNMPClient(ip, "public", timeoutSeconds)
+	client, err := NewVendorSNMPClient(ip, community, timeoutSeconds)
 	if err != nil {
 		if logger.Global != nil {
 			logger.Global.Warn("Epson remote: failed to create SNMP client", "ip", ip, "error", err)
@@ -264,6 +275,42 @@ func FetchEpsonRemoteMetricsWithIP(ctx context.Context, ip string, timeoutSecond
 	defer client.Close()
 
 	return FetchEpsonRemoteMetrics(ctx, client, ip)
+}
+
+// configuredEpsonRemoteCommunity returns credentials that the legacy Epson
+// remote-mode helper can actually honor.  The helper only supports SNMPv1/v2c;
+// silently downgrading a fleet configured for SNMPv3 to v2c would expose the
+// query and could make the well-known "public" community usable again.
+func configuredEpsonRemoteCommunity() (string, error) {
+	version := strings.ToLower(strings.TrimSpace(os.Getenv("SNMP_VERSION")))
+	switch version {
+	case "", "1", "v1", "2", "2c", "v2c":
+		// Supported by NewVendorSNMPClient.
+	case "3", "v3":
+		return "", fmt.Errorf("epson remote mode does not support SNMPv3")
+	default:
+		return "", fmt.Errorf("unsupported SNMP version %q", version)
+	}
+
+	community, ok := os.LookupEnv("SNMP_COMMUNITY")
+	if !ok || community == "" {
+		return "", fmt.Errorf("SNMP_COMMUNITY must be explicitly configured for epson remote mode")
+	}
+	if strings.TrimSpace(community) != community {
+		return "", fmt.Errorf("SNMP_COMMUNITY must not have leading or trailing whitespace")
+	}
+	if !utf8.ValidString(community) {
+		return "", fmt.Errorf("SNMP_COMMUNITY must be valid UTF-8")
+	}
+	if len([]byte(community)) > 255 {
+		return "", fmt.Errorf("SNMP_COMMUNITY exceeds 255 bytes")
+	}
+	for _, r := range community {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("SNMP_COMMUNITY contains a control character")
+		}
+	}
+	return community, nil
 }
 
 func min(a, b int) int {

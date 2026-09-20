@@ -2,7 +2,11 @@ package selfupdate
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"printmaster/common/updateauth"
 	"printmaster/server/storage"
 )
 
@@ -95,7 +100,7 @@ func TestManagerTickSelectsNewerCandidate(t *testing.T) {
 	binaryPath := createDummyBinary(t)
 
 	dataDir := t.TempDir()
-	fixed := time.Date(2025, time.November, 27, 13, 0, 0, 0, time.UTC)
+	fixed := time.Now().UTC()
 	launcher := &stubLauncher{meta: map[string]any{"helper_pid": 1337}}
 	mgr, err := NewManager(Options{
 		Store:            store,
@@ -171,7 +176,7 @@ func TestManagerApplyLauncherFailure(t *testing.T) {
 		Arch:             "amd64",
 		BinaryPath:       binaryPath,
 		ApplyLauncher:    launcher,
-		Clock:            func() time.Time { return time.Date(2025, time.November, 27, 15, 0, 0, 0, time.UTC) },
+		Clock:            func() time.Time { return time.Now().UTC() },
 		CheckEvery:       time.Minute,
 		RuntimeSkipCheck: func() string { return "" }, // Bypass CI detection
 	})
@@ -246,6 +251,33 @@ func createArtifact(t *testing.T, store storage.Store, ctx context.Context, comp
 	if err := store.UpsertReleaseManifest(ctx, manifest); err != nil {
 		t.Fatalf("UpsertReleaseManifest: %v", err)
 	}
+	provisionSignedRelease(t, artifact)
+}
+
+func provisionSignedRelease(t *testing.T, artifact *storage.ReleaseArtifact) *updateauth.Manifest {
+	t.Helper()
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustPath := filepath.Join(t.TempDir(), "trust.json")
+	dir := t.TempDir()
+	doc, _ := json.Marshal(map[string]interface{}{"keys": map[string]string{"offline": base64.StdEncoding.EncodeToString(pub)}})
+	if err := os.WriteFile(trustPath, doc, 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	m := &updateauth.Manifest{ManifestVersion: "2", Component: artifact.Component, Version: artifact.Version, Platform: artifact.Platform, Arch: artifact.Arch, Channel: artifact.Channel, SHA256: artifact.SHA256, SizeBytes: artifact.SizeBytes, GeneratedAt: now, ExpiresAt: now.Add(time.Hour), KeyID: "offline"}
+	if err := updateauth.Sign(m, key, now); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(m)
+	if err := os.WriteFile(filepath.Join(dir, "release.json"), body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRINTMASTER_UPDATE_TRUST_FILE", trustPath)
+	t.Setenv("PRINTMASTER_RELEASE_MANIFEST_DIR", dir)
+	return m
 }
 
 func createDummyBinary(t *testing.T) string {

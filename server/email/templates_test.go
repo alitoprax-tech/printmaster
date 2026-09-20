@@ -575,9 +575,13 @@ func TestEmailSpecialCharacterHandling(t *testing.T) {
 		t.Fatalf("GenerateInviteEmail error = %v", err)
 	}
 
-	// URL should be preserved (& is valid in URLs)
-	if !strings.Contains(htmlBody, data.InviteURL) {
-		t.Error("URL should be preserved in HTML")
+	// HTML attributes/text escape ampersands while the plain-text part keeps the
+	// original URL. The user-supplied script must never become executable HTML.
+	if !strings.Contains(htmlBody, "https://example.com/invite?token=abc&amp;user=123") {
+		t.Error("URL should be HTML-escaped")
+	}
+	if strings.Contains(htmlBody, "<script>") {
+		t.Error("HTML body must escape script markup")
 	}
 
 	// Text body should contain the URL as-is

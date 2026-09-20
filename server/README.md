@@ -60,7 +60,7 @@ Point agents to server in their config:
 ```ini
 # agent/config.ini
 [server]
-url = http://your-server:9090
+url = https://printmaster.example.com
 agent_id = agent-site-a
 upload_interval = 60
 ```
@@ -209,7 +209,7 @@ See `docs/ROADMAP_TO_1.0.md` for full versioning strategy.
 ### Environment Variables
 
 ```bash
-SERVER_PORT=9090              # HTTP port
+SERVER_HTTP_PORT=9090         # HTTP backend/redirect port
 SERVER_HTTPS_PORT=9443        # HTTPS port
 SERVER_DB_PATH=/path/to/db    # Database location
 SERVER_LOG_LEVEL=info         # Log level

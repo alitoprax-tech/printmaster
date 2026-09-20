@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -430,6 +431,31 @@ func TestHandleAgentDownloadLatestProxy(t *testing.T) {
 	}
 }
 
+func TestHandleAgentDownloadLatestRejectsOversizedProxyResponse(t *testing.T) {
+	enableTenancyForTest(t)
+	origVersion := serverVersion
+	serverVersion = "1.2.3"
+	t.Cleanup(func() { serverVersion = origVersion })
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(maxAgentDownloadBytes+1, 10))
+		_, _ = w.Write([]byte("bin"))
+	}))
+	t.Cleanup(func() { upstream.Close() })
+	origBase := releaseAssetBaseURL
+	releaseAssetBaseURL = upstream.URL
+	t.Cleanup(func() { releaseAssetBaseURL = origBase })
+	origClient := releaseDownloadClient
+	releaseDownloadClient = upstream.Client()
+	t.Cleanup(func() { releaseDownloadClient = origClient })
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/download/latest?platform=windows&arch=amd64&proxy=1", nil)
+	rw := httptest.NewRecorder()
+	handleAgentDownloadLatest(rw, req)
+	if rw.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for oversized package, got %d", rw.Code)
+	}
+}
+
 func TestHandleAgentDownloadLatestRedirect(t *testing.T) {
 	enableTenancyForTest(t)
 	origVersion := serverVersion
@@ -467,5 +493,58 @@ func TestHandleAgentDownloadLatestMSI(t *testing.T) {
 	}
 	if !strings.Contains(loc, "printmaster-agent-v2.0.0-windows-amd64.msi") {
 		t.Fatalf("expected MSI in redirect, got: %s", loc)
+	}
+}
+
+func TestHandleAgentDownloadLatestRejectsUnsafeParameters(t *testing.T) {
+	enableTenancyForTest(t)
+	origVersion := serverVersion
+	serverVersion = "2.0.0"
+	t.Cleanup(func() { serverVersion = origVersion })
+
+	tests := []string{
+		"/api/v1/agents/download/latest?platform=windows&arch=../../etc/passwd",
+		"/api/v1/agents/download/latest?platform=windows&arch=386",
+		"/api/v1/agents/download/latest?platform=plan9&arch=amd64",
+		"/api/v1/agents/download/latest?platform=linux&arch=amd64&format=msi",
+		"/api/v1/agents/download/latest?platform=windows&arch=amd64&format=tar",
+	}
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rw := httptest.NewRecorder()
+			handleAgentDownloadLatest(rw, req)
+			if rw.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d with body %q", rw.Code, rw.Body.String())
+			}
+		})
+	}
+}
+
+func TestBuildReleaseAssetURLRejectsUntrustedOrigin(t *testing.T) {
+	origBase := releaseAssetBaseURL
+	t.Cleanup(func() { releaseAssetBaseURL = origBase })
+	releaseAssetBaseURL = "https://attacker.example/download"
+	if _, err := buildReleaseAssetURL("agent-v1.0.0", "printmaster-agent-v1.0.0-linux-amd64"); err == nil {
+		t.Fatal("expected untrusted release origin to be rejected")
+	}
+}
+
+func TestCheckReleaseRedirectAllowsOnlyGitHubHTTPSHosts(t *testing.T) {
+	t.Parallel()
+
+	allowed := httptest.NewRequest(http.MethodGet, "https://objects.githubusercontent.com/release", nil)
+	if err := checkReleaseRedirect(allowed, nil); err != nil {
+		t.Fatalf("expected GitHub CDN redirect to be allowed: %v", err)
+	}
+	for _, target := range []string{
+		"http://github.com/release",
+		"https://169.254.169.254/latest",
+		"https://attacker.example/release",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		if err := checkReleaseRedirect(req, nil); err == nil {
+			t.Fatalf("expected redirect %s to be rejected", target)
+		}
 	}
 }

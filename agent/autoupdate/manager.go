@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -500,6 +502,9 @@ func (m *Manager) performCheck(ctx context.Context) error {
 		m.reportTelemetry(ctx, Status(StatusFailed), ErrCodeServerError, err.Error())
 		return fmt.Errorf("failed to fetch manifest: %w", err)
 	}
+	if manifest == nil {
+		return fmt.Errorf("no manifest available")
+	}
 
 	m.mu.Lock()
 	m.lastCheck = m.clock()
@@ -527,6 +532,18 @@ func (m *Manager) performCheck(ctx context.Context) error {
 }
 
 func (m *Manager) executeUpdate(ctx context.Context, manifest *UpdateManifest) error {
+	// Manual requests may reinstall the current version but cannot bypass rollback
+	// protection. An unknown development version requires an operator installation.
+	if manifest == nil {
+		return fmt.Errorf("no manifest available")
+	}
+	targetVersion, err := parseSemverVersion(manifest.Version)
+	if err != nil || targetVersion == nil || m.currentSemver == nil {
+		return fmt.Errorf("cannot establish update version ordering")
+	}
+	if targetVersion.LessThan(m.currentSemver) {
+		return fmt.Errorf("update downgrade rejected")
+	}
 	// If using package manager, use simplified flow (no download needed)
 	if m.usePackageManager && m.packageName != "" {
 		return m.executeUpdateViaPackageManager(ctx, manifest)
@@ -1409,6 +1426,15 @@ func (m *Manager) ValidatePostUpdateWithHealthCheck(healthURL string, timeout ti
 	if healthURL == "" {
 		healthURL = "http://127.0.0.1:8080/api/version"
 	}
+	parsed, err := url.Parse(healthURL)
+	if err != nil || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("health check URL must be a local HTTP(S) endpoint")
+	}
+	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
+	ip := net.ParseIP(host)
+	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("health check URL must target loopback")
+	}
 	if timeout == 0 {
 		timeout = defaultHealthCheckTimeout
 	}
@@ -1428,7 +1454,7 @@ func (m *Manager) ValidatePostUpdateWithHealthCheck(healthURL string, timeout ti
 
 		if resp.StatusCode == http.StatusOK {
 			var versionInfo map[string]string
-			if err := json.NewDecoder(resp.Body).Decode(&versionInfo); err == nil {
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&versionInfo); err == nil {
 				if version, ok := versionInfo["version"]; ok {
 					m.logInfo("Health check passed", "version", version)
 					resp.Body.Close()

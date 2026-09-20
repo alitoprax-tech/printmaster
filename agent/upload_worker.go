@@ -13,6 +13,7 @@ import (
 
 	"printmaster/agent/agent"
 	"printmaster/agent/storage"
+	commonconfig "printmaster/common/config"
 )
 
 // Logger interface for upload worker operations
@@ -235,6 +236,9 @@ func (w *UploadWorker) StartWithVersionInfo(ctx context.Context, version string,
 
 		w.wsClientMu.Lock()
 		w.wsClient = agent.NewWSClient(serverURL, token, w.client.IsInsecureSkipVerify())
+		if transport, ok := w.client.HTTPClient.Transport.(*http.Transport); ok {
+			w.wsClient.SetTLSConfig(transport.TLSClientConfig)
+		}
 		w.wsClientMu.Unlock()
 
 		// Apply pending local handler if one was set before wsClient existed
@@ -324,6 +328,9 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 		initSecret = os.Getenv("INIT_SERCRET")
 	}
 	if initSecret != "" {
+		if err := commonconfig.ValidateInitSecret(initSecret); err != nil {
+			return fmt.Errorf("configured INIT_SECRET rejected: %w", err)
+		}
 		secretUsedFile := filepath.Join(w.dataDir, ".init_secret_used")
 		usedBefore := false
 		if _, err := os.Stat(secretUsedFile); err == nil {

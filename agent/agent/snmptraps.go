@@ -2,12 +2,62 @@ package agent
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gosnmp/gosnmp"
 )
+
+const (
+	maxSNMPTrapCommunityLength = 256
+	maxSNMPTrapSources         = 4096
+)
+
+// configuredSNMPTrapCommunity returns the explicitly configured community for
+// incoming v1/v2c traps.  The trap listener is an optional network entry point;
+// accepting the historical SNMP "public" default would let any host that can
+// reach UDP/162 trigger discovery work.  An explicit value is therefore
+// required and is never inherited from SNMP_COMMUNITY.
+func configuredSNMPTrapCommunity() (string, error) {
+	community, ok := os.LookupEnv("SNMP_TRAP_COMMUNITY")
+	if !ok || community == "" {
+		return "", fmt.Errorf("SNMP_TRAP_COMMUNITY must be set before enabling the SNMP trap listener")
+	}
+	if strings.TrimSpace(community) != community {
+		return "", fmt.Errorf("SNMP_TRAP_COMMUNITY must not have leading or trailing whitespace")
+	}
+	if !utf8.ValidString(community) {
+		return "", fmt.Errorf("SNMP_TRAP_COMMUNITY must be valid UTF-8")
+	}
+	if len([]byte(community)) > maxSNMPTrapCommunityLength {
+		return "", fmt.Errorf("SNMP_TRAP_COMMUNITY exceeds %d bytes", maxSNMPTrapCommunityLength)
+	}
+	for _, r := range community {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("SNMP_TRAP_COMMUNITY contains a control character")
+		}
+	}
+	return community, nil
+}
+
+func snmpTrapCommunityMatches(expected, actual string) bool {
+	if expected == "" || len(expected) != len(actual) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
+}
+
+func usableSNMPTrapSource(ip net.IP) bool {
+	return ip != nil && ip.IsGlobalUnicast() && !ip.IsUnspecified() &&
+		!ip.IsLoopback() && !ip.IsMulticast() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast()
+}
 
 // StartSNMPTrapListener listens for SNMP trap notifications on UDP port 162
 // and enqueues discovered devices for SNMP enrichment. Runs until context is canceled.
@@ -19,6 +69,23 @@ import (
 //
 // Note: Port 162 requires elevated privileges on most systems (admin/root)
 func StartSNMPTrapListener(ctx context.Context, enqueue func(string) bool, port uint16) error {
+	if ctx == nil {
+		return fmt.Errorf("context is required")
+	}
+	if enqueue == nil {
+		return fmt.Errorf("enqueue callback is required")
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
+	trapCommunity, err := configuredSNMPTrapCommunity()
+	if err != nil {
+		return err
+	}
+
 	if port == 0 {
 		port = 162 // Standard SNMP trap port
 	}
@@ -26,37 +93,58 @@ func StartSNMPTrapListener(ctx context.Context, enqueue func(string) bool, port 
 	// Create trap listener
 	tl := gosnmp.NewTrapListener()
 	tl.OnNewTrap = func(packet *gosnmp.SnmpPacket, addr *net.UDPAddr) {
+		if packet == nil || addr == nil || !snmpTrapCommunityMatches(trapCommunity, packet.Community) {
+			// Do not log the supplied community.  Invalid packets are ignored so a
+			// reachable UDP port cannot be used to fill logs or start discovery.
+			return
+		}
 		handleTrap(packet, addr, enqueue)
 	}
 
-	// Set listener parameters
-	tl.Params = gosnmp.Default
-	tl.Params.Version = gosnmp.Version2c // Support both v1 and v2c
-	tl.Params.Community = "public"       // Most printers use "public" for traps
+	// Set listener parameters on a fresh value.  gosnmp.Default contains a
+	// mutex and must not be copied; mutating the package global would also race
+	// with concurrent SNMP clients.
+	tl.Params = &gosnmp.GoSNMP{
+		Version:   gosnmp.Version2c, // Support both v1 and v2c
+		Community: trapCommunity,
+		Logger:    gosnmp.Default.Logger,
+	}
 
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", port)
 
 	Info(fmt.Sprintf("SNMP Traps: listening on %s (requires admin/root privileges)", listenAddr))
 
-	// Listen on specified port
-	if err := tl.Listen(listenAddr); err != nil {
-		return fmt.Errorf("failed to start trap listener: %w", err)
-	}
+	// gosnmp.Listen blocks, so run it separately and close the socket when the
+	// caller cancels.  Without this select the settings endpoint could never
+	// stop the listener and UDP/162 would remain occupied until process exit.
+	listenDone := make(chan error, 1)
+	go func() { listenDone <- tl.Listen(listenAddr) }()
 	defer tl.Close()
 
-	Info("SNMP Traps: listener started successfully")
-
-	// Block until context is canceled
-	<-ctx.Done()
-
-	Info("SNMP Traps: stopping listener")
-
-	return nil
+	select {
+	case err := <-listenDone:
+		if err != nil {
+			return fmt.Errorf("failed to start trap listener: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		Info("SNMP Traps: stopping listener")
+		tl.Close()
+		select {
+		case err := <-listenDone:
+			if err != nil {
+				return fmt.Errorf("failed to stop trap listener: %w", err)
+			}
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("timed out waiting for trap listener to stop")
+		}
+		return nil
+	}
 }
 
 // handleTrap processes incoming SNMP trap notifications
 func handleTrap(packet *gosnmp.SnmpPacket, addr *net.UDPAddr, enqueue func(string) bool) {
-	if addr == nil {
+	if packet == nil || addr == nil || enqueue == nil || !usableSNMPTrapSource(addr.IP) {
 		return
 	}
 
@@ -103,6 +191,16 @@ func handleTrap(packet *gosnmp.SnmpPacket, addr *net.UDPAddr, enqueue func(strin
 // StartSNMPTrapBrowser is a wrapper that handles the trap listener lifecycle
 // with automatic restart on errors and throttling to prevent duplicate discoveries
 func StartSNMPTrapBrowser(ctx context.Context, enqueue func(string) bool, seen map[string]time.Time, throttleWindow time.Duration) {
+	if ctx == nil || enqueue == nil {
+		return
+	}
+	if seen == nil {
+		seen = make(map[string]time.Time)
+	}
+	if _, err := configuredSNMPTrapCommunity(); err != nil {
+		Info("SNMP Trap Browser: " + err.Error())
+		return
+	}
 	port := uint16(162) // Standard SNMP trap port
 
 	// Try to start trap listener
@@ -126,6 +224,32 @@ func StartSNMPTrapBrowser(ctx context.Context, enqueue func(string) bool, seen m
 				}
 			}
 
+			// Bound memory use if a compromised or noisy network sends traps from
+			// many source addresses.  Remove stale entries first, then evict the
+			// oldest entry if the cap is still reached.
+			if len(seen) >= maxSNMPTrapSources {
+				if throttleWindow > 0 {
+					cutoff := now.Add(-throttleWindow)
+					for key, timestamp := range seen {
+						if timestamp.Before(cutoff) {
+							delete(seen, key)
+						}
+					}
+				}
+				if len(seen) >= maxSNMPTrapSources {
+					var oldestKey string
+					var oldest time.Time
+					for key, timestamp := range seen {
+						if oldestKey == "" || timestamp.Before(oldest) {
+							oldestKey, oldest = key, timestamp
+						}
+					}
+					if oldestKey != "" {
+						delete(seen, oldestKey)
+					}
+				}
+			}
+
 			// Update last seen time
 			seen[ip] = now
 
@@ -140,7 +264,8 @@ func StartSNMPTrapBrowser(ctx context.Context, enqueue func(string) bool, seen m
 			Info("SNMP Trap Browser: " + err.Error())
 
 			// Check if it's a permission error
-			if netErr, ok := err.(*net.OpError); ok {
+			var netErr *net.OpError
+			if errors.As(err, &netErr) {
 				if netErr.Op == "listen" {
 					Info("SNMP Trap Browser: Port 162 requires administrator/root privileges")
 					Info("SNMP Trap Browser: Run as admin or disable trap monitoring")
@@ -156,8 +281,19 @@ func StartSNMPTrapBrowser(ctx context.Context, enqueue func(string) bool, seen m
 		default:
 		}
 
-		// Otherwise, wait a bit before retrying
+		// Otherwise, wait a bit before retrying, while still honoring shutdown.
 		Info("SNMP Trap Browser: restarting in 30 seconds...")
-		time.Sleep(30 * time.Second)
+		timer := time.NewTimer(30 * time.Second)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
 	}
 }

@@ -69,11 +69,9 @@ func TestHealthAPI_HandleVersion(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	// Verify all expected fields are present
+	// Verify only compatibility fields are exposed publicly.
 	expectedFields := []string{
-		"version", "build_time", "git_commit", "build_type",
-		"protocol_version", "go_version", "os", "arch",
-		"tenancy_enabled", "uptime",
+		"version", "protocol_version", "tenancy_enabled",
 	}
 	for _, field := range expectedFields {
 		if _, ok := resp[field]; !ok {
@@ -87,6 +85,11 @@ func TestHealthAPI_HandleVersion(t *testing.T) {
 
 	if resp["tenancy_enabled"] != true {
 		t.Errorf("expected tenancy_enabled=true, got %v", resp["tenancy_enabled"])
+	}
+	for _, field := range []string{"build_time", "git_commit", "go_version", "os", "arch", "uptime"} {
+		if _, ok := resp[field]; ok {
+			t.Errorf("sensitive fingerprint field %s must not be public", field)
+		}
 	}
 }
 

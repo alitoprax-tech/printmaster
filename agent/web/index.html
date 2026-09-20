@@ -574,8 +574,8 @@
                     <div id="snmp_v1v2c_settings">
                         <label style="display:flex;align-items:center;gap:8px;">
                             <span style="min-width:200px;">Community String:</span>
-                            <input id="dev_snmp_community" type="text" style="width:220px" placeholder="public" />
-                            <span style="color:var(--muted);font-size:12px;">SNMP v1/v2c community (read-only access)</span>
+                            <input id="dev_snmp_community" type="text" style="width:220px" placeholder="site-specific-community" />
+                            <span style="color:var(--muted);font-size:12px;">Site-specific SNMP v1/v2c community; SNMPv3 authPriv is preferred</span>
                         </label>
                     </div>
                     
@@ -992,11 +992,6 @@
                     <input id="device_auth_ca_path" type="text" placeholder="C:\\path\\to\\ca.pem" />
                 </div>
             </div>
-
-            <label class="device-auth-checkbox">
-                <input type="checkbox" id="device_auth_insecure" />
-                <span>Allow insecure TLS / skip certificate verification (not recommended)</span>
-            </label>
 
             <div class="device-auth-actions">
                 <button id="device_auth_start_btn" class="modal-button modal-button-primary">Start approval</button>

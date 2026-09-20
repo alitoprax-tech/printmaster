@@ -68,7 +68,7 @@ Fine-tune discovery behavior in **Settings** → **Discovery**:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | **Concurrent Scans** | 50 | Simultaneous SNMP queries |
-| **SNMP Community** | public | SNMP v1/v2c community string |
+| **SNMP Community** | Site-specific | SNMP v1/v2c community string; SNMPv3 is preferred |
 | **SNMP Timeout** | 2000ms | Query timeout per device |
 | **SNMP Retries** | 1 | Retry attempts for failed queries |
 
@@ -366,11 +366,17 @@ Enable encrypted connections:
 **Server:**
 ```bash
 docker run -d \
-  -e USE_HTTPS=true \
-  -e HTTPS_PORT=9443 \
-  -v /path/to/certs:/certs \
-  ghcr.io/mstrhakr/printmaster-server:latest
+  -e BIND_ADDRESS=0.0.0.0 \
+  -e SERVER_HTTPS_PORT=9443 \
+  -e TLS_MODE=custom \
+  -e TLS_CERT_PATH=/certs/fullchain.pem \
+  -e TLS_KEY_PATH=/certs/privkey.pem \
+  -v /path/to/certs:/certs:ro \
+  ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 ```
+
+Use an exact reviewed release (or an immutable digest) for production. Do not
+use the floating `latest` or `main` tags for a public deployment.
 
 **Agent:**
 ```toml
@@ -396,7 +402,7 @@ PrintMaster provides a REST API for integrations and automation.
 
 ```bash
 # Get auth token
-curl -X POST http://server:9090/api/v1/auth/login \
+curl -X POST https://printmaster.example.com/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username": "admin", "password": "your-password"}'
 ```

@@ -56,8 +56,8 @@ WORKDIR /var/lib/printmaster/server
 # Set standard container environment variable for detection
 # Default to root; users can override PUID/PGID to drop privileges
 ENV CONTAINER=docker \
-    PUID=0 \
-    PGID=0
+    PUID=99 \
+    PGID=100
 
 # Expose ports
 EXPOSE 9090 9443

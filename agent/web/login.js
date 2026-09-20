@@ -12,6 +12,7 @@
   const qs = new URLSearchParams(window.location.search || '');
   const returnTo = sanitizeReturnPath(qs.get('return_to'));
   const errorCode = qs.get('error') || '';
+  let configuredAgentID = '';
   let submitting = false;
 
   // Error messages for callback errors
@@ -60,6 +61,9 @@
   function buildAgentCallbackURL() {
     const callbackURL = new URL('/api/v1/auth/callback', window.location.origin);
     callbackURL.searchParams.set('return_to', returnTo || '/');
+    if (configuredAgentID) {
+      callbackURL.searchParams.set('agent_id', configuredAgentID);
+    }
     return callbackURL.toString();
   }
 
@@ -87,6 +91,7 @@
       const resp = await fetch('/api/v1/auth/options', { credentials: 'same-origin' });
       if (!resp.ok) throw new Error('options failed');
       const data = await resp.json();
+      configuredAgentID = typeof data.agent_id === 'string' ? data.agent_id.trim() : '';
       applyOptions(data);
     } catch (err) {
       setStatus('Unable to load authentication options. Remote login may be disabled.', 'warn');
@@ -95,6 +100,10 @@
 
   function applyOptions(opts) {
     if (!opts) return;
+
+    if (typeof opts.agent_id === 'string' && opts.agent_id.trim()) {
+      configuredAgentID = opts.agent_id.trim();
+    }
 
     // If login is not supported but we have a server auth URL, redirect to server
     if (!opts.login_supported && opts.server_auth_url) {

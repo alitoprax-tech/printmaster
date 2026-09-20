@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-  Update PrintMaster agent and server binaries from the latest GitHub release
+  Update PrintMaster agent and server binaries from a reviewed GitHub release
 
 .DESCRIPTION
-  Stops running PrintMaster services/processes, downloads the latest Windows
+  Stops running PrintMaster services/processes, downloads the selected Windows
   release binaries for agent and/or server from the GitHub releases for
   mstrhakr/printmaster, backs up the existing installation in
   C:\ProgramData\PrintMaster, replaces the executables, then runs
@@ -20,10 +20,24 @@
 
 .PARAMETER DestPath
   Installation path (default: C:\ProgramData\PrintMaster).
-.EXAMPLE
-  .\update-printmaster.ps1 -Components Both
 
-  Runs update for both agent and server using public GitHub API.
+.PARAMETER Version
+  Exact semantic version to install (for example, 0.30.5). Required unless
+  -AllowLatest is explicitly supplied.
+
+.PARAMETER AllowLatest
+  Opt into selecting the newest stable component release. This is intended
+  for evaluation only; production updates should pin -Version.
+
+.PARAMETER AllowUnsigned
+  Permit an asset whose GitHub API record has no SHA-256 digest. This weakens
+  supply-chain verification and should only be used with an independently
+  verified release.
+.EXAMPLE
+  .\update-printmaster.ps1 -Components Both -Version 0.30.5
+
+  Runs update for both agent and server using the pinned release and verifies
+  each downloaded asset against its GitHub SHA-256 digest.
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
@@ -31,13 +45,24 @@ param(
     [ValidateSet('Agent','Server','Both')]
     [string]$Components = 'Both',
 
+    [ValidatePattern('^[A-Za-z0-9_.-]+$')]
     [string]$RepoOwner = 'mstrhakr',
+    [ValidatePattern('^[A-Za-z0-9_.-]+$')]
     [string]$RepoName  = 'printmaster',
 
-    [string]$DestPath = 'C:\ProgramData\PrintMaster'
-    ,
+    [string]$DestPath = 'C:\ProgramData\PrintMaster',
+
+    [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$')]
+    [string]$Version = '',
+
+    [switch]$AllowLatest = $false,
+    [switch]$AllowUnsigned = $false,
     [switch]$SkipBackup = $false
 )
+
+if ([string]::IsNullOrWhiteSpace($Version) -and -not $AllowLatest) {
+    throw 'An exact -Version is required. Use -AllowLatest only for evaluation updates.'
+}
 
 function Test-IsAdmin {
     $current = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -102,11 +127,26 @@ function Get-Latest-Release-For-Component {
     param(
         [string]$owner,
         [string]$repo,
-        [string]$component
+        [string]$component,
+        [string]$version
     )
 
     $headers = @{ 'User-Agent' = 'PrintMaster-Updater' }
     $prefix = if ($component -ieq 'agent') { 'agent-v' } else { 'server-v' }
+
+    if (-not [string]::IsNullOrWhiteSpace($version)) {
+        $tag = "$prefix$version"
+        $uri = "https://api.github.com/repos/$owner/$repo/releases/tags/$tag"
+        try {
+            $release = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
+        } catch {
+            throw ([string]::Format('Failed to fetch pinned release {0}: {1}', $tag, $_))
+        }
+        if ($release.draft) {
+            throw "Pinned release $tag is still a draft"
+        }
+        return $release
+    }
 
     # Try a few pages of releases (most recent first). Stop when we find a matching tag.
     $foundReleases = @()
@@ -138,7 +178,7 @@ function Get-Latest-Release-For-Component {
 
     # Prefer stable (non-prerelease) releases if available
     $candidates = $foundReleases | Where-Object { -not ($_.prerelease) }
-    if (-not $candidates) { $candidates = $matches }
+    if (-not $candidates) { $candidates = $foundReleases }
 
     # Parse semantic version from tag (strip prefix like 'agent-v') and compare numeric versions
     $parsed = @()
@@ -197,17 +237,49 @@ function Find-Asset-For-Component {
 function Save-Asset {
     param(
         $asset,
-        [string]$outPath
+        [string]$outPath,
+        [string]$ExpectedDigest,
+        [switch]$AllowUnsigned
     )
     if (-not $asset) { throw "No asset provided to Download-Asset" }
+    $assetUri = $null
+    if (-not [Uri]::TryCreate([string]$asset.browser_download_url, [UriKind]::Absolute, [ref]$assetUri) -or
+        $assetUri.Scheme -ne 'https' -or
+        $assetUri.Host -notin @('github.com', 'objects.githubusercontent.com')) {
+        throw "Release asset URL must use HTTPS on GitHub"
+    }
+    $assetName = [IO.Path]::GetFileName([string]$asset.name)
+    if ([string]::IsNullOrWhiteSpace($assetName) -or $assetName -ne [string]$asset.name) {
+        throw "Release asset name is not a plain file name"
+    }
     Write-Host "Downloading $($asset.name) to $outPath"
     try {
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $outPath -UseBasicParsing -ErrorAction Stop
-        return $true
+        Invoke-WebRequest -Uri $assetUri.AbsoluteUri -OutFile $outPath -UseBasicParsing -ErrorAction Stop
     } catch {
         Write-Error ([string]::Format('Failed to download {0}: {1}', $asset.browser_download_url, $_))
         return $false
     }
+
+    $expected = ([string]$ExpectedDigest).Trim().ToLowerInvariant()
+    if ($expected.StartsWith('sha256:')) {
+        $expected = $expected.Substring(7)
+    }
+    if ($expected -notmatch '^[0-9a-f]{64}$') {
+        if (-not $AllowUnsigned) {
+            Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+            throw "GitHub did not provide a valid SHA-256 digest for $($asset.name); rerun only with -AllowUnsigned after independent verification"
+        }
+        Write-Warning "No valid GitHub SHA-256 digest for $($asset.name); continuing because -AllowUnsigned was supplied."
+        return $true
+    }
+
+    $actual = (Get-FileHash -LiteralPath $outPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+        throw "SHA-256 mismatch for $($asset.name): expected $expected, got $actual"
+    }
+    Write-Host "Verified SHA-256 for $($asset.name): $actual"
+    return $true
 }
 
 function Backup-Existing {
@@ -306,8 +378,9 @@ foreach ($comp in $componentsToRun) {
         Write-Host "No existing binary found at $existingExe; will fall back to service/process stop if needed."
     }
 
-    # Find the most recent release specifically for this component (agent-v* or server-v*)
-    $releaseForComp = Get-Latest-Release-For-Component -owner $RepoOwner -repo $RepoName -component $comp
+    # Find the pinned release for this component, or use latest only when
+    # explicitly opted in with -AllowLatest.
+    $releaseForComp = Get-Latest-Release-For-Component -owner $RepoOwner -repo $RepoName -component $comp -version $Version
     if (-not $releaseForComp) {
         Write-Warning "No release found for component $comp. Skipping."
         $allSuccess = $false
@@ -322,7 +395,7 @@ foreach ($comp in $componentsToRun) {
     }
 
     $downloadPath = Join-Path $tmp.FullName $asset.name
-    $ok = Save-Asset -asset $asset -outPath $downloadPath
+    $ok = Save-Asset -asset $asset -outPath $downloadPath -ExpectedDigest ([string]$asset.digest) -AllowUnsigned:$AllowUnsigned
     if (-not $ok) { $allSuccess = $false; continue }
 
     $installed = Install-And-Update -component $comp -downloadedFile $downloadPath -destPath $DestPath -AlreadyStopped:$stoppedViaBinary

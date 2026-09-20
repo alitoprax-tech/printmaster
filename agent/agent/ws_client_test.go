@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,43 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestWebSocketUsesBearerHeaderAndCustomCA(t *testing.T) {
+	observed := make(chan bool, 1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed <- r.URL.Query().Get("token") == "" && r.Header.Get("Authorization") == "Bearer test-secret"
+		c, e := upgrader.Upgrade(w, r, nil)
+		if e != nil {
+			return
+		}
+		defer c.Close()
+		for {
+			if _, _, e := c.ReadMessage(); e != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	client := NewWSClient(srv.URL, "test-secret", false)
+	client.SetTLSConfig(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12})
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	if !client.IsConnected() {
+		t.Fatal("custom CA was not honored")
+	}
+	select {
+	case ok := <-observed:
+		if !ok {
+			t.Fatal("credential leaked into URL or header missing")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handshake not observed")
+	}
+}
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -28,7 +67,7 @@ func TestWSClientConnection(t *testing.T) {
 	// Create a test WebSocket server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check token
-		token := r.URL.Query().Get("token")
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token != "test-token" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -89,7 +128,7 @@ func TestWSClientHeartbeat(t *testing.T) {
 	// Create a test WebSocket server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check token
-		token := r.URL.Query().Get("token")
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token != "test-token" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -177,7 +216,7 @@ func TestWSClientReconnection(t *testing.T) {
 		connectionCount++
 
 		// Check token
-		token := r.URL.Query().Get("token")
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if token != "test-token" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -259,9 +298,9 @@ func TestWSClientAuthenticationFailure(t *testing.T) {
 	t.Log("WebSocket authentication failure handled correctly")
 }
 
-// TestWSClientSkipVerify ensures the WS client respects the insecureSkipVerify flag
-// when dialing a wss:// server with a self-signed cert (httptest.NewTLSServer).
-func TestWSClientSkipVerify(t *testing.T) {
+// TestWSClientRejectsSkipVerify ensures the WS client never disables
+// certificate verification, even when a legacy caller passes true.
+func TestWSClientRejectsSkipVerify(t *testing.T) {
 	t.Parallel()
 
 	// TLS test server (self-signed cert) that upgrades to websocket and immediately closes
@@ -280,17 +319,18 @@ func TestWSClientSkipVerify(t *testing.T) {
 
 	serverURL := server.URL
 
-	// When skipVerify = true, connection should succeed despite self-signed cert
-	clientGood := NewWSClient(serverURL, "test-token", true)
-	if err := clientGood.Start(); err != nil {
-		t.Fatalf("Failed to start WS client with skipVerify=true: %v", err)
+	// A legacy skipVerify=true argument must be ignored; the self-signed
+	// certificate remains untrusted and the connection must fail.
+	clientRejected := NewWSClient(serverURL, "test-token", true)
+	if err := clientRejected.Start(); err != nil {
+		t.Fatalf("Start should remain asynchronous: %v", err)
 	}
-	defer clientGood.Stop()
+	defer clientRejected.Stop()
 
 	// wait briefly for connection
 	time.Sleep(200 * time.Millisecond)
-	if !clientGood.IsConnected() {
-		t.Fatal("Expected WS client to be connected when insecureSkipVerify=true")
+	if clientRejected.IsConnected() {
+		t.Fatal("Expected WS client to reject self-signed cert when insecureSkipVerify=true")
 	}
 
 	// When skipVerify = false, connection should fail (can't verify cert)
@@ -308,6 +348,20 @@ func TestWSClientSkipVerify(t *testing.T) {
 	}
 }
 
+func TestWSClientTLSConfigClearsInsecureOverride(t *testing.T) {
+	client := NewWSClient("https://server.example", "token", true)
+	if client.insecureSkipVerify {
+		t.Fatal("legacy insecureSkipVerify argument must be ignored")
+	}
+	client.SetTLSConfig(&tls.Config{InsecureSkipVerify: true})
+	if client.tlsConfig == nil || client.tlsConfig.InsecureSkipVerify {
+		t.Fatal("SetTLSConfig must clear InsecureSkipVerify")
+	}
+	if client.tlsConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("expected minimum TLS version 1.2, got %d", client.tlsConfig.MinVersion)
+	}
+}
+
 // TestWSClientBasePath verifies that the WebSocket client preserves any base
 // path included in the configured server URL when constructing the ws endpoint.
 func TestWSClientBasePath(t *testing.T) {
@@ -317,7 +371,7 @@ func TestWSClientBasePath(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pathCh <- r.URL.Path
-		if r.URL.Query().Get("token") != "test-token" {
+		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") != "test-token" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

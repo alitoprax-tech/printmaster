@@ -34,6 +34,8 @@ func (a *ClientAdapter) DownloadArtifact(ctx context.Context, manifest *UpdateMa
 func (a *ClientAdapter) DownloadArtifactWithProgress(ctx context.Context, manifest *UpdateManifest, destPath string, resumeFrom int64, progressCb DownloadProgressCallback) (int64, error) {
 	// Convert back to agent manifest for the download call
 	agentManifest := &agent.UpdateManifest{
+		KeyID:           manifest.KeyID,
+		ExpiresAt:       manifest.ExpiresAt,
 		ManifestVersion: manifest.ManifestVersion,
 		Component:       manifest.Component,
 		Version:         manifest.Version,
@@ -67,6 +69,8 @@ func convertManifest(m *agent.UpdateManifest) *UpdateManifest {
 		return nil
 	}
 	return &UpdateManifest{
+		KeyID:           m.KeyID,
+		ExpiresAt:       m.ExpiresAt,
 		ManifestVersion: m.ManifestVersion,
 		Component:       m.Component,
 		Version:         m.Version,

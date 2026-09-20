@@ -30,8 +30,11 @@ func TestDefaultAgentConfig(t *testing.T) {
 	if cfg.SNMP.Version != "2c" {
 		t.Errorf("expected default SNMP version to be '2c', got %s", cfg.SNMP.Version)
 	}
-	if cfg.SNMP.Community != "public" {
-		t.Errorf("expected default SNMP community to be 'public', got %s", cfg.SNMP.Community)
+	if cfg.SNMP.Community != "" {
+		t.Errorf("expected default SNMP community to be empty, got %s", cfg.SNMP.Community)
+	}
+	if cfg.SNMP.TrapCommunity != "" {
+		t.Errorf("expected trap community to be empty by default, got %q", cfg.SNMP.TrapCommunity)
 	}
 	if cfg.SNMP.TimeoutMs != 2000 {
 		t.Errorf("expected default SNMP timeout to be 2000ms, got %d", cfg.SNMP.TimeoutMs)
@@ -95,6 +98,7 @@ discovery_concurrency = 100
 
 [snmp]
 community = "private"
+trap_community = "trap-private"
 timeout_ms = 3000
 retries = 2
 
@@ -144,6 +148,9 @@ level = "debug"
 	}
 	if cfg.SNMP.Community != "private" {
 		t.Errorf("expected SNMP community to be 'private', got %s", cfg.SNMP.Community)
+	}
+	if cfg.SNMP.TrapCommunity != "trap-private" {
+		t.Errorf("expected SNMP trap community to be 'trap-private', got %s", cfg.SNMP.TrapCommunity)
 	}
 	if cfg.SNMP.TimeoutMs != 3000 {
 		t.Errorf("expected SNMP timeout to be 3000ms, got %d", cfg.SNMP.TimeoutMs)
@@ -214,7 +221,7 @@ timeout_ms = 2000
 	}
 
 	// Save original environment
-	envVars := []string{"ASSET_ID_REGEX", "SNMP_COMMUNITY", "SNMP_TIMEOUT_MS", "SNMP_RETRIES", "SERVER_ENABLED", "SERVER_URL", "WEB_HTTP_PORT", "EPSON_REMOTE_MODE_ENABLED", "AUTO_UPDATE_MODE"}
+	envVars := []string{"ASSET_ID_REGEX", "SNMP_COMMUNITY", "SNMP_TRAP_COMMUNITY", "SNMP_TIMEOUT_MS", "SNMP_RETRIES", "SERVER_ENABLED", "SERVER_URL", "WEB_HTTP_PORT", "EPSON_REMOTE_MODE_ENABLED", "AUTO_UPDATE_MODE"}
 	originalEnv := make(map[string]string)
 	for _, key := range envVars {
 		originalEnv[key] = os.Getenv(key)
@@ -223,6 +230,7 @@ timeout_ms = 2000
 	// Set environment variables
 	os.Setenv("ASSET_ID_REGEX", `\b\d{7}\b`)
 	os.Setenv("SNMP_COMMUNITY", "secret")
+	os.Setenv("SNMP_TRAP_COMMUNITY", "trap-secret")
 	os.Setenv("SNMP_TIMEOUT_MS", "5000")
 	os.Setenv("SNMP_RETRIES", "3")
 	os.Setenv("SERVER_ENABLED", "true")
@@ -254,6 +262,9 @@ timeout_ms = 2000
 	}
 	if cfg.SNMP.Community != "secret" {
 		t.Errorf("expected SNMP community to be overridden to 'secret', got %s", cfg.SNMP.Community)
+	}
+	if cfg.SNMP.TrapCommunity != "trap-secret" {
+		t.Errorf("expected SNMP trap community to be overridden to 'trap-secret', got %s", cfg.SNMP.TrapCommunity)
 	}
 	if cfg.SNMP.TimeoutMs != 5000 {
 		t.Errorf("expected SNMP timeout to be overridden to 5000ms, got %d", cfg.SNMP.TimeoutMs)
@@ -621,9 +632,10 @@ func TestAgentConfigTOMLRoundTrip(t *testing.T) {
 		AssetIDRegex: `\b\d{8}\b`,
 		Concurrency:  75,
 		SNMP: SNMPConfig{
-			Community: "test-community",
-			TimeoutMs: 4500,
-			Retries:   5,
+			Community:     "test-community",
+			TrapCommunity: "test-trap-community",
+			TimeoutMs:     4500,
+			Retries:       5,
 		},
 		Server: ServerConnectionConfig{
 			Enabled:           true,
@@ -666,6 +678,9 @@ func TestAgentConfigTOMLRoundTrip(t *testing.T) {
 	}
 	if loadedCfg.SNMP.Community != originalCfg.SNMP.Community {
 		t.Errorf("SNMP Community mismatch: got %s, want %s", loadedCfg.SNMP.Community, originalCfg.SNMP.Community)
+	}
+	if loadedCfg.SNMP.TrapCommunity != originalCfg.SNMP.TrapCommunity {
+		t.Errorf("SNMP TrapCommunity mismatch: got %s, want %s", loadedCfg.SNMP.TrapCommunity, originalCfg.SNMP.TrapCommunity)
 	}
 	if loadedCfg.Server.URL != originalCfg.Server.URL {
 		t.Errorf("Server URL mismatch: got %s, want %s", loadedCfg.Server.URL, originalCfg.Server.URL)

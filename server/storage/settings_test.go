@@ -194,6 +194,9 @@ func TestFleetUpdatePolicyLifecycle(t *testing.T) {
 	}
 
 	// Create a fleet update policy
+	if err := s.CreateTenant(ctx, &Tenant{ID: "tenant-policy", Name: "Policy test tenant"}); err != nil {
+		t.Fatal(err)
+	}
 	policy := &FleetUpdatePolicy{
 		TenantID: "tenant-policy",
 		PolicySpec: updatepolicy.PolicySpec{
@@ -270,6 +273,9 @@ func TestListFleetUpdatePolicies(t *testing.T) {
 
 	// Create multiple policies
 	for i := 1; i <= 3; i++ {
+		if err := s.CreateTenant(ctx, &Tenant{ID: "tenant-" + string(rune('0'+i)), Name: "Policy test tenant"}); err != nil {
+			t.Fatal(err)
+		}
 		policy := &FleetUpdatePolicy{
 			TenantID: "tenant-" + string(rune('0'+i)),
 			PolicySpec: updatepolicy.PolicySpec{

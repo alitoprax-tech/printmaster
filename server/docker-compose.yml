@@ -9,13 +9,15 @@ services:
         VERSION: ${VERSION:-dev}
         BUILD_TIME: ${BUILD_TIME}
         GIT_COMMIT: ${GIT_COMMIT}
-    image: ghcr.io/mstrhakr/printmaster-server:${VERSION:-latest}
+    image: ghcr.io/mstrhakr/printmaster-server:${VERSION:-dev}
     container_name: printmaster-server
     restart: unless-stopped
     
+    # Bind to loopback so the container is reachable only through the host's
+    # authenticated reverse proxy or an explicit tunnel.
     ports:
-      - "9090:9090"   # HTTP (for reverse proxy backend)
-      - "9443:9443"   # HTTPS (for direct access or dual-TLS)
+      - "127.0.0.1:9090:9090"   # HTTP (reverse proxy backend)
+      - "127.0.0.1:9443:9443"   # HTTPS
     
     volumes:
       # Database persistence
@@ -33,6 +35,8 @@ services:
       - SERVER_HTTPS_PORT=9443
       - BEHIND_PROXY=true
       - PROXY_USE_HTTPS=false  # Set to true for dual-TLS
+      # Containers on the private compose network need the service to listen
+      # on its container interface; published host ports remain loopback-only.
       - BIND_ADDRESS=0.0.0.0
       - LOG_LEVEL=info
       - TLS_MODE=self-signed
@@ -40,8 +44,8 @@ services:
       - DB_PATH=/var/lib/printmaster/server/printmaster.db
       # Optional: User/group ID for file permissions (defaults to root)
       # Set to 99:100 for Unraid (nobody:users) or your preferred UID:GID
-      - PUID=${PUID:-0}
-      - PGID=${PGID:-0}
+      - PUID=${PUID:-99}
+      - PGID=${PGID:-100}
     
     networks:
       - printmaster-network

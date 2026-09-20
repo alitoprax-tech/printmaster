@@ -437,16 +437,15 @@ jobs:
           
           #### Docker (Recommended)
           ```bash
-          # Pull the latest image (supports amd64, arm64, arm/v7)
+          # Pull the exact release image (supports amd64, arm64, arm/v7)
           docker pull ghcr.io/mstrhakr/printmaster-server:${{ steps.version.outputs.version }}
-          docker pull ghcr.io/mstrhakr/printmaster-server:latest
           
           # Run the container
           docker run -d \
             --name printmaster-server \
             -p 9090:9090 \
             -v printmaster-data:/var/lib/printmaster/server \
-            ghcr.io/mstrhakr/printmaster-server:latest
+            ghcr.io/mstrhakr/printmaster-server:${{ steps.version.outputs.version }}
           ```
           
           #### Binary Installation

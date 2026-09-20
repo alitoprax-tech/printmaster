@@ -3,6 +3,7 @@ package autoupdate
 import (
 	"time"
 
+	"printmaster/common/updateauth"
 	"printmaster/common/updatepolicy"
 )
 
@@ -66,22 +67,7 @@ type ManagerStatus struct {
 }
 
 // UpdateManifest mirrors the server's signed manifest payload.
-type UpdateManifest struct {
-	ManifestVersion string    `json:"manifest_version"`
-	Component       string    `json:"component"`
-	Version         string    `json:"version"`
-	MinorLine       string    `json:"minor_line"`
-	Platform        string    `json:"platform"`
-	Arch            string    `json:"arch"`
-	Channel         string    `json:"channel"`
-	SHA256          string    `json:"sha256"`
-	SizeBytes       int64     `json:"size_bytes"`
-	SourceURL       string    `json:"source_url"`
-	DownloadURL     string    `json:"download_url,omitempty"`
-	PublishedAt     time.Time `json:"published_at,omitempty"`
-	GeneratedAt     time.Time `json:"generated_at"`
-	Signature       string    `json:"signature,omitempty"`
-}
+type UpdateManifest = updateauth.Manifest
 
 // CheckResult captures the outcome of an update availability check.
 type CheckResult struct {

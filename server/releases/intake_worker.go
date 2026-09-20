@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,17 +19,23 @@ import (
 	"time"
 
 	"printmaster/common/logger"
+	"printmaster/common/updateauth"
 	"printmaster/server/storage"
 )
 
 const (
-	defaultRepoOwner    = "mstrhakr"
-	defaultRepoName     = "printmaster"
-	defaultPollInterval = 4 * time.Hour
-	defaultMaxReleases  = 6
+	defaultRepoOwner        = "mstrhakr"
+	defaultRepoName         = "printmaster"
+	defaultPollInterval     = 4 * time.Hour
+	defaultMaxReleases      = 6
+	maxReleaseMetadataBytes = 8 << 20
+	maxConfiguredReleases   = 50
 )
 
-var safeSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+var (
+	safeSegmentPattern        = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	releaseRepoSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+)
 
 // SyncProgress represents the current state of a release sync operation.
 type SyncProgress struct {
@@ -130,20 +138,37 @@ func NewIntakeWorker(store storage.Store, log *logger.Logger, opts Options) (*In
 	if repoName == "" {
 		repoName = defaultRepoName
 	}
+	if !releaseRepoSegmentPattern.MatchString(repoOwner) || !releaseRepoSegmentPattern.MatchString(repoName) {
+		return nil, fmt.Errorf("release repository owner/name contains unsafe characters")
+	}
 
 	baseAPI := strings.TrimRight(opts.BaseAPIURL, "/")
 	if baseAPI == "" {
 		baseAPI = "https://api.github.com"
+	}
+	if !isAllowedReleaseURL(baseAPI) {
+		return nil, fmt.Errorf("release API URL must use HTTPS GitHub infrastructure (or loopback for tests)")
 	}
 
 	client := opts.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 2 * time.Minute}
 	}
+	// Release metadata and assets are remote input. Never follow a redirect to
+	// an arbitrary host, even when a caller supplied a custom HTTP client.
+	clientCopy := *client
+	clientCopy.CheckRedirect = checkReleaseIntakeRedirect
+	if clientCopy.Timeout <= 0 || clientCopy.Timeout > 2*time.Minute {
+		clientCopy.Timeout = 2 * time.Minute
+	}
+	client = &clientCopy
 
 	maxReleases := opts.MaxReleases
 	if maxReleases <= 0 {
 		maxReleases = defaultMaxReleases
+	}
+	if maxReleases > maxConfiguredReleases {
+		maxReleases = maxConfiguredReleases
 	}
 
 	userAgent := opts.UserAgent
@@ -167,6 +192,47 @@ func NewIntakeWorker(store storage.Store, log *logger.Logger, opts Options) (*In
 		userAgent:         userAgent,
 		manifests:         opts.ManifestManager,
 	}, nil
+}
+
+func isLoopbackReleaseHost(host string) bool {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func isTrustedReleaseHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	// GitHub release metadata starts at api.github.com/github.com and asset
+	// downloads commonly redirect to one of these two documented CDN hosts.
+	// Do not accept arbitrary github.com/githubusercontent.com subdomains: a
+	// compromised or delegated subdomain must not become an artifact source.
+	switch host {
+	case "api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com":
+		return true
+	}
+	return isLoopbackReleaseHost(host)
+}
+
+func isAllowedReleaseURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u == nil || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		if !strings.EqualFold(u.Scheme, "http") || !isLoopbackReleaseHost(u.Hostname()) {
+			return false
+		}
+	}
+	return isTrustedReleaseHost(u.Hostname())
+}
+
+func checkReleaseIntakeRedirect(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil || !isAllowedReleaseURL(req.URL.String()) {
+		return fmt.Errorf("release redirect target is not trusted")
+	}
+	if len(via) >= 5 {
+		return fmt.Errorf("too many release redirects")
+	}
+	return nil
 }
 
 // Run starts the periodic release intake loop.
@@ -259,6 +325,9 @@ func (w *IntakeWorker) runOnceWithProgress(ctx context.Context, onProgress Progr
 
 		for _, asset := range rel.Assets {
 			if asset.BrowserDownloadURL == "" {
+				continue
+			}
+			if !isAllowedReleaseURL(asset.BrowserDownloadURL) || asset.Size < 0 || asset.Size > updateauth.MaxArtifactBytes {
 				continue
 			}
 			desc, ok := buildDescriptor(component, version, asset.Name)
@@ -437,6 +506,12 @@ func (w *IntakeWorker) pruneIfConfigured(ctx context.Context) {
 
 // downloadArtifactWithProgress downloads an artifact and reports progress.
 func (w *IntakeWorker) downloadArtifactWithProgress(ctx context.Context, desc artifactDescriptor, downloadURL string, expectedSize int64, onProgress func(downloaded int64)) (string, string, int64, error) {
+	if !isAllowedReleaseURL(downloadURL) {
+		return "", "", 0, fmt.Errorf("release download URL is not trusted")
+	}
+	if expectedSize < 0 || expectedSize > updateauth.MaxArtifactBytes {
+		return "", "", 0, fmt.Errorf("release artifact size is invalid")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return "", "", 0, err
@@ -453,6 +528,9 @@ func (w *IntakeWorker) downloadArtifactWithProgress(ctx context.Context, desc ar
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return "", "", 0, fmt.Errorf("download failed: %s", resp.Status)
+	}
+	if resp.ContentLength > updateauth.MaxArtifactBytes || (expectedSize > 0 && resp.ContentLength >= 0 && resp.ContentLength != expectedSize) {
+		return "", "", 0, fmt.Errorf("release artifact size does not match the bounded metadata")
 	}
 
 	componentDir, err := buildCacheDir(w.cacheDir, desc)
@@ -474,6 +552,7 @@ func (w *IntakeWorker) downloadArtifactWithProgress(ctx context.Context, desc ar
 
 	hasher := sha256.New()
 	writer := io.MultiWriter(tempFile, hasher)
+	limitedBody := io.LimitReader(resp.Body, updateauth.MaxArtifactBytes+1)
 
 	// Use a progress-tracking reader
 	var written int64
@@ -481,7 +560,7 @@ func (w *IntakeWorker) downloadArtifactWithProgress(ctx context.Context, desc ar
 	lastReport := time.Now()
 
 	for {
-		n, readErr := resp.Body.Read(buf)
+		n, readErr := limitedBody.Read(buf)
 		if n > 0 {
 			_, writeErr := writer.Write(buf[:n])
 			if writeErr != nil {
@@ -506,6 +585,9 @@ func (w *IntakeWorker) downloadArtifactWithProgress(ctx context.Context, desc ar
 	// Final progress report
 	if onProgress != nil {
 		onProgress(written)
+	}
+	if written > updateauth.MaxArtifactBytes || (expectedSize > 0 && written != expectedSize) {
+		return "", "", 0, fmt.Errorf("release artifact size exceeds or differs from metadata")
 	}
 
 	if err := tempFile.Sync(); err != nil {
@@ -600,8 +682,15 @@ func (w *IntakeWorker) fetchReleases(ctx context.Context) ([]ghRelease, error) {
 		return nil, fmt.Errorf("github api error: %s %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 
+	metadata, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseMetadataBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(metadata) > maxReleaseMetadataBytes {
+		return nil, fmt.Errorf("release metadata exceeds size limit")
+	}
 	var releases []ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	if err := json.Unmarshal(metadata, &releases); err != nil {
 		return nil, err
 	}
 	return releases, nil
@@ -613,6 +702,14 @@ func (w *IntakeWorker) processRelease(ctx context.Context, component, version st
 	for _, asset := range rel.Assets {
 		if asset.BrowserDownloadURL == "" {
 			w.logInfo("Asset has no download URL", "asset", asset.Name)
+			continue
+		}
+		if !isAllowedReleaseURL(asset.BrowserDownloadURL) {
+			w.logWarn("Skipping asset with untrusted download URL", "asset", asset.Name)
+			continue
+		}
+		if asset.Size < 0 || asset.Size > updateauth.MaxArtifactBytes {
+			w.logWarn("Skipping asset with invalid size", "asset", asset.Name, "size", asset.Size)
 			continue
 		}
 		desc, ok := buildDescriptor(component, version, asset.Name)
@@ -650,7 +747,7 @@ func (w *IntakeWorker) ensureArtifact(ctx context.Context, desc artifactDescript
 		return nil
 	}
 
-	cachePath, sha, size, err := w.downloadArtifact(ctx, desc, asset.BrowserDownloadURL)
+	cachePath, sha, size, err := w.downloadArtifact(ctx, desc, asset.BrowserDownloadURL, asset.Size)
 	if err != nil {
 		return err
 	}
@@ -678,7 +775,7 @@ func (w *IntakeWorker) ensureArtifact(ctx context.Context, desc artifactDescript
 }
 
 func (w *IntakeWorker) ensureManifest(ctx context.Context, artifact *storage.ReleaseArtifact) {
-	if w.manifests == nil || artifact == nil {
+	if w.manifests == nil || artifact == nil || w.manifests.OfflineSigningEnabled() {
 		return
 	}
 	if _, err := w.manifests.EnsureManifestForArtifact(ctx, artifact); err != nil {
@@ -686,7 +783,13 @@ func (w *IntakeWorker) ensureManifest(ctx context.Context, artifact *storage.Rel
 	}
 }
 
-func (w *IntakeWorker) downloadArtifact(ctx context.Context, desc artifactDescriptor, downloadURL string) (string, string, int64, error) {
+func (w *IntakeWorker) downloadArtifact(ctx context.Context, desc artifactDescriptor, downloadURL string, expectedSize int64) (string, string, int64, error) {
+	if !isAllowedReleaseURL(downloadURL) {
+		return "", "", 0, fmt.Errorf("release download URL is not trusted")
+	}
+	if expectedSize < 0 || expectedSize > updateauth.MaxArtifactBytes {
+		return "", "", 0, fmt.Errorf("release artifact size is invalid")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return "", "", 0, err
@@ -703,6 +806,9 @@ func (w *IntakeWorker) downloadArtifact(ctx context.Context, desc artifactDescri
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return "", "", 0, fmt.Errorf("download failed: %s", resp.Status)
+	}
+	if resp.ContentLength > updateauth.MaxArtifactBytes || (expectedSize > 0 && resp.ContentLength >= 0 && resp.ContentLength != expectedSize) {
+		return "", "", 0, fmt.Errorf("release artifact size does not match the bounded metadata")
 	}
 
 	componentDir, err := buildCacheDir(w.cacheDir, desc)
@@ -724,9 +830,12 @@ func (w *IntakeWorker) downloadArtifact(ctx context.Context, desc artifactDescri
 
 	hasher := sha256.New()
 	writer := io.MultiWriter(tempFile, hasher)
-	written, err := io.Copy(writer, resp.Body)
+	written, err := io.Copy(writer, io.LimitReader(resp.Body, updateauth.MaxArtifactBytes+1))
 	if err != nil {
 		return "", "", 0, err
+	}
+	if written > updateauth.MaxArtifactBytes || (expectedSize > 0 && written != expectedSize) {
+		return "", "", 0, fmt.Errorf("release artifact size exceeds or differs from metadata")
 	}
 	if err := tempFile.Sync(); err != nil {
 		return "", "", 0, err
@@ -771,6 +880,19 @@ func parseTag(tag string) (string, string) {
 }
 
 func buildDescriptor(component, version, assetName string) (artifactDescriptor, bool) {
+	// Asset names are later used as filenames under the cache directory.  GitHub
+	// normally supplies simple names, but release metadata is still remote input;
+	// reject path separators and control characters before any prefix parsing so
+	// a name such as "...exe/../../outside" cannot escape the cache root.
+	if assetName == "" || filepath.Base(assetName) != assetName || strings.ContainsAny(assetName, "/\\") {
+		return artifactDescriptor{}, false
+	}
+	for _, r := range assetName {
+		if r < 0x20 || r == 0x7f {
+			return artifactDescriptor{}, false
+		}
+	}
+
 	// Primary pattern: printmaster-{component}-v{version}-{platform}-{arch}[.ext]
 	// e.g., printmaster-agent-v0.29.1-linux-amd64
 	prefix := fmt.Sprintf("printmaster-%s-v%s-", component, version)

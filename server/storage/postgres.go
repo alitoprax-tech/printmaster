@@ -461,6 +461,7 @@ func (s *PostgresStore) initSchema() error {
 		CONSTRAINT fk_oidc_sessions_provider FOREIGN KEY (provider_slug) REFERENCES oidc_providers(slug) ON DELETE CASCADE,
 		CONSTRAINT fk_oidc_sessions_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 	);
+	CREATE INDEX IF NOT EXISTS idx_oidc_sessions_created_at ON oidc_sessions(created_at);
 
 	-- OIDC links
 	CREATE TABLE IF NOT EXISTS oidc_links (

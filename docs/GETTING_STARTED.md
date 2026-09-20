@@ -2,6 +2,8 @@
 
 This guide walks you through your first steps with PrintMaster after installation.
 
+For a public deployment, use the [production deployment checklist](PRODUCTION-DEPLOYMENT-TR.md): HTTPS reverse proxy, loopback/private ports, strong secrets, and a segmented agent network are required.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -71,17 +73,21 @@ For multi-site deployments or centralized management.
 If you haven't already, deploy the server using Docker:
 
 ```bash
+# Keep server.env private. It must define ADMIN_PASSWORD (>=16 characters)
+# and, only if needed, a random INIT_SECRET (32-4096 bytes).
 docker run -d \
   --name printmaster-server \
-  -p 9090:9090 \
+  -p 127.0.0.1:9090:9090 \
   -v printmaster-data:/var/lib/printmaster/server \
-  -e ADMIN_PASSWORD=your-secure-password \
-  ghcr.io/mstrhakr/printmaster-server:latest
+  -e BIND_ADDRESS=0.0.0.0 \
+  -e BEHIND_PROXY=true \
+  --env-file server.env \
+  ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 ```
 
 ### Step 2: Log Into the Server
 
-1. Open `http://your-server-ip:9090`
+1. Open the server's canonical HTTPS address
 2. Log in with username `admin` and your password
 
 ### Step 3: Connect Agents to the Server
@@ -92,7 +98,7 @@ For each agent you want to connect:
 1. Open the agent's web UI (`http://agent-ip:8080`)
 2. Go to **Settings** → **Server Connection**
 3. Enable server mode
-4. Enter the server URL (e.g., `http://your-server-ip:9090`)
+4. Enter the server URL (e.g., `https://printmaster.example.com`)
 5. Click **Save**
 
 **Option B: Via Config File**
@@ -101,7 +107,7 @@ Edit `config.toml` on the agent:
 ```toml
 [server]
 enabled = true
-url = "http://your-server-ip:9090"
+url = "https://printmaster.example.com"
 agent_name = "Office A"  # Friendly name for this agent
 ```
 
@@ -145,7 +151,7 @@ Fine-tune discovery in **Settings** → **Discovery Settings**:
 
 | Setting | Description |
 |---------|-------------|
-| **SNMP Community** | Default: `public`. Change if your printers use a different community string |
+| **SNMP Community** | Set a site-specific string; SNMPv3 `authPriv` is preferred for production |
 | **Concurrent Scans** | Number of simultaneous SNMP queries (default: 50) |
 | **Timeout** | How long to wait for SNMP responses (default: 2000ms) |
 | **Auto-Scan** | Automatically scan local subnets |
@@ -231,7 +237,7 @@ Now that you have PrintMaster running:
 
 ### Agent Not Connecting to Server
 
-1. **Verify server URL**: Include the port (e.g., `http://server:9090`)
+1. **Verify server URL**: Use the canonical HTTPS address (e.g., `https://printmaster.example.com`)
 2. **Check network path**: Can the agent reach the server?
 3. **Check firewall**: Server port 9090 must be accessible
 4. **Review agent logs**: Check for connection errors

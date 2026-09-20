@@ -154,7 +154,7 @@ Yes. The server has built-in user authentication with username/password login. T
 
 Common causes:
 1. SNMP is disabled on the printer
-2. Wrong SNMP community string (default is "public")
+2. Wrong SNMP community string (configure the site-specific value; `public` is a legacy lab default)
 3. Firewall blocking SNMP (UDP port 161)
 4. Incorrect IP range configuration
 
@@ -163,7 +163,7 @@ See the [Troubleshooting Guide](TROUBLESHOOTING.md#discovery-issues) for detaile
 ### Why can't my agent connect to the server?
 
 Check:
-1. Server URL includes protocol and port (`http://server:9090`)
+1. Server URL uses the canonical HTTPS address (`https://printmaster.example.com`)
 2. Firewall allows the connection
 3. Server is running and accessible
 
@@ -185,7 +185,8 @@ See [Connection Issues](TROUBLESHOOTING.md#connection-issues) for more help.
 
 **Docker:**
 ```bash
-docker pull ghcr.io/mstrhakr/printmaster-server:latest
+# Replace with the reviewed release or immutable image digest.
+docker pull ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 docker compose down && docker compose up -d
 ```
 

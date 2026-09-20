@@ -67,6 +67,13 @@ func allowAllAuthorizer(_ *http.Request, _ authz.Action, _ authz.ResourceRef) er
 	return nil
 }
 
+func denyGlobalFleetAuthorizer(_ *http.Request, action authz.Action, _ authz.ResourceRef) error {
+	if action == authz.ActionSettingsFleetGlobalRead || action == authz.ActionSettingsFleetGlobalWrite {
+		return authz.ErrForbidden
+	}
+	return nil
+}
+
 func TestHandleTenantPolicyGetNotFound(t *testing.T) {
 	store := newFakeStore()
 	api, err := NewAPI(store, APIOptions{Authorizer: allowAllAuthorizer})
@@ -281,5 +288,40 @@ func TestHandleListPoliciesIncludesGlobal(t *testing.T) {
 	}
 	if resp[0].TenantID != "global" {
 		t.Fatalf("expected global policy first, got %+v", resp)
+	}
+}
+
+func TestGlobalPolicyRequiresServerWidePermission(t *testing.T) {
+	store := newFakeStore()
+	store.policies[storage.GlobalFleetPolicyTenantID] = &storage.FleetUpdatePolicy{
+		TenantID: storage.GlobalFleetPolicyTenantID,
+	}
+	api, err := NewAPI(store, APIOptions{Authorizer: denyGlobalFleetAuthorizer})
+	if err != nil {
+		t.Fatalf("NewAPI failed: %v", err)
+	}
+
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			var body *bytes.Reader
+			if method == http.MethodPut {
+				body = bytes.NewReader([]byte(`{"policy":{"update_check_days":7}}`))
+			} else {
+				body = bytes.NewReader(nil)
+			}
+			req := httptest.NewRequest(method, "/api/v1/update-policies/global", body)
+			rr := httptest.NewRecorder()
+			api.handlePolicyRoute(rr, req)
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("global policy %s reached handler: status=%d body=%s", method, rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/update-policies", nil)
+	listRR := httptest.NewRecorder()
+	api.handleListPolicies(listRR, listReq)
+	if listRR.Code != http.StatusForbidden {
+		t.Fatalf("global policy list reached handler: status=%d body=%s", listRR.Code, listRR.Body.String())
 	}
 }

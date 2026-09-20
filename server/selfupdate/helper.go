@@ -21,6 +21,10 @@ func RunApplyHelper(instructionPath string) error {
 	if err != nil {
 		return err
 	}
+	// Reject untrusted bytes before opening logs, a database or controlling services.
+	if err := verifyApplyInstruction(inst, time.Now().UTC()); err != nil {
+		return err
+	}
 	logger, closeFn, err := newHelperLogger(inst.LogPath)
 	if err != nil {
 		return err
@@ -110,6 +114,9 @@ type applyWorker struct {
 }
 
 func (w *applyWorker) execute(ctx context.Context) error {
+	if err := verifyApplyInstruction(w.inst, time.Now().UTC()); err != nil {
+		return err
+	}
 	start := time.Now().UTC()
 	w.logger.Printf("apply helper started at %s", start.Format(time.RFC3339))
 	if err := w.stopService(ctx); err != nil {
@@ -214,10 +221,10 @@ func newHelperLogger(path string) (*log.Logger, func(), error) {
 	if path == "" {
 		return log.Default(), func() {}, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}

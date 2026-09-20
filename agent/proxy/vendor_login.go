@@ -15,6 +15,8 @@ import (
 	"printmaster/common/logger"
 )
 
+const maxVendorLoginPageBytes = 1 << 20
+
 // VendorLoginAdapter handles vendor-specific login flows for Web UI auto-login.
 type VendorLoginAdapter interface {
 	// Login performs the login flow and returns a cookie jar with session cookies.
@@ -32,6 +34,32 @@ type SessionCache struct {
 type sessionEntry struct {
 	Jar       *cookiejar.Jar
 	ExpiresAt time.Time
+}
+
+func samePrinterOrigin(baseURL string, target *url.URL) bool {
+	base, err := url.Parse(baseURL)
+	if err != nil || base == nil || target == nil || base.Hostname() == "" || target.Hostname() == "" {
+		return false
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) || !strings.EqualFold(base.Hostname(), target.Hostname()) {
+		return false
+	}
+	basePort, targetPort := base.Port(), target.Port()
+	if basePort == "" {
+		if strings.EqualFold(base.Scheme, "https") {
+			basePort = "443"
+		} else {
+			basePort = "80"
+		}
+	}
+	if targetPort == "" {
+		if strings.EqualFold(target.Scheme, "https") {
+			targetPort = "443"
+		} else {
+			targetPort = "80"
+		}
+	}
+	return basePort == targetPort
 }
 
 // NewSessionCache creates a new session cache.
@@ -80,14 +108,13 @@ func (e *EpsonLoginAdapter) Login(baseURL, username, password string, log *logge
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				// #nosec G402 -- InsecureSkipVerify intentionally enabled:
-				// Network printers commonly use self-signed SSL certificates.
-				// This adapter authenticates to printer web interfaces on local networks.
-				InsecureSkipVerify: true,
+				MinVersion: tls.VersionTLS12,
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Allow redirects but keep cookies
+			if !samePrinterOrigin(baseURL, req.URL) {
+				return http.ErrUseLastResponse
+			}
 			return nil
 		},
 	}
@@ -108,8 +135,12 @@ func (e *EpsonLoginAdapter) Login(baseURL, username, password string, log *logge
 			log.Debug("Epson login: GET failed", "path", path, "error", err.Error())
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxVendorLoginPageBytes+1))
 		resp.Body.Close()
+		if readErr != nil || len(body) > maxVendorLoginPageBytes {
+			log.Debug("Epson login: response body exceeded limit", "path", path)
+			continue
+		}
 
 		if resp.StatusCode == http.StatusOK {
 			loginPageURL = baseURL + path
@@ -182,14 +213,13 @@ func (k *KyoceraLoginAdapter) Login(baseURL, username, password string, log *log
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				// #nosec G402 -- InsecureSkipVerify intentionally enabled:
-				// Network printers commonly use self-signed SSL certificates.
-				// This adapter authenticates to printer web interfaces on local networks.
-				InsecureSkipVerify: true,
+				MinVersion: tls.VersionTLS12,
 			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Follow redirects but keep cookies
+			if !samePrinterOrigin(baseURL, req.URL) {
+				return http.ErrUseLastResponse
+			}
 			return nil
 		},
 	}
@@ -215,7 +245,11 @@ func (k *KyoceraLoginAdapter) Login(baseURL, username, password string, log *log
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxVendorLoginPageBytes+1))
+			if readErr != nil || len(body) > maxVendorLoginPageBytes {
+				log.Debug("Kyocera login: response body exceeded limit", "path", path)
+				continue
+			}
 			loginPageBody = string(body)
 			loginPageURL = resp.Request.URL.String()
 			log.Debug("Kyocera login: got login page", "url", loginPageURL, "body_length", len(loginPageBody))

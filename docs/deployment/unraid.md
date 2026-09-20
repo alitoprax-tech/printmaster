@@ -2,6 +2,11 @@
 
 Deploy PrintMaster Server on Unraid using the Docker container.
 
+> **Public access:** terminate TLS in Nginx Proxy Manager or another reverse
+> proxy and keep the container port private/firewalled. Do not expose the
+> PrintMaster HTTP port directly to the Internet. Pin the image to a reviewed
+> release and follow the [production checklist](../PRODUCTION-DEPLOYMENT-TR.md).
+
 ---
 
 ## Installation Methods
@@ -23,9 +28,10 @@ Deploy PrintMaster Server on Unraid using the Docker container.
 | Setting | Value |
 |---------|-------|
 | Name | `PrintMaster-Server` |
-| Repository | `ghcr.io/mstrhakr/printmaster-server:latest` |
+| Repository | `ghcr.io/mstrhakr/printmaster-server:<reviewed-version>` (pin an exact reviewed tag or digest) |
 | Network Type | `Bridge` |
 | Port | `9090` → `9090` (TCP) |
+| Port | `9443` → `9443` (TCP, HTTPS) |
 | Volume | `/mnt/user/appdata/printmaster-server/data` → `/var/lib/printmaster/server` |
 | Volume | `/mnt/user/appdata/printmaster-server/logs` → `/var/log/printmaster/server` |
 
@@ -38,6 +44,8 @@ Deploy PrintMaster Server on Unraid using the Docker container.
 | Setting | Value | Description |
 |---------|-------|-------------|
 | **HTTP Port** | `9090` | Web interface and API |
+| **HTTPS Port** | `9443` | Direct HTTPS endpoint; use a trusted certificate or a reverse proxy |
+| **ADMIN_PASSWORD** | required | Initial administrator password, minimum 16 random characters |
 | **Data Directory** | `/mnt/user/appdata/printmaster-server/data` | Database storage |
 | **Logs Directory** | `/mnt/user/appdata/printmaster-server/logs` | Application logs |
 | **Timezone** | Your timezone (e.g., `America/New_York`) | For correct timestamps |
@@ -46,8 +54,11 @@ Deploy PrintMaster Server on Unraid using the Docker container.
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `BIND_ADDRESS` | `0.0.0.0` | Allow external access |
-| `BEHIND_PROXY` | `true` or `false` | Behind Nginx Proxy Manager? |
+| `BIND_ADDRESS` | `0.0.0.0` | Container-only bind; publish/firewall the port for the reverse proxy only |
+| `BEHIND_PROXY` | `true` | Required when Nginx Proxy Manager terminates HTTPS |
+| `SERVER_EXTERNAL_URL` | `https://...` | Canonical public HTTPS URL |
+| `TRUSTED_PROXIES` | proxy IP/CIDR | Only the reverse proxy address, never all clients |
+| `INIT_SECRET` | optional | Random 32-4096-byte auto-enrollment secret; prefer one-time join tokens |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `TZ` | `America/New_York` | Your timezone |
 | `PM_DISABLE_SELFUPDATE` | `true` | Recommended for Docker |
@@ -111,15 +122,15 @@ Map port `9443` in addition to `9090`.
    - Database and config created automatically
 
 2. **Access the Web UI**
-   - Direct: `http://YOUR-UNRAID-IP:9090`
+   - Direct: `http://127.0.0.1:9090` for a local smoke test only
    - Via Proxy: `https://printmaster.yourdomain.com`
 
 3. **Login**
    - Username: `admin`
-   - Password: `printmaster` (change immediately!)
+   - Password: the value configured in `ADMIN_PASSWORD`
 
 4. **Connect Agents**
-   - Agent config: `server_url = "http://YOUR-UNRAID-IP:9090"`
+   - Agent config: `server_url = "https://printmaster.yourdomain.com"`
 
 ---
 
@@ -186,7 +197,7 @@ curl http://localhost:9090/api/v1/health
 ```bash
 # Fix permissions
 chown -R 99:100 /mnt/user/appdata/printmaster-server/
-chmod -R 755 /mnt/user/appdata/printmaster-server/
+chmod -R u+rwX,go-rX /mnt/user/appdata/printmaster-server/
 ```
 
 > Container uses UID 99, matching Unraid's `nobody` user.
@@ -224,7 +235,7 @@ Monitor PrintMaster availability:
 
 ```
 Container Name: PrintMaster-Server
-Repository: ghcr.io/mstrhakr/printmaster-server:latest
+Repository: ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 Network Type: bridge
 
 Ports:
@@ -235,7 +246,7 @@ Volumes:
   /mnt/user/appdata/printmaster-server/logs → /var/log/printmaster/server
 
 Environment Variables:
-  BIND_ADDRESS=0.0.0.0
+  BIND_ADDRESS=0.0.0.0  # container network only; keep the host port private
   BEHIND_PROXY=true
   LOG_LEVEL=info
   TZ=America/Chicago

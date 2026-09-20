@@ -5,7 +5,25 @@
 
     const params = new URLSearchParams(window.location.search);
     const tenantParam = (params.get('tenant') || '').trim();
-    const redirectTarget = params.get('redirect') || '/';
+    function safeRedirectTarget(raw){
+        if(typeof raw !== 'string') return '/';
+        const candidate = raw.trim();
+        // Only same-origin absolute paths are valid. Reject protocol-relative,
+        // backslash-normalized, encoded scheme, and userinfo destinations.
+        if(!candidate || !candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')){
+            return '/';
+        }
+        try{
+            const parsed = new URL(candidate, window.location.origin);
+            if(parsed.origin !== window.location.origin || parsed.username || parsed.password || parsed.host !== window.location.host){
+                return '/';
+            }
+            return parsed.pathname + parsed.search + parsed.hash;
+        }catch(_err){
+            return '/';
+        }
+    }
+    const redirectTarget = safeRedirectTarget(params.get('redirect'));
     const skipAuto = ['1','true','yes','on'].includes((params.get('no_auto') || '').toLowerCase());
     const errorCode = params.get('error') || '';
 
@@ -79,9 +97,7 @@
     }
 
     function navigateTo(target){
-        if(!isSafeNavigationTarget(target)){
-            target = '/';
-        }
+        target = safeRedirectTarget(target);
         if(typeof window.__pmLoginNavigate === 'function'){
             window.__pmLoginNavigate(target);
             return;
@@ -158,9 +174,10 @@
             btn.className += ' ' + provider.button_style;
         }
 
-        if(provider.icon){
+        const iconURL = safeProviderIconURL(provider.icon);
+        if(iconURL){
             const icon = document.createElement('img');
-            icon.src = provider.icon;
+            icon.src = iconURL;
             icon.alt = '';
             icon.style.width = '18px';
             icon.style.height = '18px';
@@ -170,6 +187,22 @@
 
         btn.addEventListener('click', () => startOIDC(provider.slug));
         return btn;
+    }
+
+    // Provider metadata is administrator-controlled. Restrict image sources to
+    // same-origin URLs or HTTPS so a poisoned value cannot become a javascript,
+    // data, blob, or protocol-relative URL in the login page.
+    function safeProviderIconURL(value){
+        if(!value || typeof value !== 'string') return '';
+        try {
+            const parsed = new URL(value, window.location.origin);
+            if(parsed.origin === window.location.origin && parsed.protocol === window.location.protocol){
+                return parsed.href;
+            }
+            return parsed.protocol === 'https:' ? parsed.href : '';
+        } catch(err){
+            return '';
+        }
     }
 
     function maybeAutoLogin(providers, opts){
@@ -356,7 +389,7 @@
     function isAgentCallbackRedirect(url) {
         try {
             const parsed = new URL(url, window.location.origin);
-            return parsed.pathname.includes('/api/v1/auth/callback');
+            return parsed.pathname === '/api/v1/auth/callback';
         } catch (e) {
             return false;
         }
@@ -364,11 +397,17 @@
 
     // Get a callback token for agent redirect
     async function getAgentCallbackToken(callbackUrl) {
+        let agentId = '';
+        try {
+            agentId = new URL(callbackUrl, window.location.origin).searchParams.get('agent_id') || '';
+        } catch (e) {
+            agentId = '';
+        }
         const resp = await fetch('/api/v1/auth/agent-callback', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'same-origin',
-            body: JSON.stringify({ callback_url: callbackUrl })
+            body: JSON.stringify({ callback_url: callbackUrl, agent_id: agentId })
         });
         if (!resp.ok) {
             throw new Error('Failed to create agent callback token');

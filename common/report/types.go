@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -406,12 +407,8 @@ func BuildGitHubIssueURL(report *DiagnosticReport, gistURL string) string {
 
 // urlEncode performs basic URL encoding for query parameters.
 func urlEncode(s string) string {
-	// Basic replacements for URL safety
-	s = strings.ReplaceAll(s, " ", "%20")
-	s = strings.ReplaceAll(s, "\n", "%0A")
-	s = strings.ReplaceAll(s, "#", "%23")
-	s = strings.ReplaceAll(s, "&", "%26")
-	s = strings.ReplaceAll(s, "=", "%3D")
-	s = strings.ReplaceAll(s, "?", "%3F")
-	return s
+	// QueryEscape encodes '%' and every delimiter as well as the obvious
+	// characters. Hand-written replacements allowed values such as "%26x=y"
+	// to become a second query parameter after browser decoding.
+	return url.QueryEscape(s)
 }

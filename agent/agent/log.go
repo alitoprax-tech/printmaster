@@ -36,7 +36,7 @@ func SetLogger(l ExternalLogger) {
 
 func ensureLogDir() string {
 	logDir := filepath.Join(".", "logs")
-	_ = os.MkdirAll(logDir, 0o755)
+	_ = os.MkdirAll(logDir, 0o700)
 	return logDir
 }
 
@@ -87,7 +87,7 @@ func writeLine(level string, msg string) {
 	fmt.Println(line)
 	// append to on-disk logfile
 	fpath := filepath.Join(ensureLogDir(), "agent.log")
-	f, err := os.OpenFile(fpath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(fpath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err == nil {
 		_, _ = f.WriteString(line + "\n")
 		if err := f.Close(); err != nil {

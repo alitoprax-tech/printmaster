@@ -11,12 +11,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/smtp"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	smtpclient "printmaster/server/smtp"
 	"printmaster/server/storage"
 )
 
@@ -59,9 +59,7 @@ func isAllowedWebhookURL(rawURL string) (string, error) {
 		// Resolve hostname to check for private IPs
 		ips, err := net.LookupIP(hostname)
 		if err != nil {
-			// If DNS resolution fails, allow it (could be a valid external service)
-			// The HTTP request will fail anyway if unreachable
-			return parsed.String(), nil
+			return "", fmt.Errorf("webhook DNS lookup failed: %w", err)
 		}
 
 		for _, ip := range ips {
@@ -85,6 +83,9 @@ func isAllowedWebhookURL(rawURL string) (string, error) {
 
 // isPrivateIP checks if an IP address is in a private/internal range.
 func isPrivateIP(ip net.IP) bool {
+	if !ip.IsGlobalUnicast() {
+		return true
+	}
 	// Check for loopback
 	if ip.IsLoopback() {
 		return true
@@ -97,6 +98,8 @@ func isPrivateIP(ip net.IP) bool {
 
 	// Check for private ranges (RFC 1918 and RFC 4193)
 	privateRanges := []string{
+		"100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15",
+		"198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32", "64:ff9b::/96", "2002::/16",
 		"10.0.0.0/8",     // Class A private
 		"172.16.0.0/12",  // Class B private
 		"192.168.0.0/16", // Class C private
@@ -199,16 +202,19 @@ type Notifier struct {
 	lastNotified map[string]time.Time // Track last notification per channel+alert combo
 }
 
+const maxWebhookResponseBytes int64 = 64 << 10
+
 // NewNotifier creates a new notification dispatcher.
 func NewNotifier(store NotifierStore, config NotifierConfig) *Notifier {
 	logger := config.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	client := config.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
+	// Always use the SSRF-hardened client. A caller-supplied http.Client may
+	// follow redirects or use a proxy that bypasses the DNS/IP checks, so it is
+	// intentionally ignored for production dispatch. Tests can opt into local
+	// endpoints through SetAllowTestWebhooks.
+	client := newWebhookHTTPClient()
 	if config.MaxRetries == 0 {
 		config.MaxRetries = 3
 	}
@@ -228,6 +234,9 @@ func NewNotifier(store NotifierStore, config NotifierConfig) *Notifier {
 // NotifyForAlert sends notifications for a triggered alert.
 // It looks up the associated rule's channels and dispatches to each.
 func (n *Notifier) NotifyForAlert(ctx context.Context, alert *storage.Alert) error {
+	if alert == nil {
+		return fmt.Errorf("alert is required")
+	}
 	// Skip if alert has no associated rule
 	if alert.RuleID == 0 {
 		return nil
@@ -245,6 +254,13 @@ func (n *Notifier) NotifyForAlert(ctx context.Context, alert *storage.Alert) err
 	if err != nil {
 		return fmt.Errorf("failed to get alert rule: %w", err)
 	}
+	if rule == nil {
+		return fmt.Errorf("alert rule %d not found", alert.RuleID)
+	}
+	if !tenantScopeAllowsAlert(rule.TenantIDs, alert.TenantID) {
+		n.logger.Warn("skipping alert notification outside rule tenant scope", "alert_id", alert.ID, "rule_id", rule.ID, "tenant_id", alert.TenantID)
+		return nil
+	}
 
 	if len(rule.ChannelIDs) == 0 {
 		n.logger.Debug("no notification channels configured for rule", "rule_id", rule.ID)
@@ -259,6 +275,14 @@ func (n *Notifier) NotifyForAlert(ctx context.Context, alert *storage.Alert) err
 		channel, err := n.store.GetNotificationChannel(ctx, channelID)
 		if err != nil {
 			n.logger.Warn("failed to get notification channel", "channel_id", channelID, "error", err)
+			continue
+		}
+		if channel == nil {
+			n.logger.Warn("notification channel is missing", "channel_id", channelID)
+			continue
+		}
+		if !channelAllowsAlert(channel.TenantIDs, alert.TenantID) {
+			n.logger.Warn("skipping notification outside channel tenant scope", "channel_id", channel.ID, "alert_id", alert.ID, "tenant_id", alert.TenantID)
 			continue
 		}
 
@@ -296,6 +320,31 @@ func (n *Notifier) NotifyForAlert(ctx context.Context, alert *storage.Alert) err
 	}
 
 	return lastErr
+}
+
+func tenantScopeAllowsAlert(tenantIDs []string, alertTenantID string) bool {
+	if len(tenantIDs) == 0 {
+		return true
+	}
+	alertTenantID = strings.TrimSpace(alertTenantID)
+	if alertTenantID == "" {
+		return false
+	}
+	for _, tenantID := range tenantIDs {
+		if strings.TrimSpace(tenantID) == alertTenantID {
+			return true
+		}
+	}
+	return false
+}
+
+func channelAllowsAlert(tenantIDs []string, alertTenantID string) bool {
+	if len(tenantIDs) == 0 {
+		// An empty tenant scope denotes an administrator-controlled global
+		// destination. It may receive alerts from any tenant.
+		return true
+	}
+	return tenantScopeAllowsAlert(tenantIDs, alertTenantID)
 }
 
 func (n *Notifier) shouldNotify(channelID, alertID int64, rateLimitMins int) bool {
@@ -407,7 +456,6 @@ func (n *Notifier) sendEmail(ctx context.Context, config map[string]interface{},
 		}
 		return fmt.Errorf("incomplete email configuration: %s", strings.Join(missing, ", "))
 	}
-
 	// Validate and sanitize from address to prevent header injection
 	sanitizedFrom, err := validateAndSanitizeEmail(from)
 	if err != nil {
@@ -447,18 +495,12 @@ This is an automated alert from PrintMaster.
 	msg := []byte(fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s",
 		sanitizedFrom, strings.Join(sanitizedTo, ", "), subject, body))
 
-	addr := fmt.Sprintf("%s:%d", host, port)
-
 	// Send with retry
 	var lastErr error
 	for i := 0; i < n.config.MaxRetries; i++ {
-		var auth smtp.Auth
-		if username != "" {
-			auth = smtp.PlainAuth("", username, password, host)
-		}
-
-		// Recipients validated and sanitized via validateAndSanitizeEmail above
-		sendErr := smtp.SendMail(addr, auth, sanitizedFrom, sanitizedTo, msg)
+		// Resolve once, reject private/internal addresses, and dial the numeric
+		// result so DNS rebinding cannot redirect a tenant-configured channel.
+		sendErr := smtpclient.Send(ctx, host, port, username, password, sanitizedFrom, sanitizedTo, msg, true)
 		if sendErr == nil {
 			return nil
 		}
@@ -683,8 +725,10 @@ func (n *Notifier) postJSON(ctx context.Context, url string, headers map[string]
 			continue
 		}
 
-		// Read and discard body
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// Read only a bounded response body. Webhook endpoints are external
+		// input and must not be able to hold an alert worker on an unbounded
+		// stream after the status code has arrived.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxWebhookResponseBytes))
 		resp.Body.Close()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -940,8 +984,9 @@ func (n *Notifier) postText(ctx context.Context, url string, headers map[string]
 			continue
 		}
 
-		// Read and discard body
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// Keep webhook response consumption bounded for the same reason as the
+		// JSON notification path above.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxWebhookResponseBytes))
 		resp.Body.Close()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {

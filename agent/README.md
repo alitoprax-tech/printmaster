@@ -132,11 +132,16 @@ agent/
 ### SNMP Capabilities
 
 - **Protocols**: SNMPv1, SNMPv2c (SNMPv3 planned)
-- **Community**: Configurable (default: "public")
+- **Community**: Configurable; set a site-specific value (the historical `public` fallback is suitable only for isolated lab networks)
 - **Timeout**: Configurable (default: 2000ms)
 - **Retries**: Configurable (default: 1)
 - **Concurrency**: Configurable worker pools (default: 50)
 - **Vendor Detection**: Automatic via sysObjectID enterprise OID
+
+Incoming SNMP traps are opt-in: set `SNMP_TRAP_COMMUNITY` (or
+`[snmp].trap_community`) to a site-specific value before enabling the trap
+listener. The listener does not inherit the query community or the historical
+`public` default and ignores special or link-local source addresses.
 
 ### Metrics Collected
 
@@ -169,7 +174,7 @@ agent/
 ```json
 {
   "port": 8080,
-  "snmp_community": "public",
+  "snmp_community": "replace-with-site-secret",
   "snmp_timeout_ms": 2000,
   "snmp_retries": 1,
   "discover_concurrency": 50,
@@ -404,7 +409,7 @@ CMD ["printmaster-agent", "-port", "8080"]
 ### No Devices Found
 
 1. **Check network connectivity**: Ensure agent can reach printers
-2. **Verify SNMP enabled**: Test with `snmpwalk -v2c -c public <ip> .1.3.6`
+2. **Verify SNMP enabled**: Test with `snmpwalk -v2c -c <site-specific-community> <ip> .1.3.6`
 3. **Check firewall**: Allow outbound UDP 161, TCP 9100/631
 4. **Review logs**: Look for timeout or permission errors
 5. **Try different discovery methods**: Some printers only respond to certain protocols
@@ -433,15 +438,15 @@ CMD ["printmaster-agent", "-port", "8080"]
 
 ### SNMP Community Strings
 
-- Default "public" is world-readable (low security)
+- The historical `public` fallback is world-readable and should be replaced on every production network
 - Use unique community strings in production
 - SNMPv3 recommended (planned feature) for encryption
 
 ### Network Exposure
 
 - Agent listens on the configured HTTP/HTTPS ports (default 8080/8443)
-- Web UI authentication is driven by `[web.auth]` (see `config.example.toml`). Use `mode = "server"` to force central logins or keep `mode = "local"` with `allow_local_admin = true` for loopback-only access.
-- Restrict access with firewall rules when running in local mode.
+- Web UI authentication is driven by `[web.auth]` (see `config.example.toml`). Use `mode = "server"` for central logins; local mode still requires an authenticated session because loopback alone is not a user identity. The legacy `allow_local_admin` key is ignored.
+- Restrict access with firewall rules and a trusted proxy when exposing the agent.
 - Use the built-in TLS support or terminate behind a reverse proxy (nginx, Caddy).
 
 ### Database

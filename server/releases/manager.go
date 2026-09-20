@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"printmaster/common/logger"
+	"printmaster/common/updateauth"
 	"printmaster/server/storage"
 
 	"github.com/Masterminds/semver"
@@ -40,17 +42,21 @@ type ManifestPayload struct {
 
 // ManagerOptions tweak manifest manager behavior.
 type ManagerOptions struct {
-	ManifestVersion string
-	Now             func() time.Time
+	SignedManifestDir string
+	TrustFile         string
+	ManifestVersion   string
+	Now               func() time.Time
 }
 
 // Manager owns manifest signing and signing-key lifecycle.
 type Manager struct {
-	store           storage.Store
-	log             *logger.Logger
-	manifestVersion string
-	now             func() time.Time
-	mu              sync.Mutex
+	signedManifestDir string
+	trustFile         string
+	store             storage.Store
+	log               *logger.Logger
+	manifestVersion   string
+	now               func() time.Time
+	mu                sync.Mutex
 }
 
 // NewManager constructs a release manifest manager.
@@ -67,15 +73,20 @@ func NewManager(store storage.Store, log *logger.Logger, opts ManagerOptions) (*
 		nowFn = func() time.Time { return time.Now().UTC() }
 	}
 	return &Manager{
-		store:           store,
-		log:             log,
-		manifestVersion: version,
-		now:             nowFn,
+		signedManifestDir: defaultString(opts.SignedManifestDir, os.Getenv("PRINTMASTER_RELEASE_MANIFEST_DIR")),
+		trustFile:         defaultString(opts.TrustFile, os.Getenv("PRINTMASTER_UPDATE_TRUST_FILE")),
+		store:             store,
+		log:               log,
+		manifestVersion:   version,
+		now:               nowFn,
 	}, nil
 }
 
 // EnsureActiveKey makes sure there is an active signing key, creating one if missing.
 func (m *Manager) EnsureActiveKey(ctx context.Context) (*storage.SigningKey, error) {
+	if m.OfflineSigningEnabled() {
+		return nil, fmt.Errorf("runtime signing is disabled in offline release mode")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -95,6 +106,9 @@ func (m *Manager) EnsureActiveKey(ctx context.Context) (*storage.SigningKey, err
 
 // RotateSigningKey generates a new signing key and marks it active.
 func (m *Manager) RotateSigningKey(ctx context.Context, notes string) (*storage.SigningKey, error) {
+	if m.OfflineSigningEnabled() {
+		return nil, fmt.Errorf("rotate release keys on the offline signer")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key, err := m.generateAndActivateKey(ctx, notes)
@@ -176,25 +190,13 @@ func (m *Manager) GetManifest(ctx context.Context, component, version, platform,
 }
 
 // AgentUpdateManifest is the JSON structure returned to agents for update checks.
-type AgentUpdateManifest struct {
-	ManifestVersion string    `json:"manifest_version"`
-	Component       string    `json:"component"`
-	Version         string    `json:"version"`
-	MinorLine       string    `json:"minor_line"`
-	Platform        string    `json:"platform"`
-	Arch            string    `json:"arch"`
-	Channel         string    `json:"channel"`
-	SHA256          string    `json:"sha256"`
-	SizeBytes       int64     `json:"size_bytes"`
-	SourceURL       string    `json:"source_url"`
-	DownloadURL     string    `json:"download_url,omitempty"`
-	PublishedAt     time.Time `json:"published_at,omitempty"`
-	GeneratedAt     time.Time `json:"generated_at"`
-	Signature       string    `json:"signature,omitempty"`
-}
+type AgentUpdateManifest = updateauth.Manifest
 
 // GetLatestManifest returns the latest manifest for the specified component/platform/arch/channel.
 func (m *Manager) GetLatestManifest(ctx context.Context, component, platform, arch, channel string) (*AgentUpdateManifest, error) {
+	if m.signedManifestDir != "" {
+		return m.getOfflineManifest(ctx, component, platform, arch, channel)
+	}
 	// Get all manifests for this component and find the latest matching one
 	manifests, err := m.store.ListReleaseManifests(ctx, component, 100)
 	if err != nil {

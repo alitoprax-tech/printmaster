@@ -31,6 +31,10 @@ type SNMPConfig struct {
 	Version string `toml:"version"`
 	// Community is the community string for SNMPv1/v2c
 	Community string `toml:"community"`
+	// TrapCommunity is the community accepted by the optional SNMP trap listener.
+	// It is intentionally empty by default so enabling traps cannot silently
+	// accept the well-known "public" community.
+	TrapCommunity string `toml:"trap_community"`
 	// TimeoutMs is the SNMP timeout in milliseconds
 	TimeoutMs int `toml:"timeout_ms"`
 	// Retries is the number of retry attempts for failed queries
@@ -76,20 +80,22 @@ type AutoUpdateConfig struct {
 
 // WebConfig holds web UI settings
 type WebConfig struct {
-	HTTPPort  int           `toml:"http_port"`
-	HTTPSPort int           `toml:"https_port"`
-	EnableTLS bool          `toml:"enable_tls"`
-	Auth      WebAuthConfig `toml:"auth"`
+	BindAddress string        `toml:"bind_address"`
+	HTTPPort    int           `toml:"http_port"`
+	HTTPSPort   int           `toml:"https_port"`
+	EnableTLS   bool          `toml:"enable_tls"`
+	Auth        WebAuthConfig `toml:"auth"`
 }
 
 // WebAuthConfig controls agent UI authentication behavior
 // Mode:
 //
-//	"local"    -> only local bypass (loopback treated as admin if allow_local_admin=true)
-//	"server"   -> expects server-auth callback flow (future implementation)
-//	"disabled" -> no auth at all (legacy behavior)
+//	"local"    -> local UI still requires an authenticated session
+//	"server"   -> expects server-auth callback flow
+//	"disabled" -> rejected for security; treated as "local"
 //
-// AllowLocalAdmin: if true, loopback requests get admin principal without login
+// AllowLocalAdmin is retained for configuration compatibility and ignored.
+// Loopback access alone never grants an administrator principal.
 type WebAuthConfig struct {
 	Mode            string `toml:"mode"`
 	AllowLocalAdmin bool   `toml:"allow_local_admin"`
@@ -102,8 +108,12 @@ func DefaultAgentConfig() *AgentConfig {
 		Concurrency:            50,
 		EpsonRemoteModeEnabled: false,
 		SNMP: SNMPConfig{
-			Version:       "2c",
-			Community:     "public",
+			Version: "2c",
+			// Leave the agent configuration blank so optional vendor helpers
+			// cannot mistake the legacy scanner fallback for an explicit secret.
+			// The generic scanner retains its compatibility fallback when no
+			// community is configured.
+			Community:     "",
 			TimeoutMs:     2000,
 			Retries:       1,
 			SecurityLevel: "",
@@ -133,10 +143,13 @@ func DefaultAgentConfig() *AgentConfig {
 			Level: "info",
 		},
 		Web: WebConfig{
-			HTTPPort:  8080,
-			HTTPSPort: 8443,
-			EnableTLS: false,
-			Auth:      WebAuthConfig{Mode: "local", AllowLocalAdmin: true},
+			BindAddress: "127.0.0.1",
+			HTTPPort:    8080,
+			HTTPSPort:   8443,
+			EnableTLS:   false,
+			// A loopback TCP connection is not a user identity. In production the
+			// server callback/session flow must establish a principal first.
+			Auth: WebAuthConfig{Mode: "local", AllowLocalAdmin: false},
 		},
 	}
 }
@@ -181,6 +194,9 @@ func ApplyEnvironmentOverrides(cfg *AgentConfig) {
 	}
 	if val := os.Getenv("SNMP_COMMUNITY"); val != "" {
 		cfg.SNMP.Community = val
+	}
+	if val := os.Getenv("SNMP_TRAP_COMMUNITY"); val != "" {
+		cfg.SNMP.TrapCommunity = val
 	}
 	if val := os.Getenv("SNMP_TIMEOUT_MS"); val != "" {
 		if timeout, err := strconv.Atoi(val); err == nil {
@@ -243,6 +259,9 @@ func ApplyEnvironmentOverrides(cfg *AgentConfig) {
 			cfg.Web.HTTPPort = port
 		}
 	}
+	if val := os.Getenv("WEB_BIND_ADDRESS"); val != "" {
+		cfg.Web.BindAddress = val
+	}
 	if val := os.Getenv("WEB_HTTPS_PORT"); val != "" {
 		if port, err := strconv.Atoi(val); err == nil {
 			cfg.Web.HTTPSPort = port
@@ -293,7 +312,7 @@ func SaveServerToken(dataDir, token string) error {
 	}
 	tokenPath := filepath.Join(dataDir, "agent_token")
 	// Create directory if needed
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return err
 	}
 	// Write with restrictive permissions (owner read/write only)
@@ -337,7 +356,7 @@ func SaveServerJoinToken(dataDir, token string) error {
 		}
 		return nil
 	}
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return err
 	}
 	return os.WriteFile(tokenPath, []byte(token), 0600)
@@ -367,7 +386,7 @@ func LoadOrGenerateAgentID(dataDir string) (string, error) {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 
 	// Save for future use
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(idPath, []byte(id), 0600); err != nil {

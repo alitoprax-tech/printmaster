@@ -125,6 +125,11 @@ func (s *BaseStore) upsertReturningID(ctx context.Context, query string, args ..
 	if err != nil {
 		return 0, err
 	}
+	if n, err := result.RowsAffected(); err != nil {
+		return 0, err
+	} else if n == 0 {
+		return 0, sql.ErrNoRows
+	}
 	id, _ := result.LastInsertId()
 	return id, nil
 }
@@ -137,6 +142,13 @@ func (s *BaseStore) upsertReturningID(ctx context.Context, query string, args ..
 // Note: On conflict, the 'name' field is only updated if the existing name is empty,
 // to preserve user-set display names.
 func (s *BaseStore) RegisterAgent(ctx context.Context, agent *Agent) error {
+	return s.registerAgent(ctx, agent, s.upsertReturningID)
+}
+
+func (s *BaseStore) registerAgent(ctx context.Context, agent *Agent, upsert func(context.Context, string, ...interface{}) (int64, error)) error {
+	if agent == nil {
+		return fmt.Errorf("agent required")
+	}
 	query := `
 		INSERT INTO agents (
 			agent_id, name, hostname, ip, platform, version, protocol_version, token, tenant_id,
@@ -164,10 +176,11 @@ func (s *BaseStore) RegisterAgent(ctx context.Context, agent *Agent) error {
 			build_type = excluded.build_type,
 			git_commit = excluded.git_commit,
 			last_heartbeat = excluded.last_heartbeat
+		WHERE agents.token = excluded.token AND COALESCE(agents.tenant_id, '') = COALESCE(excluded.tenant_id, '')
 	`
 
 	// Use upsertReturningID which handles both Postgres RETURNING and SQLite LastInsertId
-	id, err := s.upsertReturningID(ctx, query,
+	id, err := upsert(ctx, query,
 		agent.AgentID, agent.Name, agent.Hostname, agent.IP, agent.Platform,
 		agent.Version, agent.ProtocolVersion, agent.Token, agent.TenantID, agent.RegisteredAt,
 		agent.LastSeen, agent.Status,
@@ -579,9 +592,10 @@ func (s *BaseStore) UpsertDevice(ctx context.Context, device *Device) error {
 			is_shared = excluded.is_shared,
 			spooler_status = excluded.spooler_status,
 			usb_webui_available = excluded.usb_webui_available
+		WHERE devices.agent_id = excluded.agent_id
 	`
 
-	_, err := s.execContext(ctx, query,
+	result, err := s.execContext(ctx, query,
 		device.Serial, device.AgentID, device.IP, device.Manufacturer,
 		device.Model, device.Hostname, device.Firmware, device.MACAddress,
 		device.SubnetMask, device.Gateway, string(consumablesJSON),
@@ -593,6 +607,13 @@ func (s *BaseStore) UpsertDevice(ctx context.Context, device *Device) error {
 		device.DriverName, device.IsDefault, device.IsShared, device.SpoolerStatus,
 		device.UsbWebUIAvailable)
 
+	if err == nil {
+		if n, e := result.RowsAffected(); e != nil {
+			return e
+		} else if n == 0 {
+			return fmt.Errorf("device belongs to a different agent")
+		}
+	}
 	return err
 }
 
@@ -920,6 +941,51 @@ func (s *BaseStore) DeleteDevice(ctx context.Context, serial string, deleteMetri
 	return nil
 }
 
+// DeleteDeviceForAgent removes a device only when its current owner matches
+// agentID. The ownership predicate is part of the DELETE statement so an
+// agent cannot race a lookup and delete another agent's device by serial.
+func (s *BaseStore) DeleteDeviceForAgent(ctx context.Context, serial, agentID string, deleteMetrics bool) error {
+	serial = strings.TrimSpace(serial)
+	agentID = strings.TrimSpace(agentID)
+	if serial == "" || agentID == "" {
+		return fmt.Errorf("device serial and agent ID are required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin device delete: %w", err)
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+
+	if deleteMetrics {
+		if _, err := tx.ExecContext(ctx, s.query(`DELETE FROM metrics_history WHERE serial = ? AND agent_id = ?`), serial, agentID); err != nil {
+			return rollback(fmt.Errorf("failed to delete metrics: %w", err))
+		}
+	}
+	if _, err := tx.ExecContext(ctx, s.query(`DELETE FROM device_credentials WHERE serial = ?`), serial); err != nil {
+		return rollback(fmt.Errorf("failed to delete credentials: %w", err))
+	}
+
+	result, err := tx.ExecContext(ctx, s.query(`DELETE FROM devices WHERE serial = ? AND agent_id = ?`), serial, agentID)
+	if err != nil {
+		return rollback(fmt.Errorf("failed to delete device: %w", err))
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return rollback(err)
+	}
+	if rowsAffected == 0 {
+		return rollback(fmt.Errorf("device not found or not owned by agent"))
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit device delete: %w", err)
+	}
+	return nil
+}
+
 // ============================================================================
 // Metrics Methods
 // ============================================================================
@@ -930,14 +996,22 @@ func (s *BaseStore) SaveMetrics(ctx context.Context, metrics *MetricsSnapshot) e
 
 	query := `
 		INSERT INTO metrics_history (serial, agent_id, timestamp, page_count, color_pages, mono_pages, scan_count, toner_levels)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM devices WHERE serial = ? AND agent_id = ?)
 	`
 
-	_, err := s.execContext(ctx, query,
+	result, err := s.execContext(ctx, query,
 		metrics.Serial, metrics.AgentID, metrics.Timestamp,
 		metrics.PageCount, metrics.ColorPages, metrics.MonoPages,
-		metrics.ScanCount, string(tonerJSON))
+		metrics.ScanCount, string(tonerJSON), metrics.Serial, metrics.AgentID)
 
+	if err == nil {
+		if n, e := result.RowsAffected(); e != nil {
+			return e
+		} else if n == 0 {
+			return fmt.Errorf("device not owned by agent")
+		}
+	}
 	return err
 }
 
@@ -1639,10 +1713,23 @@ func (s *BaseStore) ListUsers(ctx context.Context) ([]*User, error) {
 		u.TenantID = tenantID.String
 		u.Email = email.String
 		u.Role = NormalizeRole(string(u.Role))
-		u.TenantIDs, _ = s.loadUserTenantIDs(ctx, u.ID)
 		users = append(users, &u)
 	}
-	return users, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	// Release the outer cursor before acquiring a connection for tenant lookups.
+	for _, user := range users {
+		tenants, err := s.loadUserTenantIDs(ctx, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		user.TenantIDs = tenants
+	}
+	return users, nil
 }
 
 // UpdateUser updates a user's profile
@@ -1872,6 +1959,7 @@ func (s *BaseStore) SaveAuditEntry(ctx context.Context, entry *AuditEntry) error
 // GetAuditLog retrieves audit entries for an actor since a given time
 // If actorID is empty, retrieves all entries since the given time
 func (s *BaseStore) GetAuditLog(ctx context.Context, actorID string, since time.Time) ([]*AuditEntry, error) {
+	since = since.UTC()
 	var query string
 	var args []interface{}
 
@@ -1920,6 +2008,7 @@ func (s *BaseStore) GetAuditLog(ctx context.Context, actorID string, since time.
 
 // CountAuditLog returns the total number of audit entries matching the filter
 func (s *BaseStore) CountAuditLog(ctx context.Context, actorID string, since time.Time) (int64, error) {
+	since = since.UTC()
 	var count int64
 	var query string
 	var args []interface{}
@@ -1938,6 +2027,7 @@ func (s *BaseStore) CountAuditLog(ctx context.Context, actorID string, since tim
 
 // GetAuditLogPaginated retrieves paginated audit entries
 func (s *BaseStore) GetAuditLogPaginated(ctx context.Context, actorID string, since time.Time, limit, offset int) ([]*AuditEntry, error) {
+	since = since.UTC()
 	var query string
 	var args []interface{}
 
@@ -2007,7 +2097,7 @@ func (s *BaseStore) CreateJoinToken(ctx context.Context, tenantID string, ttlMin
 		return nil, "", err
 	}
 	rawToken := hex.EncodeToString(b)
-	logDebug("CreateJoinToken: generated token", "tenant_id", tenantID, "token_length", len(rawToken), "token_prefix", rawToken[:8], "ttl_minutes", ttlMinutes, "one_time", oneTime)
+	logDebug("CreateJoinToken: generated token", "tenant_id", tenantID, "token_length", len(rawToken), "ttl_minutes", ttlMinutes, "one_time", oneTime)
 
 	// Hash the token using Argon2
 	tokenHash, err := hashArgon(rawToken)
@@ -2106,6 +2196,12 @@ func isValidTokenFormat(token string) bool {
 	if strings.TrimSpace(token) == "" {
 		return false
 	}
+	// Join-token verification uses Argon2 and may inspect multiple active
+	// records. Bound the input before any expensive hash work; generated tokens
+	// and the documented INIT_SECRET limit are much smaller than this ceiling.
+	if len([]byte(token)) > 4096 {
+		return false
+	}
 	// Accept any non-empty token - Argon2 hash comparison will validate
 	return true
 }
@@ -2113,7 +2209,11 @@ func isValidTokenFormat(token string) bool {
 // ValidateJoinToken validates a join token and returns the JoinToken if valid.
 // Returns specific errors for expired vs unknown tokens to allow different handling.
 func (s *BaseStore) ValidateJoinToken(ctx context.Context, rawToken string) (*JoinToken, error) {
-	logDebug("ValidateJoinToken: starting validation", "token_length", len(rawToken), "token_prefix", safePrefix(rawToken, 8))
+	return s.validateJoinToken(ctx, rawToken, true)
+}
+
+func (s *BaseStore) validateJoinToken(ctx context.Context, rawToken string, consume bool) (*JoinToken, error) {
+	logDebug("ValidateJoinToken: starting validation", "token_length", len(rawToken))
 
 	// First check token format - reject obviously invalid tokens early
 	if !isValidTokenFormat(rawToken) {
@@ -2158,11 +2258,22 @@ func (s *BaseStore) ValidateJoinToken(ctx context.Context, rawToken string) (*Jo
 		}
 		if ok {
 			logInfo("ValidateJoinToken: token matched", "token_id", id, "tenant_id", tenantID, "one_time", intToBool(oneTimeInt))
+			// Release the cursor before writing (also supports a single SQLite connection).
+			if err := rows.Close(); err != nil {
+				return nil, err
+			}
 			// If one-time token, mark as used (revoked)
-			if intToBool(oneTimeInt) {
-				markUsedQuery := fmt.Sprintf(`UPDATE join_tokens SET revoked = %s, used_at = ? WHERE id = ?`, s.dialect.BoolValue(true))
-				if _, err := s.execContext(ctx, markUsedQuery, time.Now().UTC(), id); err != nil {
-					logWarn("ValidateJoinToken: failed to mark token as used", "token_id", id, "error", err)
+			if consume && intToBool(oneTimeInt) {
+				markUsedQuery := fmt.Sprintf(`UPDATE join_tokens SET revoked = %s, used_at = ? WHERE id = ? AND revoked = %s AND expires_at > ?`, s.dialect.BoolValue(true), s.dialect.BoolValue(false))
+				usedAt := time.Now().UTC()
+				result, err := s.execContext(ctx, markUsedQuery, usedAt, id, usedAt)
+				if err != nil {
+					return nil, err
+				}
+				if n, err := result.RowsAffected(); err != nil {
+					return nil, err
+				} else if n != 1 {
+					return nil, &TokenValidationError{Err: ErrTokenRevoked}
 				}
 				logInfo("ValidateJoinToken: marked one-time token as used", "token_id", id)
 			}
@@ -2217,7 +2328,7 @@ func (s *BaseStore) ValidateJoinToken(ctx context.Context, rawToken string) (*Jo
 		}
 	}
 
-	logWarn("ValidateJoinToken: no matching token found (unknown token)", "candidates_checked", candidateCount, "token_prefix", safePrefix(rawToken, 8))
+	logWarn("ValidateJoinToken: no matching token found (unknown token)", "candidates_checked", candidateCount)
 	return nil, &TokenValidationError{Err: ErrTokenInvalid}
 }
 
@@ -2392,13 +2503,18 @@ func (s *BaseStore) ListPendingAgentRegistrations(ctx context.Context, status st
 // This creates a new join token for the agent to use.
 func (s *BaseStore) ApprovePendingRegistration(ctx context.Context, id int64, tenantID, reviewedBy string) error {
 	now := time.Now().UTC()
-	_, err := s.execContext(ctx, `
+	result, err := s.execContext(ctx, `
 		UPDATE pending_agent_registrations 
 		SET status = ?, reviewed_at = ?, reviewed_by = ?
-		WHERE id = ?
-	`, PendingStatusApproved, now, reviewedBy, id)
+		WHERE id = ? AND status = ?
+	`, PendingStatusApproved, now, reviewedBy, id, PendingStatusPending)
 	if err != nil {
 		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("pending registration is missing or already reviewed")
 	}
 	logInfo("ApprovePendingRegistration: approved", "id", id, "tenant_id", tenantID, "reviewed_by", reviewedBy)
 	return nil
@@ -2407,13 +2523,18 @@ func (s *BaseStore) ApprovePendingRegistration(ctx context.Context, id int64, te
 // RejectPendingRegistration rejects a pending registration with optional notes.
 func (s *BaseStore) RejectPendingRegistration(ctx context.Context, id int64, reviewedBy, notes string) error {
 	now := time.Now().UTC()
-	_, err := s.execContext(ctx, `
+	result, err := s.execContext(ctx, `
 		UPDATE pending_agent_registrations 
 		SET status = ?, reviewed_at = ?, reviewed_by = ?, notes = ?
-		WHERE id = ?
-	`, PendingStatusRejected, now, reviewedBy, notes, id)
+		WHERE id = ? AND status = ?
+	`, PendingStatusRejected, now, reviewedBy, notes, id, PendingStatusPending)
 	if err != nil {
 		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return fmt.Errorf("pending registration is missing or already reviewed")
 	}
 	logInfo("RejectPendingRegistration: rejected", "id", id, "reviewed_by", reviewedBy)
 	return nil
@@ -2492,10 +2613,19 @@ func (s *BaseStore) ValidatePasswordResetToken(ctx context.Context, token string
 		return 0, fmt.Errorf("invalid or expired token")
 	}
 
-	// Now safe to UPDATE since rows are closed
-	updateQuery := fmt.Sprintf("UPDATE password_resets SET used = %s WHERE id = ?", s.dialect.BoolValue(true))
-	if _, err := s.execContext(ctx, updateQuery, foundMatch.id); err != nil {
+	// Claim the token atomically. A concurrent request may have matched the
+	// same Argon2 hash while this request was verifying it; only one caller may
+	// transition the row from unused to used.
+	updateQuery := fmt.Sprintf("UPDATE password_resets SET used = %s WHERE id = ? AND used = %s AND expires_at > ?", s.dialect.BoolValue(true), s.dialect.BoolValue(false))
+	result, err := s.execContext(ctx, updateQuery, foundMatch.id, time.Now().UTC())
+	if err != nil {
 		return 0, err
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		if err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("invalid or expired token")
 	}
 	return foundMatch.userID, nil
 }
@@ -2612,9 +2742,19 @@ func (s *BaseStore) GetUserInvitation(ctx context.Context, token string) (*UserI
 
 // MarkInvitationUsed marks an invitation as used
 func (s *BaseStore) MarkInvitationUsed(ctx context.Context, id int64) error {
-	query := fmt.Sprintf("UPDATE user_invitations SET used = %s WHERE id = ?", s.dialect.BoolValue(true))
-	_, err := s.execContext(ctx, query, id)
-	return err
+	query := fmt.Sprintf("UPDATE user_invitations SET used = %s WHERE id = ? AND used = %s AND expires_at > ?", s.dialect.BoolValue(true), s.dialect.BoolValue(false))
+	result, err := s.execContext(ctx, query, id, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("invitation already used or expired")
+	}
+	return nil
 }
 
 // ListUserInvitations returns all invitations (for admin UI)
@@ -2839,6 +2979,17 @@ func (s *BaseStore) GetOIDCSession(ctx context.Context, id string) (*OIDCSession
 func (s *BaseStore) DeleteOIDCSession(ctx context.Context, id string) error {
 	_, err := s.execContext(ctx, `DELETE FROM oidc_sessions WHERE id = ?`, id)
 	return err
+}
+
+// DeleteOIDCSessionsBefore removes abandoned OIDC login attempts.  OIDC state
+// is intentionally short lived; periodic cleanup prevents public login starts
+// that never reach the callback from growing the table without bound.
+func (s *BaseStore) DeleteOIDCSessionsBefore(ctx context.Context, before time.Time) (int64, error) {
+	result, err := s.execContext(ctx, `DELETE FROM oidc_sessions WHERE created_at < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // CreateOIDCLink creates a link between an OIDC subject and a local user
@@ -4482,6 +4633,14 @@ const (
 
 // GetAggregatedMetrics calculates fleet-wide aggregated metrics for dashboards
 func (s *BaseStore) GetAggregatedMetrics(ctx context.Context, since time.Time, tenantIDs []string) (*AggregatedMetrics, error) {
+	return s.GetAggregatedMetricsFiltered(ctx, since, tenantIDs, "", "")
+}
+
+// GetAggregatedMetricsFiltered calculates an aggregate while restricting the
+// input set to an optional agent ID and/or device serial. Keeping these
+// predicates in the storage query prevents a tenant-scoped caller from
+// receiving a broader fleet aggregate and relying on client-side filtering.
+func (s *BaseStore) GetAggregatedMetricsFiltered(ctx context.Context, since time.Time, tenantIDs []string, agentID, deviceSerial string) (*AggregatedMetrics, error) {
 	now := time.Now().UTC()
 	agg := &AggregatedMetrics{
 		GeneratedAt: now,
@@ -4504,6 +4663,9 @@ func (s *BaseStore) GetAggregatedMetrics(ctx context.Context, since time.Time, t
 		if a == nil {
 			continue
 		}
+		if agentID != "" && a.AgentID != agentID {
+			continue
+		}
 		if len(tenantIDs) > 0 {
 			if _, ok := allowedTenants[a.TenantID]; !ok {
 				continue
@@ -4524,6 +4686,12 @@ func (s *BaseStore) GetAggregatedMetrics(ctx context.Context, since time.Time, t
 	deviceBySerial := make(map[string]*Device, len(devices))
 	for _, d := range devices {
 		if d == nil {
+			continue
+		}
+		if deviceSerial != "" && d.Serial != deviceSerial {
+			continue
+		}
+		if agentID != "" && d.AgentID != agentID {
 			continue
 		}
 		if len(tenantIDs) > 0 {
@@ -4612,6 +4780,14 @@ func (s *BaseStore) GetAggregatedMetrics(ctx context.Context, since time.Time, t
 		for _, id := range tenantIDs {
 			args = append(args, id)
 		}
+	}
+	if agentID != "" {
+		query += ` AND m.agent_id = ` + s.dialect.Placeholder(len(args)+1)
+		args = append(args, agentID)
+	}
+	if deviceSerial != "" {
+		query += ` AND m.serial = ` + s.dialect.Placeholder(len(args)+1)
+		args = append(args, deviceSerial)
 	}
 	query += ` ORDER BY m.timestamp ASC`
 

@@ -79,6 +79,26 @@ func TestAuthorizeRolePolicies(t *testing.T) {
 			wantErr:  ErrForbidden,
 		},
 		{
+			name: "operator allowed device write",
+			subject: Subject{
+				Role:             storage.RoleOperator,
+				AllowedTenantIDs: []string{"tenant-a"},
+			},
+			action:   ActionDevicesWrite,
+			resource: ResourceRef{TenantIDs: []string{"tenant-a"}},
+			wantErr:  nil,
+		},
+		{
+			name: "viewer denied device write",
+			subject: Subject{
+				Role:             storage.RoleViewer,
+				AllowedTenantIDs: []string{"tenant-a"},
+			},
+			action:   ActionDevicesWrite,
+			resource: ResourceRef{TenantIDs: []string{"tenant-a"}},
+			wantErr:  ErrForbidden,
+		},
+		{
 			name: "operator allowed via wildcard",
 			subject: Subject{
 				Role:             storage.RoleOperator,
@@ -99,13 +119,13 @@ func TestAuthorizeRolePolicies(t *testing.T) {
 			wantErr:  ErrForbidden,
 		},
 		{
-			name: "viewer allowed logs",
+			name: "viewer denied global logs",
 			subject: Subject{
 				Role: storage.RoleViewer,
 			},
 			action:   ActionLogsRead,
 			resource: ResourceRef{},
-			wantErr:  nil,
+			wantErr:  ErrForbidden,
 		},
 	}
 

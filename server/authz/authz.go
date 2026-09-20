@@ -39,10 +39,14 @@ const (
 	ActionAgentsWrite  Action = "agents.write"
 	ActionAgentsDelete Action = "agents.delete"
 
-	ActionDevicesRead Action = "devices.read"
+	ActionDevicesRead            Action = "devices.read"
+	ActionDevicesWrite           Action = "devices.write"
+	ActionDevicesDelete          Action = "devices.delete"
+	ActionDeviceCredentialsWrite Action = "devices.credentials.write"
 
-	ActionMetricsSummaryRead Action = "metrics.summary.read"
-	ActionMetricsHistoryRead Action = "metrics.history.read"
+	ActionMetricsSummaryRead      Action = "metrics.summary.read"
+	ActionMetricsHistoryRead      Action = "metrics.history.read"
+	ActionMetricsServerGlobalRead Action = "metrics.server.global.read"
 
 	ActionProxyAgentConnect  Action = "proxy.agent"
 	ActionProxyDeviceConnect Action = "proxy.device"
@@ -55,12 +59,20 @@ const (
 	// Fleet settings (discovery, snmp, features) - tenant-scoped for operators+
 	ActionSettingsFleetRead  Action = "settings.fleet.read"
 	ActionSettingsFleetWrite Action = "settings.fleet.write"
+	// Global fleet settings are server-wide and therefore admin-only.  Tenant
+	// operators use ActionSettingsFleetRead/Write with a tenant ResourceRef.
+	ActionSettingsFleetGlobalRead  Action = "settings.fleet.global.read"
+	ActionSettingsFleetGlobalWrite Action = "settings.fleet.global.write"
 
 	// Alert settings (rules, channels, policies) - tenant-scoped for operators+
 	ActionSettingsAlertsRead  Action = "settings.alerts.read"
 	ActionSettingsAlertsWrite Action = "settings.alerts.write"
+	// Global alert settings and summaries have no tenant key and are admin-only.
+	ActionSettingsAlertsGlobalRead  Action = "settings.alerts.global.read"
+	ActionSettingsAlertsGlobalWrite Action = "settings.alerts.global.write"
 
 	ActionLogsRead      Action = "logs.read"
+	ActionLogsWrite     Action = "logs.write"
 	ActionAuditLogsRead Action = "audit.logs.read"
 
 	ActionReleasesRead  Action = "releases.read"
@@ -113,11 +125,13 @@ var rolePolicies = map[storage.Role][]string{
 		"agents.*",
 		"packages.generate",
 		"devices.read",
+		"devices.write",
+		"devices.delete",
+		"devices.credentials.write",
 		"metrics.summary.read",
 		"metrics.history.read",
 		"proxy.agent",
 		"proxy.device",
-		"logs.read",
 		// Granular settings permissions (tenant-scoped via ResourceRef)
 		"settings.fleet.read",   // Read fleet settings (discovery, snmp, features)
 		"settings.fleet.write",  // Write fleet settings
@@ -132,7 +146,6 @@ var rolePolicies = map[storage.Role][]string{
 		"devices.read",
 		"metrics.summary.read",
 		"metrics.history.read",
-		"logs.read",
 		// Granular settings permissions (read-only, tenant-scoped)
 		"settings.fleet.read",  // Read fleet settings
 		"settings.alerts.read", // Read alert rules

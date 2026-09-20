@@ -2,7 +2,9 @@ package vendor
 
 import (
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gosnmp/gosnmp"
 )
@@ -18,7 +20,21 @@ func NewVendorSNMPClient(ip string, community string, timeoutSeconds int) (SNMPC
 	}
 
 	if community == "" {
-		community = "public"
+		return nil, fmt.Errorf("SNMP community is required")
+	}
+	if strings.TrimSpace(community) != community {
+		return nil, fmt.Errorf("SNMP community must not have leading or trailing whitespace")
+	}
+	if !utf8.ValidString(community) {
+		return nil, fmt.Errorf("SNMP community must be valid UTF-8")
+	}
+	if len([]byte(community)) > 255 {
+		return nil, fmt.Errorf("SNMP community exceeds 255 bytes")
+	}
+	for _, r := range community {
+		if r < 0x20 || r == 0x7f {
+			return nil, fmt.Errorf("SNMP community contains a control character")
+		}
 	}
 
 	if timeoutSeconds <= 0 {

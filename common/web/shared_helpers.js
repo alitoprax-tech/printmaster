@@ -42,8 +42,10 @@ function formatRelativeTime(dateString) {
 }
 
 function formatNumber(num) {
-    if (num === null || num === undefined) return '0';
-    return num.toLocaleString('en-US');
+    const number = typeof num === 'number'
+        ? num
+        : (typeof num === 'string' && num.trim() !== '' ? Number(num) : NaN);
+    return Number.isFinite(number) ? number.toLocaleString('en-US') : '0';
 }
 
 function formatBytes(bytes, decimals = 2) {

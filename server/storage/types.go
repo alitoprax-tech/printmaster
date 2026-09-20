@@ -133,18 +133,20 @@ func NormalizeTenantDomain(value string) string {
 
 // Agent represents a registered PrintMaster agent
 type Agent struct {
-	ID              int64     `json:"id"`
-	AgentID         string    `json:"agent_id"` // Stable UUID identifier
-	Name            string    `json:"name"`     // User-friendly name (defaults to hostname)
-	Hostname        string    `json:"hostname"`
-	IP              string    `json:"ip"`
-	Platform        string    `json:"platform"`         // windows, linux, darwin
-	Version         string    `json:"version"`          // Agent version
-	ProtocolVersion string    `json:"protocol_version"` // Protocol compatibility
-	Token           string    `json:"token"`            // Bearer token for authentication
-	RegisteredAt    time.Time `json:"registered_at"`
-	LastSeen        time.Time `json:"last_seen"`
-	Status          string    `json:"status"` // active, inactive, offline
+	ID              int64  `json:"id"`
+	AgentID         string `json:"agent_id"` // Stable UUID identifier
+	Name            string `json:"name"`     // User-friendly name (defaults to hostname)
+	Hostname        string `json:"hostname"`
+	IP              string `json:"ip"`
+	Platform        string `json:"platform"`         // windows, linux, darwin
+	Version         string `json:"version"`          // Agent version
+	ProtocolVersion string `json:"protocol_version"` // Protocol compatibility
+	// Token is a bearer credential used only internally for agent authentication.
+	// Never serialize it as part of an Agent API response.
+	Token        string    `json:"-"`
+	RegisteredAt time.Time `json:"registered_at"`
+	LastSeen     time.Time `json:"last_seen"`
+	Status       string    `json:"status"` // active, inactive, offline
 
 	// Additional metadata
 	OSVersion       string    `json:"os_version,omitempty"`        // Detailed OS version
@@ -634,6 +636,7 @@ type AuditEntry struct {
 type Store interface {
 	// Agent management
 	RegisterAgent(ctx context.Context, agent *Agent) error
+	EnrollAgent(ctx context.Context, token string, agent *Agent) (*JoinToken, error)
 	GetAgent(ctx context.Context, agentID string) (*Agent, error)
 	GetAgentByToken(ctx context.Context, token string) (*Agent, error)
 	ListAgents(ctx context.Context) ([]*Agent, error)
@@ -655,6 +658,10 @@ type Store interface {
 	CountDevices(ctx context.Context, agentIDs []string) (int64, error)
 	// DeleteDevice removes a device by serial. If deleteMetrics is true, also deletes metrics history.
 	DeleteDevice(ctx context.Context, serial string, deleteMetrics bool) error
+	// DeleteDeviceForAgent removes a device only when it is currently owned by
+	// agentID. Agent-originated synchronization must use this ownership-bound
+	// operation instead of the administrator-only serial delete.
+	DeleteDeviceForAgent(ctx context.Context, serial, agentID string, deleteMetrics bool) error
 
 	// Metrics
 	SaveMetrics(ctx context.Context, metrics *MetricsSnapshot) error

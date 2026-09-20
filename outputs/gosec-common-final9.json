@@ -1,0 +1,404 @@
+{
+	"Golang errors": {},
+	"Issues": [
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion uint64 -\u003e int64",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\util\\helpers.go",
+			"code": "67: \tcase uint64:\n68: \t\treturn int64(t), true\n69: \tcase string:\n",
+			"line": "68",
+			"column": "15",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion uint -\u003e int64",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\util\\helpers.go",
+			"code": "63: \tcase uint:\n64: \t\treturn int64(t), true\n65: \tcase uint32:\n",
+			"line": "64",
+			"column": "15",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G703",
+			"details": "Path traversal via taint analysis",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\config\\config.go",
+			"code": "169: \t// Create directory if it doesn't exist\n170: \tif err := os.MkdirAll(logDir, 0700); err != nil {\n171: \t\treturn \"\", fmt.Errorf(\"failed to create log directory: %w\", err)\n",
+			"line": "170",
+			"column": "23",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G703",
+			"details": "Path traversal via taint analysis",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\config\\config.go",
+			"code": "137: \t// Create directory if it doesn't exist\n138: \tif err := os.MkdirAll(dataDir, 0700); err != nil {\n139: \t\treturn \"\", fmt.Errorf(\"failed to create data directory: %w\", err)\n",
+			"line": "138",
+			"column": "23",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\util\\secret.go",
+			"code": "16: func LoadOrCreateKey(path string) ([]byte, error) {\n17: \tif b, err := os.ReadFile(path); err == nil {\n18: \t\tif len(b) != 32 {\n",
+			"line": "17",
+			"column": "15",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\updateauth\\manifest.go",
+			"code": "187: \t}\n188: \tf, err := os.Open(path)\n189: \tif err != nil {\n",
+			"line": "188",
+			"column": "12",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\updateauth\\manifest.go",
+			"code": "127: func readDocument(path string, value interface{}) error {\n128: \tf, err := os.Open(path)\n129: \tif err != nil {\n",
+			"line": "128",
+			"column": "12",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\logger\\logger.go",
+			"code": "358: \t\tfilename := filepath.Join(l.logDir, logFileName)\n359: \t\tf, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)\n360: \t\tif err != nil {\n",
+			"line": "359",
+			"column": "13",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\config\\config.go",
+			"code": "248: \t\tif strings.Contains(err.Error(), \"invalid escape\") || strings.Contains(err.Error(), \"invalid escape in string\") {\n249: \t\t\tdata, rerr := os.ReadFile(configPath)\n250: \t\t\tif rerr != nil {\n",
+			"line": "249",
+			"column": "18",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\config\\config.go",
+			"code": "190: \n191: \tfile, err := os.OpenFile(configPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)\n192: \tif err != nil {\n",
+			"line": "191",
+			"column": "15",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\config\\config.go",
+			"code": "51: \tfor _, path := range searchPaths {\n52: \t\tif data, err := os.ReadFile(path); err == nil {\n53: \t\t\treturn path, data, nil\n",
+			"line": "52",
+			"column": "19",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\cmd\\release-sign\\main.go",
+			"code": "22: func writeNew(path string, data []byte) error {\n23: \tf, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)\n24: \tif err != nil {\n",
+			"line": "23",
+			"column": "12",
+			"nosec": false,
+			"suppressions": null,
+			"autofix": "Consider using os.Root to scope file access under a fixed root (Go \u003e=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal."
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "276",
+				"url": "https://cwe.mitre.org/data/definitions/276.html"
+			},
+			"rule_id": "G301",
+			"details": "Expect directory permissions to be 0750 or less",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\util\\helpers.go",
+			"code": "104: \tdir := filepath.Dir(path)\n105: \tif err := os.MkdirAll(dir, 0o755); err != nil {\n106: \t\treturn err\n",
+			"line": "105",
+			"column": "12",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\ws\\conn.go",
+			"code": "118: \tif timeout \u003e 0 {\n119: \t\tcw.c.SetWriteDeadline(time.Now().Add(timeout))\n120: \t}\n",
+			"line": "119",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\ws\\conn.go",
+			"code": "95: \tif timeout \u003e 0 {\n96: \t\tcw.c.SetWriteDeadline(time.Now().Add(timeout))\n97: \t}\n",
+			"line": "96",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\ws\\conn.go",
+			"code": "80: \tif timeout \u003e 0 {\n81: \t\tcw.c.SetWriteDeadline(time.Now().Add(timeout))\n82: \t}\n",
+			"line": "81",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\util\\terminal_ui.go",
+			"code": "203: \tfmt.Printf(\"  %sPress Enter to continue...%s\", ColorDim, ColorReset)\n204: \tfmt.Scanln()\n205: }\n",
+			"line": "204",
+			"column": "2",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\logger\\logger.go",
+			"code": "466: \t\tfor i := 0; i \u003c len(files)-l.rotationPolicy.MaxFiles; i++ {\n467: \t\t\tos.Remove(files[i])\n468: \t\t}\n",
+			"line": "467",
+			"column": "4",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\logger\\logger.go",
+			"code": "457: \t\t\tif stat.ModTime().Before(cutoff) {\n458: \t\t\t\tos.Remove(file)\n459: \t\t\t}\n",
+			"line": "458",
+			"column": "5",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\logger\\logger.go",
+			"code": "431: \t\t\tbackupPath := filepath.Join(l.logDir, fmt.Sprintf(\"%s_%s.log\", l.component, timestamp))\n432: \t\t\tos.Rename(l.currentFilePath, backupPath)\n433: \t\t}\n",
+			"line": "432",
+			"column": "4",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\logger\\logger.go",
+			"code": "374: \tl.currentFile.WriteString(line + \"\\n\")\n375: \tl.currentFile.Sync() // Flush to disk for accurate size checks\n376: \n",
+			"line": "375",
+			"column": "2",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\logger\\logger.go",
+			"code": "373: \tline := formatLogEntry(entry)\n374: \tl.currentFile.WriteString(line + \"\\n\")\n375: \tl.currentFile.Sync() // Flush to disk for accurate size checks\n",
+			"line": "374",
+			"column": "2",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\cmd\\release-sign\\main.go",
+			"code": "90: \tsize, err := io.Copy(h, io.LimitReader(f, updateauth.MaxArtifactBytes+1))\n91: \tf.Close()\n92: \tif err != nil {\n",
+			"line": "91",
+			"column": "2",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "C:\\Users\\ali\\Documents\\Codex\\2026-09-06\\https-github-com-mstrhakr-printmaster-https\\work\\printmaster\\common\\cmd\\release-sign\\main.go",
+			"code": "27: \tif _, err := f.Write(data); err != nil {\n28: \t\tf.Close()\n29: \t\treturn err\n",
+			"line": "28",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		}
+	],
+	"Stats": {
+		"files": 24,
+		"lines": 4355,
+		"nosec": 0,
+		"found": 24
+	},
+	"GosecVersion": "dev"
+}

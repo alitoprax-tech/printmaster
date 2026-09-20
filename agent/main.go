@@ -39,6 +39,7 @@ import (
 	"printmaster/common/config"
 	"printmaster/common/logger"
 	"printmaster/common/report"
+	"printmaster/common/requestauth"
 	pmsettings "printmaster/common/settings"
 	commonutil "printmaster/common/util"
 	sharedweb "printmaster/common/web"
@@ -69,6 +70,12 @@ type loggingResponseWriter struct {
 	http.ResponseWriter
 	status int
 	bytes  int
+}
+
+func writeAgentJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
@@ -189,10 +196,49 @@ const (
 )
 
 const (
-	agentSessionCookieName = "pm_agent_session"
-	defaultAgentSessionTTL = 24 * time.Hour
-	serverAuthTimeout      = 15 * time.Second
+	agentSessionCookieName        = "pm_agent_session"
+	defaultAgentSessionTTL        = 24 * time.Hour
+	serverAuthTimeout             = 15 * time.Second
+	maxAgentRequestBodySize       = 2 << 20 // 2 MiB; report/proxy handlers apply tighter limits
+	maxAgentProxyResponseBodySize = 8 << 20 // Bound printer content before it reaches the server WebSocket
 )
+
+// boundedProxyBody prevents a printer (or a USB device) from exhausting the
+// agent while a browser proxy response is being forwarded to the server.
+type boundedProxyBody struct {
+	io.ReadCloser
+	remaining int64
+}
+
+func (b *boundedProxyBody) Read(p []byte) (int, error) {
+	if b == nil || b.ReadCloser == nil {
+		return 0, io.EOF
+	}
+	if b.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+func readBoundedProxyResponse(body io.ReadCloser) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, maxAgentProxyResponseBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxAgentProxyResponseBodySize {
+		return nil, fmt.Errorf("proxy response body exceeds %d bytes", maxAgentProxyResponseBodySize)
+	}
+	return data, nil
+}
 
 type agentSession struct {
 	ID          string
@@ -218,6 +264,12 @@ func (m *agentSessionManager) Create(principal *AgentPrincipal, serverToken stri
 		expiresAt = time.Now().Add(24 * time.Hour)
 	}
 	token := randomSessionToken()
+	// Never fall back to a timestamp (or any other predictable value) when the
+	// system CSPRNG is unavailable. A missing session is safer than issuing a
+	// guessable bearer credential.
+	if token == "" {
+		return ""
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cleanupLocked()
@@ -268,7 +320,7 @@ func (m *agentSessionManager) cleanupLocked() {
 func randomSessionToken() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
@@ -281,6 +333,7 @@ type agentAuthManager struct {
 	mode             string
 	allowLocalAdmin  bool
 	serverURL        string
+	agentID          string
 	serverCAPath     string
 	serverSkipVerify bool
 	sessions         *agentSessionManager
@@ -293,33 +346,58 @@ type agentAuthOptions struct {
 	AllowLocalAdmin bool   `json:"allow_local_admin"`
 	ServerURL       string `json:"server_url,omitempty"`
 	ServerAuthURL   string `json:"server_auth_url,omitempty"` // URL to redirect for server auth
+	AgentID         string `json:"agent_id,omitempty"`
 	LoginSupported  bool   `json:"login_supported"`
 }
 
 func newAgentAuthManager(cfg *AgentConfig, sessions *agentSessionManager) *agentAuthManager {
 	mode := "local"
-	allowLocal := true
+	allowLocal := false
 	serverURL := ""
+	agentID := ""
 	serverCA := ""
 	serverSkip := false
 	if cfg != nil {
 		if cfg.Web.Auth.Mode != "" {
 			mode = strings.ToLower(strings.TrimSpace(cfg.Web.Auth.Mode))
 		}
-		allowLocal = cfg.Web.Auth.AllowLocalAdmin
+		// TCP loopback proves only that a process is local; it does not prove
+		// which Windows user owns that process. The legacy setting is ignored.
+		allowLocal = false
 		serverURL = strings.TrimSpace(cfg.Server.URL)
+		if serverURL != "" {
+			validated, err := validateOnboardingServerURL(serverURL)
+			if err != nil {
+				// Keep an invalid hand-edited URL from becoming a redirect or
+				// credential destination. The upload worker reports the same
+				// configuration error at startup.
+				if appLogger != nil {
+					appLogger.Error("Invalid configured server URL; server integration disabled", "error", err.Error())
+				}
+				serverURL = ""
+			} else {
+				serverURL = validated
+			}
+		}
 		serverCA = strings.TrimSpace(cfg.Server.CAPath)
 		serverSkip = cfg.Server.InsecureSkipVerify
+		agentID = strings.TrimSpace(cfg.Server.AgentID)
 
 		// Auto-enable server mode if server URL is configured and mode not explicitly set
 		if serverURL != "" && cfg.Web.Auth.Mode == "" {
 			mode = "server"
 		}
 	}
+	if mode == "disabled" {
+		// The historic unauthenticated mode granted every caller admin access.
+		// Preserve startup compatibility without preserving that privilege.
+		mode = "local"
+	}
 	return &agentAuthManager{
 		mode:             mode,
 		allowLocalAdmin:  allowLocal,
 		serverURL:        serverURL,
+		agentID:          agentID,
 		serverCAPath:     serverCA,
 		serverSkipVerify: serverSkip,
 		sessions:         sessions,
@@ -336,14 +414,13 @@ func newAgentAuthManager(cfg *AgentConfig, sessions *agentSessionManager) *agent
 		},
 		publicPrefixes: []string{
 			"/static/",
-			"/api/usb-printers/", // USB printer metrics (public for testing)
 		},
 	}
 }
 
 func (a *agentAuthManager) optionsPayload() agentAuthOptions {
 	if a == nil {
-		return agentAuthOptions{Mode: "disabled", AllowLocalAdmin: true, LoginSupported: false}
+		return agentAuthOptions{Mode: "local", AllowLocalAdmin: false, LoginSupported: false}
 	}
 	serverURL := strings.TrimSpace(a.serverURL)
 	hasServer := serverURL != ""
@@ -351,6 +428,7 @@ func (a *agentAuthManager) optionsPayload() agentAuthOptions {
 	opts := agentAuthOptions{
 		Mode:            a.mode,
 		AllowLocalAdmin: a.allowLocalAdmin,
+		AgentID:         a.agentID,
 		LoginSupported:  loginSupported,
 	}
 	if hasServer {
@@ -368,6 +446,16 @@ func (a *agentAuthManager) Wrap(next http.Handler) http.Handler {
 		if handler == nil {
 			handler = http.DefaultServeMux
 		}
+		if r.Body != nil {
+			// Bound every request before a route-specific decoder runs. This also
+			// covers legacy handlers that still use json.Decoder directly.
+			r.Body = http.MaxBytesReader(w, r.Body, maxAgentRequestBodySize)
+		}
+		_, trustedProxy := requestauth.ProxyPrincipalFromContext(r.Context())
+		if !trustedProxy && r.URL.Path != "/api/v1/auth/callback" && !requestauth.BrowserRequestAllowed(r) {
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
 		if a == nil || a.shouldBypass(r) {
 			handler.ServeHTTP(w, r)
 			return
@@ -377,18 +465,17 @@ func (a *agentAuthManager) Wrap(next http.Handler) http.Handler {
 			a.respondUnauthorized(w, r)
 			return
 		}
+		if !agentRoleAllows(principal, r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		ctx := context.WithValue(r.Context(), agentPrincipalContextKey, principal)
 		handler.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 func (a *agentAuthManager) shouldBypass(r *http.Request) bool {
-	if a == nil || a.mode == "disabled" {
-		return true
-	}
-	// Bypass auth for server-proxied requests (header is set by ws_client.go handleProxyRequest)
-	// This is safe because only the internal proxy code path can set this header
-	if r.Header.Get("X-PrintMaster-Proxy") == "server" {
+	if a == nil {
 		return true
 	}
 	path := r.URL.Path
@@ -408,14 +495,14 @@ func (a *agentAuthManager) PrincipalForRequest(r *http.Request) (*AgentPrincipal
 }
 
 func (a *agentAuthManager) authenticate(r *http.Request) (*AgentPrincipal, bool) {
-	if a == nil || a.mode == "disabled" {
-		return &AgentPrincipal{Username: "system", Role: "admin", Source: "disabled"}, true
+	if p, ok := requestauth.ProxyPrincipalFromContext(r.Context()); ok {
+		return &AgentPrincipal{Username: p.Username, Role: p.Role, Source: "server-proxy"}, true
+	}
+	if a == nil {
+		return nil, false
 	}
 	if sess := a.sessionFromRequest(r); sess != nil {
 		return sess.Principal, true
-	}
-	if a.allowLocalAdmin && requestIsLoopback(r) {
-		return &AgentPrincipal{Username: "local-admin", Role: "admin", Source: "loopback"}, true
 	}
 	switch a.mode {
 	case "local":
@@ -475,17 +562,7 @@ func requestIsLoopback(r *http.Request) bool {
 		ip := net.ParseIP(strings.TrimSpace(host))
 		return ip != nil && ip.IsLoopback()
 	}
-	if checkHost(r.RemoteAddr) {
-		return true
-	}
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 && checkHost(parts[0]) {
-			return true
-		}
-	}
-	return false
+	return checkHost(r.RemoteAddr)
 }
 
 func requestIsHTTPS(r *http.Request) bool {
@@ -587,7 +664,12 @@ func runAgentHealthCheck(configFlag string) error {
 func probeAgentHealth(endpoint string, insecure bool) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	if insecure {
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec
+		if !isLoopbackHealthEndpoint(endpoint) {
+			return fmt.Errorf("insecure health probes are restricted to loopback")
+		}
+		// #nosec G402 -- the endpoint is checked above and is fixed loopback;
+		// the agent may use a self-signed certificate for this local probe only.
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
@@ -609,7 +691,7 @@ func probeAgentHealth(endpoint string, insecure bool) error {
 		Status string `json:"status"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 
@@ -618,6 +700,15 @@ func probeAgentHealth(endpoint string, insecure bool) error {
 	}
 
 	return nil
+}
+
+func isLoopbackHealthEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
 func acceptsHTML(r *http.Request) bool {
@@ -639,6 +730,9 @@ func (a *agentAuthManager) issueSessionCookie(w http.ResponseWriter, r *http.Req
 		expiresAt = time.Now().Add(defaultAgentSessionTTL)
 	}
 	sessionID := a.sessions.Create(principal, serverToken, expiresAt)
+	if sessionID == "" {
+		return "", errors.New("failed to generate secure session token")
+	}
 	cookie := &http.Cookie{
 		Name:     agentSessionCookieName,
 		Value:    sessionID,
@@ -672,22 +766,6 @@ func (a *agentAuthManager) handleAuthMe(w http.ResponseWriter, r *http.Request) 
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
-	}
-
-	// When accessed through server proxy, the server injects principal info in headers
-	// Return that info so the proxied UI can display the correct role/permissions
-	if r.Header.Get("X-PrintMaster-Proxy") == "server" {
-		user := r.Header.Get("X-PrintMaster-User")
-		role := r.Header.Get("X-PrintMaster-Role")
-		if user != "" && role != "" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(&AgentPrincipal{
-				Username: user,
-				Role:     role,
-				Source:   "server-proxy",
-			})
-			return
-		}
 	}
 
 	if principal, ok := a.authenticate(r); ok && principal != nil {
@@ -786,6 +864,9 @@ func (a *agentAuthManager) handleAuthLogout(w http.ResponseWriter, r *http.Reque
 // This is called when the server redirects back to the agent after authentication.
 // The server includes a short-lived callback token that we validate to create a local session.
 func (a *agentAuthManager) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	if a == nil {
 		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
 		return
@@ -839,6 +920,9 @@ func (a *agentAuthManager) validateServerCallbackToken(ctx context.Context, toke
 	if a == nil || strings.TrimSpace(a.serverURL) == "" {
 		return nil, "", time.Time{}, fmt.Errorf("server validation unavailable")
 	}
+	if strings.TrimSpace(a.agentID) == "" {
+		return nil, "", time.Time{}, fmt.Errorf("agent identity unavailable")
+	}
 
 	if appLogger != nil {
 		appLogger.Debug("Validating callback token with server", "server_url", a.serverURL)
@@ -852,7 +936,7 @@ func (a *agentAuthManager) validateServerCallbackToken(ctx context.Context, toke
 		return nil, "", time.Time{}, err
 	}
 
-	payload := map[string]string{"token": token}
+	payload := map[string]string{"token": token, "agent_id": a.agentID}
 	buf := &bytes.Buffer{}
 	if err := json.NewEncoder(buf).Encode(payload); err != nil {
 		return nil, "", time.Time{}, err
@@ -999,7 +1083,7 @@ func (a *agentAuthManager) serverLogout(ctx context.Context, serverToken string)
 		return err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("server logout failed: status %d", resp.StatusCode)
 	}
@@ -1027,7 +1111,7 @@ func (a *agentAuthManager) fetchServerPrincipal(ctx context.Context, client *htt
 		TenantID  string   `json:"tenant_id"`
 		TenantIDs []string `json:"tenant_ids"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
 		return nil, err
 	}
 	ids := payload.TenantIDs
@@ -1043,7 +1127,16 @@ func (a *agentAuthManager) fetchServerPrincipal(ctx context.Context, client *htt
 }
 
 func (a *agentAuthManager) newServerHTTPClient() (*http.Client, error) {
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: a.serverSkipVerify}
+	if a == nil {
+		return nil, fmt.Errorf("authentication manager unavailable")
+	}
+	if _, err := validateOnboardingServerURL(a.serverURL); err != nil {
+		return nil, fmt.Errorf("invalid server URL: %w", err)
+	}
+	if a.serverSkipVerify {
+		return nil, fmt.Errorf("insecure server TLS verification is not permitted")
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	if a.serverCAPath != "" {
 		pemData, err := os.ReadFile(a.serverCAPath)
 		if err != nil {
@@ -1074,6 +1167,10 @@ func (a *agentAuthManager) serverLoginURL(r *http.Request) string {
 	if a == nil || strings.TrimSpace(a.serverURL) == "" {
 		return "/login"
 	}
+	serverURL, err := validateOnboardingServerURL(a.serverURL)
+	if err != nil {
+		return "/login?error=invalid_server_url"
+	}
 	// Determine what URL the user originally wanted
 	returnTo := "/"
 	if r != nil && r.URL != nil {
@@ -1087,7 +1184,7 @@ func (a *agentAuthManager) serverLoginURL(r *http.Request) string {
 	agentCallbackURL := buildAgentCallbackURL(r, returnTo)
 
 	// Use 'redirect' parameter for external redirects (server login page convention)
-	return strings.TrimRight(a.serverURL, "/") + "/login?redirect=" + url.QueryEscape(agentCallbackURL)
+	return serverURL + "/login?redirect=" + url.QueryEscape(agentCallbackURL)
 }
 
 // buildAgentCallbackURL constructs the callback URL that the server should redirect to after auth
@@ -1100,7 +1197,13 @@ func buildAgentCallbackURL(r *http.Request, returnTo string) string {
 	// Check for X-Forwarded-Proto header
 	if r != nil {
 		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-			scheme = strings.ToLower(strings.TrimSpace(proto))
+			// Trust only the first standard forwarding value and keep the
+			// generated callback URL within HTTP(S). The server performs a
+			// second host/agent binding check before minting a bearer token.
+			proto = strings.ToLower(strings.TrimSpace(strings.Split(proto, ",")[0]))
+			if proto == "http" || proto == "https" {
+				scheme = proto
+			}
 		}
 	}
 
@@ -1406,7 +1509,11 @@ func ensureTLSCertificates(customCertPath, customKeyPath string) (certFile, keyF
 	// Check if certificates already exist
 	if _, err := os.Stat(certFile); err == nil {
 		if _, err := os.Stat(keyFile); err == nil {
-			// Both files exist
+			// Both files exist. Tighten permissions on files created by the
+			// agent itself in case an older release left them world-readable.
+			if err := hardenTLSFilePermissions(certFile, keyFile); err != nil {
+				return "", "", err
+			}
 			return certFile, keyFile, nil
 		}
 	}
@@ -1450,7 +1557,7 @@ func ensureTLSCertificates(customCertPath, customKeyPath string) (certFile, keyF
 	}
 
 	// Write certificate file
-	certOut, err := os.Create(certFile)
+	certOut, err := os.OpenFile(certFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create cert file: %w", err)
 	}
@@ -1461,7 +1568,7 @@ func ensureTLSCertificates(customCertPath, customKeyPath string) (certFile, keyF
 	certOut.Close()
 
 	// Write private key file
-	keyOut, err := os.Create(keyFile)
+	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create key file: %w", err)
 	}
@@ -1475,9 +1582,28 @@ func ensureTLSCertificates(customCertPath, customKeyPath string) (certFile, keyF
 		return "", "", fmt.Errorf("failed to write key: %w", err)
 	}
 	keyOut.Close()
+	if err := hardenTLSFilePermissions(certFile, keyFile); err != nil {
+		return "", "", err
+	}
 
 	appLogger.Info("Generated self-signed TLS certificate", "cert", certFile, "key", keyFile)
 	return certFile, keyFile, nil
+}
+
+// hardenTLSFilePermissions applies least-privilege permissions to the
+// agent-generated certificate pair. The certificate is public material; the
+// private key must remain readable only by the account running the agent.
+func hardenTLSFilePermissions(certFile, keyFile string) error {
+	if strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" {
+		return fmt.Errorf("TLS certificate paths are required")
+	}
+	if err := os.Chmod(certFile, 0644); err != nil {
+		return fmt.Errorf("failed to set TLS certificate permissions: %w", err)
+	}
+	if err := os.Chmod(keyFile, 0600); err != nil {
+		return fmt.Errorf("failed to set TLS private key permissions: %w", err)
+	}
+	return nil
 }
 
 // deviceStorageAdapter implements agent.DeviceStorage interface
@@ -2049,6 +2175,14 @@ func startServerUploadWorker(
 	if strings.TrimSpace(agentCfg.Server.URL) == "" {
 		return nil, fmt.Errorf("server URL not configured")
 	}
+	validatedServerURL, err := validateOnboardingServerURL(agentCfg.Server.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server URL: %w", err)
+	}
+	// Keep every subsequent HTTP and WebSocket client on the canonical,
+	// validated origin. In particular, do not allow a hand-edited config to
+	// send the agent token to a remote plaintext HTTP endpoint.
+	agentCfg.Server.URL = validatedServerURL
 
 	agentID := agentCfg.Server.AgentID
 	if agentID == "" {
@@ -2210,11 +2344,14 @@ func performServerJoin(
 	logger *logger.Logger,
 	isSvc bool,
 ) (*serverJoinResult, error) {
-	serverURL := strings.TrimSpace(params.ServerURL)
-	joinToken := strings.TrimSpace(params.Token)
-	if serverURL == "" {
-		return nil, newJoinError(http.StatusBadRequest, fmt.Errorf("server_url required"))
+	serverURL, err := validateOnboardingServerURL(params.ServerURL)
+	if err != nil {
+		return nil, newJoinError(http.StatusBadRequest, err)
 	}
+	if params.Insecure {
+		return nil, newJoinError(http.StatusBadRequest, fmt.Errorf("insecure TLS verification is not permitted"))
+	}
+	joinToken := strings.TrimSpace(params.Token)
 	if joinToken == "" {
 		return nil, newJoinError(http.StatusBadRequest, fmt.Errorf("token required"))
 	}
@@ -2854,8 +2991,11 @@ func runInteractive(ctx context.Context, configFlag string) {
 	} else {
 		logDir = "logs"
 	}
+	if override := os.Getenv("PRINTMASTER_LOG_DIR"); override != "" {
+		logDir = filepath.Join(override, "agent")
+	}
 
-	if err := os.MkdirAll(logDir, 0755); err == nil {
+	if err := os.MkdirAll(logDir, 0700); err == nil {
 		appLogger = logger.New(logger.DEBUG, logDir, 1000)
 		// Expose logger globally for scanner/vendor packages
 		logger.SetGlobal(appLogger)
@@ -2969,8 +3109,6 @@ func runInteractive(ctx context.Context, configFlag string) {
 	}
 	configEpsonRemoteModeEnabled = agentConfig != nil && agentConfig.EpsonRemoteModeEnabled
 	featureflags.SetEpsonRemoteMode(configEpsonRemoteModeEnabled)
-	agentAuth = newAgentAuthManager(agentConfig, agentSessions)
-
 	// Always apply environment overrides for database path (supports AGENT_DB_PATH and DB_PATH)
 	// even when using default configuration (no config file present).
 	config.ApplyDatabaseEnvOverrides(&agentConfig.Database, "AGENT")
@@ -2986,12 +3124,12 @@ func runInteractive(ctx context.Context, configFlag string) {
 		}
 
 		parent := filepath.Dir(dbPath)
-		if err := os.MkdirAll(parent, 0755); err != nil {
+		if err := os.MkdirAll(parent, 0700); err != nil {
 			appLogger.Warn("Could not create DB parent directory, falling back", "parent", parent, "error", err)
 			agentConfig.Database.Path = ""
 		} else {
 			// Probe write access
-			f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0644)
+			f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0600)
 			if err != nil {
 				appLogger.Warn("Cannot write to DB path, falling back", "path", dbPath, "error", err)
 				agentConfig.Database.Path = ""
@@ -3047,6 +3185,11 @@ func runInteractive(ctx context.Context, configFlag string) {
 	appLogger.Info("Agent config database initialized", "path", agentDBPath)
 	settingsManager = NewSettingsManager(agentConfigStore)
 	applyServerConfigFromStore(agentConfig, agentConfigStore, appLogger)
+	// The agent config store may contain the URL, agent ID, and token produced
+	// by the device-auth onboarding flow. Build the auth manager only after
+	// merging that state so callback binding and server-mode login use the same
+	// identity as the upload worker.
+	agentAuth = newAgentAuthManager(agentConfig, agentSessions)
 
 	// Migration: consolidate legacy dev_settings / developer_settings / security_settings into unified "settings" key
 	// Also migrates from old Developer/Security structure to new SNMP/Features/Logging/Web structure.
@@ -4269,6 +4412,9 @@ func runInteractive(ctx context.Context, configFlag string) {
 		if agentConfig.SNMP.Community != "" {
 			_ = os.Setenv("SNMP_COMMUNITY", agentConfig.SNMP.Community)
 		}
+		if agentConfig.SNMP.TrapCommunity != "" {
+			_ = os.Setenv("SNMP_TRAP_COMMUNITY", agentConfig.SNMP.TrapCommunity)
+		}
 		// SNMPv3 settings
 		if agentConfig.SNMP.SecurityLevel != "" {
 			_ = os.Setenv("SNMP_SECURITY_LEVEL", agentConfig.SNMP.SecurityLevel)
@@ -4470,7 +4616,9 @@ func runInteractive(ctx context.Context, configFlag string) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// The endpoint is same-origin and protected by the agent auth wrapper.
+		// Do not emit a wildcard CORS policy for a stream that can contain fleet data.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -4841,30 +4989,41 @@ func runInteractive(ctx context.Context, configFlag string) {
 		zw := zip.NewWriter(w)
 		defer zw.Close()
 
-		// Walk logs directory and add files
-		_ = filepath.Walk(logDir, func(p string, info os.FileInfo, err error) error {
+		// Walk logs directory and add regular files.  Open each entry through
+		// os.OpenInRoot so a symlink/race cannot make the archive read outside
+		// the logs directory.
+		_ = filepath.WalkDir(logDir, func(p string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return nil // skip problematic entries
 			}
-			if info.IsDir() {
+			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 				return nil
 			}
 			rel, err := filepath.Rel(logDir, p)
 			if err != nil {
-				rel = info.Name()
+				rel = entry.Name()
+			}
+			if rel == "." || filepath.IsAbs(rel) {
+				return nil
 			}
 			// Normalize to forward slashes for zip entries
 			zipName := strings.ReplaceAll(rel, "\\", "/")
-			f, err := os.Open(p)
+			f, err := os.OpenInRoot(logDir, rel)
 			if err != nil {
 				return nil
 			}
-			defer f.Close()
+			info, err := f.Stat()
+			if err != nil || !info.Mode().IsRegular() {
+				_ = f.Close()
+				return nil
+			}
 			wtr, err := zw.Create(zipName)
 			if err != nil {
+				_ = f.Close()
 				return nil
 			}
 			_, _ = io.Copy(wtr, f)
+			_ = f.Close()
 			return nil
 		})
 	})
@@ -4907,6 +5066,12 @@ func runInteractive(ctx context.Context, configFlag string) {
 			http.Error(w, "ip parameter required", http.StatusBadRequest)
 			return
 		}
+		parsedIP := net.ParseIP(strings.TrimSpace(ip))
+		if parsedIP == nil {
+			http.Error(w, "ip must be a literal address", http.StatusBadRequest)
+			return
+		}
+		ip = parsedIP.String()
 		// try in-memory snapshot first
 		if d, ok := agent.GetParseDebug(ip); ok {
 			w.Header().Set("Content-Type", "application/json")
@@ -4915,14 +5080,16 @@ func runInteractive(ctx context.Context, configFlag string) {
 		}
 		// fallback to persisted file
 		logDir := filepath.Join(".", "logs")
-		fpath := filepath.Join(logDir, fmt.Sprintf("parse_debug_%s.json", strings.ReplaceAll(ip, ".", "_")))
-		data, err := os.ReadFile(fpath)
+		fileIP := strings.NewReplacer(".", "_", ":", "_").Replace(ip)
+		fpath := filepath.Join(logDir, fmt.Sprintf("parse_debug_%s.json", fileIP))
+		data, err := os.OpenInRoot(logDir, filepath.Base(fpath))
 		if err != nil {
 			http.Error(w, "no diagnostics found", http.StatusNotFound)
 			return
 		}
+		defer data.Close()
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(data)
+		_, _ = io.Copy(w, data)
 	})
 
 	// POST /api/report - Submit a device data report to the proxy service
@@ -5960,10 +6127,10 @@ func runInteractive(ctx context.Context, configFlag string) {
 		var altURL string
 		if parsed.Scheme == "https" {
 			// Try HTTP on port 80
-			altURL = "http://" + deviceIP
+			altURL = buildPrinterProxyURL("http", deviceIP, "")
 		} else {
 			// Try HTTPS on port 443
-			altURL = "https://" + deviceIP
+			altURL = buildPrinterProxyURL("https", deviceIP, "")
 		}
 
 		altParsed, err := url.Parse(altURL)
@@ -6071,15 +6238,35 @@ func runInteractive(ctx context.Context, configFlag string) {
 			}
 			appLogger.Debug("Proxy: device found", "serial", serial, "ip", device.IP, "manufacturer", device.Manufacturer)
 
-			// Determine target URL (prefer web_ui_url, fallback to http://<ip>)
-			targetURL = device.WebUIURL
+			// Determine target URL (prefer web_ui_url, fallback to http://<ip>).
+			// Network proxy targets are canonicalized to the device's recorded
+			// literal IP before any connectivity check or reverse proxy is built.
+			// This prevents a user-controlled web_ui_url from turning the agent
+			// into an SSRF proxy for localhost or another internal service.
+			targetURL = strings.TrimSpace(device.WebUIURL)
 			if targetURL == "" {
-				targetURL = "http://" + device.IP
+				targetURL = buildPrinterProxyURL("http", device.IP, "")
 			}
+			validatedTarget, validationErr := validatePrinterProxyTarget(targetURL, device.IP)
+			if validationErr != nil {
+				appLogger.Warn("Proxy: refusing unsafe printer target", "serial", serial, "error", validationErr.Error())
+				http.Error(w, "invalid printer target", http.StatusBadRequest)
+				return
+			}
+			targetURL = validatedTarget.String()
 
 			// Quick connectivity check with automatic HTTP/HTTPS fallback
 			// This helps when web_ui_url is incorrectly set (common with self-signed HTTPS)
 			targetURL = checkAndFallbackProtocol(ctx, targetURL, device.IP, serial, appLogger)
+			// The fallback is constructed from device.IP, but validate it again so
+			// future changes to the fallback logic cannot weaken this boundary.
+			validatedTarget, validationErr = validatePrinterProxyTarget(targetURL, device.IP)
+			if validationErr != nil {
+				appLogger.Warn("Proxy: refusing unsafe fallback target", "serial", serial, "error", validationErr.Error())
+				http.Error(w, "invalid printer target", http.StatusBadRequest)
+				return
+			}
+			targetURL = validatedTarget.String()
 		}
 
 		target, err := url.Parse(targetURL)
@@ -6437,10 +6624,10 @@ window.top.location.href = '/proxy/%s/';
 		} else {
 			rproxy.Transport = &http.Transport{
 				TLSClientConfig: &tls.Config{
-					// #nosec G402 -- InsecureSkipVerify intentionally enabled:
-					// Network printers commonly use self-signed SSL certificates.
-					// This reverse proxy connects to printer web interfaces on local networks.
-					InsecureSkipVerify: true,
+					// Printer certificates must be validated against the system trust
+					// store (or an explicitly configured CA).  Accepting any certificate
+					// would allow a LAN attacker to capture printer credentials/cookies.
+					MinVersion: tls.VersionTLS12,
 				},
 				MaxIdleConns:          10,
 				IdleConnTimeout:       60 * time.Second,
@@ -6458,10 +6645,12 @@ window.top.location.href = '/proxy/%s/';
 
 		// Modify response to rewrite URLs in content and headers
 		rproxy.ModifyResponse = func(resp *http.Response) error {
-			if isKyoceraModelScript(targetPath) {
-				resp.Header.Set("Content-Type", "application/javascript")
+			if resp == nil || resp.Body == nil {
+				return nil
 			}
-
+			if resp.ContentLength > maxAgentProxyResponseBodySize {
+				return fmt.Errorf("proxy response body exceeds %d bytes", maxAgentProxyResponseBodySize)
+			}
 			// Rewrite Set-Cookie headers to include the proxy path
 			// This ensures the browser stores cookies and includes them in iframe requests
 			if cookies := resp.Cookies(); len(cookies) > 0 {
@@ -6528,11 +6717,10 @@ window.top.location.href = '/proxy/%s/';
 				strings.Contains(contentType, "application/x-javascript")
 
 			if shouldRewrite {
-				body, err := io.ReadAll(resp.Body)
+				body, err := readBoundedProxyResponse(resp.Body)
 				if err != nil {
 					return err
 				}
-				resp.Body.Close()
 
 				content := string(body)
 				appLogger.TraceTag("proxy_body_rewrite", "Rewriting response body", "content_type", contentType, "original_size", len(body), "path", targetPath)
@@ -6636,9 +6824,8 @@ window.top.location.href = '/proxy/%s/';
 			// Cache static resources for performance (printers are very slow)
 			if isStaticResource && resp.StatusCode == http.StatusOK {
 				// Read the body to cache it
-				body, err := io.ReadAll(resp.Body)
+				body, err := readBoundedProxyResponse(resp.Body)
 				if err == nil {
-					resp.Body.Close()
 					// Cache for 15 minutes
 					cacheKey := serial + ":" + targetPath
 					staticCache.Set(cacheKey, body, resp.Header.Get("Content-Type"), resp.Header.Clone(), 15*time.Minute)
@@ -6646,7 +6833,17 @@ window.top.location.href = '/proxy/%s/';
 					// Restore the body for the response
 					resp.Body = io.NopCloser(bytes.NewReader(body))
 					resp.ContentLength = int64(len(body))
+				} else {
+					return err
 				}
+			}
+
+			// Responses that are not rewritten or cached are streamed directly by
+			// ReverseProxy. Bound unknown-length bodies so a malicious printer cannot
+			// keep the agent or its WebSocket peer busy indefinitely.
+			if resp.Body != nil && resp.ContentLength < 0 {
+				resp.Body = &boundedProxyBody{ReadCloser: resp.Body, remaining: maxAgentProxyResponseBodySize}
+				resp.Header.Del("Content-Length")
 			}
 
 			return nil
@@ -8110,6 +8307,10 @@ window.top.location.href = '/proxy/%s/';
 			w.Write([]byte(`{"error":"server_url and token required"}`))
 			return
 		}
+		if in.Insecure {
+			writeAgentJSONError(w, http.StatusBadRequest, "insecure TLS verification is not permitted")
+			return
+		}
 
 		result, err := performServerJoin(
 			r.Context(),
@@ -8130,8 +8331,7 @@ window.top.location.href = '/proxy/%s/';
 		)
 		if err != nil {
 			status := joinErrorStatus(err)
-			w.WriteHeader(status)
-			w.Write([]byte(`{"error":"` + err.Error() + `"}`))
+			writeAgentJSONError(w, status, err.Error())
 			return
 		}
 
@@ -8163,6 +8363,16 @@ window.top.location.href = '/proxy/%s/';
 		if serverURL == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"error":"server_url required"}`))
+			return
+		}
+		validatedServerURL, err := validateOnboardingServerURL(serverURL)
+		if err != nil {
+			writeAgentJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		serverURL = validatedServerURL
+		if in.Insecure {
+			writeAgentJSONError(w, http.StatusBadRequest, "insecure TLS verification is not permitted")
 			return
 		}
 		// Validate CA path to prevent path traversal attacks
@@ -8206,8 +8416,7 @@ window.top.location.href = '/proxy/%s/';
 		client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, in.Insecure)
 		respBody, err := client.DeviceAuthStart(r.Context(), reqBody)
 		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			w.Write([]byte(`{"error":"` + err.Error() + `"}`))
+			writeAgentJSONError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		if respBody == nil {
@@ -8250,6 +8459,16 @@ window.top.location.href = '/proxy/%s/';
 			w.Write([]byte(`{"error":"server_url and poll_token required"}`))
 			return
 		}
+		validatedServerURL, err := validateOnboardingServerURL(serverURL)
+		if err != nil {
+			writeAgentJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		serverURL = validatedServerURL
+		if in.Insecure {
+			writeAgentJSONError(w, http.StatusBadRequest, "insecure TLS verification is not permitted")
+			return
+		}
 		// Validate CA path to prevent path traversal attacks
 		caPath := strings.TrimSpace(in.CAPath)
 		if caPath != "" {
@@ -8281,8 +8500,7 @@ window.top.location.href = '/proxy/%s/';
 		client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, in.Insecure)
 		respBody, err := client.DeviceAuthPoll(r.Context(), pollToken)
 		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			w.Write([]byte(`{"error":"` + err.Error() + `"}`))
+			writeAgentJSONError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		if respBody == nil {
@@ -8425,6 +8643,10 @@ window.top.location.href = '/proxy/%s/';
 	defer StopUSBProxy()
 
 	// Get HTTP/HTTPS settings
+	bindAddress := "127.0.0.1"
+	if agentConfig != nil && agentConfig.Web.BindAddress != "" {
+		bindAddress = agentConfig.Web.BindAddress
+	}
 	enableHTTP := true
 	enableHTTPS := true
 	httpPort := "8080"
@@ -8493,8 +8715,28 @@ window.top.location.href = '/proxy/%s/';
 
 	// Ensure at least one server is enabled
 	if !enableHTTP && !enableHTTPS {
-		enableHTTP = true
-		appLogger.Warn("Both HTTP and HTTPS disabled in settings, enabling HTTP as fallback")
+		if isLoopbackHost(bindAddress) {
+			// Plain HTTP remains useful for an explicitly local development
+			// instance when no certificate is available.
+			enableHTTP = true
+			appLogger.Warn("Both HTTP and HTTPS disabled in settings, enabling loopback HTTP for local development")
+		} else {
+			// Never make a failed TLS setup silently expose an internet-facing
+			// listener. The operator must repair certificates/configuration first.
+			appLogger.Error("Both HTTP and HTTPS disabled; refusing to start on a non-loopback bind address", "bind_address", bindAddress)
+			return
+		}
+	}
+	if enableHTTP && !isLoopbackHost(bindAddress) {
+		// Credentials, callback tokens, and printer data must not traverse
+		// plaintext HTTP on a remotely reachable interface. Use HTTPS directly
+		// (or put a TLS reverse proxy in front of a loopback-bound agent).
+		enableHTTP = false
+		appLogger.Warn("Plain HTTP disabled on non-loopback bind address; HTTPS is required", "bind_address", bindAddress)
+		if !enableHTTPS {
+			appLogger.Error("HTTPS is unavailable; agent listener will not start", "bind_address", bindAddress)
+			return
+		}
 	}
 
 	rootHandler := http.Handler(http.DefaultServeMux)
@@ -8540,12 +8782,13 @@ window.top.location.href = '/proxy/%s/';
 		}
 
 		httpServer = &http.Server{
-			Addr:              ":" + httpPort,
+			Addr:              net.JoinHostPort(bindAddress, httpPort),
 			Handler:           httpHandler,
 			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 10 * time.Second,
 			WriteTimeout:      30 * time.Second,
 			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    16 << 10,
 		}
 
 		wg.Add(1)
@@ -8576,6 +8819,7 @@ window.top.location.href = '/proxy/%s/';
 				ReadHeaderTimeout: 10 * time.Second,
 				WriteTimeout:      120 * time.Second, // USB proxy can be very slow (5-10s per page)
 				IdleTimeout:       120 * time.Second,
+				MaxHeaderBytes:    16 << 10,
 			}
 
 			wg.Add(1)
@@ -8583,7 +8827,7 @@ window.top.location.href = '/proxy/%s/';
 				defer wg.Done()
 
 				// Create base TCP listener
-				baseListener, err := net.Listen("tcp", ":"+httpsPort)
+				baseListener, err := net.Listen("tcp", net.JoinHostPort(bindAddress, httpsPort))
 				if err != nil {
 					appLogger.Error("Failed to create HTTPS listener", "error", err.Error())
 					return
