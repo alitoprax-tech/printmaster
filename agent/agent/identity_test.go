@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -120,7 +121,14 @@ func TestPreEnrollmentAttemptCrashRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatalf("restart load after %s: %v", checkpoint, err)
 			}
-			if loaded == nil || loaded.EnrollmentAttemptID == "" || len(loaded.PrivateKeyPEM) == 0 || len(loaded.CSRPEM) == 0 {
+			keyAvailable := loaded != nil && len(loaded.PrivateKeyPEM) > 0
+			if runtime.GOOS == "windows" {
+				// Windows CNG/TPM keeps the private key non-exportable; the
+				// persisted key reference is the recovery invariant instead.
+				keyAvailable = loaded != nil && (isCNGKeyBackend(loaded.KeyBackend) && loaded.KeyReference != "" ||
+					(loaded.KeyBackend == keyBackendDPAPI && len(loaded.PrivateKeyPEM) > 0))
+			}
+			if loaded == nil || loaded.EnrollmentAttemptID == "" || !keyAvailable || len(loaded.CSRPEM) == 0 {
 				t.Fatalf("pre-enrollment attempt lost after %s: %#v", checkpoint, loaded)
 			}
 		})

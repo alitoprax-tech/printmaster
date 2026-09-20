@@ -45,7 +45,7 @@ cd C:\Path\To\PrintMaster
 Get-Service PrintMasterAgent
 
 # Check logs
-Get-Content "C:\ProgramData\PrintMaster\logs\agent.log" -Tail 50
+Get-Content "C:\ProgramData\PrintMaster\agent\logs\agent.log" -Tail 50
 ```
 
 **Access Web UI**: http://localhost:8080 (or https://localhost:8443)
@@ -144,7 +144,10 @@ Service uses the same configuration as interactive mode:
 ## Security
 
 When running as service:
-- **Windows**: Runs as Local System (or configure specific service account)
+- **Windows**: Runs as the virtual service account `NT SERVICE\PrintMasterAgent`.
+  Installation enables the service SID and applies a protected ACL to
+  `C:\ProgramData\PrintMaster` so only the service, SYSTEM, and local
+  Administrators can access state. The account has no interactive logon.
 - **Linux**: Runs as dedicated `printmaster` user (create with `useradd -r printmaster`)
 - **macOS**: Runs as root (can be configured to run as specific user)
 
@@ -153,6 +156,28 @@ For production deployments:
 2. Configure firewall rules appropriately
 3. Enable HTTPS for web UI access
 4. Review security settings in Web UI > Settings > Security
+
+### Windows identity key protection
+
+On Windows, new enrollment, pending, renewal, and migration keys first use the
+Microsoft Platform Crypto Provider when an available TPM can create an ECDSA
+P-256 non-exportable key. If hardware CNG is unavailable, the Microsoft
+Software Key Storage Provider is attempted with the same non-exportable policy
+and service ACL. The identity generation stores only the CNG provider/key
+reference and certificate; no raw private-key PEM is written to disk. If CNG
+is unavailable, the Agent uses user-scoped DPAPI only after verifying that the
+current process token is the installed `NT SERVICE\PrintMasterAgent` identity.
+Encryption and decryption must therefore both run under that service account;
+an interactive or administrator process fails closed and does not write a
+plaintext or machine-scoped fallback key. A legacy plaintext generation is
+copied to protected storage, reopened and verified before the old generation
+is removed; if migration cannot be completed, the old identity is retained
+and the service refuses to continue with an unprotected replacement.
+
+The updater remains in the existing Agent process for now. Separating update
+installation into a narrowly privileged helper is deferred to P0-07; this
+change does not add a generic process, shell, PowerShell, registry, or
+arbitrary file-write capability.
 
 ## See Also
 

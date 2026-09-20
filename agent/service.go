@@ -80,10 +80,12 @@ func (p *program) Stop(s service.Service) error {
 func getServiceConfig() *service.Config {
 	// Determine service data directory based on platform
 	var workingDir string
+	var serviceUser string
 	switch runtime.GOOS {
 	case "windows":
 		// Windows: C:\ProgramData\PrintMaster
 		workingDir = filepath.Join(os.Getenv("ProgramData"), "PrintMaster")
+		serviceUser = `NT SERVICE\PrintMasterAgent`
 	case "darwin":
 		// macOS: /Library/Application Support/PrintMaster
 		workingDir = "/Library/Application Support/PrintMaster"
@@ -96,6 +98,7 @@ func getServiceConfig() *service.Config {
 		Name:             "PrintMasterAgent",
 		DisplayName:      "PrintMaster Agent",
 		Description:      "PrintMaster printer and copier fleet management agent. Discovers network printers, collects device metadata, and provides web-based management.",
+		UserName:         serviceUser,
 		WorkingDirectory: workingDir,
 		Arguments:        []string{"--service", "run"},
 		Option: service.KeyValue{
