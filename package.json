@@ -8,7 +8,13 @@
     "@playwright/test": "^1.63.0"
   },
   "jest": {
-    "testPathIgnorePatterns": ["<rootDir>/common/web/__tests__/playwright/"]
+    "testPathIgnorePatterns": [
+      "<rootDir>/common/web/__tests__/playwright/",
+      "<rootDir>/.v1-backup/"
+    ],
+    "modulePathIgnorePatterns": [
+      "<rootDir>/.v1-backup/"
+    ]
   },
   "scripts": {
     "test:js": "jest --runInBand",

@@ -149,6 +149,12 @@ results, err := Discover(ctx, []string{"192.168.1.0/24"}, "full", config, db, 50
 
 **Configuration Required**: Printers must be configured to send traps to agent's IP address
 
+The listener is disabled unless `SNMP_TRAP_COMMUNITY` (or
+`[snmp].trap_community` in the agent TOML) is explicitly set. It never falls
+back to the well-known `public` community. Incoming packets with a different
+community, or with loopback/link-local/multicast/unspecified source addresses,
+are ignored. Restrict UDP/162 at the host firewall to the printer VLAN.
+
 **Best For**: Enterprise environments, proactive monitoring, real-time status updates
 
 ### 6. LLMNR (`llmnr.go`)
@@ -371,7 +377,7 @@ Agent behavior is controlled via:
 **Example Configuration**:
 ```json
 {
-  "snmp_community": "public",
+  "snmp_community": "replace-with-site-secret",
   "snmp_timeout_ms": 2000,
   "snmp_retries": 1,
   "discover_concurrency": 50,

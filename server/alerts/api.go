@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	webutil "printmaster/common/web"
 	authz "printmaster/server/authz"
 	"printmaster/server/storage"
 )
@@ -67,9 +68,13 @@ type Store interface {
 type APIOptions struct {
 	AuthMiddleware func(http.HandlerFunc) http.HandlerFunc
 	Authorizer     func(*http.Request, authz.Action, authz.ResourceRef) error
-	ActorResolver  func(*http.Request) string
-	AuditLogger    func(*http.Request, *storage.AuditEntry)
-	Notifier       *Notifier
+	// TenantScope returns (allowed tenant IDs, isAdmin, authenticated).  It is
+	// intentionally supplied by the server package so this reusable API does
+	// not import the server's Principal type.
+	TenantScope   func(*http.Request) ([]string, bool, bool)
+	ActorResolver func(*http.Request) string
+	AuditLogger   func(*http.Request, *storage.AuditEntry)
+	Notifier      *Notifier
 }
 
 // RouteConfig controls how HTTP handlers are registered.
@@ -84,6 +89,7 @@ type API struct {
 	notifier      *Notifier
 	authWrap      func(http.HandlerFunc) http.HandlerFunc
 	authorizer    func(*http.Request, authz.Action, authz.ResourceRef) error
+	tenantScope   func(*http.Request) ([]string, bool, bool)
 	actorResolver func(*http.Request) string
 	auditLogger   func(*http.Request, *storage.AuditEntry)
 }
@@ -98,9 +104,142 @@ func NewAPI(store Store, opts APIOptions) (*API, error) {
 		notifier:      opts.Notifier,
 		authWrap:      opts.AuthMiddleware,
 		authorizer:    opts.Authorizer,
+		tenantScope:   opts.TenantScope,
 		actorResolver: opts.ActorResolver,
 		auditLogger:   opts.AuditLogger,
 	}, nil
+}
+
+func (api *API) callerScope(r *http.Request) (map[string]struct{}, bool, bool) {
+	// Unit users of the package that do not supply a server scope resolver are
+	// treated as an explicit unrestricted test principal. Production wiring
+	// always supplies the resolver and therefore fails closed.
+	if api.tenantScope == nil {
+		return nil, true, true
+	}
+	ids, admin, authenticated := api.tenantScope(r)
+	if !authenticated {
+		return nil, false, false
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	return set, admin, true
+}
+
+func (api *API) tenantVisible(r *http.Request, tenantID string) bool {
+	set, admin, authenticated := api.callerScope(r)
+	if !authenticated {
+		return false
+	}
+	if admin {
+		return true
+	}
+	_, ok := set[strings.TrimSpace(tenantID)]
+	return strings.TrimSpace(tenantID) != "" && ok
+}
+
+func (api *API) tenantIDsVisible(r *http.Request, tenantIDs []string) bool {
+	set, admin, authenticated := api.callerScope(r)
+	if !authenticated {
+		return false
+	}
+	if admin {
+		return true
+	}
+	if len(tenantIDs) == 0 {
+		return false
+	}
+	for _, id := range tenantIDs {
+		if _, ok := set[strings.TrimSpace(id)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (api *API) currentTenantSet(r *http.Request) (map[string]struct{}, bool, bool) {
+	return api.callerScope(r)
+}
+
+func filterByTenant[T any](items []T, visible func(T) bool) []T {
+	out := make([]T, 0, len(items))
+	for _, item := range items {
+		if visible(item) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+const maxAlertRuleChannels = 64
+
+// channelSupportsRule enforces the data boundary between an alert rule and
+// the notification destinations it can use. A global channel may be shared
+// by an explicitly tenant-scoped rule only when a server administrator makes
+// that choice. A tenant-scoped channel must cover every tenant in the rule;
+// otherwise an alert for one tenant could be delivered to another tenant's
+// destination.
+func channelSupportsRule(ruleTenantIDs, channelTenantIDs []string, allowGlobalChannel bool) bool {
+	ruleTenants := make(map[string]struct{}, len(ruleTenantIDs))
+	for _, id := range ruleTenantIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			ruleTenants[id] = struct{}{}
+		}
+	}
+	channelTenants := make(map[string]struct{}, len(channelTenantIDs))
+	for _, id := range channelTenantIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			channelTenants[id] = struct{}{}
+		}
+	}
+
+	// A global rule can only use a global channel. Otherwise alerts from all
+	// tenants could be delivered to a tenant-specific destination.
+	if len(ruleTenants) == 0 {
+		return len(channelTenants) == 0
+	}
+	if len(channelTenants) == 0 {
+		return allowGlobalChannel
+	}
+	for tenantID := range ruleTenants {
+		if _, ok := channelTenants[tenantID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// validateRuleChannels resolves every channel reference before an alert rule
+// is persisted. Authorization on the rule alone is insufficient because
+// channel IDs are independent resources and could otherwise be guessed.
+func (api *API) validateRuleChannels(r *http.Request, rule *storage.AlertRule) error {
+	if len(rule.ChannelIDs) > maxAlertRuleChannels {
+		return fmt.Errorf("an alert rule may reference at most %d notification channels", maxAlertRuleChannels)
+	}
+	_, admin, authenticated := api.currentTenantSet(r)
+	if !authenticated {
+		return errors.New("authentication required")
+	}
+	for _, channelID := range rule.ChannelIDs {
+		if channelID <= 0 {
+			return errors.New("notification channel ID must be positive")
+		}
+		channel, err := api.store.GetNotificationChannel(r.Context(), channelID)
+		if err != nil || channel == nil {
+			return errors.New("alert rule references an unavailable notification channel")
+		}
+		if !admin && !api.tenantIDsVisible(r, channel.TenantIDs) {
+			return errors.New("alert rule references an unavailable notification channel")
+		}
+		if !channelSupportsRule(rule.TenantIDs, channel.TenantIDs, admin) {
+			return errors.New("alert rule and notification channel tenant scopes are incompatible")
+		}
+	}
+	return nil
 }
 
 // RegisterRoutes wires all alert endpoints.
@@ -193,7 +332,7 @@ func (api *API) handleAlertSummary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -222,6 +361,11 @@ func (api *API) handleAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleListAlerts(w http.ResponseWriter, r *http.Request) {
+	set, admin, authenticated := api.currentTenantSet(r)
+	if !authenticated {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return
+	}
 	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
 		return
 	}
@@ -242,6 +386,10 @@ func (api *API) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 		filters.Type = storage.AlertType(alertType)
 	}
 	if tenantID := r.URL.Query().Get("tenant_id"); tenantID != "" {
+		if !admin && !api.tenantVisible(r, tenantID) {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		filters.TenantID = tenantID
 	}
 	if limit := r.URL.Query().Get("limit"); limit != "" {
@@ -264,12 +412,48 @@ func (api *API) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to count alerts")
 		return
 	}
+	if !admin {
+		allAlerts = filterByTenant(allAlerts, func(alert storage.Alert) bool {
+			_, ok := set[strings.TrimSpace(alert.TenantID)]
+			return strings.TrimSpace(alert.TenantID) != "" && ok
+		})
+		if filters.TenantID == "" && len(set) == 1 {
+			for tenantID := range set {
+				filters.TenantID = tenantID
+				countFilters.TenantID = tenantID
+			}
+			allAlerts, err = api.store.ListActiveAlerts(r.Context(), countFilters)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to count alerts")
+				return
+			}
+		}
+	}
 	totalCount := len(allAlerts)
 
 	alerts, err := api.store.ListActiveAlerts(r.Context(), filters)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list alerts")
 		return
+	}
+	if !admin {
+		alerts = filterByTenant(alerts, func(alert storage.Alert) bool {
+			_, ok := set[strings.TrimSpace(alert.TenantID)]
+			return strings.TrimSpace(alert.TenantID) != "" && ok
+		})
+		// Apply pagination after tenant filtering when the caller spans multiple
+		// tenants, otherwise a database page could be mostly foreign records.
+		if filters.TenantID == "" && filters.Limit > 0 {
+			start := filters.Offset
+			if start > len(alerts) {
+				start = len(alerts)
+			}
+			end := start + filters.Limit
+			if end > len(alerts) {
+				end = len(alerts)
+			}
+			alerts = alerts[start:end]
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -283,10 +467,6 @@ func (api *API) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleCreateAlert(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
-		return
-	}
-
 	var alert storage.Alert
 	if err := decodeJSON(r.Body, &alert); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -306,6 +486,18 @@ func (api *API) handleCreateAlert(w http.ResponseWriter, r *http.Request) {
 	}
 	if alert.Status == "" {
 		alert.Status = storage.AlertStatusActive
+	}
+	if !api.tenantVisible(r, alert.TenantID) {
+		// Tenant-scoped callers may only create alerts for their own tenant. A
+		// tenantless alert is a global object and is reserved for admins.
+		_, admin, authenticated := api.currentTenantSet(r)
+		if !authenticated || !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{alert.TenantID}}) {
+		return
 	}
 
 	id, err := api.store.CreateAlert(r.Context(), &alert)
@@ -366,10 +558,6 @@ func (api *API) handleAlertRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleGetAlert(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
-		return
-	}
-
 	alert, err := api.store.GetAlert(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get alert")
@@ -379,12 +567,20 @@ func (api *API) handleGetAlert(w http.ResponseWriter, r *http.Request, id int64)
 		http.NotFound(w, r)
 		return
 	}
+	if !api.tenantVisible(r, alert.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{TenantIDs: []string{alert.TenantID}}) {
+		return
+	}
 
 	writeJSON(w, http.StatusOK, alert)
 }
 
 func (api *API) handleDeleteAlert(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	alert, err := api.store.GetAlert(r.Context(), id)
+	if err != nil || alert == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantVisible(r, alert.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{alert.TenantID}}) {
 		return
 	}
 
@@ -409,7 +605,12 @@ func (api *API) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request, i
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	alert, err := api.store.GetAlert(r.Context(), id)
+	if err != nil || alert == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantVisible(r, alert.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{alert.TenantID}}) {
 		return
 	}
 
@@ -434,7 +635,12 @@ func (api *API) handleResolveAlert(w http.ResponseWriter, r *http.Request, id in
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	alert, err := api.store.GetAlert(r.Context(), id)
+	if err != nil || alert == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantVisible(r, alert.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{alert.TenantID}}) {
 		return
 	}
 
@@ -472,12 +678,22 @@ func (api *API) handleListAlertRules(w http.ResponseWriter, r *http.Request) {
 	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
 		return
 	}
+	_, admin, authenticated := api.currentTenantSet(r)
+	if !authenticated {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return
+	}
 
 	// Note: filtering is done client-side for now since ListAlertRules doesn't take options
 	rules, err := api.store.ListAlertRules(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list alert rules")
 		return
+	}
+	if !admin {
+		rules = filterByTenant(rules, func(rule storage.AlertRule) bool {
+			return api.tenantIDsVisible(r, rule.TenantIDs)
+		})
 	}
 
 	// Optional client-side filtering
@@ -502,10 +718,6 @@ func (api *API) handleListAlertRules(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
-		return
-	}
-
 	var rule storage.AlertRule
 	if err := decodeJSON(r.Body, &rule); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -526,6 +738,20 @@ func (api *API) handleCreateAlertRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if rule.Scope == "" {
 		rule.Scope = storage.AlertScopeDevice
+	}
+	if !api.tenantIDsVisible(r, rule.TenantIDs) {
+		_, admin, authenticated := api.currentTenantSet(r)
+		if !authenticated || !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: rule.TenantIDs}) {
+		return
+	}
+	if err := api.validateRuleChannels(r, &rule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	rule.CreatedBy = api.actorLabel(r)
@@ -574,10 +800,6 @@ func (api *API) handleAlertRuleRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleGetAlertRule(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
-		return
-	}
-
 	rule, err := api.store.GetAlertRule(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to get alert rule")
@@ -587,12 +809,20 @@ func (api *API) handleGetAlertRule(w http.ResponseWriter, r *http.Request, id in
 		http.NotFound(w, r)
 		return
 	}
+	if !api.tenantIDsVisible(r, rule.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{TenantIDs: rule.TenantIDs}) {
+		return
+	}
 
 	writeJSON(w, http.StatusOK, rule)
 }
 
 func (api *API) handleUpdateAlertRule(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	existing, err := api.store.GetAlertRule(r.Context(), id)
+	if err != nil || existing == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantIDsVisible(r, existing.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: existing.TenantIDs}) {
 		return
 	}
 
@@ -603,6 +833,17 @@ func (api *API) handleUpdateAlertRule(w http.ResponseWriter, r *http.Request, id
 	}
 
 	rule.ID = id
+	if !api.tenantIDsVisible(r, rule.TenantIDs) {
+		_, admin, _ := api.currentTenantSet(r)
+		if !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+	if err := api.validateRuleChannels(r, &rule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := api.store.UpdateAlertRule(r.Context(), &rule); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update alert rule")
 		return
@@ -619,7 +860,12 @@ func (api *API) handleUpdateAlertRule(w http.ResponseWriter, r *http.Request, id
 }
 
 func (api *API) handleDeleteAlertRule(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	rule, err := api.store.GetAlertRule(r.Context(), id)
+	if err != nil || rule == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantIDsVisible(r, rule.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: rule.TenantIDs}) {
 		return
 	}
 
@@ -663,6 +909,19 @@ func (api *API) handleListNotificationChannels(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, "failed to list notification channels")
 		return
 	}
+	_, admin, authenticated := api.currentTenantSet(r)
+	if !authenticated {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return
+	}
+	if !admin {
+		channels = filterByTenant(channels, func(channel storage.NotificationChannel) bool {
+			return api.tenantIDsVisible(r, channel.TenantIDs)
+		})
+		for i := range channels {
+			channels[i].ConfigJSON = ""
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"channels": channels,
@@ -671,10 +930,6 @@ func (api *API) handleListNotificationChannels(w http.ResponseWriter, r *http.Re
 }
 
 func (api *API) handleCreateNotificationChannel(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
-		return
-	}
-
 	var channel storage.NotificationChannel
 	if err := decodeJSON(r.Body, &channel); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -688,6 +943,16 @@ func (api *API) handleCreateNotificationChannel(w http.ResponseWriter, r *http.R
 	}
 	if channel.Type == "" {
 		writeError(w, http.StatusBadRequest, "channel type is required")
+		return
+	}
+	if !api.tenantIDsVisible(r, channel.TenantIDs) {
+		_, admin, authenticated := api.currentTenantSet(r)
+		if !authenticated || !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: channel.TenantIDs}) {
 		return
 	}
 
@@ -705,6 +970,9 @@ func (api *API) handleCreateNotificationChannel(w http.ResponseWriter, r *http.R
 		Details:    fmt.Sprintf("Created notification channel: %s (%s)", channel.Name, api.actorLabel(r)),
 	})
 
+	if _, admin, _ := api.currentTenantSet(r); !admin {
+		channel.ConfigJSON = ""
+	}
 	writeJSON(w, http.StatusCreated, channel)
 }
 
@@ -747,31 +1015,45 @@ func (api *API) handleNotificationChannelRoute(w http.ResponseWriter, r *http.Re
 }
 
 func (api *API) handleGetNotificationChannel(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
-		return
-	}
-
 	channel, err := api.store.GetNotificationChannel(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "notification channel not found")
 		return
+	}
+	if !api.tenantIDsVisible(r, channel.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{TenantIDs: channel.TenantIDs}) {
+		return
+	}
+	if _, admin, _ := api.currentTenantSet(r); !admin {
+		channel.ConfigJSON = ""
 	}
 
 	writeJSON(w, http.StatusOK, channel)
 }
 
 func (api *API) handleUpdateNotificationChannel(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	existing, err := api.store.GetNotificationChannel(r.Context(), id)
+	if err != nil || existing == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantIDsVisible(r, existing.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: existing.TenantIDs}) {
 		return
 	}
 
 	var req storage.NotificationChannel
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &req, 1<<20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	req.ID = id
+	if !api.tenantIDsVisible(r, req.TenantIDs) {
+		_, admin, _ := api.currentTenantSet(r)
+		if !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
 
 	if err := api.store.UpdateNotificationChannel(r.Context(), &req); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update notification channel")
@@ -785,11 +1067,19 @@ func (api *API) handleUpdateNotificationChannel(w http.ResponseWriter, r *http.R
 		Details:    fmt.Sprintf("Updated notification channel: %s (%s)", req.Name, api.actorLabel(r)),
 	})
 
+	if _, admin, _ := api.currentTenantSet(r); !admin {
+		req.ConfigJSON = ""
+	}
 	writeJSON(w, http.StatusOK, &req)
 }
 
 func (api *API) handleDeleteNotificationChannel(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	channel, err := api.store.GetNotificationChannel(r.Context(), id)
+	if err != nil || channel == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantIDsVisible(r, channel.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: channel.TenantIDs}) {
 		return
 	}
 
@@ -816,7 +1106,7 @@ func (api *API) handleTestNotificationChannel(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalWrite, authz.ResourceRef{}) {
 		return
 	}
 
@@ -830,7 +1120,7 @@ func (api *API) handleTestNotificationChannel(w http.ResponseWriter, r *http.Req
 		Name       string `json:"name"`
 		ConfigJSON string `json:"config_json"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &req, 1<<20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -866,10 +1156,6 @@ func (api *API) handleTestExistingChannel(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
-		return
-	}
-
 	if api.notifier == nil {
 		writeError(w, http.StatusServiceUnavailable, "notification service not available")
 		return
@@ -878,6 +1164,9 @@ func (api *API) handleTestExistingChannel(w http.ResponseWriter, r *http.Request
 	channel, err := api.store.GetNotificationChannel(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "notification channel not found")
+		return
+	}
+	if !api.tenantIDsVisible(r, channel.TenantIDs) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: channel.TenantIDs}) {
 		return
 	}
 
@@ -913,7 +1202,7 @@ func (api *API) handleEscalationPolicies(w http.ResponseWriter, r *http.Request)
 }
 
 func (api *API) handleListEscalationPolicies(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -930,7 +1219,7 @@ func (api *API) handleListEscalationPolicies(w http.ResponseWriter, r *http.Requ
 }
 
 func (api *API) handleCreateEscalationPolicy(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalWrite, authz.ResourceRef{}) {
 		return
 	}
 
@@ -990,7 +1279,7 @@ func (api *API) handleEscalationPolicyRoute(w http.ResponseWriter, r *http.Reque
 }
 
 func (api *API) handleGetEscalationPolicy(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -1004,12 +1293,12 @@ func (api *API) handleGetEscalationPolicy(w http.ResponseWriter, r *http.Request
 }
 
 func (api *API) handleUpdateEscalationPolicy(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalWrite, authz.ResourceRef{}) {
 		return
 	}
 
 	var req storage.EscalationPolicy
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &req, 1<<20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -1032,7 +1321,7 @@ func (api *API) handleUpdateEscalationPolicy(w http.ResponseWriter, r *http.Requ
 }
 
 func (api *API) handleDeleteEscalationPolicy(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalWrite, authz.ResourceRef{}) {
 		return
 	}
 
@@ -1087,6 +1376,16 @@ func (api *API) handleListMaintenanceWindows(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "failed to list maintenance windows")
 		return
 	}
+	_, admin, authenticated := api.currentTenantSet(r)
+	if !authenticated {
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return
+	}
+	if !admin {
+		windows = filterByTenant(windows, func(window storage.AlertMaintenanceWindow) bool {
+			return api.tenantVisible(r, window.TenantID)
+		})
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"windows": windows,
@@ -1095,13 +1394,19 @@ func (api *API) handleListMaintenanceWindows(w http.ResponseWriter, r *http.Requ
 }
 
 func (api *API) handleCreateMaintenanceWindow(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
-		return
-	}
-
 	var window storage.AlertMaintenanceWindow
 	if err := decodeJSON(r.Body, &window); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !api.tenantVisible(r, window.TenantID) {
+		_, admin, authenticated := api.currentTenantSet(r)
+		if !authenticated || !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
+	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{window.TenantID}}) {
 		return
 	}
 
@@ -1169,13 +1474,12 @@ func (api *API) handleMaintenanceWindowRoute(w http.ResponseWriter, r *http.Requ
 }
 
 func (api *API) handleGetMaintenanceWindow(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
-		return
-	}
-
 	window, err := api.store.GetAlertMaintenanceWindow(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "maintenance window not found")
+		return
+	}
+	if !api.tenantVisible(r, window.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{TenantIDs: []string{window.TenantID}}) {
 		return
 	}
 
@@ -1183,17 +1487,29 @@ func (api *API) handleGetMaintenanceWindow(w http.ResponseWriter, r *http.Reques
 }
 
 func (api *API) handleUpdateMaintenanceWindow(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	existing, err := api.store.GetAlertMaintenanceWindow(r.Context(), id)
+	if err != nil || existing == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantVisible(r, existing.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{existing.TenantID}}) {
 		return
 	}
 
 	var req storage.AlertMaintenanceWindow
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &req, 1<<20); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	req.ID = id
+	if !api.tenantVisible(r, req.TenantID) {
+		_, admin, _ := api.currentTenantSet(r)
+		if !admin {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+	}
 
 	if err := api.store.UpdateAlertMaintenanceWindow(r.Context(), &req); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update maintenance window")
@@ -1211,7 +1527,12 @@ func (api *API) handleUpdateMaintenanceWindow(w http.ResponseWriter, r *http.Req
 }
 
 func (api *API) handleDeleteMaintenanceWindow(w http.ResponseWriter, r *http.Request, id int64) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	window, err := api.store.GetAlertMaintenanceWindow(r.Context(), id)
+	if err != nil || window == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !api.tenantVisible(r, window.TenantID) || !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{TenantIDs: []string{window.TenantID}}) {
 		return
 	}
 
@@ -1246,7 +1567,7 @@ func (api *API) handleAlertSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleGetAlertSettings(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsRead, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -1260,7 +1581,7 @@ func (api *API) handleGetAlertSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleSaveAlertSettings(w http.ResponseWriter, r *http.Request) {
-	if !api.authorize(w, r, authz.ActionSettingsAlertsWrite, authz.ResourceRef{}) {
+	if !api.authorize(w, r, authz.ActionSettingsAlertsGlobalWrite, authz.ResourceRef{}) {
 		return
 	}
 

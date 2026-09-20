@@ -576,8 +576,6 @@ func (w *Watcher) refreshPrinterJobs(printerName string) {
 		job := &PrintJob{
 			JobID:        jobID,
 			PrinterName:  printerName,
-			DocumentName: utf16PtrToString(info.Document),
-			UserName:     utf16PtrToString(info.UserName),
 			MachineName:  utf16PtrToString(info.MachineName),
 			Status:       jobStatusToString(info.StatusCode),
 			StatusCode:   info.StatusCode,
@@ -673,7 +671,7 @@ func (w *Watcher) checkCompletedJobs(printerName string, currentJobs map[uint32]
 			printer.LastPageUpdate = now
 			w.logger.Debug("Updated page count",
 				"printer", printerName,
-				"job", job.DocumentName,
+				"job_id", job.JobID,
 				"pages", pages,
 				"color", job.IsColor,
 				"total", printer.TotalPages)

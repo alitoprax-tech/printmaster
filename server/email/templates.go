@@ -5,8 +5,9 @@ import (
 	"bytes"
 	"fmt"
 	"html"
+	htmltemplate "html/template"
 	"strings"
-	"text/template"
+	texttemplate "text/template"
 )
 
 // Theme represents the email color scheme
@@ -105,8 +106,8 @@ type AgentDeploymentEmailData struct {
 func GenerateInviteEmail(theme Theme, data InviteEmailData) (htmlBody, textBody string, err error) {
 	colors := getThemeColors(theme)
 
-	htmlTmpl := template.Must(template.New("invite").Parse(inviteHTMLTemplate))
-	textTmpl := template.Must(template.New("inviteText").Parse(inviteTextTemplate))
+	htmlTmpl := htmltemplate.Must(htmltemplate.New("invite").Parse(inviteHTMLTemplate))
+	textTmpl := texttemplate.Must(texttemplate.New("inviteText").Parse(inviteTextTemplate))
 
 	tmplData := struct {
 		InviteEmailData
@@ -137,8 +138,8 @@ func GenerateInviteEmail(theme Theme, data InviteEmailData) (htmlBody, textBody 
 func GeneratePasswordResetEmail(theme Theme, data PasswordResetEmailData) (htmlBody, textBody string, err error) {
 	colors := getThemeColors(theme)
 
-	htmlTmpl := template.Must(template.New("reset").Parse(resetHTMLTemplate))
-	textTmpl := template.Must(template.New("resetText").Parse(resetTextTemplate))
+	htmlTmpl := htmltemplate.Must(htmltemplate.New("reset").Parse(resetHTMLTemplate))
+	textTmpl := texttemplate.Must(texttemplate.New("resetText").Parse(resetTextTemplate))
 
 	tmplData := struct {
 		PasswordResetEmailData
@@ -169,8 +170,8 @@ func GeneratePasswordResetEmail(theme Theme, data PasswordResetEmailData) (htmlB
 func GenerateAgentDeploymentEmail(theme Theme, data AgentDeploymentEmailData) (htmlBody, textBody string, err error) {
 	colors := getThemeColors(theme)
 
-	htmlTmpl := template.Must(template.New("deploy").Parse(agentDeployHTMLTemplate))
-	textTmpl := template.Must(template.New("deployText").Parse(agentDeployTextTemplate))
+	htmlTmpl := htmltemplate.Must(htmltemplate.New("deploy").Parse(agentDeployHTMLTemplate))
+	textTmpl := texttemplate.Must(texttemplate.New("deployText").Parse(agentDeployTextTemplate))
 
 	tmplData := struct {
 		AgentDeploymentEmailData

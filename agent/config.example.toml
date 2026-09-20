@@ -13,12 +13,18 @@ epson_remote_mode_enabled = false
 [snmp]
   # SNMP protocol version: "1", "2c", or "3"
   # - "1"  : Legacy, no encryption, community-based auth
-  # - "2c" : Standard, no encryption, community-based auth (recommended for most networks)
-  # - "3"  : Secure, supports authentication and encryption
+  # - "2c" : Legacy compatibility, no encryption, community-based auth
+  # - "3"  : Secure, supports authentication and encryption (recommended for production)
   version = "2c"
   
-  # Community string for SNMPv1/v2c (ignored for v3)
-  community = "public"
+  # Community string for SNMPv1/v2c (ignored for v3). Set a site-specific
+  # value; SNMPv3 with authPriv is preferred for production networks.
+  community = "replace-with-site-secret"
+
+  # Community accepted by the optional UDP/162 trap listener. Keep empty to
+  # keep trap monitoring disabled; set a separate site-specific secret before
+  # enabling traps. The listener never falls back to the well-known "public".
+  trap_community = ""
   
   # SNMP timeout in milliseconds
   timeout_ms = 2000
@@ -56,7 +62,7 @@ epson_remote_mode_enabled = false
   # Enable server upload mode (set to true when using with PrintMaster Server)
   enabled = true
   
-  # PrintMaster Server URL (e.g., "http://printmaster.example.com:9090")
+  # PrintMaster Server URL (use HTTPS for every remote server)
   url = "https://localhost:9443"
   
   # Unique agent identifier (auto-generated if blank)
@@ -113,13 +119,15 @@ epson_remote_mode_enabled = false
 
 [database]
   # SQLite database path (blank = use default location)
-  path = 'C:\temp\printmaster\agent\test_db\'
+  path = ''
 
 [logging]
   # Log level: debug, info, warn, error
   level = "info"
 
 [web]
+  # Keep the agent UI on loopback. Remote management uses its authenticated server connection.
+  bind_address = '127.0.0.1'
   # HTTP port for web UI
   http_port = 8080
   

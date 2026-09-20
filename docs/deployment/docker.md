@@ -2,18 +2,28 @@
 
 Deploy PrintMaster Server using Docker containers with multi-architecture support.
 
+> **Production security:** Pin the image to a reviewed release or digest, keep
+> the published port on loopback, and place an HTTPS reverse proxy in front of
+> it. Never copy a password into a command line. See
+> [the production checklist](../PRODUCTION-DEPLOYMENT-TR.md).
+
 ## Quick Start
 
 ```bash
+# server.env must contain ADMIN_PASSWORD (>=16 characters) and, only when
+# automatic enrollment is needed, a random INIT_SECRET (32-4096 bytes).
 docker run -d \
   --name printmaster-server \
-  -p 9090:9090 \
+  -p 127.0.0.1:9090:9090 \
   -v printmaster-data:/var/lib/printmaster/server \
-  -e ADMIN_PASSWORD=your-secure-password \
-  ghcr.io/mstrhakr/printmaster-server:latest
+  -e BIND_ADDRESS=0.0.0.0 \
+  -e BEHIND_PROXY=true \
+  --env-file server.env \
+  ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 ```
 
-Access at `http://localhost:9090` with username `admin`.
+Use `http://127.0.0.1:9090` only for a local smoke test. Public access must
+come through the reverse proxy at the configured HTTPS `SERVER_EXTERNAL_URL`.
 
 ---
 
@@ -37,8 +47,8 @@ Docker automatically pulls the correct architecture for your platform.
 - **User**: Runs as non-root (UID 65532)
 
 **Image tags:**
-- `latest` - Latest stable release (recommended)
-- `v0.23.6` - Specific version
+- `<reviewed-version>` - Pin the exact release selected for production
+- `latest` - Moving convenience tag for evaluation only; do not use it for customer data
 
 ---
 
@@ -50,19 +60,25 @@ Create a `docker-compose.yml` file:
 version: '3.8'
 services:
   printmaster-server:
-    image: ghcr.io/mstrhakr/printmaster-server:latest
+    image: ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
     container_name: printmaster-server
     ports:
-      - "9090:9090"
-      - "9443:9443"  # HTTPS (optional)
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:9443:9443"  # HTTPS (publish through a reverse proxy)
     volumes:
       - printmaster-data:/var/lib/printmaster/server
       - printmaster-logs:/var/log/printmaster/server
     environment:
-      - ADMIN_PASSWORD=your-secure-password
       - BIND_ADDRESS=0.0.0.0
+      - BEHIND_PROXY=true
+      - SERVER_EXTERNAL_URL=https://printmaster.example.com
+      - TRUSTED_PROXIES=127.0.0.1/32
       - LOG_LEVEL=info
       - PM_DISABLE_SELFUPDATE=true
+      # Prefer one-time join tokens. Set INIT_SECRET only for controlled
+      # bootstrap automation; it must be a private random value of at least
+      # 32 bytes.
+      - INIT_SECRET=${INIT_SECRET:-}
     restart: unless-stopped
 
 volumes:
@@ -83,8 +99,9 @@ docker compose up -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ADMIN_PASSWORD` | `printmaster` | **Set before first run!** |
-| `BIND_ADDRESS` | `127.0.0.1` | Set to `0.0.0.0` for external access |
+| `ADMIN_PASSWORD` | required | **Set before first run; no default is accepted.** |
+| `BIND_ADDRESS` | `127.0.0.1` | Keep loopback; use `0.0.0.0` only inside a private container network |
+| `INIT_SECRET` | optional | Auto-enrollment bearer secret; 32-4096 bytes, no whitespace |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
 ### Network & Ports
@@ -100,7 +117,7 @@ docker compose up -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TLS_MODE` | `self-signed` | `none`, `self-signed`, `acme`, `manual` |
+| `TLS_MODE` | `self-signed` | `self-signed`, `custom`, `letsencrypt` |
 | `TLS_CERT_PATH` | — | Certificate path (manual mode) |
 | `TLS_KEY_PATH` | — | Key path (manual mode) |
 
@@ -224,7 +241,7 @@ healthcheck:
 
 ```bash
 # Pull latest image
-docker pull ghcr.io/mstrhakr/printmaster-server:latest
+docker pull ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 
 # Recreate container
 docker compose down
@@ -256,8 +273,8 @@ docker run -d \
   --network host \
   -v printmaster-agent-data:/var/lib/printmaster/agent \
   -e SERVER_ENABLED=true \
-  -e SERVER_URL=http://your-server:9090 \
-  ghcr.io/mstrhakr/printmaster-agent:latest
+  -e SERVER_URL=https://printmaster.example.com \
+  ghcr.io/mstrhakr/printmaster-agent:<reviewed-version>
 ```
 
 > **Note**: `--network host` is required for SNMP discovery to work properly.

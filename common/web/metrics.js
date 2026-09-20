@@ -13,6 +13,16 @@ const TONER_COLOR_MAP = {
     default: '#8bc34a',
 };
 
+function escapeHtmlMetrics(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function normalizeTonerValue(value) {
     if (value === null || value === undefined || value === '') return null;
     if (typeof value === 'number' && !Number.isNaN(value)) {
@@ -159,7 +169,7 @@ function renderTonerLegend(container, tonerSeries) {
         const latestText = lastPoint ? Math.round(lastPoint.value) + '%' : '–';
         return '<div class="toner-legend-item" style="display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(0,0,0,0.15);border-radius:999px;margin:4px 6px;color:var(--text);font-size:12px">'
             + '<span style="width:10px;height:10px;border-radius:50%;background:' + color + ';"></span>'
-            + '<span>' + name + ': <strong>' + latestText + '</strong></span>'
+            + '<span>' + escapeHtmlMetrics(name) + ': <strong>' + escapeHtmlMetrics(latestText) + '</strong></span>'
             + '</div>';
     }).join('');
 }
@@ -183,7 +193,7 @@ async function loadDeviceMetrics(serial, targetId) {
     // Toggle to show/hide the datetime selector (hidden by default)
     const toggleTarget = targetId || '';
     html += '<div style="display:flex;justify-content:flex-end;margin-bottom:8px">';
-    html += '<button id="metrics_toggle_time_btn" data-action="toggle-time" data-target="' + toggleTarget + '" aria-expanded="false" style="padding:6px 10px;font-size:13px">Show time selector</button>';
+    html += '<button id="metrics_toggle_time_btn" data-action="toggle-time" data-target="' + escapeHtmlMetrics(toggleTarget) + '" aria-expanded="false" style="padding:6px 10px;font-size:13px">Show time selector</button>';
     html += '</div>';
 
     // Datetime range picker - hidden by default
@@ -194,11 +204,11 @@ async function loadDeviceMetrics(serial, targetId) {
     html += '<div style="margin-bottom:16px">';
     html += '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">Quick Select:</div>';
     html += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
-    html += "<button id=\"preset_day\" data-action=\"preset\" data-preset=\"day\" data-serial=\"" + serial + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last 24 Hours</button>";
-    html += "<button id=\"preset_week\" data-action=\"preset\" data-preset=\"week\" data-serial=\"" + serial + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last 7 Days</button>";
-    html += "<button id=\"preset_month\" data-action=\"preset\" data-preset=\"month\" data-serial=\"" + serial + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last 30 Days</button>";
-    html += "<button id=\"preset_year\" data-action=\"preset\" data-preset=\"year\" data-serial=\"" + serial + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last Year</button>";
-    html += "<button id=\"preset_all\" data-action=\"preset\" data-preset=\"all\" data-serial=\"" + serial + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">All Time</button>";
+    html += "<button id=\"preset_day\" data-action=\"preset\" data-preset=\"day\" data-serial=\"" + escapeHtmlMetrics(serial) + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last 24 Hours</button>";
+    html += "<button id=\"preset_week\" data-action=\"preset\" data-preset=\"week\" data-serial=\"" + escapeHtmlMetrics(serial) + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last 7 Days</button>";
+    html += "<button id=\"preset_month\" data-action=\"preset\" data-preset=\"month\" data-serial=\"" + escapeHtmlMetrics(serial) + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last 30 Days</button>";
+    html += "<button id=\"preset_year\" data-action=\"preset\" data-preset=\"year\" data-serial=\"" + escapeHtmlMetrics(serial) + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">Last Year</button>";
+    html += "<button id=\"preset_all\" data-action=\"preset\" data-preset=\"all\" data-serial=\"" + escapeHtmlMetrics(serial) + "\" style=\"padding:6px 12px;font-size:13px;min-height:32px\">All Time</button>";
     html += '</div>'; // close metrics_custom_range
     html += '</div>'; // close metrics_time_selector
     html += '</div>';
@@ -220,7 +230,7 @@ async function loadDeviceMetrics(serial, targetId) {
     html += '<input type="checkbox" id="metrics_raw_mode" style="width:16px;height:16px;accent-color:#268bd2" />';
     html += '<span>Raw data mode</span>';
     html += '</label>';
-    html += '<button data-action="refresh" data-serial="' + serial + '" style="flex:1;padding:10px;font-size:14px;min-height:40px;font-weight:600;background:#268bd2;color:#fff">Update Chart</button>';
+    html += '<button data-action="refresh" data-serial="' + escapeHtmlMetrics(serial) + '" style="flex:1;padding:10px;font-size:14px;min-height:40px;font-weight:600;background:#268bd2;color:#fff">Update Chart</button>';
     html += '</div>';
     html += '</div>';
 
@@ -352,7 +362,7 @@ async function initializeCustomDatetimePicker(serial, contentElOverride) {
         try { window.__pm_shared && window.__pm_shared.error && window.__pm_shared.error('[Metrics] Failed to initialize datetime picker:', e); } catch (err) {}
         const contentEl = document.getElementById('metrics_content');
         if (contentEl) {
-            contentEl.innerHTML = '<div style="color:#d33;padding:12px">Error loading metrics: ' + e.message + '</div>';
+            contentEl.innerHTML = '<div style="color:#d33;padding:12px">Error loading metrics: ' + escapeHtmlMetrics(e && e.message ? e.message : e) + '</div>';
         }
     }
 }
@@ -604,9 +614,9 @@ async function refreshMetricsChart(serial) {
                     const ts = new Date(item.timestamp).toLocaleString();
                     rowsHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.03)">';
                     rowsHtml += '<td style="padding:8px 12px;display:flex;align-items:center;justify-content:space-between">';
-                    rowsHtml += '<span>' + ts + ' <span style="color:var(--muted);font-size:11px;margin-left:6px">(' + (item.tier || 'raw') + ')</span></span>';
+                    rowsHtml += '<span>' + escapeHtmlMetrics(ts) + ' <span style="color:var(--muted);font-size:11px;margin-left:6px">(' + escapeHtmlMetrics(item.tier || 'raw') + ')</span></span>';
                     rowsHtml += '<span style="margin-left:12px">';
-                    rowsHtml += '<button class="trash-btn" data-id="' + (item.id || '') + '" data-tier="' + (item.tier || '') + '" title="Delete this metrics row"></button>';
+                    rowsHtml += '<button class="trash-btn" data-id="' + escapeHtmlMetrics(item.id || '') + '" data-tier="' + escapeHtmlMetrics(item.tier || '') + '" title="Delete this metrics row"></button>';
                     rowsHtml += '</span>';
                     rowsHtml += '</td>';
                     rowsHtml += '<td style="padding:8px 12px;text-align:right">' + ((item.page_count||0).toLocaleString()) + '</td>';
@@ -1175,4 +1185,3 @@ window.initializeCustomDatetimePicker = window.initializeCustomDatetimePicker ||
 window.setMetricsQuickRange = window.setMetricsQuickRange || setMetricsQuickRange;
 window.refreshMetricsChart = window.refreshMetricsChart || refreshMetricsChart;
 window.loadUsageGraph = window.loadUsageGraph || loadUsageGraph;
-

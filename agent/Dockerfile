@@ -56,8 +56,8 @@ WORKDIR /var/lib/printmaster/agent
 # Set environment to indicate Docker environment
 # Default to root; users can override PUID/PGID to drop privileges
 ENV DOCKER=true \
-    PUID=0 \
-    PGID=0
+    PUID=99 \
+    PGID=100
 
 # Expose web UI port (default 8080 HTTP, 8443 HTTPS)
 EXPOSE 8080 8443

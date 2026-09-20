@@ -57,7 +57,7 @@
             filterOptions: ['healthy', 'warning', 'error', 'jam'],
             render: (device, meta) => {
                 return window.__pm_shared?.renderDeviceStatusBadge?.(meta.status) || 
-                    `<span class="status-pill ${meta.status?.code || 'healthy'}">${escapeHtml(meta.status?.label || 'healthy')}</span>`;
+                    `<span class="status-pill ${['healthy', 'warning', 'error', 'jam'].includes(meta.status?.code) ? meta.status.code : 'healthy'}">${escapeHtml(meta.status?.label || 'healthy')}</span>`;
             }
         },
         {
@@ -369,7 +369,7 @@
             filterOptions: ['active', 'degraded', 'offline'],
             render: (agent, meta) => {
                 return window.renderAgentStatusBadge?.(meta) || 
-                    `<span class="status-pill ${meta.statusKey || 'offline'}">${escapeHtml(meta.statusLabel || 'Unknown')}</span>`;
+                    `<span class="status-pill ${['active', 'degraded', 'offline'].includes(meta.statusKey) ? meta.statusKey : 'offline'}">${escapeHtml(meta.statusLabel || 'Unknown')}</span>`;
             }
         },
         {
@@ -532,14 +532,25 @@
             }
 
             // Build columns from definitions + saved config
+            const savedColumns = Array.isArray(savedConfig?.columns) ? savedConfig.columns : [];
             this.columns = this.options.columnDefs.map((def, index) => {
-                const saved = savedConfig?.columns?.find(c => c.id === def.id);
+                const saved = savedColumns.find(c => c && c.id === def.id);
+                const defaultPinned = def.pinnedRight ? 'right' : (def.pinned ? 'left' : null);
+                const savedOrder = Number(saved?.order);
+                const savedWidth = Number(saved?.width);
+                const pinned = def.pinnable && (saved?.pinned === 'left' || saved?.pinned === 'right')
+                    ? saved.pinned : defaultPinned;
                 return {
                     ...def,
-                    visible: saved?.visible ?? !def.defaultHidden,
-                    order: saved?.order ?? index,
-                    width: saved?.width ?? def.width,
-                    pinned: saved?.pinned ?? (def.pinnedRight ? 'right' : (def.pinned ? 'left' : null))
+                    // localStorage is user-controlled; accept only the scalar
+                    // types and bounded values used by the renderer. This
+                    // prevents crafted table state from escaping into style
+                    // or class attributes.
+                    visible: typeof saved?.visible === 'boolean' ? saved.visible : !def.defaultHidden,
+                    order: Number.isSafeInteger(savedOrder) && savedOrder >= 0 ? savedOrder : index,
+                    width: Number.isFinite(savedWidth) && savedWidth >= (def.minWidth || 50) && savedWidth <= 2000
+                        ? savedWidth : def.width,
+                    pinned
                 };
             });
 
@@ -547,8 +558,25 @@
             this.columns.sort((a, b) => a.order - b.order);
 
             // Restore sort state
-            if (savedConfig?.sortState) {
-                this.sortState = savedConfig.sortState;
+            const allowedSortKeys = new Set(this.options.columnDefs.map(c => c.sortKey).filter(Boolean));
+            const rawSort = savedConfig?.sortState;
+            if (rawSort && typeof rawSort === 'object') {
+                const normalizeSort = (entry) => {
+                    if (!entry || !allowedSortKeys.has(entry.key)) return null;
+                    const dir = entry.dir === 'desc' ? 'desc' : entry.dir === 'asc' ? 'asc' : null;
+                    return dir ? { key: entry.key, dir } : null;
+                };
+                const primary = normalizeSort(rawSort);
+                const multiSort = Array.isArray(rawSort.multiSort)
+                    ? rawSort.multiSort.map(normalizeSort).filter(Boolean).slice(0, this.options.columnDefs.length)
+                    : [];
+                if (primary || multiSort.length > 0) {
+                    this.sortState = {
+                        key: primary?.key || null,
+                        dir: primary?.dir || 'asc',
+                        multiSort
+                    };
+                }
             }
         }
 
@@ -752,7 +780,7 @@
                         <div class="column-picker-list" data-group="${title.toLowerCase()}">
                             ${cols.map(col => `
                                 <div class="column-picker-item ${col.visible ? 'column-visible' : 'column-hidden'} ${col.pinned ? 'pinned-' + col.pinned : ''}" 
-                                     data-column-id="${col.id}"
+                                     data-column-id="${escapeHtml(col.id)}"
                                      draggable="${showDrag && this.options.enableReorder && col.visible ? 'true' : 'false'}">
                                     ${showDrag && this.options.enableReorder && col.visible ? `
                                         <span class="column-drag-handle" title="Drag to reorder">⋮⋮</span>
@@ -762,17 +790,17 @@
                                         <input type="checkbox" 
                                                ${col.visible ? 'checked' : ''} 
                                                ${!col.hideable ? 'disabled' : ''}
-                                               data-column-id="${col.id}">
+                                               data-column-id="${escapeHtml(col.id)}">
                                     </label>
                                     ${col.pinnable ? `
                                         <div class="column-pin-controls">
                                             <button class="pin-btn ${col.pinned === 'left' ? 'active' : ''}" 
                                                     data-pin="left" 
-                                                    data-column-id="${col.id}" 
+                                                    data-column-id="${escapeHtml(col.id)}"
                                                     title="Pin to left">◀</button>
                                             <button class="pin-btn ${col.pinned === 'right' ? 'active' : ''}" 
                                                     data-pin="right" 
-                                                    data-column-id="${col.id}" 
+                                                    data-column-id="${escapeHtml(col.id)}"
                                                     title="Pin to right">▶</button>
                                         </div>
                                     ` : ''}
@@ -835,8 +863,8 @@
                 const actionsClass = col.isActions ? 'actions-col' : '';
                 
                 return `
-                    <th data-column-id="${col.id}" 
-                        data-sort-key="${col.sortKey || ''}"
+                    <th data-column-id="${escapeHtml(col.id)}"
+                        data-sort-key="${escapeHtml(col.sortKey || '')}"
                         class="${sortable} ${pinClass} ${actionsClass} ${isSorted ? 'sorted' : ''}"
                         ${widthStyle}>
                         <div class="th-content">
@@ -844,7 +872,7 @@
                             ${sortIndicator}
                         </div>
                         ${col.resizable && this.options.enableResize ? `
-                            <div class="column-resize-handle" data-column-id="${col.id}"></div>
+                            <div class="column-resize-handle" data-column-id="${escapeHtml(col.id)}"></div>
                         ` : ''}
                     </th>
                 `;
@@ -870,7 +898,7 @@
                     content = '<span class="muted-text">—</span>';
                 }
                 
-                return `<td class="${pinClass} ${actionsClass}" data-column-id="${col.id}">${content}</td>`;
+                return `<td class="${pinClass} ${actionsClass}" data-column-id="${escapeHtml(col.id)}">${content}</td>`;
             }).join('');
         }
 

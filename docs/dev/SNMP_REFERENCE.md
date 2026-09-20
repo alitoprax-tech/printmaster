@@ -256,7 +256,7 @@ Devices stored in `logs/devices/<serial>.json`:
 
 **Connection:**
 - SNMP Port: `161` (default)
-- SNMP Community: `"public"` (default)
+- SNMP Community: site-specific value (`public` is a legacy lab fallback)
 - SNMP Version: `v2c` (default)
 
 **Timing:**

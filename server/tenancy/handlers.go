@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -20,25 +22,28 @@ import (
 	"printmaster/server/storage"
 
 	"printmaster/common/logger"
+	webutil "printmaster/common/web"
 )
 
-// getEffectiveScheme determines the protocol scheme, checking X-Forwarded-Proto
-// for requests behind a reverse proxy (Cloudflare, nginx, etc.) where TLS
-// termination happens at the proxy level.
-func getEffectiveScheme(r *http.Request) string {
-	// Check for proxy-forwarded protocol header first (Cloudflare, nginx, etc.)
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		return proto
+func buildTenancyExternalURL(r *http.Request) string {
+	if externalURLBuilder != nil {
+		if value := strings.TrimRight(strings.TrimSpace(externalURLBuilder(r)), "/"); value != "" {
+			return value
+		}
 	}
-	// Check the internal header set by reverseProxyMiddleware
-	if proto := r.Header.Get("X-Detected-Proto"); proto != "" {
-		return proto
+	host := "localhost"
+	if r != nil {
+		candidate := strings.TrimSpace(r.Host)
+		if hostOnly, _, err := net.SplitHostPort(candidate); err == nil {
+			candidate = hostOnly
+		}
+		if strings.EqualFold(candidate, "localhost") || (net.ParseIP(candidate) != nil && net.ParseIP(candidate).IsLoopback()) {
+			if !strings.ContainsAny(r.Host, "\r\n/@\\") {
+				host = r.Host
+			}
+		}
 	}
-	// Fall back to direct TLS detection
-	if r.TLS != nil {
-		return "https"
-	}
-	return "http"
+	return "https://" + host
 }
 
 // RegisterRoutes registers HTTP handlers for tenancy endpoints.
@@ -110,13 +115,164 @@ var emailSender func(to, subject, htmlBody, textBody string) error
 // emailThemeGetter, when configured, returns the configured email theme.
 var emailThemeGetter func() string
 
+// externalURLBuilder is supplied by the server so generated bootstrap links
+// use the configured canonical URL rather than an untrusted Host header.
+var externalURLBuilder func(*http.Request) string
+
 // getUserFromContext, when configured, retrieves the current user from request context.
 var getUserFromContext func(ctx context.Context) *storage.User
 
 var (
-	releaseAssetBaseURL   = "https://github.com/mstrhakr/printmaster/releases/download"
-	releaseDownloadClient = &http.Client{Timeout: 2 * time.Minute}
+	defaultReleaseAssetBaseURL = "https://github.com/mstrhakr/printmaster/releases/download"
+	releaseAssetBaseURL        = defaultReleaseAssetBaseURL
+	releaseDownloadClient      = &http.Client{Timeout: 2 * time.Minute, CheckRedirect: checkReleaseRedirect}
 )
+
+const (
+	maxAgentDownloadBytes       int64 = 256 << 20
+	maxConcurrentAgentDownloads       = 4
+)
+
+var agentDownloadSlots = make(chan struct{}, maxConcurrentAgentDownloads)
+
+// checkReleaseRedirect keeps the download proxy on GitHub's HTTPS release
+// infrastructure. The initial URL is fixed, but release assets legitimately
+// redirect to GitHub's CDN; following an arbitrary Location would reintroduce
+// SSRF and allow a compromised upstream to target private network services.
+func checkReleaseRedirect(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") {
+		return fmt.Errorf("release redirect must use HTTPS")
+	}
+	host := strings.ToLower(strings.TrimSuffix(req.URL.Hostname(), "."))
+	if host != "github.com" && host != "githubusercontent.com" &&
+		!strings.HasSuffix(host, ".github.com") && !strings.HasSuffix(host, ".githubusercontent.com") {
+		return fmt.Errorf("release redirect host is not trusted")
+	}
+	if len(via) >= 5 {
+		return fmt.Errorf("too many release redirects")
+	}
+	return nil
+}
+
+func acquireAgentDownload(ctx context.Context) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case agentDownloadSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func releaseAgentDownload() {
+	select {
+	case <-agentDownloadSlots:
+	default:
+	}
+}
+
+type enrollmentRateEntry struct {
+	windowStart time.Time
+	count       int
+}
+
+var publicEnrollmentRate = struct {
+	sync.Mutex
+	entries map[string]enrollmentRateEntry
+}{entries: make(map[string]enrollmentRateEntry)}
+
+// Argon2 verification is intentionally expensive. A small process-wide slot
+// pool prevents a distributed flood of valid-looking enrollment requests from
+// consuming unbounded memory/CPU even when each source IP stays below its
+// individual rate limit.
+var publicEnrollmentSlots = make(chan struct{}, 4)
+
+const (
+	publicEnrollmentWindow  = time.Minute
+	publicEnrollmentLimit   = 20
+	publicEnrollmentMaxKeys = 4096
+)
+
+func publicEnrollmentKey(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	if remote := strings.TrimSpace(r.RemoteAddr); remote != "" {
+		return remote
+	}
+	return "unknown"
+}
+
+// allowPublicEnrollment bounds the Argon2 work and pending-row creation on
+// the unauthenticated enrollment endpoint.  The map is capped and expired
+// entries are evicted so attacker-controlled IPs cannot grow it forever.
+func allowPublicEnrollment(r *http.Request) bool {
+	now := time.Now().UTC()
+	key := publicEnrollmentKey(r)
+	publicEnrollmentRate.Lock()
+	defer publicEnrollmentRate.Unlock()
+	for k, entry := range publicEnrollmentRate.entries {
+		if now.Sub(entry.windowStart) >= publicEnrollmentWindow {
+			delete(publicEnrollmentRate.entries, k)
+		}
+	}
+	entry, ok := publicEnrollmentRate.entries[key]
+	if !ok || now.Sub(entry.windowStart) >= publicEnrollmentWindow {
+		if len(publicEnrollmentRate.entries) >= publicEnrollmentMaxKeys {
+			return false
+		}
+		publicEnrollmentRate.entries[key] = enrollmentRateEntry{windowStart: now, count: 1}
+		return true
+	}
+	if entry.count >= publicEnrollmentLimit {
+		return false
+	}
+	entry.count++
+	publicEnrollmentRate.entries[key] = entry
+	return true
+}
+
+// requestTenantAccess returns the tenant scope carried by the authenticated
+// web user. Pending registrations are indexed by the tenant of the expired
+// token, so every read or mutation must use this scope before touching the
+// record.
+func requestTenantAccess(r *http.Request) (*storage.User, map[string]struct{}, bool) {
+	if getUserFromContext == nil {
+		return nil, nil, false
+	}
+	u := getUserFromContext(r.Context())
+	if u == nil {
+		return nil, nil, false
+	}
+	if storage.NormalizeRole(string(u.Role)) == storage.RoleAdmin {
+		return u, nil, true
+	}
+	ids := append([]string{}, u.TenantIDs...)
+	if len(ids) == 0 && strings.TrimSpace(u.TenantID) != "" {
+		ids = []string{strings.TrimSpace(u.TenantID)}
+	}
+	allowed := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+	return u, allowed, len(allowed) > 0
+}
+
+func pendingTenantAllowed(allowed map[string]struct{}, admin bool, tenantID string) bool {
+	if admin {
+		return true
+	}
+	_, ok := allowed[strings.TrimSpace(tenantID)]
+	return ok
+}
 
 // SetAgentEventSink registers a callback invoked for agent lifecycle events.
 func SetAgentEventSink(sink func(eventType string, data map[string]interface{})) {
@@ -141,6 +297,10 @@ func SetEmailSender(sender func(to, subject, htmlBody, textBody string) error) {
 // SetEmailThemeGetter wires the function that returns the configured email theme.
 func SetEmailThemeGetter(getter func() string) {
 	emailThemeGetter = getter
+}
+
+func SetExternalURLBuilder(builder func(*http.Request) string) {
+	externalURLBuilder = builder
 }
 
 // SetUserFromContextGetter wires the function that retrieves the current user from context.
@@ -186,7 +346,7 @@ func maskTokenValue(token string) string {
 		return ""
 	}
 	if len(token) <= 8 {
-		return token
+		return "[redacted]"
 	}
 	return token[:4] + "..." + token[len(token)-2:]
 }
@@ -259,6 +419,24 @@ var installStore = struct {
 	m  map[string]installEntry
 }{
 	m: make(map[string]installEntry),
+}
+
+const maxInstallEntries = 4096
+
+func storeInstallEntry(code string, entry installEntry) bool {
+	installStore.mu.Lock()
+	defer installStore.mu.Unlock()
+	now := time.Now().UTC()
+	for existing, value := range installStore.m {
+		if !now.Before(value.ExpiresAt) {
+			delete(installStore.m, existing)
+		}
+	}
+	if _, exists := installStore.m[code]; !exists && len(installStore.m) >= maxInstallEntries {
+		return false
+	}
+	installStore.m[code] = entry
+	return true
 }
 
 var installCleanerOnce sync.Once
@@ -372,7 +550,7 @@ func handleTenants(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var in tenantPayload
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"error":"invalid json"}`))
 			return
@@ -542,7 +720,7 @@ func handleTenantByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var in tenantPayload
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"error":"invalid json"}`))
 			return
@@ -705,7 +883,7 @@ func handleCreateJoinToken(w http.ResponseWriter, r *http.Request) {
 		TTLMinutes int    `json:"ttl_minutes"`
 		OneTime    bool   `json:"one_time"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 		pkgLogger.Warn("create-join-token: invalid JSON", "remote_addr", r.RemoteAddr, "error", err)
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid json"}`))
@@ -838,7 +1016,7 @@ func handleRevokeJoinToken(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid json"}`))
 		return
@@ -895,6 +1073,12 @@ func handlePendingRegistrations(w http.ResponseWriter, r *http.Request) {
 	if !authorizeOrReject(w, r, authz.ActionAgentsRead, authz.ResourceRef{}) {
 		return
 	}
+	user, allowedTenants, scopeOK := requestTenantAccess(r)
+	admin := user != nil && storage.NormalizeRole(string(user.Role)) == storage.RoleAdmin
+	if !admin && !scopeOK {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	if dbStore == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte(`{"error":"database not available"}`))
@@ -909,6 +1093,15 @@ func handlePendingRegistrations(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error":"failed to list pending registrations"}`))
 		return
+	}
+	if !admin {
+		filtered := make([]*storage.PendingAgentRegistration, 0, len(list))
+		for _, reg := range list {
+			if reg != nil && pendingTenantAllowed(allowedTenants, false, reg.ExpiredTenantID) {
+				filtered = append(filtered, reg)
+			}
+		}
+		list = filtered
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -937,13 +1130,19 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if !authorizeOrReject(w, r, authz.ActionAgentsRead, authz.ResourceRef{}) {
-			return
-		}
 		reg, err := dbStore.GetPendingAgentRegistration(r.Context(), id)
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte(`{"error":"registration not found"}`))
+			return
+		}
+		user, allowedTenants, scopeOK := requestTenantAccess(r)
+		admin := user != nil && storage.NormalizeRole(string(user.Role)) == storage.RoleAdmin
+		if !scopeOK && !admin {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !pendingTenantAllowed(allowedTenants, admin, reg.ExpiredTenantID) || !authorizeOrReject(w, r, authz.ActionAgentsRead, authz.ResourceRef{TenantIDs: []string{reg.ExpiredTenantID}}) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -951,7 +1150,22 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		// Approve or reject
-		if !authorizeOrReject(w, r, authz.ActionAgentsWrite, authz.ResourceRef{}) {
+		reg, err := dbStore.GetPendingAgentRegistration(r.Context(), id)
+		if err != nil || reg == nil {
+			http.Error(w, "registration not found", http.StatusNotFound)
+			return
+		}
+		user, allowedTenants, scopeOK := requestTenantAccess(r)
+		admin := user != nil && storage.NormalizeRole(string(user.Role)) == storage.RoleAdmin
+		if !scopeOK && !admin {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !pendingTenantAllowed(allowedTenants, admin, reg.ExpiredTenantID) || !authorizeOrReject(w, r, authz.ActionAgentsWrite, authz.ResourceRef{TenantIDs: []string{reg.ExpiredTenantID}}) {
+			return
+		}
+		if reg.Status != storage.PendingStatusPending {
+			http.Error(w, "registration already reviewed", http.StatusConflict)
 			return
 		}
 		var in struct {
@@ -959,13 +1173,16 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 			TenantID string `json:"tenant_id,omitempty"` // For approve
 			Notes    string `json:"notes,omitempty"`     // For reject
 		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"error":"invalid json"}`))
 			return
 		}
 
-		username := "admin" // TODO: Extract from auth context when available
+		username := "system"
+		if user != nil && strings.TrimSpace(user.Username) != "" {
+			username = strings.TrimSpace(user.Username)
+		}
 
 		switch in.Action {
 		case "approve":
@@ -974,8 +1191,15 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 				w.Write([]byte(`{"error":"tenant_id required for approval"}`))
 				return
 			}
+			if !pendingTenantAllowed(allowedTenants, admin, in.TenantID) {
+				http.Error(w, "tenant not permitted", http.StatusForbidden)
+				return
+			}
+			if tenant, tenantErr := dbStore.GetTenant(r.Context(), strings.TrimSpace(in.TenantID)); tenantErr != nil || tenant == nil {
+				http.Error(w, "tenant not found", http.StatusBadRequest)
+				return
+			}
 			// Get registration details before approving for SSE broadcast
-			reg, _ := dbStore.GetPendingAgentRegistration(r.Context(), id)
 			if err := dbStore.ApprovePendingRegistration(r.Context(), id, in.TenantID, username); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(`{"error":"failed to approve registration"}`))
@@ -1016,7 +1240,7 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 
 		case "reject":
 			// Get registration details before rejecting for SSE broadcast
-			regForReject, _ := dbStore.GetPendingAgentRegistration(r.Context(), id)
+			regForReject := reg
 			if err := dbStore.RejectPendingRegistration(r.Context(), id, username, in.Notes); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(`{"error":"failed to reject registration"}`))
@@ -1050,7 +1274,18 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case http.MethodDelete:
-		if !authorizeOrReject(w, r, authz.ActionAgentsWrite, authz.ResourceRef{}) {
+		reg, err := dbStore.GetPendingAgentRegistration(r.Context(), id)
+		if err != nil || reg == nil {
+			http.Error(w, "registration not found", http.StatusNotFound)
+			return
+		}
+		user, allowedTenants, scopeOK := requestTenantAccess(r)
+		admin := user != nil && storage.NormalizeRole(string(user.Role)) == storage.RoleAdmin
+		if !scopeOK && !admin {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !pendingTenantAllowed(allowedTenants, admin, reg.ExpiredTenantID) || !authorizeOrReject(w, r, authz.ActionAgentsWrite, authz.ResourceRef{TenantIDs: []string{reg.ExpiredTenantID}}) {
 			return
 		}
 		if err := dbStore.DeletePendingAgentRegistration(r.Context(), id); err != nil {
@@ -1085,6 +1320,10 @@ func handleRegisterWithToken(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !allowPublicEnrollment(r) {
+		http.Error(w, "enrollment rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
 	var in struct {
 		Token           string `json:"token"`
 		AgentID         string `json:"agent_id"`
@@ -1102,12 +1341,18 @@ func handleRegisterWithToken(w http.ResponseWriter, r *http.Request) {
 		BuildType       string `json:"build_type,omitempty"`
 		GitCommit       string `json:"git_commit,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err := decoder.Decode(&in); err != nil {
 		if pkgLogger != nil {
 			pkgLogger.Warn("register-with-token: invalid JSON", "remote_addr", r.RemoteAddr, "error", err)
 		}
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid json"}`))
+		return
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		http.Error(w, "expected one bounded JSON document", http.StatusBadRequest)
 		return
 	}
 	if pkgLogger != nil {
@@ -1119,10 +1364,49 @@ func handleRegisterWithToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if dbStore != nil {
+		select {
+		case publicEnrollmentSlots <- struct{}{}:
+			defer func() { <-publicEnrollmentSlots }()
+		case <-r.Context().Done():
+			http.Error(w, "request canceled", http.StatusRequestTimeout)
+			return
+		}
 		if pkgLogger != nil {
 			pkgLogger.Debug("register-with-token: validating with dbStore", "agent_id", in.AgentID)
 		}
-		jt, err := dbStore.ValidateJoinToken(r.Context(), in.Token)
+		// Create or update agent in server DB with tenant assignment and issue a secure token
+		// Generate secure random token (256 bits -> base64url)
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"failed to generate agent token"}`))
+			return
+		}
+		token := base64.URLEncoding.EncodeToString(b)
+
+		// Prepare agent metadata; persistence and token consumption commit together.
+		ag := &storage.Agent{
+			AgentID:         in.AgentID,
+			Name:            in.Name,
+			Hostname:        in.Hostname,
+			IP:              in.IP,
+			Platform:        in.Platform,
+			Version:         in.AgentVersion,
+			Token:           token,
+			RegisteredAt:    time.Now().UTC(),
+			LastSeen:        time.Now().UTC(),
+			Status:          "active",
+			OSVersion:       in.OSVersion,
+			GoVersion:       in.GoVersion,
+			Architecture:    in.Architecture,
+			NumCPU:          in.NumCPU,
+			TotalMemoryMB:   in.TotalMemoryMB,
+			BuildType:       in.BuildType,
+			GitCommit:       in.GitCommit,
+			ProtocolVersion: in.ProtocolVersion,
+			// Tenant assignment is supplied by the atomic enrollment transaction.
+		}
+		jt, err := dbStore.EnrollAgent(r.Context(), in.Token, ag)
 		if err != nil {
 			// Check if this is an expired (but known) token - we can capture these for admin review
 			if storage.IsExpiredToken(err) {
@@ -1144,6 +1428,24 @@ func handleRegisterWithToken(w http.ResponseWriter, r *http.Request) {
 						ExpiredTokenID:  tve.TokenID,
 						ExpiredTenantID: tve.TenantID,
 						Status:          storage.PendingStatusPending,
+					}
+					// Do not create an unbounded stream of identical pending rows
+					// when a stale agent retries. The endpoint is public and the
+					// token hash lookup is deliberately expensive.
+					pendingList, listErr := dbStore.ListPendingAgentRegistrations(r.Context(), storage.PendingStatusPending)
+					if listErr == nil {
+						duplicate := false
+						for _, existing := range pendingList {
+							if existing != nil && existing.AgentID == pending.AgentID && existing.ExpiredTokenID == pending.ExpiredTokenID {
+								duplicate = true
+								break
+							}
+						}
+						if duplicate {
+							w.WriteHeader(http.StatusUnauthorized)
+							w.Write([]byte(`{"error":"token expired - registration pending admin approval"}`))
+							return
+						}
 					}
 					pendingID, createErr := dbStore.CreatePendingAgentRegistration(r.Context(), pending)
 					if createErr != nil {
@@ -1209,47 +1511,6 @@ func handleRegisterWithToken(w http.ResponseWriter, r *http.Request) {
 
 		if pkgLogger != nil {
 			pkgLogger.Info("register-with-token: token validated successfully", "agent_id", in.AgentID, "tenant_id", jt.TenantID, "token_id", jt.ID)
-		}
-
-		// Create or update agent in server DB with tenant assignment and issue a secure token
-		// Generate secure random token (256 bits -> base64url)
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to generate agent token"}`))
-			return
-		}
-		token := base64.URLEncoding.EncodeToString(b)
-
-		// Persist agent with tenant assignment using storage.Store.RegisterAgent
-		ag := &storage.Agent{
-			AgentID:         in.AgentID,
-			Name:            in.Name,
-			Hostname:        in.Hostname,
-			IP:              in.IP,
-			Platform:        in.Platform,
-			Version:         in.AgentVersion,
-			Token:           token,
-			RegisteredAt:    time.Now().UTC(),
-			LastSeen:        time.Now().UTC(),
-			Status:          "active",
-			OSVersion:       in.OSVersion,
-			GoVersion:       in.GoVersion,
-			Architecture:    in.Architecture,
-			NumCPU:          in.NumCPU,
-			TotalMemoryMB:   in.TotalMemoryMB,
-			BuildType:       in.BuildType,
-			GitCommit:       in.GitCommit,
-			ProtocolVersion: in.ProtocolVersion,
-			TenantID:        jt.TenantID,
-		}
-		if err := dbStore.RegisterAgent(r.Context(), ag); err != nil {
-			if pkgLogger != nil {
-				pkgLogger.Error("register-with-token: failed to register agent", "agent_id", in.AgentID, "error", err)
-			}
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to register agent"}`))
-			return
 		}
 
 		if pkgLogger != nil {
@@ -1438,7 +1699,7 @@ func handleGeneratePackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in packageRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid json"}`))
 		return
@@ -1451,6 +1712,9 @@ func handleGeneratePackage(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.TTLMinutes <= 0 {
 		in.TTLMinutes = 10
+	}
+	if in.TTLMinutes > 24*60 {
+		in.TTLMinutes = 24 * 60
 	}
 	platform := normalizePlatform(in.Platform)
 	installerType := strings.ToLower(strings.TrimSpace(in.InstallerType))
@@ -1499,8 +1763,7 @@ func handleGeneratePackage(w http.ResponseWriter, r *http.Request) {
 		rawToken = jt.Token
 	}
 
-	scheme := getEffectiveScheme(r)
-	serverURL := scheme + "://" + r.Host
+	serverURL := buildTenancyExternalURL(r)
 
 	recordAudit(r, &storage.AuditEntry{
 		Action:     "package.generate",
@@ -1523,7 +1786,11 @@ func handleGeneratePackage(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "unable to build bootstrap script")
 			return
 		}
-		code := randomHex(12)
+		code, err := randomHex(12)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to generate install code")
+			return
+		}
 		oneTimeDownload := true
 		if inOneTime, ok := r.URL.Query()["one_time_download"]; ok && len(inOneTime) > 0 {
 			value := strings.ToLower(strings.TrimSpace(inOneTime[0]))
@@ -1532,18 +1799,16 @@ func handleGeneratePackage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		expiresAt := time.Now().UTC().Add(time.Duration(in.TTLMinutes) * time.Minute)
-		installStore.mu.Lock()
-		installStore.m[code] = installEntry{Script: script, Filename: filename, ExpiresAt: expiresAt, OneTime: oneTimeDownload}
-		installStore.mu.Unlock()
+		if !storeInstallEntry(code, installEntry{Script: script, Filename: filename, ExpiresAt: expiresAt, OneTime: oneTimeDownload}) {
+			writeJSONError(w, http.StatusServiceUnavailable, "too many active install packages")
+			return
+		}
 
 		downloadURL := fmt.Sprintf("%s/install/%s", serverURL, code)
 		w.Header().Set("Content-Type", "application/json")
-		oneLiner := fmt.Sprintf("curl -fsSL %q | sudo sh", downloadURL)
+		oneLiner := fmt.Sprintf("curl -fsSL '%s' | sudo sh", escapePOSIXSingleQuoted(downloadURL))
 		if platform == "windows" {
-			// Use HTTP for initial fetch (maximum compatibility with older PowerShell/Windows)
-			// The bootstrap script will upgrade to HTTPS when possible for MSI download
-			httpURL := strings.Replace(downloadURL, "https://", "http://", 1)
-			oneLiner = fmt.Sprintf("irm %s | iex", httpURL)
+			oneLiner = fmt.Sprintf("irm '%s' | iex", escapePowerShellSingleQuoted(downloadURL))
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"script":       script,
@@ -1581,7 +1846,7 @@ func handleSendDeploymentEmail(w http.ResponseWriter, r *http.Request) {
 		Email      string `json:"email"`
 		TTLMinutes int    `json:"ttl_minutes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &in, 1<<20); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -1595,6 +1860,9 @@ func handleSendDeploymentEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.TTLMinutes <= 0 {
 		in.TTLMinutes = 60
+	}
+	if in.TTLMinutes > 24*60 {
+		in.TTLMinutes = 24 * 60
 	}
 
 	platform := normalizePlatform(in.Platform)
@@ -1629,8 +1897,7 @@ func handleSendDeploymentEmail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Determine server URL (respects X-Forwarded-Proto for proxy scenarios)
-	scheme := getEffectiveScheme(r)
-	serverURL := scheme + "://" + r.Host
+	serverURL := buildTenancyExternalURL(r)
 
 	// Create a join token
 	var rawToken string
@@ -1660,19 +1927,21 @@ func handleSendDeploymentEmail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store for download URL (not one-time since email may be opened multiple times)
-	code := randomHex(12)
+	code, err := randomHex(12)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to generate install code")
+		return
+	}
 	expiresAt := time.Now().UTC().Add(time.Duration(in.TTLMinutes) * time.Minute)
-	installStore.mu.Lock()
-	installStore.m[code] = installEntry{Script: script, Filename: filename, ExpiresAt: expiresAt, OneTime: false}
-	installStore.mu.Unlock()
+	if !storeInstallEntry(code, installEntry{Script: script, Filename: filename, ExpiresAt: expiresAt, OneTime: false}) {
+		writeJSONError(w, http.StatusServiceUnavailable, "too many active install packages")
+		return
+	}
 
 	downloadURL := fmt.Sprintf("%s/install/%s", serverURL, code)
-	oneLiner := fmt.Sprintf("curl -fsSL %q | sudo sh", downloadURL)
+	oneLiner := fmt.Sprintf("curl -fsSL '%s' | sudo sh", escapePOSIXSingleQuoted(downloadURL))
 	if platform == "windows" {
-		// Use HTTP for initial fetch (maximum compatibility with older PowerShell/Windows)
-		// The bootstrap script will upgrade to HTTPS when possible for MSI download
-		httpURL := strings.Replace(downloadURL, "https://", "http://", 1)
-		oneLiner = fmt.Sprintf("irm %s | iex", httpURL)
+		oneLiner = fmt.Sprintf("irm '%s' | iex", escapePowerShellSingleQuoted(downloadURL))
 	}
 
 	// Get the sender name from the request context (user who initiated)
@@ -1796,18 +2065,42 @@ func installCleanupLoop() {
 }
 
 func buildBootstrapScript(platform, serverURL, token string) (string, string) {
+	// Bootstrap values are embedded into shell scripts.  Quote them for the
+	// target shell before formatting the templates so a malicious Host header
+	// or token can never become executable script text.
+	serverURL = validateBootstrapURL(serverURL)
 	switch normalizePlatform(platform) {
 	case "windows":
-		return fmt.Sprintf(windowsBootstrapScript, serverURL, token), "install.ps1"
+		return fmt.Sprintf(windowsBootstrapScript, escapePowerShellSingleQuoted(serverURL), escapePowerShellSingleQuoted(token)), "install.ps1"
 	default:
-		return fmt.Sprintf(unixBootstrapScript, serverURL, token), "install.sh"
+		return fmt.Sprintf(unixBootstrapScript, escapePOSIXSingleQuoted(serverURL), escapePOSIXSingleQuoted(token)), "install.sh"
 	}
+}
+
+func escapePowerShellSingleQuoted(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
+}
+
+func escapePOSIXSingleQuoted(value string) string {
+	return strings.ReplaceAll(value, "'", "'\"'\"'")
+}
+
+func validateBootstrapURL(value string) string {
+	value = strings.TrimSpace(value)
+	u, err := url.Parse(value)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		!strings.EqualFold(u.Scheme, "https") {
+		// A generated installer must never silently downgrade to clear text.
+		// Keep a syntactically valid placeholder so the script fails closed.
+		return "https://invalid.invalid"
+	}
+	return value
 }
 
 const windowsBootstrapScript = `# PowerShell bootstrap for PrintMaster
 $ErrorActionPreference = "Stop"
-$server = "%s"
-$token = "%s"
+$server = '%s'
+$token = '%s'
 
 # ANSI color codes
 $ESC = [char]27
@@ -1969,10 +2262,7 @@ function Assert-Administrator {
 }
 
 function Set-TlsPolicy {
-	param(
-		[string]$TlsVersion = "Modern",
-		[bool]$IgnoreCerts = $false
-	)
+	param([string]$TlsVersion = "Modern")
 	
 	# Set TLS version
 	switch ($TlsVersion) {
@@ -1995,47 +2285,15 @@ function Set-TlsPolicy {
 		}
 	}
 	
-	if ($IgnoreCerts) {
-		# Skip certificate validation for self-signed certs
-		if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-			Add-Type @"
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-public class TrustAllCertsPolicy : ICertificatePolicy {
-    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
-}
-"@
-		}
-		[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-		[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-	} else {
-		# Use default certificate validation
-		[System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
-	}
+	# Always retain the platform certificate and hostname validation policy.
+	[System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 }
 
-function Confirm-InsecureDownload {
-	param([string]$Reason)
-	
-	Write-Host ""
-	Write-Host "  ${ColorYellow}╔════════════════════════════════════════════════════════════╗${ColorReset}"
-	Write-Host "  ${ColorYellow}║${ColorReset}  ${ColorRed}⚠  SECURITY WARNING${ColorReset}                                       ${ColorYellow}║${ColorReset}"
-	Write-Host "  ${ColorYellow}╠════════════════════════════════════════════════════════════╣${ColorReset}"
-	Write-Host "  ${ColorYellow}║${ColorReset}  $Reason"
-	Write-Host "  ${ColorYellow}║${ColorReset}                                                            ${ColorYellow}║${ColorReset}"
-	Write-Host "  ${ColorYellow}║${ColorReset}  Do you want to continue anyway?                          ${ColorYellow}║${ColorReset}"
-	Write-Host "  ${ColorYellow}╚════════════════════════════════════════════════════════════╝${ColorReset}"
-	Write-Host ""
-	
-	$response = Read-Host "  Type 'yes' to continue, or press Enter to cancel"
-	return ($response -eq 'yes')
-}
-
-function Download-WithFallback {
+function Download-Secure {
 	param([string]$Url, [string]$OutFile)
-	
-	$httpsUrl = $Url -replace '^http://', 'https://'
-	$httpUrl = $Url -replace '^https://', 'http://'
+	if (-not $Url.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) {
+		throw "Refusing to download over a non-HTTPS URL. Configure server.external_url with HTTPS."
+	}
 	
 	# Detect PowerShell version for optimal method selection
 	$isPwsh7 = $PSVersionTable.PSVersion.Major -ge 6
@@ -2043,30 +2301,19 @@ function Download-WithFallback {
 	
 	Show-Info "Detected PowerShell $psVersion"
 	
-	# Build fallback chain - most secure to least secure
-	# Phase 1: Secure connections with certificate validation
+	# Build a secure fallback chain. Every method uses normal certificate
+	# validation; there is deliberately no HTTP or skip-certificate fallback.
 	$secureAttempts = @()
 	
 	if ($isPwsh7) {
 		# PowerShell 7+ has native TLS 1.3 and better cert handling
-		$secureAttempts += @{ Name = "TLS 1.3 (PowerShell 7+)"; Method = "Pwsh7"; TlsVersion = "Tls13"; Url = $httpsUrl; IgnoreCerts = $false }
-		$secureAttempts += @{ Name = "TLS 1.2 (PowerShell 7+)"; Method = "Pwsh7"; TlsVersion = "Tls12"; Url = $httpsUrl; IgnoreCerts = $false }
+		$secureAttempts += @{ Name = "TLS 1.3 (PowerShell 7+)"; Method = "Pwsh7"; TlsVersion = "Tls13"; Url = $Url }
+		$secureAttempts += @{ Name = "TLS 1.2 (PowerShell 7+)"; Method = "Pwsh7"; TlsVersion = "Tls12"; Url = $Url }
 	}
 	
 	# WebClient methods (works on all PS versions)
-	$secureAttempts += @{ Name = "TLS 1.3 (WebClient)"; Method = "WebClient"; TlsVersion = "Tls13"; Url = $httpsUrl; IgnoreCerts = $false }
-	$secureAttempts += @{ Name = "TLS 1.2 (WebClient)"; Method = "WebClient"; TlsVersion = "Tls12"; Url = $httpsUrl; IgnoreCerts = $false }
-	
-	# Phase 2: Connections that ignore certificate validation (requires user consent)
-	$insecureAttempts = @()
-	
-	if ($isPwsh7) {
-		$insecureAttempts += @{ Name = "TLS 1.2 ignore certs (PowerShell 7+)"; Method = "Pwsh7SkipCert"; TlsVersion = "Tls12"; Url = $httpsUrl; IgnoreCerts = $true; Reason = "Certificate validation will be skipped." }
-	}
-	$insecureAttempts += @{ Name = "TLS 1.2 ignore certs (WebClient)"; Method = "WebClient"; TlsVersion = "Tls12"; Url = $httpsUrl; IgnoreCerts = $true; Reason = "Certificate validation will be skipped." }
-	
-	# Phase 3: HTTP fallback (last resort, requires user consent)
-	$httpAttempt = @{ Name = "HTTP (unencrypted)"; Method = "WebClient"; TlsVersion = "Modern"; Url = $httpUrl; IgnoreCerts = $false; Reason = "Connection is UNENCRYPTED - data may be intercepted!" }
+	$secureAttempts += @{ Name = "TLS 1.3 (WebClient)"; Method = "WebClient"; TlsVersion = "Tls13"; Url = $Url }
+	$secureAttempts += @{ Name = "TLS 1.2 (WebClient)"; Method = "WebClient"; TlsVersion = "Tls12"; Url = $Url }
 	
 	$lastError = $null
 	$totalSecure = $secureAttempts.Count
@@ -2078,7 +2325,7 @@ function Download-WithFallback {
 		try {
 			Show-Info "Attempt $attemptNum of $totalSecure - $($attempt.Name)..."
 			
-			Set-TlsPolicy -TlsVersion $attempt.TlsVersion -IgnoreCerts $false
+			Set-TlsPolicy -TlsVersion $attempt.TlsVersion
 			
 			switch ($attempt.Method) {
 				"Pwsh7" {
@@ -2100,69 +2347,12 @@ function Download-WithFallback {
 		}
 	}
 	
-	# Secure methods failed - ask user before trying insecure methods
+	# Secure methods failed. Stop rather than downgrade transport or certificate
+	# validation, because the downloaded executable and enrollment token are
+	# security-sensitive.
 	Show-Warning "All secure download methods failed."
 	Show-Warning "Last error: $lastError"
-	Write-Host ""
-	
-	# Try insecure HTTPS methods (with user consent)
-	foreach ($attempt in $insecureAttempts) {
-		if (-not (Confirm-InsecureDownload -Reason $attempt.Reason)) {
-			Show-Info "User declined insecure download method."
-			continue
-		}
-		
-		try {
-			Show-Info "Trying: $($attempt.Name)..."
-			
-			Set-TlsPolicy -TlsVersion $attempt.TlsVersion -IgnoreCerts $true
-			
-			switch ($attempt.Method) {
-				"Pwsh7SkipCert" {
-					Invoke-WebRequest -Uri $attempt.Url -OutFile $OutFile -SkipCertificateCheck -UseBasicParsing -ErrorAction Stop
-				}
-				"WebClient" {
-					$wc = New-Object System.Net.WebClient
-					$wc.DownloadFile($attempt.Url, $OutFile)
-				}
-			}
-			
-			Show-Warning "Downloaded with certificate validation disabled."
-			Show-Success "Downloaded via $($attempt.Name)"
-			return $true
-		} catch {
-			$lastError = $_.Exception.Message
-			Show-Warning "Failed: $lastError"
-			if (Test-Path $OutFile) {
-				Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
-			}
-		}
-	}
-	
-	# HTTP fallback (last resort, with strong warning)
-	if (Confirm-InsecureDownload -Reason $httpAttempt.Reason) {
-		try {
-			Show-Info "Trying: $($httpAttempt.Name)..."
-			
-			Set-TlsPolicy -TlsVersion "Modern" -IgnoreCerts $false
-			
-			$wc = New-Object System.Net.WebClient
-			$wc.DownloadFile($httpAttempt.Url, $OutFile)
-			
-			Show-Warning "Downloaded over unencrypted HTTP connection!"
-			Show-Success "Downloaded via $($httpAttempt.Name)"
-			return $true
-		} catch {
-			$lastError = $_.Exception.Message
-			Show-Error "HTTP download failed: $lastError"
-			if (Test-Path $OutFile) {
-				Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
-			}
-		}
-	}
-	
-	# All attempts failed or user cancelled
-	Show-Error "Download failed. All methods exhausted or cancelled by user."
+	Show-Error "Download failed. HTTPS certificate validation is required."
 	return $false
 }
 
@@ -2311,7 +2501,7 @@ enabled = true
 url = "$server"
 name = "$agentName"
 token = "$token"
-insecure_skip_verify = true
+insecure_skip_verify = false
 "@
 Set-Content -Path $configPath -Value $configContent -Encoding UTF8
 Show-Success "Configuration saved to $configPath"
@@ -2321,7 +2511,7 @@ Show-Progress -Percent 35 -Message "Downloading agent..."
 
 $downloadUrl = "$server/api/v1/agents/download/latest?platform=windows&arch=amd64&format=exe&proxy=1"
 
-if (-not (Download-WithFallback -Url $downloadUrl -OutFile $tempExePath)) {
+if (-not (Download-Secure -Url $downloadUrl -OutFile $tempExePath)) {
 	Show-CompletionBox -Success $false -Message "Download Failed"
 	exit 1
 }
@@ -2438,9 +2628,14 @@ Write-Host ""
 `
 
 const unixBootstrapScript = `#!/bin/sh
-SERVER="%s"
-TOKEN="%s"
+SERVER='%s'
+TOKEN='%s'
 set -e
+
+case "$SERVER" in
+	https://*) ;;
+	*) echo "Error: server URL must use HTTPS; configure server.external_url." >&2; exit 1 ;;
+esac
 
 # Check for root privileges
 if [ "$(id -u)" -ne 0 ]; then
@@ -2488,7 +2683,7 @@ enabled = true
 url = "$SERVER"
 name = "$AGENT_NAME"
 token = "$TOKEN"
-insecure_skip_verify = true
+insecure_skip_verify = false
 EOF
 	chmod 600 /etc/printmaster/config.toml
 	echo "Configuration: /etc/printmaster/config.toml"
@@ -2547,14 +2742,19 @@ case "$DISTRO_FAMILY" in
 	debian)
 		if command -v apt-get >/dev/null 2>&1; then
 			echo "Installing via APT (Debian/Ubuntu family)..."
-			echo "deb [trusted=yes] $REPO_BASE stable main" > /etc/apt/sources.list.d/printmaster.list
-			apt-get update -qq
-			if apt-get install -y printmaster-agent; then
-				configure_agent
-				systemctl restart printmaster-agent 2>/dev/null || true
-				echo "PrintMaster Agent installed via APT."
-				echo "Check status: systemctl status printmaster-agent"
-				exit 0
+			APT_KEYRING="/usr/share/keyrings/printmaster.gpg"
+			if command -v gpg >/dev/null 2>&1 && install -d -m 0755 /usr/share/keyrings && curl -fsSL "$REPO_BASE/gpg.key" | gpg --dearmor --yes -o "$APT_KEYRING"; then
+				chmod 0644 "$APT_KEYRING"
+				echo "deb [signed-by=$APT_KEYRING] $REPO_BASE stable main" > /etc/apt/sources.list.d/printmaster.list
+				if apt-get update -qq && apt-get install -y printmaster-agent; then
+					configure_agent
+					systemctl restart printmaster-agent 2>/dev/null || true
+					echo "PrintMaster Agent installed via APT."
+					echo "Check status: systemctl status printmaster-agent"
+					exit 0
+				fi
+			else
+				echo "APT signature verification setup failed; falling back to the binary installer."
 			fi
 			echo "APT install failed, falling back to binary..."
 			rm -f /etc/apt/sources.list.d/printmaster.list
@@ -2621,6 +2821,48 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
+// buildReleaseAssetURL constructs an asset URL from the fixed release origin.
+// The loopback exception exists only for in-process httptest servers; an
+// externally configured release origin is never accepted.
+func buildReleaseAssetURL(releaseTag, asset string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(releaseAssetBaseURL))
+	if err != nil || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+		return "", fmt.Errorf("invalid release asset base URL")
+	}
+	host := strings.ToLower(base.Hostname())
+	if !(base.Scheme == "https" && host == "github.com" && base.Port() == "") {
+		// Tests use a local HTTP server.  Keep that narrow exception while
+		// rejecting any other runtime origin that could become an SSRF target.
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", fmt.Errorf("release asset origin must be github.com over HTTPS")
+		}
+		if base.Scheme != "http" && base.Scheme != "https" {
+			return "", fmt.Errorf("release asset origin must use HTTP or HTTPS")
+		}
+	}
+
+	base.Path = strings.TrimRight(base.Path, "/") + "/" + url.PathEscape(releaseTag) + "/" + url.PathEscape(asset)
+	base.RawPath = ""
+	return base.String(), nil
+}
+
+func safeReleaseVersion(version string) bool {
+	version = strings.TrimSpace(version)
+	if version == "" || len(version) > 64 {
+		return false
+	}
+	for _, r := range version {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		if r != '.' && r != '-' && r != '+' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 // handleAgentDownloadLatest redirects to the latest compatible agent binary
 // on GitHub Releases. Query params accepted: ?platform=linux|windows|darwin&arch=amd64|arm64
 // If server version was supplied by main via SetServerVersion, that is used;
@@ -2628,8 +2870,8 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 // directory. If no version can be determined, a 404 is returned.
 func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	platform := strings.ToLower(q.Get("platform"))
-	arch := strings.ToLower(q.Get("arch"))
+	platform := strings.ToLower(strings.TrimSpace(q.Get("platform")))
+	arch := strings.ToLower(strings.TrimSpace(q.Get("arch")))
 	proxyParam := strings.ToLower(q.Get("proxy"))
 	proxyDownload := proxyParam == "1" || proxyParam == "true" || proxyParam == "yes"
 	if platform == "" {
@@ -2639,12 +2881,31 @@ func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 		arch = "amd64"
 	}
 	switch platform {
+	case "linux":
+		platform = "linux"
 	case "win", "windows", "windows_nt":
 		platform = "windows"
 	case "mac", "darwin", "osx":
 		platform = "darwin"
 	default:
-		platform = "linux"
+		http.Error(w, "unsupported platform", http.StatusBadRequest)
+		return
+	}
+	if arch != "amd64" && arch != "arm64" {
+		http.Error(w, "unsupported architecture", http.StatusBadRequest)
+		return
+	}
+	format := strings.ToLower(strings.TrimSpace(q.Get("format")))
+	if format == "" {
+		format = "exe"
+	}
+	if format != "exe" && format != "msi" {
+		http.Error(w, "unsupported agent package format", http.StatusBadRequest)
+		return
+	}
+	if platform != "windows" && format == "msi" {
+		http.Error(w, "MSI format is only available for Windows", http.StatusBadRequest)
+		return
 	}
 
 	ver := serverVersion
@@ -2657,6 +2918,10 @@ func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server version unknown", http.StatusNotFound)
 		return
 	}
+	if !safeReleaseVersion(ver) {
+		http.Error(w, "server version is invalid", http.StatusInternalServerError)
+		return
+	}
 
 	tag := ver
 	if !strings.HasPrefix(tag, "v") {
@@ -2664,9 +2929,31 @@ func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 	}
 	releaseTag := "agent-" + tag
 
-	// Determine file extension based on platform and requested format
+	// Select the suffix from constants after the allowlists above.  Keeping
+	// user input out of the URL path itself prevents path traversal and SSRF
+	// taint from reaching the download client.
+	var suffix string
+	switch platform {
+	case "linux":
+		if arch == "amd64" {
+			suffix = "-linux-amd64"
+		} else {
+			suffix = "-linux-arm64"
+		}
+	case "windows":
+		if arch == "amd64" {
+			suffix = "-windows-amd64"
+		} else {
+			suffix = "-windows-arm64"
+		}
+	case "darwin":
+		if arch == "amd64" {
+			suffix = "-darwin-amd64"
+		} else {
+			suffix = "-darwin-arm64"
+		}
+	}
 	ext := ""
-	format := strings.ToLower(q.Get("format"))
 	if platform == "windows" {
 		if format == "msi" {
 			ext = ".msi"
@@ -2674,15 +2961,24 @@ func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 			ext = ".exe"
 		}
 	}
-
-	asset := fmt.Sprintf("printmaster-agent-%s-%s-%s%s", tag, platform, arch, ext)
-	redirectURL := fmt.Sprintf("%s/%s/%s", releaseAssetBaseURL, releaseTag, asset)
+	asset := "printmaster-agent-" + tag + suffix + ext
+	redirectURL, err := buildReleaseAssetURL(releaseTag, asset)
+	if err != nil {
+		http.Error(w, "release asset source is not configured safely", http.StatusInternalServerError)
+		return
+	}
 
 	if !proxyDownload {
 		// Use 302/Found to allow capable clients to follow to GitHub directly.
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 		return
 	}
+	if !acquireAgentDownload(r.Context()) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "agent download capacity is temporarily full", http.StatusTooManyRequests)
+		return
+	}
+	defer releaseAgentDownload()
 
 	// Fall back to proxying the download through the server for older clients
 	// (notably legacy PowerShell) that cannot negotiate GitHub's TLS/SNI
@@ -2703,6 +2999,13 @@ func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("upstream responded with %s", resp.Status), http.StatusBadGateway)
 		return
 	}
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		size, parseErr := strconv.ParseInt(contentLength, 10, 64)
+		if parseErr != nil || size < 0 || size > maxAgentDownloadBytes {
+			http.Error(w, "upstream agent package is too large", http.StatusBadGateway)
+			return
+		}
+	}
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	} else {
@@ -2718,7 +3021,10 @@ func handleAgentDownloadLatest(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	// Unknown-length responses are still capped. If the upstream sends more
+	// than the limit, the client receives a truncated package and must reject it
+	// rather than allowing an unbounded response stream.
+	if _, err := io.Copy(w, io.LimitReader(resp.Body, maxAgentDownloadBytes)); err != nil {
 		// We cannot change the response at this point; best-effort copy only.
 		return
 	}

@@ -59,6 +59,19 @@ func Sanitize(s *Settings) {
 	}
 }
 
+// RedactSecrets removes credential material from a settings value before it is
+// returned to a browser or another low-trust API consumer.  Runtime agent
+// payloads must use the original settings value and should not call this
+// helper.
+func RedactSecrets(s *Settings) {
+	if s == nil {
+		return
+	}
+	s.SNMP.Community = ""
+	s.SNMP.AuthPassword = ""
+	s.SNMP.PrivPassword = ""
+}
+
 // Validate ensures settings satisfy constraints; returns slice of violations.
 func Validate(s Settings) []ValidationError {
 	Sanitize(&s)

@@ -30,6 +30,8 @@ type Manager struct {
 	running bool
 }
 
+const maxUSBProxyResponseBodyBytes int64 = 8 << 20
+
 // NewManager creates a new USB proxy manager
 func NewManager(config Config) (*Manager, error) {
 	if !IsSupported() {
@@ -395,6 +397,17 @@ func (m *Manager) createProxyHandler(session *ProxySession) http.Handler {
 				}
 				w.Header().Set("Location", "/proxy/"+serial+loc)
 			}
+		}
+
+		// Write status code. Unknown-length USB responses are bounded below so a
+		// device cannot exhaust the agent while a browser proxy is open.
+		if resp.ContentLength < 0 {
+			resp.Body = io.NopCloser(io.LimitReader(resp.Body, maxUSBProxyResponseBodyBytes))
+			w.Header().Del("Content-Length")
+		} else if resp.ContentLength > maxUSBProxyResponseBodyBytes {
+			resp.Body.Close()
+			http.Error(w, "USB proxy response too large", http.StatusBadGateway)
+			return
 		}
 
 		// Write status code

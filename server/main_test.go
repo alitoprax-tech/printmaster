@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,29 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLoggingMiddlewareBoundsRequestBody(t *testing.T) {
+	t.Parallel()
+
+	tooLarge := bytes.Repeat([]byte{'x'}, maxRequestBodySize+1)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(tooLarge))
+	rec := httptest.NewRecorder()
+	readErr := error(nil)
+	handler := loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, readErr = io.ReadAll(r.Body)
+		if readErr != nil {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		}
+	}))
+
+	handler.ServeHTTP(rec, req)
+	if readErr == nil {
+		t.Fatal("expected middleware to reject an oversized request body")
+	}
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
 
 // setupTestServer creates a test server with in-memory storage
 func setupTestServer(t *testing.T) (*httptest.Server, storage.Store) {
@@ -580,8 +604,8 @@ func TestHandleLogsAuthorization(t *testing.T) {
 	viewerReq = InjectTestUser(viewerReq, NewTestUser(storage.RoleViewer))
 	viewerRec := httptest.NewRecorder()
 	handleLogs(viewerRec, viewerReq)
-	if viewerRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for viewer, got %d", viewerRec.Code)
+	if viewerRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for viewer, got %d", viewerRec.Code)
 	}
 }
 
@@ -825,6 +849,7 @@ func TestExtractClientIP(t *testing.T) {
 		xRealIP       string
 		expectedIP    string
 		behindProxy   bool // Whether to simulate being behind a proxy
+		trusted       []string
 	}{
 		{
 			name:       "Direct connection",
@@ -837,6 +862,7 @@ func TestExtractClientIP(t *testing.T) {
 			xForwardedFor: "203.0.113.1, 192.168.1.1",
 			expectedIP:    "203.0.113.1",
 			behindProxy:   true,
+			trusted:       []string{"10.0.0.0/8"},
 		},
 		{
 			name:        "Behind proxy with X-Real-IP",
@@ -844,6 +870,7 @@ func TestExtractClientIP(t *testing.T) {
 			xRealIP:     "203.0.113.2",
 			expectedIP:  "203.0.113.2",
 			behindProxy: true,
+			trusted:     []string{"10.0.0.0/8"},
 		},
 		{
 			name:          "X-Forwarded-For takes precedence",
@@ -851,6 +878,14 @@ func TestExtractClientIP(t *testing.T) {
 			xForwardedFor: "203.0.113.3",
 			xRealIP:       "203.0.113.4",
 			expectedIP:    "203.0.113.3",
+			behindProxy:   true,
+			trusted:       []string{"10.0.0.0/8"},
+		},
+		{
+			name:          "Private proxy is not trusted by default",
+			remoteAddr:    "10.0.0.1:12345",
+			xForwardedFor: "203.0.113.6",
+			expectedIP:    "10.0.0.1",
 			behindProxy:   true,
 		},
 		{
@@ -869,7 +904,8 @@ func TestExtractClientIP(t *testing.T) {
 			if tt.behindProxy {
 				serverConfig = &Config{
 					Server: ServerConfig{
-						BehindProxy: true,
+						BehindProxy:    true,
+						TrustedProxies: tt.trusted,
 					},
 				}
 				// Reset the trusted proxies cache for this test

@@ -32,6 +32,47 @@ func newMockNotifierStore() *mockNotifierStore {
 	}
 }
 
+func TestNotifierDoesNotCrossTenantBoundary(t *testing.T) {
+	t.Parallel()
+
+	var received int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	store := newMockNotifierStore()
+	store.channels[1] = &storage.NotificationChannel{
+		ID:         1,
+		Name:       "Tenant A webhook",
+		Type:       storage.ChannelTypeWebhook,
+		Enabled:    true,
+		TenantIDs:  []string{"tenant-a"},
+		ConfigJSON: `{"url":"` + server.URL + `"}`,
+	}
+	store.rules[1] = &storage.AlertRule{
+		ID:         1,
+		TenantIDs:  []string{"tenant-a"},
+		ChannelIDs: []int64{1},
+	}
+
+	notifier := NewNotifier(store, NotifierConfig{MaxRetries: 1})
+	err := notifier.NotifyForAlert(context.Background(), &storage.Alert{
+		ID:       1,
+		RuleID:   1,
+		TenantID: "tenant-b",
+		Type:     storage.AlertTypeDeviceOffline,
+		Severity: storage.AlertSeverityWarning,
+	})
+	if err != nil {
+		t.Fatalf("NotifyForAlert() error = %v", err)
+	}
+	if received != 0 {
+		t.Fatalf("foreign tenant notification was sent %d time(s)", received)
+	}
+}
+
 func (m *mockNotifierStore) GetNotificationChannel(ctx context.Context, id int64) (*storage.NotificationChannel, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html translate="no" data-lpignore="true" data-1p-ignore data-bwignore="true" data-form-type="other">
+<html lang="tr" translate="no" data-lpignore="true" data-1p-ignore data-bwignore="true" data-form-type="other">
 
 <head>
     <meta charset="UTF-8">
@@ -12,11 +12,26 @@
     <meta name="format-detection" content="telephone=no">
     <title>PrintMaster Server</title>
     <script>window.__pm_shared = window.__pm_shared || {};</script>
+    <script>
+        (() => {
+            const queryVersion = new URLSearchParams(window.location.search).get('ui');
+            const version = queryVersion === 'v1' || queryVersion === 'v2'
+                ? queryVersion
+                : 'v1';
+            if (queryVersion === 'v1' || queryVersion === 'v2') {
+                try { window.localStorage.setItem('pm_ui_version', queryVersion); } catch (e) { /* private mode */ }
+            }
+            window.__pm_ui_version = version;
+            document.documentElement.dataset.pmUiVersion = version;
+            document.documentElement.classList.toggle('pm-ui-v2', version === 'v2');
+        })();
+    </script>
     <link rel="icon" type="image/svg+xml"
         href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect x='16' y='8' width='32' height='12' fill='%234a5568' rx='2'/><rect x='12' y='20' width='40' height='24' fill='%23718096' rx='3'/><rect x='16' y='24' width='32' height='16' fill='%23cbd5e0' rx='2'/><rect x='20' y='28' width='8' height='2' fill='%234299e1'/><rect x='20' y='32' width='12' height='2' fill='%234299e1'/><rect x='20' y='36' width='10' height='2' fill='%234299e1'/><circle cx='46' cy='32' r='3' fill='%2348bb78'/><rect x='16' y='44' width='32' height='12' fill='%234a5568' rx='2'/><rect x='20' y='48' width='24' height='4' fill='%23e2e8f0'/></svg>">
     <!-- flatpickr is injected centrally from common/web/shared.js -->
     <link rel="stylesheet" href="/static/shared.css{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}">
     <link rel="stylesheet" href="/static/style.css{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}">
+    <link rel="stylesheet" href="/static/v2.css{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}">
     <script src="/static/shared.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
     <script src="/static/cards.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
     <script src="/static/report.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
@@ -3374,6 +3389,7 @@
     <script src="/static/utils/formatters.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
     <script src="/static/utils/charts.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
     <script src="/static/app.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
+    <script src="/static/v2.js{{if .AssetVersion}}?v={{.AssetVersion}}{{end}}"></script>
 
 </body>
 

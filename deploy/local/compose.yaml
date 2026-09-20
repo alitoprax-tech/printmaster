@@ -1,0 +1,22 @@
+name: printmaster-local
+services:
+  database:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_DB: printmaster
+      POSTGRES_USER: printmaster
+      POSTGRES_PASSWORD: ${PRINTMASTER_LOCAL_DB_PASSWORD:?Run dev.ps1 init first}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U printmaster -d printmaster"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  postgres_data:

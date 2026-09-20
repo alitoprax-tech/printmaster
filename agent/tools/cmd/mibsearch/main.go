@@ -51,6 +51,12 @@ func main() {
 	flag.Parse()
 
 	out := []Match{}
+	root, rootErr := os.OpenRoot(mibDir)
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "unable to open MIB directory: %v\n", rootErr)
+		return
+	}
+	defer root.Close()
 
 	_ = filepath.WalkDir(mibDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -62,7 +68,11 @@ func main() {
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".mib") {
 			return nil
 		}
-		f, err := os.Open(path)
+		rel, err := filepath.Rel(mibDir, path)
+		if err != nil || rel == "." || filepath.IsAbs(rel) {
+			return nil
+		}
+		f, err := root.Open(rel)
 		if err != nil {
 			return nil
 		}

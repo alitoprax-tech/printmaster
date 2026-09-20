@@ -36,9 +36,9 @@ Solutions for common PrintMaster issues.
 3. **Verify the SNMP community string**
    ```bash
    # Test with snmpwalk (if available)
-   snmpwalk -v2c -c public 192.168.1.100 sysDescr
+   snmpwalk -v2c -c <site-specific-community> 192.168.1.100 sysDescr
    ```
-   - Default is `public`, but some printers use `private` or a custom string
+   - Use the printer's site-specific string; `public` is retained only as a legacy lab default
    - Update in **Settings** → **SNMP Community**
 
 4. **Check firewall rules**
@@ -103,13 +103,13 @@ Solutions for common PrintMaster issues.
 1. **Verify server URL format**
    ```toml
    [server]
-   url = "http://server-ip:9090"  # Include protocol and port!
+   url = "https://printmaster.example.com"  # Use the canonical HTTPS URL.
    ```
 
 2. **Test network connectivity**
    ```bash
    # From agent machine
-   curl http://server-ip:9090/api/v1/health
+   curl https://printmaster.example.com/api/v1/health
    ```
 
 3. **Check firewall**
@@ -228,7 +228,8 @@ Solutions for common PrintMaster issues.
 **Solutions**:
 
 1. **Verify credentials**
-   - Default server: `admin` / `printmaster` (or your set password)
+   - Username is `admin` unless you configured `ADMIN_USER`; use the password
+     supplied at first initialization. There is no production default password.
 
 2. **Check for cookie issues**
    - Clear browser cookies

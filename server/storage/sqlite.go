@@ -25,7 +25,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// Ensure directory exists (unless in-memory)
 	if dbPath != ":memory:" {
 		dir := filepath.Dir(dbPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("failed to create db directory: %w", err)
 		}
 	}
@@ -36,9 +36,9 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	if dbPath != ":memory:" {
 		// WAL mode allows concurrent reads while writing
 		// _txlock=immediate acquires write lock at transaction start, reducing contention
-		connStr += fmt.Sprintf("?_busy_timeout=%d&_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_foreign_keys=ON&_txlock=immediate", busyTimeoutMS)
+		connStr += fmt.Sprintf("?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)&_pragma=foreign_keys(ON)&_txlock=immediate", busyTimeoutMS)
 	} else {
-		connStr += fmt.Sprintf("?_busy_timeout=%d&_foreign_keys=ON", busyTimeoutMS)
+		connStr += fmt.Sprintf("?_pragma=busy_timeout(%d)&_pragma=foreign_keys(ON)", busyTimeoutMS)
 	}
 
 	// Open database
@@ -54,6 +54,11 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// Note: SQLite handles write serialization internally with busy_timeout
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
+	if dbPath == ":memory:" {
+		// Each :memory: connection is a different database.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	}
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	logInfo("Opened SQLite database", "path", dbPath)
@@ -395,6 +400,7 @@ func (s *SQLiteStore) initSchema() error {
 		FOREIGN KEY (provider_slug) REFERENCES oidc_providers(slug) ON DELETE CASCADE,
 		FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 	);
+	CREATE INDEX IF NOT EXISTS idx_oidc_sessions_created_at ON oidc_sessions(created_at);
 
 	CREATE TABLE IF NOT EXISTS oidc_links (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

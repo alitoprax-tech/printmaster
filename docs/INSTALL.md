@@ -2,6 +2,12 @@
 
 This guide covers installing PrintMaster on all supported platforms.
 
+> For an Internet-facing deployment, read the [production deployment
+> checklist](PRODUCTION-DEPLOYMENT-TR.md) first. Use a reviewed/pinned image or
+> a binary built from the hardened branch, HTTPS at the reverse proxy, strong
+> secrets, and private database ports. The examples below keep the server port
+> on loopback.
+
 ## Table of Contents
 
 - [Quick Install](#quick-install)
@@ -24,15 +30,22 @@ This guide covers installing PrintMaster on all supported platforms.
 ### Server (Docker)
 
 ```bash
+# server.env must contain strong ADMIN_PASSWORD and, when needed, a random
+# INIT_SECRET generated with: openssl rand -hex 32
 docker run -d \
   --name printmaster-server \
-  -p 9090:9090 \
+  -p 127.0.0.1:9090:9090 \
   -v printmaster-data:/var/lib/printmaster/server \
-  -e ADMIN_PASSWORD=your-secure-password \
-  ghcr.io/mstrhakr/printmaster-server:latest
+  -e BIND_ADDRESS=0.0.0.0 \
+  -e BEHIND_PROXY=true \
+  --env-file server.env \
+  ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 ```
 
-Access at `http://localhost:9090` with username `admin` and your chosen password.
+Put the container behind an HTTPS reverse proxy and set
+`SERVER_EXTERNAL_URL=https://printmaster.example.com` plus a narrow
+`TRUSTED_PROXIES` value. For a local smoke test only, use
+`http://127.0.0.1:9090`; do not publish this port to the Internet.
 
 ### Agent (Windows)
 
@@ -45,7 +58,9 @@ Download and run the MSI installer from [GitHub Releases](https://github.com/mst
 curl -fsSL https://mstrhakr.github.io/printmaster/install.sh | sudo bash
 
 # Or manual apt install
-echo "deb [trusted=yes] https://mstrhakr.github.io/printmaster stable main" | \
+curl -fsSL https://mstrhakr.github.io/printmaster/gpg.key | \
+  sudo gpg --dearmor -o /usr/share/keyrings/printmaster.gpg
+echo "deb [signed-by=/usr/share/keyrings/printmaster.gpg] https://mstrhakr.github.io/printmaster stable main" | \
   sudo tee /etc/apt/sources.list.d/printmaster.list
 sudo apt-get update && sudo apt-get install -y printmaster-agent
 ```
@@ -67,14 +82,16 @@ Docker is the recommended deployment method for the server.
 #### Using Docker Run
 
 ```bash
-# Basic setup
+# Basic setup; pin the image to a reviewed version and keep server.env private.
 docker run -d \
   --name printmaster-server \
-  -p 9090:9090 \
+  -p 127.0.0.1:9090:9090 \
   -v printmaster-data:/var/lib/printmaster/server \
   -v printmaster-logs:/var/log/printmaster/server \
-  -e ADMIN_PASSWORD=your-secure-password \
-  ghcr.io/mstrhakr/printmaster-server:latest
+  -e BIND_ADDRESS=0.0.0.0 \
+  -e BEHIND_PROXY=true \
+  --env-file server.env \
+  ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 ```
 
 #### Using Docker Compose
@@ -85,17 +102,22 @@ Create a `docker-compose.yml` file:
 version: '3.8'
 services:
   printmaster-server:
-    image: ghcr.io/mstrhakr/printmaster-server:latest
+    image: ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
     container_name: printmaster-server
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - printmaster-data:/var/lib/printmaster/server
       - printmaster-logs:/var/log/printmaster/server
     environment:
-      - ADMIN_PASSWORD=your-secure-password
+      - BIND_ADDRESS=0.0.0.0
+      - BEHIND_PROXY=true
+      - SERVER_EXTERNAL_URL=https://printmaster.example.com
+      - TRUSTED_PROXIES=127.0.0.1/32
       - LOG_LEVEL=info
-      - BEHIND_PROXY=false
+      # Set INIT_SECRET only when automatic enrollment is required; use a
+      # random value with 32-4096 bytes. Prefer one-time join tokens.
+      - INIT_SECRET=${INIT_SECRET:?Set a random INIT_SECRET in the environment}
     restart: unless-stopped
 
 volumes:
@@ -112,12 +134,13 @@ docker compose up -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ADMIN_PASSWORD` | `printmaster` | Admin password (set before first run!) |
+| `ADMIN_PASSWORD` | required | Admin password (minimum 16 characters; no default) |
+| `INIT_SECRET` | optional | Auto-enrollment bearer secret; 32-4096 bytes, no whitespace |
 | `LOG_LEVEL` | `info` | Logging level: debug, info, warn, error |
-| `BEHIND_PROXY` | `false` | Set to `true` if behind a reverse proxy |
-| `BIND_ADDRESS` | `0.0.0.0` | Address to bind to |
-| `HTTP_PORT` | `9090` | HTTP port |
-| `HTTPS_PORT` | `9443` | HTTPS port (when TLS enabled) |
+| `BEHIND_PROXY` | `false` | Set to `true` only when an HTTPS reverse proxy fronts the server |
+| `BIND_ADDRESS` | `127.0.0.1` | Keep loopback; use `0.0.0.0` only for a private container network |
+| `SERVER_HTTP_PORT` | `9090` | HTTP backend/redirect port |
+| `SERVER_HTTPS_PORT` | `9443` | HTTPS port |
 
 > **Important**: Set `ADMIN_PASSWORD` before the first run. The password can only be set during initial database creation.
 
@@ -145,7 +168,7 @@ Configure your proxy to:
 
 2. **Manual Docker Setup**:
    - Go to Docker tab → Add Container
-   - Repository: `ghcr.io/mstrhakr/printmaster-server:latest`
+   - Repository: `ghcr.io/mstrhakr/printmaster-server:<reviewed-version>`
    - Port: 9090 → 9090
    - Path: `/mnt/user/appdata/printmaster-server/data` → `/var/lib/printmaster/server`
    - Path: `/mnt/user/appdata/printmaster-server/logs` → `/var/log/printmaster/server`
@@ -172,7 +195,7 @@ Download the server binary from [GitHub Releases](https://github.com/mstrhakr/pr
 
 #### MSI Installer (Recommended)
 
-1. Download the latest MSI from [GitHub Releases](https://github.com/mstrhakr/printmaster/releases)
+1. Download the exact reviewed MSI from [GitHub Releases](https://github.com/mstrhakr/printmaster/releases) and verify its published checksum/signature
 2. Run the installer
 3. The agent will be installed as a Windows service and start automatically
 4. Access the web UI at `http://localhost:8080`
@@ -180,8 +203,9 @@ Download the server binary from [GitHub Releases](https://github.com/mstrhakr/pr
 #### Manual Installation
 
 ```powershell
-# Download the binary
-Invoke-WebRequest -Uri "https://github.com/mstrhakr/printmaster/releases/latest/download/printmaster-agent-windows-amd64.exe" -OutFile "printmaster-agent.exe"
+# Download the exact reviewed asset from the selected release tag. Do not use
+# the mutable /releases/latest/download URL for a production installation.
+Invoke-WebRequest -Uri "https://github.com/mstrhakr/printmaster/releases/download/<reviewed-tag>/printmaster-agent-windows-amd64.exe" -OutFile "printmaster-agent.exe"
 
 # Install as service (requires Administrator)
 .\printmaster-agent.exe --service install
@@ -209,7 +233,9 @@ Get-Service PrintMasterAgent
 
 ```bash
 # Add repository
-echo "deb [trusted=yes] https://mstrhakr.github.io/printmaster stable main" | \
+curl -fsSL https://mstrhakr.github.io/printmaster/gpg.key | \
+  sudo gpg --dearmor -o /usr/share/keyrings/printmaster.gpg
+echo "deb [signed-by=/usr/share/keyrings/printmaster.gpg] https://mstrhakr.github.io/printmaster stable main" | \
   sudo tee /etc/apt/sources.list.d/printmaster.list
 
 # Install
@@ -239,8 +265,9 @@ sudo apt-get install -y printmaster-agent
 #### Manual Installation
 
 ```bash
-# Download
-wget https://github.com/mstrhakr/printmaster/releases/latest/download/printmaster-agent-linux-amd64
+# Download the exact reviewed asset and verify its checksum from the release
+# page before installing. Replace <reviewed-tag> with the chosen release tag.
+wget https://github.com/mstrhakr/printmaster/releases/download/<reviewed-tag>/printmaster-agent-linux-amd64
 
 # Make executable
 chmod +x printmaster-agent-linux-amd64
@@ -281,8 +308,9 @@ systemctl status printmaster-agent
 ### macOS
 
 ```bash
-# Download
-curl -LO https://github.com/mstrhakr/printmaster/releases/latest/download/printmaster-agent-darwin-amd64
+# Download the exact reviewed asset and verify its checksum from the release
+# page before installing. Replace <reviewed-tag> with the chosen release tag.
+curl -LO https://github.com/mstrhakr/printmaster/releases/download/<reviewed-tag>/printmaster-agent-darwin-amd64
 
 # Make executable
 chmod +x printmaster-agent-darwin-amd64
@@ -304,7 +332,7 @@ docker run -d \
   --name printmaster-agent \
   --network host \
   -v printmaster-agent-data:/var/lib/printmaster/agent \
-  ghcr.io/mstrhakr/printmaster-agent:latest
+  ghcr.io/mstrhakr/printmaster-agent:<reviewed-version>
 ```
 
 > **Note**: `--network host` is required for SNMP discovery to work properly.
@@ -322,17 +350,16 @@ docker run -d \
 
 ### Server First Login
 
-1. Open `http://your-server:9090`
+1. Open the canonical HTTPS address configured for your deployment
 2. Log in with:
    - Username: `admin`
-   - Password: The password you set via `ADMIN_PASSWORD` (default: `printmaster`)
-3. **Change the default password immediately** if you didn't set one during installation
+   - Password: The password you set via `ADMIN_PASSWORD`
 
 ### Connecting an Agent to the Server
 
 1. Open the agent's web UI at `http://agent-ip:8080`
 2. Go to **Settings** → **Server Connection**
-3. Enter your server URL: `http://your-server:9090`
+3. Enter your server URL: `https://your-server.example.com`
 4. Click **Save**
 
 Or edit the agent's config file:
@@ -340,7 +367,7 @@ Or edit the agent's config file:
 ```toml
 [server]
 enabled = true
-url = "http://your-server:9090"
+url = "https://your-server.example.com"
 ```
 
 ### Next Steps
@@ -356,7 +383,7 @@ url = "http://your-server:9090"
 ### Docker
 
 ```bash
-docker pull ghcr.io/mstrhakr/printmaster-server:latest
+docker pull ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 docker compose down
 docker compose up -d
 ```

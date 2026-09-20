@@ -67,18 +67,33 @@ Contributions, feedback, and vendor-specific SNMP knowledge are welcome—printe
 
 ## Quick Start
 
+> **Production:** Do not expose the container directly to the Internet. Use a
+> reverse proxy with HTTPS, keep the published server port on loopback, and
+> read [the production deployment checklist](docs/PRODUCTION-DEPLOYMENT-TR.md)
+> before connecting customer networks. The command below expects a local
+> `server.env` file containing strong `ADMIN_PASSWORD` and (if auto-enrollment
+> is required) a random `INIT_SECRET` of 32–4096 bytes.
+
 ### Server (Docker)
 
 ```bash
+# server.env is a secret file; do not commit it
+# ADMIN_PASSWORD=<at least 16 random characters>
+# INIT_SECRET=<openssl rand -hex 32>
 docker run -d \
   --name printmaster-server \
-  -p 9090:9090 \
+  -p 127.0.0.1:9090:9090 \
   -v printmaster-data:/var/lib/printmaster/server \
-  -e ADMIN_PASSWORD=your-password \
-  ghcr.io/mstrhakr/printmaster-server:latest
+  -e BIND_ADDRESS=0.0.0.0 \
+  -e BEHIND_PROXY=true \
+  --env-file server.env \
+  ghcr.io/mstrhakr/printmaster-server:<reviewed-version>
 ```
 
-Access at `http://localhost:9090` — Login: `admin` / your password
+Put the container behind an HTTPS reverse proxy and set
+`SERVER_EXTERNAL_URL=https://printmaster.example.com` and a narrow
+`TRUSTED_PROXIES` value. For a local-only smoke test, use
+`http://127.0.0.1:9090`; do not publish this port publicly.
 
 ### Agent (Windows)
 
@@ -96,7 +111,9 @@ Access at `http://localhost:8080`
 
 ```bash
 # Debian/Ubuntu
-echo "deb [trusted=yes] https://mstrhakr.github.io/printmaster stable main" | \
+curl -fsSL https://mstrhakr.github.io/printmaster/gpg.key | \
+  sudo gpg --dearmor -o /usr/share/keyrings/printmaster.gpg
+echo "deb [signed-by=/usr/share/keyrings/printmaster.gpg] https://mstrhakr.github.io/printmaster stable main" | \
   sudo tee /etc/apt/sources.list.d/printmaster.list
 sudo apt-get update && sudo apt-get install -y printmaster-agent
 ```
@@ -121,6 +138,7 @@ sudo apt-get update && sudo apt-get install -y printmaster-agent
 | Guide | Description |
 |-------|-------------|
 | [Installation](docs/INSTALL.md) | Complete setup instructions for all platforms |
+| [Production deployment (TR)](docs/PRODUCTION-DEPLOYMENT-TR.md) | HTTPS, secrets, proxy and tenant-network checklist |
 | [Getting Started](docs/GETTING_STARTED.md) | First steps after installation |
 | [Features](docs/FEATURES.md) | Detailed feature documentation |
 | [Configuration](docs/CONFIGURATION.md) | All configuration options |
@@ -136,7 +154,7 @@ Developer documentation is in [docs/dev/](docs/dev/).
 ```toml
 [server]
 enabled = true
-url = "http://your-server:9090"
+url = "https://printmaster.example.com"
 agent_name = "Office A"
 ```
 
@@ -144,7 +162,8 @@ agent_name = "Office A"
 
 ```toml
 [snmp]
-community = "public"
+# Replace with the site-specific community; prefer SNMPv3 where supported.
+community = "replace-with-site-secret"
 timeout_ms = 2000
 retries = 1
 ```
@@ -169,4 +188,3 @@ MIT License — see [LICENSE](LICENSE)
 - [Releases](https://github.com/mstrhakr/printmaster/releases)
 - [Issues](https://github.com/mstrhakr/printmaster/issues)
 - [Discussions](https://github.com/mstrhakr/printmaster/discussions)
-

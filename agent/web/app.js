@@ -1104,12 +1104,18 @@ function updateSavedDevicesTable(devices) {
         const p = item.printer_info || {};
         const serial = item.serial || '';
         const lifeCount = p.page_count || p.total_mono_impressions || 0;
-        const webUIUrl = item.web_ui_url || (item.is_usb && serial ? '/proxy/' + encodeURIComponent(serial) + '/' : '');
+        let webUIUrl = item.web_ui_url || (item.is_usb && serial ? '/proxy/' + encodeURIComponent(serial) + '/' : '');
+        try {
+            const parsedWebUI = new URL(String(webUIUrl), window.location.origin);
+            webUIUrl = (parsedWebUI.protocol === 'http:' || parsedWebUI.protocol === 'https:') ? parsedWebUI.href : '';
+        } catch (e) {
+            webUIUrl = '';
+        }
         
         // Build consumables bars (vertical progress indicators) - shared with server UI
         const consumablesHtml = window.__pm_shared_cards.renderTonerBars(window.__pm_shared_cards.getDeviceTonerBarData(p));
         
-        html += '<tr class="device-row-clickable" data-serial="' + serial + '" data-ip="' + (p.ip || '') + '">';
+        html += '<tr class="device-row-clickable" data-serial="' + escapeHtml(serial) + '" data-ip="' + escapeHtml(p.ip || '') + '">';
         html += '<td><div class="table-device-info"><span class="table-device-name">' + escapeHtml(p.manufacturer || 'Unknown') + ' ' + escapeHtml(p.model || '') + '</span>';
         html += '<span class="table-device-serial">' + escapeHtml(serial) + '</span></div></td>';
         html += '<td>' + consumablesHtml + '</td>';
@@ -1118,10 +1124,10 @@ function updateSavedDevicesTable(devices) {
         html += '<td style="text-align:right;font-family:monospace">' + (lifeCount || 0).toLocaleString() + '</td>';
         html += '<td class="actions-col"><div class="table-actions">';
         if (webUIUrl) {
-            html += '<button data-action="webui" data-webui-url="' + webUIUrl + '" data-serial="' + serial + '">WebUI</button>';
+            html += '<button data-action="webui" data-webui-url="' + escapeHtml(webUIUrl) + '" data-serial="' + escapeHtml(serial) + '">WebUI</button>';
         }
-        html += '<button data-action="details" data-serial="' + serial + '" data-source="saved">Details</button>';
-        html += '<button class="delete" data-action="delete" data-serial="' + serial + '">Delete</button>';
+        html += '<button data-action="details" data-serial="' + escapeHtml(serial) + '" data-source="saved">Details</button>';
+        html += '<button class="delete" data-action="delete" data-serial="' + escapeHtml(serial) + '">Delete</button>';
         html += '</div></td>';
         html += '</tr>';
     });
@@ -1485,9 +1491,65 @@ function escapeHtml(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// Toner color mapping and toner-bar rendering now live in common/web/cards.js
-// (window.__pm_shared_cards.getTonerColor / renderTonerBars) so agent and
-// server share identical coloring and mono/color filtering behavior.
+// Map toner names to CSS colors (matches server UI)
+const TONER_COLORS = {
+    'black': '#1a1a1a',
+    'cyan': '#00bcd4',
+    'magenta': '#e91e63',
+    'yellow': '#ffc107',
+    'photo_black': '#333',
+    'matte_black': '#444',
+    'light_cyan': '#4dd0e1',
+    'light_magenta': '#f48fb1',
+    'gray': '#9e9e9e',
+    'light_gray': '#bdbdbd',
+    'orange': '#ff9800',
+    'green': '#4caf50',
+    'red': '#f44336',
+    'blue': '#2196f3',
+};
+
+function getTonerColor(name) {
+    const key = (name || '').toLowerCase().replace(/[^a-z_]/g, '_');
+    if (TONER_COLORS[key]) return TONER_COLORS[key];
+    // Try partial match
+    for (const [k, v] of Object.entries(TONER_COLORS)) {
+        if (key.includes(k) || k.includes(key)) return v;
+    }
+    // Default gray for unknown
+    return '#757575';
+}
+
+// Render vertical toner bars from a toner levels object (matches server UI)
+function renderTonerBarsFromLevels(toners) {
+    if (!toners || Object.keys(toners).length === 0) return '<span class="muted-text">—</span>';
+    const order = ['black', 'cyan', 'magenta', 'yellow'];
+    const entries = Object.entries(toners)
+        .filter(([_, v]) => typeof v === 'number' || !isNaN(Number(v)))
+        .map(([name, value]) => ({
+            name,
+            level: typeof value === 'number' ? value : Number(value),
+            color: getTonerColor(name)
+        }));
+    // Sort by color order
+    entries.sort((a, b) => {
+        const aKey = a.name.toLowerCase();
+        const bKey = b.name.toLowerCase();
+        const aIdx = order.findIndex(c => aKey.includes(c));
+        const bIdx = order.findIndex(c => bKey.includes(c));
+        if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+        if (aIdx !== -1) return -1;
+        if (bIdx !== -1) return 1;
+        return aKey.localeCompare(bKey);
+    });
+    if (entries.length === 0) return '<span class="muted-text">—</span>';
+    const bars = entries.map(t => {
+        const level = Number.isFinite(t.level) ? Math.max(0, Math.min(100, t.level)) : 0;
+        const levelClass = level <= 10 ? 'critical' : level <= 25 ? 'low' : '';
+        return '<div class="toner-bar ' + levelClass + '" title="' + escapeHtml(t.name) + ': ' + level + '%" style="--toner-color: ' + t.color + '; --toner-level: ' + level + '%"></div>';
+    }).join('');
+    return '<div class="toner-bars">' + bars + '</div>';
+}
 
 // Database backend field toggles are provided by the shared bundle
 // (common/web/shared.js) and exported as window.__pm_shared.toggleDatabaseFields.
@@ -1688,9 +1750,9 @@ function colorizeLogLine(line) {
     if (match) {
         const [, timestamp, level, message] = match;
         const color = levelColors[level] || '#93a1a1';
-        return `<span style="color:#586e75">${timestamp}</span> <span style="color:${color};font-weight:bold">[${level}]</span> <span style="color:${color}">${message}</span>`;
+        return `<span style="color:#586e75">${escapeHtml(timestamp)}</span> <span style="color:${color};font-weight:bold">[${escapeHtml(level)}]</span> <span style="color:${color}">${escapeHtml(message)}</span>`;
     }
-    return line;
+    return escapeHtml(line);
 }
 
 /**
@@ -1848,7 +1910,9 @@ function renderLogsTable(entries) {
             ? `<span class="log-time-date">${formatDateShort(entry.timestamp)}</span>${formatTimeShort(entry.timestamp)}`
             : '<span class="log-time">—</span>';
 
-        const levelClass = entry.level ? `log-level-${entry.level.toLowerCase()}` : '';
+        const levelToken = ['ERROR', 'WARN', 'WARNING', 'INFO', 'DEBUG', 'TRACE'].includes(String(entry.level || '').toUpperCase())
+            ? String(entry.level).toLowerCase() : 'info';
+        const levelClass = entry.level ? `log-level-${levelToken}` : '';
         const levelHtml = entry.level
             ? `<span class="log-level ${levelClass}">${escapeHtml(entry.level)}</span>`
             : '';
@@ -2414,7 +2478,7 @@ async function loadDeviceMetrics(serial, targetId) {
     // Toggle to show/hide the datetime selector (hidden by default)
     const toggleTarget = targetId || '';
     html += '<div style="display:flex;justify-content:flex-end;margin-bottom:8px">';
-    html += '<button id="metrics_toggle_time_btn" data-action="toggle-time" data-target="' + toggleTarget + '" aria-expanded="false" style="padding:6px 10px;font-size:13px">Show time selector</button>';
+    html += '<button id="metrics_toggle_time_btn" data-action="toggle-time" data-target="' + escapeHtml(toggleTarget) + '" aria-expanded="false" style="padding:6px 10px;font-size:13px">Show time selector</button>';
     html += '</div>';
 
     // Datetime range picker - hidden by default
@@ -2425,11 +2489,11 @@ async function loadDeviceMetrics(serial, targetId) {
     html += '<div style="margin-bottom:16px">';
     html += '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">Quick Select:</div>';
     html += '<div style="display:flex;gap:6px;flex-wrap:wrap">';
-    html += '<button id="preset_day" data-action="preset" data-preset="day" data-serial="' + serial + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last 24 Hours</button>';
-    html += '<button id="preset_week" data-action="preset" data-preset="week" data-serial="' + serial + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last 7 Days</button>';
-    html += '<button id="preset_month" data-action="preset" data-preset="month" data-serial="' + serial + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last 30 Days</button>';
-    html += '<button id="preset_year" data-action="preset" data-preset="year" data-serial="' + serial + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last Year</button>';
-    html += '<button id="preset_all" data-action="preset" data-preset="all" data-serial="' + serial + '" style="padding:6px 12px;font-size:13px;min-height:32px">All Time</button>';
+    html += '<button id="preset_day" data-action="preset" data-preset="day" data-serial="' + escapeHtml(serial) + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last 24 Hours</button>';
+    html += '<button id="preset_week" data-action="preset" data-preset="week" data-serial="' + escapeHtml(serial) + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last 7 Days</button>';
+    html += '<button id="preset_month" data-action="preset" data-serial="' + escapeHtml(serial) + '" data-preset="month" style="padding:6px 12px;font-size:13px;min-height:32px">Last 30 Days</button>';
+    html += '<button id="preset_year" data-action="preset" data-serial="' + escapeHtml(serial) + '" style="padding:6px 12px;font-size:13px;min-height:32px">Last Year</button>';
+    html += '<button id="preset_all" data-action="preset" data-serial="' + escapeHtml(serial) + '" style="padding:6px 12px;font-size:13px;min-height:32px">All Time</button>';
     html += '</div>'; // close metrics_custom_range
     html += '</div>'; // close metrics_time_selector
     html += '</div>';
@@ -2446,7 +2510,7 @@ async function loadDeviceMetrics(serial, targetId) {
     html += '</div>';
 
     // Apply button
-    html += '<button data-action="refresh" data-serial="' + serial + '" style="width:100%;padding:10px;font-size:14px;min-height:40px;font-weight:600;background:#268bd2;color:#fff">Update Chart</button>';
+    html += '<button data-action="refresh" data-serial="' + escapeHtml(serial) + '" style="width:100%;padding:10px;font-size:14px;min-height:40px;font-weight:600;background:#268bd2;color:#fff">Update Chart</button>';
     html += '</div>';
 
     // Stats summary
@@ -2580,7 +2644,7 @@ async function initializeCustomDatetimePicker(serial, contentElOverride) {
         window.__pm_shared.error('[Metrics] Failed to initialize datetime picker:', e);
         const contentEl = document.getElementById('metrics_content');
         if (contentEl) {
-            contentEl.innerHTML = '<div style="color:#d33;padding:12px">Error loading metrics: ' + e.message + '</div>';
+            contentEl.innerHTML = '<div style="color:#d33;padding:12px">Error loading metrics: ' + escapeHtml(e && e.message ? e.message : e) + '</div>';
         }
     }
 }
@@ -2709,6 +2773,10 @@ window.refreshMetricsChart = async function (serial) {
         // Calculate stats - comprehensive metrics table
         const latest = history[history.length - 1];
         const oldest = history[0];
+        const safeMetricNumber = (value) => {
+            const number = Number(value);
+            return Number.isFinite(number) ? number : 0;
+        };
         const durationMs = new Date(latest.timestamp).getTime() - new Date(oldest.timestamp).getTime();
         const durationDays = Math.max(1, durationMs / (24 * 60 * 60 * 1000));
 
@@ -2722,8 +2790,8 @@ window.refreshMetricsChart = async function (serial) {
         statsHtml += '</tr></thead><tbody>';
 
         // Total Pages
-        const lifetimePages = latest.page_count || 0;
-        const periodPages = lifetimePages - (oldest.page_count || 0);
+        const lifetimePages = safeMetricNumber(latest.page_count);
+        const periodPages = lifetimePages - safeMetricNumber(oldest.page_count);
         const avgPagesPerDay = (periodPages / durationDays).toFixed(1);
         statsHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05)">';
         statsHtml += '<td style="padding:6px 8px;color:var(--text)">Total Pages</td>';
@@ -2734,8 +2802,8 @@ window.refreshMetricsChart = async function (serial) {
 
         // Color Pages (if available)
         if (latest.color_pages !== undefined && latest.color_pages > 0) {
-            const lifetimeColor = latest.color_pages || 0;
-            const periodColor = lifetimeColor - (oldest.color_pages || 0);
+            const lifetimeColor = safeMetricNumber(latest.color_pages);
+            const periodColor = lifetimeColor - safeMetricNumber(oldest.color_pages);
             const avgColorPerDay = (periodColor / durationDays).toFixed(1);
             statsHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05)">';
             statsHtml += '<td style="padding:6px 8px;color:var(--text)">Color Pages</td>';
@@ -2747,8 +2815,8 @@ window.refreshMetricsChart = async function (serial) {
 
         // Mono Pages (if available)
         if (latest.mono_pages !== undefined && latest.mono_pages > 0) {
-            const lifetimeMono = latest.mono_pages || 0;
-            const periodMono = lifetimeMono - (oldest.mono_pages || 0);
+            const lifetimeMono = safeMetricNumber(latest.mono_pages);
+            const periodMono = lifetimeMono - safeMetricNumber(oldest.mono_pages);
             const avgMonoPerDay = (periodMono / durationDays).toFixed(1);
             statsHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05)">';
             statsHtml += '<td style="padding:6px 8px;color:var(--text)">Mono Pages</td>';
@@ -2760,8 +2828,8 @@ window.refreshMetricsChart = async function (serial) {
 
         // Scans (if available)
         if (latest.scan_count !== undefined && latest.scan_count > 0) {
-            const lifetimeScans = latest.scan_count || 0;
-            const periodScans = lifetimeScans - (oldest.scan_count || 0);
+            const lifetimeScans = safeMetricNumber(latest.scan_count);
+            const periodScans = lifetimeScans - safeMetricNumber(oldest.scan_count);
             const avgScansPerDay = (periodScans / durationDays).toFixed(1);
             statsHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05)">';
             statsHtml += '<td style="padding:6px 8px;color:var(--text)">Scans</td>';
@@ -2783,7 +2851,7 @@ window.refreshMetricsChart = async function (serial) {
                 const levelNum = typeof level === 'number' ? level : parseInt(level) || 0;
                 const levelColor = levelNum < 20 ? '#d32f2f' : (levelNum < 50 ? '#f57c00' : '#388e3c');
                 statsHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.05)">';
-                statsHtml += '<td style="padding:6px 8px;color:var(--text)">' + color + '</td>';
+                statsHtml += '<td style="padding:6px 8px;color:var(--text)">' + escapeHtml(color) + '</td>';
                 statsHtml += '<td style="padding:6px 8px;text-align:right;color:' + levelColor + ';font-weight:600">' + levelNum + '%</td>';
                 statsHtml += '<td style="padding:6px 8px;text-align:right;color:var(--muted)" colspan="2">Current Level</td>';
                 statsHtml += '</tr>';
@@ -2813,20 +2881,20 @@ window.refreshMetricsChart = async function (serial) {
             tableHtml += '</tr></thead><tbody>';
 
             history.forEach(item => {
-                const ts = new Date(item.timestamp).toLocaleString();
+                const ts = escapeHtml(new Date(item.timestamp).toLocaleString());
                 tableHtml += '<tr style="border-bottom:1px solid rgba(255,255,255,0.03)">';
                 // Place delete button inline with timestamp (right-aligned within the same cell)
                 tableHtml += '<td style="padding:8px 12px;display:flex;align-items:center;justify-content:space-between">';
-                tableHtml += '<span>' + ts + ' <span style="color:var(--muted);font-size:11px;margin-left:6px">(' + (item.tier || 'raw') + ')</span></span>';
+                tableHtml += '<span>' + escapeHtml(ts) + ' <span style="color:var(--muted);font-size:11px;margin-left:6px">(' + escapeHtml(item.tier || 'raw') + ')</span></span>';
                 tableHtml += '<span style="margin-left:12px">';
-                tableHtml += '<button class="trash-btn" data-id="' + (item.id || '') + '" data-tier="' + (item.tier || '') + '" title="Delete this metrics row"></button>';
+                tableHtml += '<button class="trash-btn" data-id="' + escapeHtml(item.id || '') + '" data-tier="' + escapeHtml(item.tier || '') + '" title="Delete this metrics row"></button>';
                 tableHtml += '</span>';
                 tableHtml += '</td>';
-                tableHtml += '<td style="padding:8px 12px;text-align:right">' + ((item.page_count||0).toLocaleString()) + '</td>';
-                tableHtml += '<td style="padding:8px 12px;text-align:right">' + ((item.color_pages||0).toLocaleString()) + '</td>';
-                tableHtml += '<td style="padding:8px 12px;text-align:right">' + ((item.mono_pages||0).toLocaleString()) + '</td>';
-                tableHtml += '<td style="padding:8px 12px;text-align:right">' + ((item.scan_count||0).toLocaleString()) + '</td>';
-                tableHtml += '<td style="padding:8px 12px;text-align:right">' + ((item.fax_pages||0).toLocaleString()) + '</td>';
+                tableHtml += '<td style="padding:8px 12px;text-align:right">' + safeMetricNumber(item.page_count).toLocaleString() + '</td>';
+                tableHtml += '<td style="padding:8px 12px;text-align:right">' + safeMetricNumber(item.color_pages).toLocaleString() + '</td>';
+                tableHtml += '<td style="padding:8px 12px;text-align:right">' + safeMetricNumber(item.mono_pages).toLocaleString() + '</td>';
+                tableHtml += '<td style="padding:8px 12px;text-align:right">' + safeMetricNumber(item.scan_count).toLocaleString() + '</td>';
+                tableHtml += '<td style="padding:8px 12px;text-align:right">' + safeMetricNumber(item.fax_pages).toLocaleString() + '</td>';
                 tableHtml += '</tr>';
             });
 
@@ -4439,7 +4507,7 @@ function loadTraceTags() {
         window.__pm_shared.log('Rendered', totalTags, 'trace tag checkboxes in', Object.keys(TRACE_TAG_CATEGORIES).length, 'sections');
     }).catch(e => {
         window.__pm_shared.error('loadTraceTags failed', e);
-        container.innerHTML = '<span style="color:var(--muted);font-size:12px">Error: ' + e.message + '</span>';
+        container.innerHTML = '<span style="color:var(--muted);font-size:12px">Error: ' + escapeHtml(e && e.message ? e.message : e) + '</span>';
     });
 }
 
@@ -5047,14 +5115,14 @@ function closeWebUIModal() {
 
 function openProxyUI() {
     if (currentSerial) {
-        window.open('/proxy/' + currentSerial, '_blank');
+        window.open('/proxy/' + currentSerial, '_blank', 'noopener,noreferrer');
         closeWebUIModal();
     }
 }
 
 function openDirectUI() {
     if (currentWebUIURL) {
-        window.open(currentWebUIURL, '_blank');
+        window.open(currentWebUIURL, '_blank', 'noopener,noreferrer');
         closeWebUIModal();
     }
 }
@@ -5141,7 +5209,6 @@ const deviceAuthState = {
     pollToken: '',
     serverURL: '',
     caPath: '',
-    insecure: false,
     agentName: '',
     authorizeURL: ''
 };
@@ -5254,7 +5321,7 @@ function summarizeCertificate(cert) {
 }
 
 async function evaluateProbeResult(probe) {
-    const summary = { ok: true, insecure: false };
+    const summary = { ok: true };
     if (!probe) {
         return summary;
     }
@@ -5264,34 +5331,30 @@ async function evaluateProbeResult(probe) {
             return summary;
         }
         if (tls.error_code === 'unknown_authority') {
-            const proceed = await window.__pm_shared.showConfirm(
-                'The server presented a certificate that is not trusted by this system.\n' +
-                summarizeCertificate(tls.certificate) +
-                '\n\nClick OK to continue with TLS verification disabled (not recommended).',
-                'Untrusted certificate',
-                false
-            );
-            if (!proceed) {
-                return { ok: false, insecure: false };
-            }
-            summary.insecure = true;
-            return summary;
+            return {
+                ok: false,
+                message: 'The server certificate is not trusted. Install the issuing CA or provide its path before joining.' +
+                    (tls.certificate ? '\n\n' + summarizeCertificate(tls.certificate) : '')
+            };
         }
-        return { ok: false, insecure: false, message: 'TLS verification failed: ' + (tls.error || tls.error_code || 'unknown error') };
+        return { ok: false, message: 'TLS verification failed: ' + (tls.error || tls.error_code || 'unknown error') };
     }
 
     if (!probe.reachable) {
-        return { ok: false, insecure: false, message: 'Unable to reach the server.' };
+        return { ok: false, message: 'Unable to reach the server.' };
     }
 
     if (probe.scheme === 'http') {
-        const proceed = await window.__pm_shared.showConfirm(
-            'The server appears to be using HTTP without TLS. Continue anyway?',
-            'Insecure connection',
-            false
-        );
-        if (!proceed) {
-            return { ok: false, insecure: false };
+        let isLoopback = false;
+        try {
+            const parsed = new URL(probe.server_url || '');
+            const hostname = parsed.hostname.toLowerCase();
+            isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+        } catch (_) {
+            isLoopback = false;
+        }
+        if (!isLoopback) {
+            return { ok: false, message: 'HTTPS is required for server onboarding. HTTP is allowed only for loopback development.' };
         }
     }
 
@@ -5301,8 +5364,7 @@ async function evaluateProbeResult(probe) {
 async function submitJoinRequest(serverURL, joinToken, options = {}) {
     const payload = {
         server_url: serverURL,
-        token: joinToken,
-        insecure: !!options.insecure
+        token: joinToken
     };
     if (options.caPath) {
         payload.ca_path = options.caPath;
@@ -5338,7 +5400,6 @@ async function runJoinWorkflow(defaultURL) {
 
         window.__pm_shared.showToast('Validating server...', 'info', 2000);
         let normalizedServer = server;
-        let insecure = false;
         const probe = await probeServerConnection(server);
         if (probe && probe.server_url) {
             normalizedServer = probe.server_url;
@@ -5350,14 +5411,12 @@ async function runJoinWorkflow(defaultURL) {
             }
             return false;
         }
-        insecure = !!probeResult.insecure;
-
         const token = await window.__pm_shared.showPrompt('Join token (copy on create):', '');
         if (!token) return false;
 
         window.__pm_shared.showToast('Joining server...', 'info', 3000);
 
-        const body = await submitJoinRequest(normalizedServer, token, { insecure });
+        const body = await submitJoinRequest(normalizedServer, token);
         if (body && body.success) {
             // Cache tenant info for header display
             if (body.tenant_id) {
@@ -5419,7 +5478,6 @@ function resetDeviceAuthModal(options = {}) {
     deviceAuthState.pollToken = '';
     deviceAuthState.serverURL = '';
     deviceAuthState.caPath = '';
-    deviceAuthState.insecure = false;
     deviceAuthState.agentName = '';
     deviceAuthState.authorizeURL = '';
     const pending = document.getElementById('device_auth_pending');
@@ -5445,11 +5503,9 @@ function resetDeviceAuthModal(options = {}) {
         const serverInput = document.getElementById('device_auth_server_url');
         const agentNameInput = document.getElementById('device_auth_agent_name');
         const caPathInput = document.getElementById('device_auth_ca_path');
-        const insecureInput = document.getElementById('device_auth_insecure');
         if (serverInput) serverInput.value = '';
         if (agentNameInput) agentNameInput.value = '';
         if (caPathInput) caPathInput.value = '';
-        if (insecureInput) insecureInput.checked = false;
     }
     setDeviceAuthMessage('', 'info');
 }
@@ -5486,7 +5542,6 @@ async function startDeviceAuthFlow() {
     const serverInput = document.getElementById('device_auth_server_url');
     const agentNameInput = document.getElementById('device_auth_agent_name');
     const caPathInput = document.getElementById('device_auth_ca_path');
-    const insecureInput = document.getElementById('device_auth_insecure');
     const startBtn = document.getElementById('device_auth_start_btn');
     if (!serverInput || !startBtn) return;
     const serverURL = (serverInput.value || '').trim();
@@ -5497,7 +5552,6 @@ async function startDeviceAuthFlow() {
     rememberServerURL(serverURL);
     const caPath = (caPathInput?.value || '').trim();
     const agentName = (agentNameInput?.value || '').trim();
-    const insecure = !!(insecureInput?.checked);
     setDeviceAuthMessage('Requesting approval from server…', 'info');
     startBtn.disabled = true;
     startBtn.textContent = 'Starting…';
@@ -5508,8 +5562,7 @@ async function startDeviceAuthFlow() {
             body: JSON.stringify({
                 server_url: serverURL,
                 agent_name: agentName || undefined,
-                ca_path: caPath || undefined,
-                insecure: insecure
+                ca_path: caPath || undefined
             })
         });
         if (!resp.ok) {
@@ -5520,7 +5573,6 @@ async function startDeviceAuthFlow() {
         deviceAuthState.pollToken = data.poll_token;
         deviceAuthState.serverURL = serverURL;
         deviceAuthState.caPath = caPath;
-        deviceAuthState.insecure = insecure;
         deviceAuthState.agentName = agentName;
         deviceAuthState.authorizeURL = data.authorize_url || '';
         const pending = document.getElementById('device_auth_pending');
@@ -5575,8 +5627,7 @@ async function pollDeviceAuthStatus() {
     try {
         const payload = {
             server_url: deviceAuthState.serverURL,
-            poll_token: deviceAuthState.pollToken,
-            insecure: !!deviceAuthState.insecure
+            poll_token: deviceAuthState.pollToken
         };
         if (deviceAuthState.caPath) {
             payload.ca_path = deviceAuthState.caPath;
@@ -5651,7 +5702,6 @@ async function finalizeDeviceAuthJoin(joinToken, approvedName) {
     }
     try {
         const result = await submitJoinRequest(deviceAuthState.serverURL, joinToken, {
-            insecure: deviceAuthState.insecure,
             caPath: deviceAuthState.caPath,
             agentName: approvedName || deviceAuthState.agentName
         });
@@ -5759,7 +5809,7 @@ function populateServerInfoModal(status) {
     setField('server_info_url', info.url || 'Not configured');
     setField('server_info_agent_id', info.agent_id || 'Not generated yet');
     setField('server_info_name', info.name || 'Using system hostname');
-    setField('server_info_insecure', info.insecure_skip_verify ? 'TLS verification is skipped' : 'TLS verification enforced');
+    setField('server_info_insecure', info.insecure_skip_verify ? 'Invalid configuration: insecure TLS is rejected' : 'TLS verification enforced');
     setField('server_info_ca_path', info.ca_path || 'Not configured');
     const heartbeat = info.heartbeat_interval > 0 ? info.heartbeat_interval + 's' : 'default';
     const upload = info.upload_interval > 0 ? info.upload_interval + 's' : 'default';

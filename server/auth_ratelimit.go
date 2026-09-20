@@ -21,6 +21,8 @@ type AuthRateLimiter struct {
 	stopCleanup     chan struct{}
 }
 
+const maxAuthRateLimitRecords = 10000
+
 // authAttemptRecord tracks authentication attempts from a specific IP+token
 type authAttemptRecord struct {
 	firstAttempt    time.Time
@@ -58,6 +60,12 @@ func (rl *AuthRateLimiter) RecordFailure(ip, tokenPrefix string) (bool, bool, in
 
 	record, exists := rl.attempts[key]
 	if !exists {
+		if len(rl.attempts) >= maxAuthRateLimitRecords {
+			// Bound memory even when an attacker rotates source addresses and
+			// token prefixes. Prefer removing expired/oldest unblocked entries;
+			// active blocks remain protected until they expire.
+			rl.evictOneLocked(now)
+		}
 		record = &authAttemptRecord{
 			firstAttempt: now,
 			lastAttempt:  now,
@@ -105,6 +113,40 @@ func (rl *AuthRateLimiter) RecordFailure(ip, tokenPrefix string) (bool, bool, in
 	}
 
 	return false, shouldLog, record.failureCount
+}
+
+func (rl *AuthRateLimiter) evictOneLocked(now time.Time) {
+	var candidate string
+	var candidateTime time.Time
+	for key, record := range rl.attempts {
+		if record == nil {
+			delete(rl.attempts, key)
+			return
+		}
+		if now.Before(record.blockedUntil) {
+			continue
+		}
+		if candidate == "" || record.lastAttempt.Before(candidateTime) {
+			candidate = key
+			candidateTime = record.lastAttempt
+		}
+	}
+	if candidate != "" {
+		delete(rl.attempts, candidate)
+		return
+	}
+	// If every entry is actively blocked, evict the oldest one rather than
+	// allowing unbounded growth. The block is a defense-in-depth control and
+	// cannot justify a memory exhaustion condition.
+	for key, record := range rl.attempts {
+		if candidate == "" || record.lastAttempt.Before(candidateTime) {
+			candidate = key
+			candidateTime = record.lastAttempt
+		}
+	}
+	if candidate != "" {
+		delete(rl.attempts, candidate)
+	}
 }
 
 // IsBlocked checks if an IP+token is currently blocked
@@ -257,14 +299,28 @@ func getRealIP(r *http.Request) string {
 	return remoteIP
 }
 
-// defaultTrustedProxyCIDRs contains private network ranges commonly used by Docker/reverse proxies
+// defaultTrustedProxyCIDRs intentionally contains only loopback.  Trusting all
+// RFC1918 networks by default lets any host on a customer LAN spoof
+// X-Forwarded-For/Proto when the server is reachable on a non-loopback bind.
+// Docker/reverse-proxy deployments must explicitly configure their proxy CIDR
+// (or enable Cloudflare proxy mode) instead.
 var defaultTrustedProxyCIDRs = []string{
-	"10.0.0.0/8",
-	"172.16.0.0/12",
-	"192.168.0.0/16",
 	"127.0.0.0/8",
 	"::1/128",
-	"fc00::/7",
+}
+
+func isLoopbackBindAddress(bindAddress string) bool {
+	value := strings.TrimSpace(bindAddress)
+	if value == "" || strings.EqualFold(value, "localhost") {
+		return true
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = strings.Trim(host, "[]")
+	} else {
+		value = strings.Trim(value, "[]")
+	}
+	ip := net.ParseIP(value)
+	return ip != nil && ip.IsLoopback()
 }
 
 // cloudflareIPURLs are the authoritative sources for Cloudflare's IP ranges
@@ -272,6 +328,8 @@ var cloudflareIPURLs = []string{
 	"https://www.cloudflare.com/ips-v4",
 	"https://www.cloudflare.com/ips-v6",
 }
+
+const maxCloudflareIPResponseBytes = 64 << 10
 
 // fetchCloudflareIPs fetches the current Cloudflare IP ranges from their official endpoints
 func fetchCloudflareIPs() []string {
@@ -284,16 +342,20 @@ func fetchCloudflareIPs() []string {
 			logWarn("Failed to fetch Cloudflare IPs", "url", url, "error", err)
 			continue
 		}
-		defer resp.Body.Close()
-
 		if resp.StatusCode != http.StatusOK {
 			logWarn("Cloudflare IP fetch returned non-200", "url", url, "status", resp.StatusCode)
+			_ = resp.Body.Close()
 			continue
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxCloudflareIPResponseBytes+1))
+		_ = resp.Body.Close()
 		if err != nil {
 			logWarn("Failed to read Cloudflare IP response", "url", url, "error", err)
+			continue
+		}
+		if len(body) > maxCloudflareIPResponseBytes {
+			logWarn("Cloudflare IP response exceeded size limit", "url", url)
 			continue
 		}
 
@@ -334,6 +396,9 @@ func initTrustedProxies() {
 			entries = serverConfig.Server.TrustedProxies
 		} else {
 			entries = defaultTrustedProxyCIDRs
+			if serverConfig != nil && serverConfig.Server.BehindProxy && !isLoopbackBindAddress(serverConfig.Server.BindAddress) && !serverConfig.Server.CloudflareProxy {
+				logWarn("behind_proxy is enabled without trusted_proxies on a non-loopback bind; forwarded headers will only be trusted from loopback")
+			}
 		}
 
 		// Add Cloudflare IPs if cloudflare_proxy is enabled

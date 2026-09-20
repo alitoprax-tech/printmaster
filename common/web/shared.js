@@ -1,5 +1,15 @@
 // PrintMaster Shared JavaScript - Common utilities for Agent and Server UIs
 
+function escapeSharedHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 // Ensure a minimal namespaced API exists immediately so other bundles can
 // call into `window.__pm_shared` without guards. We provide a readiness
 // promise and a small SHARED logger here so other scripts can await and
@@ -366,7 +376,8 @@ function showPrinterDetails(identifier, source) {
         if (!container) return;
 
         const toast = document.createElement('div');
-        toast.className = `toast toast-${type}`;
+        const toastType = ['success', 'error', 'warning', 'info'].includes(String(type)) ? String(type) : 'info';
+        toast.className = `toast toast-${toastType}`;
 
         const icons = {
             success: '✓',
@@ -374,10 +385,13 @@ function showPrinterDetails(identifier, source) {
             info: 'ℹ'
         };
 
-        toast.innerHTML = `
-            <span class="toast-icon">${icons[type] || icons.info}</span>
-            <span class="toast-message">${message}</span>
-        `;
+        const iconEl = document.createElement('span');
+        iconEl.className = 'toast-icon';
+        iconEl.textContent = icons[toastType] || icons.info;
+        const messageEl = document.createElement('span');
+        messageEl.className = 'toast-message';
+        messageEl.textContent = message === null || message === undefined ? '' : String(message);
+        toast.replaceChildren(iconEl, messageEl);
 
         container.appendChild(toast);
 
@@ -838,11 +852,11 @@ function showPrompt(message, defaultValue = '', title = 'Input') {
             modal.innerHTML = `
                 <div class="modal-content" style="max-width:480px;">
                     <div class="modal-header">
-                        <h3 class="modal-title" id="prompt_modal_title">${title}</h3>
+                        <h3 class="modal-title" id="prompt_modal_title"></h3>
                         <button class="modal-close-x" id="prompt_modal_close_x" title="Close">&times;</button>
                     </div>
                     <div class="modal-body">
-                        <p id="prompt_modal_message">${message}</p>
+                        <p id="prompt_modal_message"></p>
                         <input id="prompt_modal_input" class="modal-input" style="width:100%;padding:8px;margin-top:8px;" />
                     </div>
                     <div class="modal-footer">
@@ -953,7 +967,12 @@ function makeClipboardIcon() {
 function showWebUIModal(webUIURL, serial) {
     // Simple default: open in new tab if URL present
     if (!webUIURL) return;
-    try { window.open(webUIURL, '_blank'); } catch (e) { window.__pm_shared.warn('showWebUIModal fallback failed', e); }
+    try {
+        const url = new URL(String(webUIURL), window.location.origin);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+        const opened = window.open(url.href, '_blank', 'noopener,noreferrer');
+        if (opened) opened.opener = null;
+    } catch (e) { window.__pm_shared.warn('showWebUIModal fallback failed', e); }
 }
 
 
@@ -1195,7 +1214,10 @@ window.__pm_shared.openAgentUI = function (agentId) {
 
 window.__pm_shared.openDeviceUI = function (serial) {
     if (!serial) return;
-    try { window.open('/proxy/' + encodeURIComponent(serial) + '/', '_blank'); } catch (e) { /* best-effort */ }
+    try {
+        const opened = window.open('/proxy/' + encodeURIComponent(serial) + '/', '_blank', 'noopener,noreferrer');
+        if (opened) opened.opener = null;
+    } catch (e) { /* best-effort */ }
 };
 
 window.__pm_shared.openDeviceMetrics = function (serial) {
@@ -1218,7 +1240,11 @@ window.__pm_shared.viewAgentDetails = async function (agentId) {
             const res = await fetch('/api/v1/agents/' + encodeURIComponent(agentId));
             if (!res.ok) { body.innerHTML = '<div style="color:var(--muted);padding:12px">Failed to load agent details</div>'; return; }
             const agent = await res.json();
-            body.innerHTML = '<pre style="white-space:pre-wrap;word-break:break-word">' + JSON.stringify(agent, null, 2) + '</pre>';
+            const pre = document.createElement('pre');
+            pre.style.whiteSpace = 'pre-wrap';
+            pre.style.wordBreak = 'break-word';
+            pre.textContent = JSON.stringify(agent, null, 2);
+            body.replaceChildren(pre);
             return;
         }
         // Fallback: open agents tab
@@ -1258,8 +1284,10 @@ window.__pm_shared.deleteAgent = async function (agentId, agentName) {
  * @returns {string} - Formatted number (e.g., "1,234,567")
  */
 function formatNumber(num) {
-    if (num === null || num === undefined) return '0';
-    return num.toLocaleString('en-US');
+    const number = typeof num === 'number'
+        ? num
+        : (typeof num === 'string' && num.trim() !== '' ? Number(num) : NaN);
+    return Number.isFinite(number) ? number.toLocaleString('en-US') : '0';
 }
 
 /**
@@ -1488,13 +1516,15 @@ window.showMetricsModal = async function (opts = {}) {
             let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
             items.forEach(it => {
                 const t = it.timestamp ? new Date(it.timestamp).toLocaleString() : 'N/A';
-                html += `<div style="padding:8px;background:rgba(0,0,0,0.03);border-radius:6px;"><strong>${it.serial || it.Serial || ''}</strong> — ${t} — pages: ${it.page_count || it.pageCount || 'n/a'}</div>`;
+                const serialText = it.serial || it.Serial || '';
+                const pagesText = it.page_count || it.pageCount || 'n/a';
+                html += `<div style="padding:8px;background:rgba(0,0,0,0.03);border-radius:6px;"><strong>${escapeSharedHtml(serialText)}</strong> — ${escapeSharedHtml(t)} — pages: ${escapeSharedHtml(pagesText)}</div>`;
             });
             html += '</div>';
             contentEl.innerHTML = html;
         } catch (err) {
             window.__pm_shared.error('Metrics fetch failed', err);
-            contentEl.innerHTML = `<div style="color:var(--error);">Failed to load metrics: ${typeof escapeHtml === 'function' ? escapeHtml(err.message || err) : String(err.message || err)}</div>`;
+            contentEl.innerHTML = `<div style="color:var(--error);">Failed to load metrics: ${escapeSharedHtml(err && err.message ? err.message : err)}</div>`;
         }
     }
 
@@ -1504,4 +1534,3 @@ window.showMetricsModal = async function (opts = {}) {
     modal.style.display = 'flex';
     setTimeout(doLoad, 50);
 };
-

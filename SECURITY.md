@@ -4,12 +4,14 @@
 
 We release security patches for the following versions:
 
-| Component | Version | Supported          |
-| --------- | ------- | ------------------ |
-| Agent     | latest  | :white_check_mark: |
-| Server    | latest  | :white_check_mark: |
+| Component | Version policy | Supported          |
+| --------- | -------------- | ------------------ |
+| Agent     | Current reviewed release | :white_check_mark: |
+| Server    | Current reviewed release | :white_check_mark: |
 
-We recommend always running the latest version for the best security.
+Use a reviewed, pinned release (or an internally rebuilt commit) and verify its
+artifact signature/checksum. Do not treat a mutable `latest`, `main`, or
+development image as a production security baseline.
 
 ## Reporting a Vulnerability
 
@@ -61,8 +63,7 @@ When deploying PrintMaster:
 
 ### Authentication
 
-- **Change the default admin password immediately**
-- Use strong, unique passwords
+- Set a strong, unique `ADMIN_PASSWORD` before the first startup; there is no production default password
 - Enable TLS for agent-server communication in production
 
 ### Server Configuration
@@ -86,8 +87,8 @@ require_token = true
 
 ### SNMP Security
 
-- Use SNMPv2c with non-default community strings
-- Consider SNMPv3 for sensitive environments (future feature)
+- Use SNMPv3 `authPriv` for production whenever supported
+- If SNMPv1/v2c is required, use a site-specific community and restrict access at the printer/network level
 - Restrict SNMP access at the printer level
 
 ## Known Security Considerations
@@ -106,9 +107,11 @@ export SNMP_COMMUNITY="your-community-string"
 
 ### Web UI Sessions
 
-- Sessions expire after inactivity
+- Sessions have a bounded lifetime and are revoked on logout/password reset
 - Cookies are HTTP-only and secure (when using TLS)
-- CSRF protection is enabled
+- Browser state-changing requests are restricted to the same origin; keep the
+  reverse proxy's host/proto headers authoritative and configure its trusted
+  proxy CIDR narrowly
 
 ### API Authentication
 

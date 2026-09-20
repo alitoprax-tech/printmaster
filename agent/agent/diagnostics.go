@@ -67,7 +67,7 @@ func RecordParseDebug(ip string, d ParseDebug) error {
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(fpath, data, 0o644)
+		return os.WriteFile(fpath, data, 0o600)
 	}
 	return nil
 }

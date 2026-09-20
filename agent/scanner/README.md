@@ -174,7 +174,7 @@ fmt.Printf("Found printer: %s %s (Serial: %s)\n", pi.Vendor, pi.Model, pi.Serial
 
 ```go
 config := &scanner.ScanConfig{
-    SNMPCommunity: "public",
+    SNMPCommunity: "replace-with-site-secret",
     Timeout:       5,
     Concurrency:   50,
 }
@@ -297,7 +297,7 @@ Scanner logs to structured logger:
 ### No Devices Found
 1. Check network connectivity: `ping <device_ip>`
 2. Verify SNMP enabled on printer
-3. Test SNMP manually: `snmpwalk -v2c -c public <device_ip> .1.3.6`
+3. Test SNMP manually: `snmpwalk -v2c -c <site-specific-community> <device_ip> .1.3.6`
 4. Check firewall allows UDP 161 outbound
 
 ### Incomplete Data

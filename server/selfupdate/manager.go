@@ -2,7 +2,7 @@ package selfupdate
 
 import (
 	"context"
-	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"printmaster/common/logger"
+	"printmaster/common/updateauth"
+	"printmaster/server/releases"
 	"printmaster/server/storage"
 
 	"github.com/Masterminds/semver"
@@ -111,12 +113,19 @@ func NewManager(opts Options) (*Manager, error) {
 		maxArtifacts = defaultMaxArtifacts
 	}
 	stateDir := filepath.Join(dataDir, selfUpdateDirName)
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to prepare self-update directory: %w", err)
 	}
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(stateDir, 0o700)
+	}
 	for _, dir := range []string{stagingDirName, backupDirName, applyDirName, helperDirName, logDirName} {
-		if err := os.MkdirAll(filepath.Join(stateDir, dir), 0o755); err != nil {
+		dirPath := filepath.Join(stateDir, dir)
+		if err := os.MkdirAll(dirPath, 0o700); err != nil {
 			return nil, fmt.Errorf("failed to prepare self-update subdirectory %s: %w", dir, err)
+		}
+		if runtime.GOOS != "windows" {
+			_ = os.Chmod(dirPath, 0o700)
 		}
 	}
 	binaryPath := strings.TrimSpace(opts.BinaryPath)
@@ -460,22 +469,37 @@ func (m *Manager) stageCandidate(ctx context.Context, run *storage.SelfUpdateRun
 	if strings.TrimSpace(artifact.CachePath) == "" {
 		return fmt.Errorf("artifact cache path missing")
 	}
-	manifest, err := m.store.GetReleaseManifest(ctx, artifact.Component, artifact.Version, artifact.Platform, artifact.Arch)
+	releaseManager, err := releases.NewManager(m.store, m.log, releases.ManagerOptions{Now: m.clock})
 	if err != nil {
-		return fmt.Errorf("load manifest: %w", err)
+		return err
 	}
-	if manifest == nil {
-		return fmt.Errorf("manifest not found")
+	manifest, err := releaseManager.GetLatestManifest(ctx, artifact.Component, artifact.Platform, artifact.Arch, artifact.Channel)
+	if err != nil {
+		return fmt.Errorf("load independently signed release: %w", err)
+	}
+	keys, err := updateauth.LoadKeyring(os.Getenv("PRINTMASTER_UPDATE_TRUST_FILE"))
+	if err != nil {
+		return err
+	}
+	if err := keys.Verify(manifest, updateauth.Target{Component: m.component, Platform: m.platform, Arch: m.arch, Channel: m.channel}, m.clock()); err != nil {
+		return err
+	}
+	if manifest.Version != artifact.Version || manifest.SHA256 != artifact.SHA256 || manifest.SizeBytes != artifact.SizeBytes {
+		return fmt.Errorf("selected artifact does not match signed release")
+	}
+	target, err := semver.NewVersion(manifest.Version)
+	if err != nil || m.currentSemver == nil || !target.GreaterThan(m.currentSemver) {
+		return fmt.Errorf("self-update version ordering rejected")
 	}
 	stageDir := filepath.Join(m.stateDir, stagingDirName, fmt.Sprintf("run-%d", run.ID))
-	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+	if err := os.MkdirAll(stageDir, 0o700); err != nil {
 		return fmt.Errorf("create staging dir: %w", err)
 	}
 	stagePath := filepath.Join(stageDir, filepath.Base(artifact.CachePath))
 	if err := copyFile(artifact.CachePath, stagePath); err != nil {
 		return fmt.Errorf("copy artifact: %w", err)
 	}
-	if err := verifySHA(stagePath, artifact.SHA256); err != nil {
+	if err := updateauth.VerifyFile(stagePath, manifest); err != nil {
 		return err
 	}
 	backupPath, err := m.createBackup(run)
@@ -485,7 +509,7 @@ func (m *Manager) stageCandidate(ctx context.Context, run *storage.SelfUpdateRun
 	run.Metadata = mergeMetadata(run.Metadata, map[string]any{
 		"stage_path":       stagePath,
 		"backup_path":      backupPath,
-		"manifest_id":      manifest.ID,
+		"signed_manifest":  manifest,
 		"manifest_version": manifest.ManifestVersion,
 		"manifest_channel": manifest.Channel,
 	})
@@ -504,7 +528,16 @@ func (m *Manager) beginApply(ctx context.Context, run *storage.SelfUpdateRun) er
 	if strings.TrimSpace(backupPath) == "" {
 		return fmt.Errorf("backup path missing from metadata")
 	}
+	proofJSON, err := json.Marshal(run.Metadata["signed_manifest"])
+	if err != nil {
+		return err
+	}
+	var proof *updateauth.Manifest
+	if err := json.Unmarshal(proofJSON, &proof); err != nil || proof == nil {
+		return fmt.Errorf("signed release proof missing")
+	}
 	inst := &ApplyInstruction{
+		Manifest:       proof,
 		RunID:          run.ID,
 		StagePath:      stagePath,
 		BackupPath:     backupPath,
@@ -544,7 +577,7 @@ func (m *Manager) createBackup(run *storage.SelfUpdateRun) (string, error) {
 		return "", fmt.Errorf("stat binary: %w", err)
 	}
 	backupDir := filepath.Join(m.stateDir, backupDirName, fmt.Sprintf("run-%d", run.ID))
-	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
 		return "", fmt.Errorf("create backup dir: %w", err)
 	}
 	backupPath := filepath.Join(backupDir, filepath.Base(path))
@@ -555,12 +588,17 @@ func (m *Manager) createBackup(run *storage.SelfUpdateRun) (string, error) {
 }
 
 func copyFile(src, dst string) error {
+	for name, path := range map[string]string{"source": src, "destination": dst} {
+		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s path must not be a symbolic link", name)
+		}
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
 	if err != nil {
 		return err
 	}
@@ -570,26 +608,10 @@ func copyFile(src, dst string) error {
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
+	if runtime.GOOS != "windows" {
+		if err := out.Chmod(0o700); err != nil {
+			return err
+		}
+	}
 	return out.Sync()
-}
-
-func verifySHA(path, expected string) error {
-	expected = strings.TrimSpace(strings.ToLower(expected))
-	if expected == "" {
-		return nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	actual := fmt.Sprintf("%x", h.Sum(nil))
-	if actual != expected {
-		return fmt.Errorf("sha mismatch: expected %s got %s", expected, actual)
-	}
-	return nil
 }

@@ -296,12 +296,9 @@ func probeWebUI(probeURL string) string {
 		},
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				// #nosec G402 -- InsecureSkipVerify intentionally enabled:
-				// Network printers commonly use self-signed SSL certificates that
-				// would fail standard validation. This is a local network probe to
-				// detect printer web UIs, not a general-purpose HTTP client.
-				// SSRF protections are implemented above (redirect host validation).
-				InsecureSkipVerify: true,
+				// Discovery probes use the system trust store.  A printer with a
+				// self-signed certificate must be enrolled with its CA explicitly.
+				MinVersion: tls.VersionTLS12,
 			},
 			DisableKeepAlives: true,
 		},

@@ -628,7 +628,7 @@ func migrateSchemaV7(s *SQLiteStore) error {
 
 			// Copy data (excluding page_count and toner_levels)
 			_, err = s.db.Exec(`
-				INSERT INTO devices_new 
+				INSERT INTO devices_new
 				SELECT serial, ip, manufacturer, model, hostname, firmware, mac_address, subnet_mask, gateway, dns_servers, dhcp_server,
 				       consumables, status_messages, last_seen, created_at, first_seen, is_saved, visible, discovery_method, walk_filename,
 				       last_scan_id, asset_number, location, description, web_ui_url, locked_fields, raw_data

@@ -3,11 +3,13 @@ package main
 import (
 	context "context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -18,6 +20,7 @@ import (
 	oidclib "github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 
+	webutil "printmaster/common/web"
 	authz "printmaster/server/authz"
 	"printmaster/server/storage"
 )
@@ -28,8 +31,74 @@ var (
 		providers map[string]*oidclib.Provider
 	}{providers: make(map[string]*oidclib.Provider)}
 
-	slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{2,63}$`)
+	slugPattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{2,63}$`)
+	oidcFlowRate = struct {
+		mu      sync.Mutex
+		entries map[string]oidcFlowRateEntry
+	}{entries: make(map[string]oidcFlowRateEntry)}
+	oidcCleanupState = struct {
+		mu   sync.Mutex
+		last time.Time
+	}{}
 )
+
+type oidcFlowRateEntry struct {
+	windowStart time.Time
+	count       int
+}
+
+const (
+	oidcFlowRateWindow  = time.Minute
+	oidcFlowRateLimit   = 20
+	oidcFlowRateMaxKeys = 4096
+)
+
+func allowOIDCFlow(r *http.Request, operation string) bool {
+	key := operation + ":" + getRealIP(r)
+	now := time.Now()
+	oidcFlowRate.mu.Lock()
+	defer oidcFlowRate.mu.Unlock()
+	if len(oidcFlowRate.entries) >= oidcFlowRateMaxKeys {
+		for existing, entry := range oidcFlowRate.entries {
+			if now.Sub(entry.windowStart) >= oidcFlowRateWindow {
+				delete(oidcFlowRate.entries, existing)
+			}
+		}
+		if len(oidcFlowRate.entries) >= oidcFlowRateMaxKeys {
+			return false
+		}
+	}
+	entry, ok := oidcFlowRate.entries[key]
+	if !ok || now.Sub(entry.windowStart) >= oidcFlowRateWindow {
+		oidcFlowRate.entries[key] = oidcFlowRateEntry{windowStart: now, count: 1}
+		return true
+	}
+	if entry.count >= oidcFlowRateLimit {
+		return false
+	}
+	entry.count++
+	oidcFlowRate.entries[key] = entry
+	return true
+}
+
+func cleanupOIDCSessions(ctx context.Context) {
+	janitor, ok := serverStore.(interface {
+		DeleteOIDCSessionsBefore(context.Context, time.Time) (int64, error)
+	})
+	if !ok {
+		return
+	}
+	oidcCleanupState.mu.Lock()
+	if time.Since(oidcCleanupState.last) < time.Minute {
+		oidcCleanupState.mu.Unlock()
+		return
+	}
+	oidcCleanupState.last = time.Now()
+	oidcCleanupState.mu.Unlock()
+	if _, err := janitor.DeleteOIDCSessionsBefore(ctx, time.Now().UTC().Add(-10*time.Minute)); err != nil {
+		serverLogger.Warn("OIDC session cleanup failed", "error", err)
+	}
+}
 
 type oidcClaims struct {
 	Subject           string `json:"sub"`
@@ -57,6 +126,11 @@ type oidcProviderPayload struct {
 }
 
 func handleAuthOptions(w http.ResponseWriter, r *http.Request) {
+	if !allowOIDCFlow(r, "options") {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	ctx := context.Background()
 	resolution := resolveTenantForAuthRequest(ctx, r)
 	tenantID := ""
@@ -109,10 +183,15 @@ func handleTenantLookup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if !allowOIDCFlow(r, "tenant-lookup") {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	var payload struct {
 		Hint string `json:"hint"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := webutil.DecodeJSONBody(nil, r, &payload, 1<<20); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -157,7 +236,7 @@ func handleOIDCProviders(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var payload oidcProviderPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &payload, 1<<20); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
@@ -206,7 +285,7 @@ func handleOIDCProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var payload oidcProviderPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &payload, 1<<20); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
@@ -239,6 +318,11 @@ func handleOIDCProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleOIDCStart(w http.ResponseWriter, r *http.Request) {
+	if !allowOIDCFlow(r, "start") {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
 	rest := strings.TrimPrefix(r.URL.Path, "/auth/oidc/start/")
 	slug := strings.Trim(rest, "/")
 	if slug == "" {
@@ -247,6 +331,7 @@ func handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
+	cleanupOIDCSessions(ctx)
 	provider, err := serverStore.GetOIDCProvider(ctx, slug)
 	if err != nil {
 		http.NotFound(w, r)
@@ -301,12 +386,29 @@ func handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to persist state", http.StatusInternalServerError)
 		return
 	}
+	// Bind the one-time state to the browser that initiated the flow. Without
+	// this cookie an attacker can complete their own IdP flow and force the
+	// callback URL onto another browser (login CSRF/session swapping).
+	http.SetCookie(w, &http.Cookie{
+		Name:     "printmaster_oidc_state",
+		Value:    state,
+		Path:     "/",
+		MaxAge:   600,
+		Secure:   requestIsHTTPS(r),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 
 	authURL := oauthConfig.AuthCodeURL(state, oauth2.SetAuthURLParam("nonce", nonce))
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	// The callback URL carries the one-time authorization code and state. Do
+	// not allow browsers, proxies, or referrers to retain or forward it.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	state := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
 	if state == "" || code == "" {
@@ -316,6 +418,13 @@ func handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
+	stateCookie, cookieErr := r.Cookie("printmaster_oidc_state")
+	if cookieErr != nil || stateCookie == nil || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(state)) != 1 {
+		http.Redirect(w, r, "/login?error=oidc_state", http.StatusFound)
+		return
+	}
+	// Consume the browser binding even when a later provider/token check fails.
+	http.SetCookie(w, &http.Cookie{Name: "printmaster_oidc_state", Value: "", Path: "/", MaxAge: -1, Secure: requestIsHTTPS(r), HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	sess, err := serverStore.GetOIDCSession(ctx, state)
 	if err != nil {
 		serverLogger.Warn("OIDC session lookup failed", "state", state[:min(len(state), 16)]+"...", "error", err)
@@ -323,6 +432,10 @@ func handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer serverStore.DeleteOIDCSession(ctx, sess.ID)
+	if sess.CreatedAt.IsZero() || time.Since(sess.CreatedAt) > 10*time.Minute {
+		http.Redirect(w, r, "/login?error=oidc_state", http.StatusFound)
+		return
+	}
 
 	provider, err := serverStore.GetOIDCProvider(ctx, sess.ProviderSlug)
 	if err != nil {
@@ -399,10 +512,14 @@ func handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	if isAgentCallbackURL(redirectURL) {
 		serverLogger.Debug("OIDC callback detected agent redirect", "user_id", user.ID, "callback_url", redirectURL)
 		// Generate an agent callback token and append it to the URL
-		act := generateAgentCallbackToken(user, "", redirectURL)
+		parsed, parseErr := url.Parse(redirectURL)
+		agentID := ""
+		if parseErr == nil {
+			agentID = strings.TrimSpace(parsed.Query().Get("agent_id"))
+		}
+		act := generateAgentCallbackToken(user, agentID, redirectURL)
 		if act != nil {
-			parsed, err := url.Parse(redirectURL)
-			if err == nil {
+			if parseErr == nil {
 				q := parsed.Query()
 				q.Set("token", act.Token)
 				parsed.RawQuery = q.Encode()
@@ -423,7 +540,9 @@ func isAgentCallbackURL(rawURL string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(parsed.Path, "/api/v1/auth/callback")
+	// OIDC redirect targets are same-origin relative paths. Do not mint a
+	// bearer callback token for an arbitrary path or external host.
+	return parsed.IsAbs() && strings.EqualFold(parsed.Scheme, "https") && parsed.Host != "" && parsed.User == nil && parsed.Path == "/api/v1/auth/callback" && strings.TrimSpace(parsed.Query().Get("agent_id")) != ""
 }
 
 type tenantResolution struct {
@@ -693,13 +812,43 @@ func buildOAuthConfig(r *http.Request, provider *storage.OIDCProvider, op *oidcl
 }
 
 func buildExternalURL(r *http.Request) string {
-	scheme := "http"
-	if requestIsHTTPS(r) {
-		scheme = "https"
+	if serverConfig != nil {
+		if configured := strings.TrimRight(strings.TrimSpace(serverConfig.Server.ExternalURL), "/"); configured != "" {
+			if parsed, err := url.Parse(configured); err == nil && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && !strings.ContainsAny(configured, "\r\n\\") && strings.EqualFold(parsed.Scheme, "https") {
+				return configured
+			}
+			if serverLogger != nil {
+				serverLogger.Warn("Ignoring invalid server.external_url")
+			}
+		}
 	}
-	host := r.Host
-	if host == "" {
-		host = "localhost"
+	// Host headers are attacker-controlled on a directly exposed server. Use a
+	// request host only for loopback development or when the peer is an
+	// explicitly trusted reverse proxy; production deployments should set the
+	// canonical server.external_url value.
+	host := "localhost"
+	scheme := "https"
+	if r != nil {
+		candidate := strings.TrimSpace(r.Host)
+		trusted := false
+		if hostOnly, _, err := net.SplitHostPort(candidate); err == nil {
+			candidate = hostOnly
+		}
+		if strings.EqualFold(candidate, "localhost") {
+			trusted = true
+		} else if ip := net.ParseIP(candidate); ip != nil && ip.IsLoopback() {
+			trusted = true
+		} else if serverConfig != nil && (serverConfig.Server.BehindProxy || serverConfig.Server.CloudflareProxy) {
+			trusted = isTrustedProxy(extractIPFromAddr(r.RemoteAddr))
+		}
+		if trusted && candidate != "" && !strings.ContainsAny(r.Host, "\r\n/@\\") {
+			host = r.Host
+			if requestIsHTTPS(r) {
+				scheme = "https"
+			} else {
+				scheme = "http"
+			}
+		}
 	}
 	return fmt.Sprintf("%s://%s", scheme, host)
 }
@@ -710,7 +859,10 @@ func sanitizeRedirectTarget(raw string) string {
 		return "/"
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.IsAbs() {
+	// OIDC callbacks may redirect only within this application. External
+	// redirects can turn the login endpoint into an open redirect and can leak
+	// an agent callback token to an attacker-controlled host.
+	if err != nil || u.IsAbs() || u.Host != "" || u.Scheme != "" || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "\\") || !strings.HasPrefix(u.Path, "/") {
 		return "/"
 	}
 	if u.Path == "" {
@@ -727,16 +879,14 @@ func randomURLSafe(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// maskSecret returns a hint about a secret for logging (length + first/last 2 chars)
+// maskSecret returns only whether a secret is present and its byte length.
+// Secret fragments must never be written to logs because logs are copied to
+// central systems and may be retained longer than the credential itself.
 func maskSecret(s string) string {
 	if s == "" {
 		return "(empty)"
 	}
-	n := len(s)
-	if n <= 4 {
-		return fmt.Sprintf("len=%d", n)
-	}
-	return fmt.Sprintf("len=%d [%s...%s]", n, s[:2], s[n-2:])
+	return fmt.Sprintf("set(len=%d)", len(s))
 }
 
 func resolveOIDCUser(ctx context.Context, provider *storage.OIDCProvider, claims *oidcClaims) (*storage.User, error) {
@@ -756,7 +906,10 @@ func resolveOIDCUser(ctx context.Context, provider *storage.OIDCProvider, claims
 		return nil, err
 	}
 
-	email := strings.ToLower(strings.TrimSpace(claims.Email))
+	email := ""
+	if claims.EmailVerified {
+		email = strings.ToLower(strings.TrimSpace(claims.Email))
+	}
 	if email != "" {
 		user, err := serverStore.GetUserByEmail(ctx, email)
 		if err == nil {

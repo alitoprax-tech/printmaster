@@ -38,14 +38,19 @@ type Config struct {
 type ServerConfig struct {
 	HTTPPort            int      `toml:"http_port"`
 	HTTPSPort           int      `toml:"https_port"`
+	ExternalURL         string   `toml:"external_url"` // Canonical browser-facing HTTPS URL
 	BehindProxy         bool     `toml:"behind_proxy"`
 	CloudflareProxy     bool     `toml:"cloudflare_proxy"` // If true, automatically trust Cloudflare IP ranges
 	ProxyUseHTTPS       bool     `toml:"proxy_use_https"`  // If true, use HTTPS even when behind proxy (default: false for HTTP)
 	TrustedProxies      []string `toml:"trusted_proxies"`  // CIDR ranges, IPs, or hostnames to trust for proxy headers
-	BindAddress         string   `toml:"bind_address"`     // Address to bind to (default: 0.0.0.0 for all interfaces, 127.0.0.1 for localhost)
+	BindAddress         string   `toml:"bind_address"`     // Address to bind to (default: 127.0.0.1; set explicitly for network access)
 	AutoApproveAgents   bool     `toml:"auto_approve_agents"`
 	AgentTimeoutMinutes int      `toml:"agent_timeout_minutes"`
 	SelfUpdateEnabled   bool     `toml:"self_update_enabled"`
+	// BrowserProxyEnabled permits browser-facing agent and printer UI proxying.
+	// It is disabled by default because active content from a customer network must
+	// never share the management panel's origin or session.
+	BrowserProxyEnabled bool `toml:"browser_proxy_enabled"`
 }
 
 // ReleasesConfig tunes the GitHub release intake worker.
@@ -75,6 +80,8 @@ type SecurityConfig struct {
 	PasswordRequireNumber  bool `toml:"password_require_number"`   // Require number (default: false)
 	PasswordRequireSpecial bool `toml:"password_require_special"`  // Require special character (default: false)
 }
+
+const maxPasswordLength = 4096
 
 // TLSConfigTOML holds TLS configuration from TOML
 type TLSConfigTOML struct {
@@ -114,13 +121,17 @@ func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			HTTPPort:            9090,
+			ExternalURL:         "",
 			HTTPSPort:           9443,
 			BehindProxy:         false,
-			ProxyUseHTTPS:       false,     // Default to HTTP when behind proxy
-			BindAddress:         "0.0.0.0", // Bind to all interfaces by default
+			ProxyUseHTTPS:       false,       // Default to HTTP when behind proxy
+			BindAddress:         "127.0.0.1", // Keep management listeners local unless explicitly published
 			AutoApproveAgents:   false,
 			AgentTimeoutMinutes: 15,
-			SelfUpdateEnabled:   true,
+			// Keep privileged self-update disabled until the service/broker apply
+			// path has completed its deployment-specific acceptance review.
+			SelfUpdateEnabled:   false,
+			BrowserProxyEnabled: false,
 		},
 		Security: SecurityConfig{
 			RateLimitEnabled:       true, // Enable rate limiting by default
@@ -227,6 +238,10 @@ func applyEnvOverrides(cfg *Config, tracker *ConfigSourceTracker) {
 		cfg.Server.BindAddress = val
 		tracker.EnvKeys["server.bind_address"] = true
 	}
+	if val := os.Getenv("SERVER_EXTERNAL_URL"); val != "" {
+		cfg.Server.ExternalURL = strings.TrimRight(strings.TrimSpace(val), "/")
+		tracker.EnvKeys["server.external_url"] = true
+	}
 	if val := os.Getenv("AUTO_APPROVE_AGENTS"); val != "" {
 		cfg.Server.AutoApproveAgents = val == "true" || val == "1"
 		tracker.EnvKeys["server.auto_approve_agents"] = true
@@ -241,6 +256,10 @@ func applyEnvOverrides(cfg *Config, tracker *ConfigSourceTracker) {
 	if val := os.Getenv("SERVER_SELF_UPDATE_ENABLED"); val != "" {
 		cfg.Server.SelfUpdateEnabled = val == "true" || val == "1"
 		tracker.EnvKeys["server.self_update_enabled"] = true
+	}
+	if val := os.Getenv("BROWSER_PROXY_ENABLED"); val != "" {
+		cfg.Server.BrowserProxyEnabled = val == "true" || val == "1"
+		tracker.EnvKeys["server.browser_proxy_enabled"] = true
 	}
 	if val := os.Getenv("RELEASES_MAX_RELEASES"); val != "" {
 		var v int
@@ -421,6 +440,9 @@ func (c *Config) ToTLSConfig() *TLSConfig {
 // ValidatePassword checks if a password meets the configured requirements.
 // Returns nil if valid, or an error describing what's missing.
 func (c *SecurityConfig) ValidatePassword(password string) error {
+	if len(password) > maxPasswordLength {
+		return fmt.Errorf("password must be at most %d characters", maxPasswordLength)
+	}
 	if c == nil {
 		return nil
 	}

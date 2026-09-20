@@ -571,7 +571,9 @@ jobs:
           
           **Debian/Ubuntu (APT repo):**
           ```bash
-          echo "deb [trusted=yes] https://mstrhakr.github.io/printmaster stable main" | sudo tee /etc/apt/sources.list.d/printmaster.list && sudo apt-get update && sudo apt-get install -y printmaster-agent
+          curl -fsSL https://mstrhakr.github.io/printmaster/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/printmaster.gpg
+          echo "deb [signed-by=/usr/share/keyrings/printmaster.gpg] https://mstrhakr.github.io/printmaster stable main" | sudo tee /etc/apt/sources.list.d/printmaster.list
+          sudo apt-get update && sudo apt-get install -y printmaster-agent
           ```
           
           **Fedora/RHEL (DNF repo):**
@@ -600,7 +602,7 @@ jobs:
           
           ```bash
           # Docker (recommended)
-          docker pull ghcr.io/mstrhakr/printmaster-server:latest
+          docker pull ghcr.io/mstrhakr/printmaster-server:${{ steps.version.outputs.server_version }}
           ```
           
           ---
@@ -1056,7 +1058,8 @@ jobs:
           
           <h3>Quick Install</h3>
           <pre><code># Add repository
-        echo "deb [trusted=yes] https://mstrhakr.github.io/printmaster stable main" | sudo tee /etc/apt/sources.list.d/printmaster.list
+        curl -fsSL https://mstrhakr.github.io/printmaster/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/printmaster.gpg
+        echo "deb [signed-by=/usr/share/keyrings/printmaster.gpg] https://mstrhakr.github.io/printmaster stable main" | sudo tee /etc/apt/sources.list.d/printmaster.list
 
         # Update and install
         sudo apt-get update

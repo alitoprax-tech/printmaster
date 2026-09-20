@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	webutil "printmaster/common/web"
 	authz "printmaster/server/authz"
 	"printmaster/server/storage"
 )
@@ -93,7 +94,7 @@ func handleSitesCollection(w http.ResponseWriter, r *http.Request, tenantID stri
 			Address     string                   `json:"address"`
 			FilterRules []storage.SiteFilterRule `json:"filter_rules"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &payload, 1<<20); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
@@ -172,7 +173,7 @@ func handleSiteByID(w http.ResponseWriter, r *http.Request, tenantID, siteID str
 			Address     string                   `json:"address"`
 			FilterRules []storage.SiteFilterRule `json:"filter_rules"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &payload, 1<<20); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
@@ -265,7 +266,7 @@ func handleSiteAgents(w http.ResponseWriter, r *http.Request, tenantID, siteID s
 		var payload struct {
 			AgentIDs []string `json:"agent_ids"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &payload, 1<<20); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}

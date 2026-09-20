@@ -343,7 +343,6 @@ $changelog
 
 Docker:
 docker pull ghcr.io/mstrhakr/printmaster-${component}:$version
-docker pull ghcr.io/mstrhakr/printmaster-${component}:latest
 EOF
 )
   gh release create "$tag" --title "$title" --notes "$release_notes" --latest

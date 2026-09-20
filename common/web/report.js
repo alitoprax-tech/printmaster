@@ -43,7 +43,9 @@
                 </div>
                 <p class="device-report-description">
                     Help improve PrintMaster by reporting incorrect or missing device data.
-                    Your report will be submitted to our development team via GitHub.
+                    Submitting sends device identifiers, raw SNMP data, and recent logs to
+                    the configured PrintMaster diagnostic service and may create a private
+                    GitHub Gist. Use this only after your organization's data policy permits it.
                 </p>
                 
                 <form id="device_report_form" class="device-report-form">
@@ -130,6 +132,16 @@
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#039;');
+    }
+
+    function isSafeGitHubURL(value) {
+        try {
+            const url = new URL(String(value));
+            return url.protocol === 'https:' &&
+                (url.hostname === 'github.com' || url.hostname.endsWith('.github.com'));
+        } catch (e) {
+            return false;
+        }
     }
 
     /**
@@ -371,12 +383,17 @@
                 
                 const fallbackUrl = buildFallbackIssueUrl(report);
                 
-                showStatus(statusEl, 'warning', 
-                    'Could not submit automatically. ' +
-                    'A diagnostic file has been downloaded. ' +
-                    '<a href="' + fallbackUrl + '" target="_blank">Click here to open GitHub</a> ' +
-                    'and attach the file to your issue.'
+                showStatus(statusEl, 'warning',
+                    'Could not submit automatically. A diagnostic file has been downloaded. '
                 );
+                if (isSafeGitHubURL(fallbackUrl)) {
+                    const link = document.createElement('a');
+                    link.href = fallbackUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.textContent = 'Click here to open GitHub';
+                    statusEl.append(' ', link, ' and attach the file to your issue.');
+                }
             } finally {
                 // Re-enable button
                 submitBtn.disabled = false;
@@ -393,7 +410,7 @@
         if (result.success && result.issue_url) {
             showStatus(statusEl, 'success', 'Report submitted! Opening GitHub...');
             setTimeout(() => {
-                window.open(result.issue_url, '_blank');
+                if (isSafeGitHubURL(result.issue_url)) window.open(result.issue_url, '_blank', 'noopener,noreferrer');
             }, 500);
         } else if (result.gist_url) {
             // Partial success - gist created but issue URL missing
@@ -401,18 +418,23 @@
                 '&gist=' + encodeURIComponent(result.gist_url);
             showStatus(statusEl, 'success', 'Report submitted! Opening GitHub...');
             setTimeout(() => {
-                window.open(issueUrl, '_blank');
+                if (isSafeGitHubURL(issueUrl)) window.open(issueUrl, '_blank', 'noopener,noreferrer');
             }, 500);
         } else if (result.fallback) {
             // Server returned fallback mode
             downloadReportFile(result.report || report);
             const fallbackUrl = result.issue_url || buildFallbackIssueUrl(report);
-            showStatus(statusEl, 'warning', 
-                'Could not submit automatically. ' +
-                'A diagnostic file has been downloaded. ' +
-                '<a href="' + fallbackUrl + '" target="_blank">Click here to open GitHub</a> ' +
-                'and attach the file to your issue.'
-            );
+                showStatus(statusEl, 'warning',
+                    'Could not submit automatically. A diagnostic file has been downloaded. '
+                );
+                if (isSafeGitHubURL(fallbackUrl)) {
+                    const link = document.createElement('a');
+                    link.href = fallbackUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.textContent = 'Click here to open GitHub';
+                    statusEl.append(' ', link, ' and attach the file to your issue.');
+                }
         } else {
             throw new Error(result.error || 'Unknown error');
         }
@@ -498,7 +520,7 @@
     function showStatus(el, type, message) {
         if (!el) return;
         el.className = 'device-report-status device-report-status-' + type;
-        el.innerHTML = message;
+        el.textContent = message === null || message === undefined ? '' : String(message);
         el.style.display = 'block';
     }
 

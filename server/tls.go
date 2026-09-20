@@ -9,11 +9,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"html"
 	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -141,7 +144,7 @@ func (cfg *TLSConfig) getCustomCertConfig() (*tls.Config, error) {
 // getSelfSignedConfig generates or loads a self-signed certificate
 func (cfg *TLSConfig) getSelfSignedConfig() (*tls.Config, error) {
 	certDir := "certs"
-	if err := os.MkdirAll(certDir, 0755); err != nil {
+	if err := os.MkdirAll(certDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create certs directory: %w", err)
 	}
 
@@ -152,6 +155,12 @@ func (cfg *TLSConfig) getSelfSignedConfig() (*tls.Config, error) {
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err := os.Stat(keyPath); err == nil {
 			// Both files exist, try to load them
+			if err := os.Chmod(certPath, 0644); err != nil {
+				return nil, fmt.Errorf("failed to set certificate permissions: %w", err)
+			}
+			if err := os.Chmod(keyPath, 0600); err != nil {
+				return nil, fmt.Errorf("failed to set private key permissions: %w", err)
+			}
 			logDebug("Loading existing self-signed certificate", "cert", certPath, "key", keyPath)
 			cfg.CertPath = certPath
 			cfg.KeyPath = keyPath
@@ -216,7 +225,7 @@ func generateSelfSignedCert(certPath, keyPath, domain string) error {
 	}
 
 	// Write certificate file
-	certOut, err := os.Create(certPath)
+	certOut, err := os.OpenFile(certPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create cert file: %w", err)
 	}
@@ -225,9 +234,10 @@ func generateSelfSignedCert(certPath, keyPath, domain string) error {
 	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
 		return fmt.Errorf("failed to write cert: %w", err)
 	}
+	_ = os.Chmod(certPath, 0644)
 
 	// Write private key file
-	keyOut, err := os.Create(keyPath)
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create key file: %w", err)
 	}
@@ -241,6 +251,7 @@ func generateSelfSignedCert(certPath, keyPath, domain string) error {
 	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
 		return fmt.Errorf("failed to write key: %w", err)
 	}
+	_ = os.Chmod(keyPath, 0600)
 
 	logInfo("Generated self-signed certificate", "cert", certPath, "key", keyPath, "domain", domain)
 
@@ -271,15 +282,23 @@ func (cfg *TLSConfig) GetACMEHTTPHandler() (*autocert.Manager, error) {
 // on a TLS port and redirect them to HTTPS instead of showing a TLS error.
 type httpRedirectListener struct {
 	net.Listener
-	httpsPort int
+	httpsPort     int
+	redirectSlots chan struct{}
 }
+
+const (
+	httpRedirectReadTimeout    = 5 * time.Second
+	httpRedirectMaxHeaderBytes = 16 << 10
+	httpRedirectMaxWorkers     = 64
+)
 
 // newHTTPRedirectListener creates a listener that detects HTTP on HTTPS port
 // and sends a redirect response instead of a TLS handshake error.
 func newHTTPRedirectListener(inner net.Listener, httpsPort int) net.Listener {
 	return &httpRedirectListener{
-		Listener:  inner,
-		httpsPort: httpsPort,
+		Listener:      inner,
+		httpsPort:     httpsPort,
+		redirectSlots: make(chan struct{}, httpRedirectMaxWorkers),
 	}
 }
 
@@ -294,6 +313,13 @@ func (l *httpRedirectListener) Accept() (net.Conn, error) {
 
 		// Wrap connection to peek at first byte
 		peekedConn := &peekConn{Conn: conn, reader: bufio.NewReader(conn)}
+		// A client that connects and sends no bytes must not block Accept
+		// indefinitely, otherwise one idle plaintext connection can starve the
+		// TLS listener.
+		if err := conn.SetReadDeadline(time.Now().Add(httpRedirectReadTimeout)); err != nil {
+			conn.Close()
+			continue
+		}
 
 		// Peek at first byte to determine protocol
 		firstByte, err := peekedConn.reader.Peek(1)
@@ -306,11 +332,24 @@ func (l *httpRedirectListener) Accept() (net.Conn, error) {
 		// HTTP methods start with uppercase letters (G, P, H, D, O, C, T)
 		if firstByte[0] == 0x16 {
 			// TLS connection - return wrapped conn that replays peeked byte
+			_ = conn.SetReadDeadline(time.Time{})
 			return peekedConn, nil
 		}
 
 		// Plain HTTP request on HTTPS port - send redirect
-		go l.handleHTTPRedirect(peekedConn)
+		if l.redirectSlots == nil {
+			// Keep manually constructed listeners safe in tests and extensions.
+			l.redirectSlots = make(chan struct{}, httpRedirectMaxWorkers)
+		}
+		select {
+		case l.redirectSlots <- struct{}{}:
+			go func() {
+				defer func() { <-l.redirectSlots }()
+				l.handleHTTPRedirect(peekedConn)
+			}()
+		default:
+			conn.Close()
+		}
 		// Continue accepting - don't return this connection
 	}
 }
@@ -320,10 +359,11 @@ func (l *httpRedirectListener) handleHTTPRedirect(conn *peekConn) {
 	defer conn.Close()
 
 	// Set a reasonable timeout for reading the request
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(httpRedirectReadTimeout))
+	remaining := httpRedirectMaxHeaderBytes
 
 	// Read the first line to get the request path
-	line, err := conn.reader.ReadString('\n')
+	line, err := readRedirectLine(conn.reader, &remaining)
 	if err != nil {
 		return
 	}
@@ -335,28 +375,34 @@ func (l *httpRedirectListener) handleHTTPRedirect(conn *peekConn) {
 	if path == "" {
 		path = "/"
 	}
+	path = sanitizeRedirectPath(path)
 
 	// Determine the host from Host header or use localhost
 	host := fmt.Sprintf("localhost:%d", l.httpsPort)
 
 	// Read headers to find Host
 	for {
-		headerLine, err := conn.reader.ReadString('\n')
+		headerLine, err := readRedirectLine(conn.reader, &remaining)
 		if err != nil || headerLine == "\r\n" || headerLine == "\n" {
 			break
 		}
-		if len(headerLine) > 6 && (headerLine[:5] == "Host:" || headerLine[:5] == "host:") {
-			host = headerLine[6 : len(headerLine)-2] // Strip "Host: " and "\r\n"
-			// Ensure we use HTTPS port if host doesn't include port
-			if !hasPort(host) {
-				host = fmt.Sprintf("%s:%d", host, l.httpsPort)
-			}
+		if len(headerLine) > 5 && strings.EqualFold(headerLine[:5], "Host:") {
+			host = sanitizeRedirectHost(headerLine[5:], l.httpsPort)
 			break
 		}
 	}
 
 	// Build redirect URL
 	redirectURL := fmt.Sprintf("https://%s%s", host, path)
+	redirectHTMLURL := html.EscapeString(redirectURL)
+	body := fmt.Sprintf(
+		"<html><head><title>Redirecting</title></head><body>"+
+			"<h1>Moved Permanently</h1>"+
+			"<p>This server requires HTTPS. Redirecting to <a href=\"%s\">%s</a></p>"+
+			"</body></html>",
+		redirectHTMLURL,
+		redirectHTMLURL,
+	)
 
 	// Send HTTP 301 redirect response
 	response := fmt.Sprintf(
@@ -366,14 +412,10 @@ func (l *httpRedirectListener) handleHTTPRedirect(conn *peekConn) {
 			"Content-Length: %d\r\n"+
 			"Connection: close\r\n"+
 			"\r\n"+
-			"<html><head><title>Redirecting</title></head><body>"+
-			"<h1>Moved Permanently</h1>"+
-			"<p>This server requires HTTPS. Redirecting to <a href=\"%s\">%s</a></p>"+
-			"</body></html>",
+			"%s",
 		redirectURL,
-		len(fmt.Sprintf("<html><head><title>Redirecting</title></head><body><h1>Moved Permanently</h1><p>This server requires HTTPS. Redirecting to <a href=\"%s\">%s</a></p></body></html>", redirectURL, redirectURL)),
-		redirectURL,
-		redirectURL,
+		len(body),
+		body,
 	)
 
 	conn.Write([]byte(response))
@@ -384,17 +426,113 @@ func (l *httpRedirectListener) handleHTTPRedirect(conn *peekConn) {
 		"redirect_url", redirectURL)
 }
 
-// hasPort checks if a host string contains a port
-func hasPort(host string) bool {
-	for i := len(host) - 1; i >= 0; i-- {
-		if host[i] == ':' {
-			return true
+// readRedirectLine reads one HTTP request line while enforcing the aggregate
+// request-header budget used by the custom plaintext redirect path. A regular
+// net/http Server would enforce MaxHeaderBytes for us, but this listener parses
+// the request before TLS negotiation and therefore needs its own bound.
+func readRedirectLine(reader *bufio.Reader, remaining *int) (string, error) {
+	if reader == nil || remaining == nil || *remaining <= 0 {
+		return "", bufio.ErrBufferFull
+	}
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(part) > *remaining {
+			return "", bufio.ErrBufferFull
 		}
-		if host[i] == ']' { // IPv6 address
+		*remaining -= len(part)
+		line = append(line, part...)
+		if err == bufio.ErrBufferFull {
+			if *remaining == 0 {
+				return "", bufio.ErrBufferFull
+			}
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return string(line), nil
+	}
+}
+
+// sanitizeRedirectPath validates the request target before it is reflected in
+// both the Location header and the HTML response. A malformed target must not
+// be able to inject response headers or turn the redirect into an open redirect.
+func sanitizeRedirectPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || len(path) > 8192 || !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\\\r\n") {
+		return "/"
+	}
+	return path
+}
+
+// sanitizeRedirectHost accepts a normal Host header (DNS name or IP, with an
+// optional numeric port) and returns a safe host:port for an HTTPS redirect.
+// Invalid, ambiguous, or control-character-containing values use localhost.
+func sanitizeRedirectHost(raw string, httpsPort int) string {
+	fallback := fmt.Sprintf("localhost:%d", httpsPort)
+	host := strings.TrimSpace(raw)
+	if host == "" || len(host) > 255 || strings.ContainsAny(host, "\r\n\t /?#@") {
+		return fallback
+	}
+
+	name := host
+	port := httpsPort
+	if strings.HasPrefix(host, "[") {
+		parsedHost, parsedPort, err := net.SplitHostPort(host)
+		if err != nil || net.ParseIP(parsedHost) == nil {
+			return fallback
+		}
+		name = parsedHost
+		port = parsedPortNumber(parsedPort)
+		if port <= 0 {
+			return fallback
+		}
+	} else if strings.Count(host, ":") == 1 {
+		parsedHost, parsedPort, err := net.SplitHostPort(host)
+		if err != nil || !validRedirectHostname(parsedHost) {
+			return fallback
+		}
+		name = parsedHost
+		port = parsedPortNumber(parsedPort)
+		if port <= 0 {
+			return fallback
+		}
+	} else if strings.Count(host, ":") > 1 {
+		// Bare IPv6 literals are not valid Host header syntax; require brackets.
+		return fallback
+	} else if net.ParseIP(host) != nil {
+		name = host
+	} else if !validRedirectHostname(host) {
+		return fallback
+	}
+	return net.JoinHostPort(name, strconv.Itoa(port))
+}
+
+func parsedPortNumber(raw string) int {
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0
+	}
+	return port
+}
+
+func validRedirectHostname(host string) bool {
+	if host == "" || len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
 			return false
 		}
 	}
-	return false
+	return true
 }
 
 // peekConn wraps a net.Conn with a buffered reader to allow peeking

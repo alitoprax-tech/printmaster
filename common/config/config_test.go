@@ -223,6 +223,30 @@ func TestResolveConfigPath_FlagFallback(t *testing.T) {
 	}
 }
 
+func TestValidateInitSecret(t *testing.T) {
+	tests := []struct {
+		name    string
+		secret  string
+		wantErr bool
+	}{
+		{name: "disabled", secret: ""},
+		{name: "strong", secret: "0123456789abcdef0123456789abcdef"},
+		{name: "too short", secret: "0123456789abcdef", wantErr: true},
+		{name: "whitespace", secret: "0123456789abcdef0123456789abcde ", wantErr: true},
+		{name: "control", secret: "0123456789abcdef0123456789abcde\x00", wantErr: true},
+		{name: "invalid utf8", secret: string([]byte{'x', 0xff}), wantErr: true},
+		{name: "too long", secret: strings.Repeat("a", maxInitSecretBytes+1), wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateInitSecret(tc.secret)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateInitSecret() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestGetEnvPrefixed_Fallback(t *testing.T) {
 	t.Parallel()
 	os.Setenv("DB_PATH", "/var/lib/printmaster/db.sqlite")

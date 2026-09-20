@@ -52,8 +52,8 @@ discovery_concurrency = 50
 epson_remote_mode_enabled = false
 
 [snmp]
-  # Default SNMP community string
-  community = "public"
+  # Set a site-specific SNMP community string (SNMPv3 authPriv is preferred)
+  community = "replace-with-site-secret"
   
   # SNMP timeout in milliseconds
   timeout_ms = 2000
@@ -81,15 +81,15 @@ epson_remote_mode_enabled = false
   # Authentication mode: local, server, disabled
   mode = "local"
   
-  # Allow admin access from localhost without login
-  allow_local_admin = true
+  # Legacy compatibility key. It is ignored: localhost is not an identity.
+  allow_local_admin = false
 
 [server]
   # Enable server upload mode
   enabled = false
   
   # PrintMaster Server URL
-  url = "http://printmaster-server:9090"
+  url = "https://printmaster.example.com"
   
   # Friendly name for this agent
   agent_name = "Main Office"
@@ -152,7 +152,8 @@ epson_remote_mode_enabled = false
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `community` | `public` | SNMP v1/v2c community string |
+| `community` | `replace-with-site-secret` | SNMP v1/v2c community string; use a site-specific value |
+| `trap_community` | empty | Community accepted by optional UDP/162 traps; empty keeps listener fail-closed |
 | `timeout_ms` | `2000` | Query timeout in milliseconds |
 | `retries` | `1` | Retry attempts for failed queries |
 
@@ -173,7 +174,7 @@ epson_remote_mode_enabled = false
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `false` | Enable server upload mode |
-| `url` | - | Server URL (e.g., `http://server:9090`) |
+| `url` | - | Server URL; use canonical HTTPS (e.g., `https://printmaster.example.com`) |
 | `agent_name` | hostname | Friendly name for this agent |
 | `upload_interval_seconds` | `300` | Full sync interval |
 | `heartbeat_interval_seconds` | `60` | Status ping interval |
@@ -208,8 +209,8 @@ epson_remote_mode_enabled = false
   # Enable TLS
   enable_tls = false
   
-  # Bind address
-  bind_address = "0.0.0.0"
+  # Bind address (loopback by default; expose only through a trusted proxy)
+  bind_address = "127.0.0.1"
 
 [database]
   # Database type: sqlite, postgres
@@ -266,7 +267,7 @@ path = "/var/lib/printmaster/server/printmaster.db"
 ```toml
 [database]
 type = "postgres"
-postgres_url = "postgres://printmaster:password@localhost:5432/printmaster?sslmode=disable"
+postgres_url = "postgres://printmaster:<set-via-secret>@localhost:5432/printmaster?sslmode=verify-full"
 ```
 
 ### Authentication Settings
@@ -300,8 +301,9 @@ Both agent and server support environment variable configuration. Variables over
 | `WEB_HTTP_PORT` | HTTP port | `8080` |
 | `WEB_HTTPS_PORT` | HTTPS port | `8443` |
 | `WEB_AUTH_MODE` | Auth mode: local, server, disabled | `local` |
-| `WEB_ALLOW_LOCAL_ADMIN` | Allow localhost admin | `true` |
-| `SNMP_COMMUNITY` | SNMP community string | `public` |
+| `WEB_ALLOW_LOCAL_ADMIN` | Legacy localhost-admin setting (ignored) | `false` |
+| `SNMP_COMMUNITY` | SNMP community string | site-specific value |
+| `SNMP_TRAP_COMMUNITY` | Explicit community accepted by optional UDP/162 trap listener | unset (traps fail closed) |
 | `SNMP_TIMEOUT_MS` | SNMP timeout (ms) | `3000` |
 | `SNMP_RETRIES` | SNMP retry count | `2` |
 | `DISCOVERY_CONCURRENCY` | Concurrent scans | `100` |
@@ -319,9 +321,9 @@ Both agent and server support environment variable configuration. Variables over
 | `SERVER_HTTPS_PORT` | HTTPS port | `9443` |
 | `BIND_ADDRESS` | Bind address | `127.0.0.1` |
 | `BEHIND_PROXY` | Behind reverse proxy | `false` |
-| `TRUSTED_PROXIES` | Trusted proxy CIDRs | Private ranges |
+| `TRUSTED_PROXIES` | Trusted proxy CIDRs | Loopback only; configure explicitly |
 | `ADMIN_USER` | Initial admin username | `admin` |
-| `ADMIN_PASSWORD` | Initial admin password | `printmaster` |
+| `ADMIN_PASSWORD` | Initial admin password | required; no default |
 | `AUTO_APPROVE_AGENTS` | Auto-approve agents | `false` |
 | `AGENT_TIMEOUT_MINUTES` | Agent offline timeout | `5` |
 
@@ -329,7 +331,7 @@ Both agent and server support environment variable configuration. Variables over
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TLS_MODE` | none, self-signed, acme, manual | `self-signed` |
+| `TLS_MODE` | self-signed, custom, letsencrypt | `self-signed` |
 | `TLS_CERT_PATH` | Certificate path (manual) | — |
 | `TLS_KEY_PATH` | Key path (manual) | — |
 | `LETSENCRYPT_DOMAIN` | Let's Encrypt domain | — |
@@ -346,6 +348,12 @@ Both agent and server support environment variable configuration. Variables over
 | `SMTP_USER` | SMTP username | — |
 | `SMTP_PASS` | SMTP password | — |
 | `SMTP_FROM` | Sender address | — |
+
+When `SMTP_USER`/`SMTP_PASS` are set, the server requires the SMTP endpoint to
+advertise STARTTLS and refuses authenticated cleartext SMTP. Keep the SMTP
+service on a trusted network and use a certificate-validated TLS endpoint in
+production. Unauthenticated SMTP remains dependent on the transport security
+provided by the configured mail service.
 
 ### Docker Example
 

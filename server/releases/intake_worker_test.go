@@ -11,6 +11,75 @@ import (
 	"printmaster/server/storage"
 )
 
+func TestReleaseURLAllowlist(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{
+		"https://api.github.com/repos/mstrhakr/printmaster/releases",
+		"https://objects.githubusercontent.com/release?sig=test",
+		"https://release-assets.githubusercontent.com/release",
+		"http://127.0.0.1:1234/test",
+	} {
+		if !isAllowedReleaseURL(raw) {
+			t.Fatalf("expected release URL to be allowed: %s", raw)
+		}
+	}
+	for _, raw := range []string{
+		"http://github.com/releases",
+		"https://attacker.example/release",
+		"https://evil.github.com/release",
+		"https://evil.githubusercontent.com/release",
+		"https://169.254.169.254/latest",
+		"https://github.com@attacker.example/release",
+		"https://github.com/release#fragment",
+	} {
+		if isAllowedReleaseURL(raw) {
+			t.Fatalf("expected release URL to be rejected: %s", raw)
+		}
+	}
+}
+
+func TestReleaseIntakeRedirectAllowlist(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{
+		"https://objects.githubusercontent.com/release",
+		"https://release-assets.githubusercontent.com/release",
+		"http://127.0.0.1:1234/release",
+	} {
+		req := httptest.NewRequest(http.MethodGet, raw, nil)
+		if err := checkReleaseIntakeRedirect(req, nil); err != nil {
+			t.Fatalf("expected redirect to be allowed: %s: %v", raw, err)
+		}
+	}
+	for _, raw := range []string{
+		"http://github.com/release",
+		"https://attacker.example/release",
+		"https://evil.github.com/release",
+		"https://evil.githubusercontent.com/release",
+		"https://10.0.0.1/release",
+	} {
+		req := httptest.NewRequest(http.MethodGet, raw, nil)
+		if err := checkReleaseIntakeRedirect(req, nil); err == nil {
+			t.Fatalf("expected redirect to be rejected: %s", raw)
+		}
+	}
+}
+
+func TestBuildDescriptorRejectsPathLikeAssetNames(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{
+		"printmaster-agent-v1.2.3-windows-amd64.exe/../../outside",
+		"printmaster-agent-v1.2.3-windows-amd64.exe\\..\\outside",
+		"printmaster-agent-v1.2.3-windows-amd64.exe\n",
+	} {
+		if _, ok := buildDescriptor("agent", "1.2.3", name); ok {
+			t.Fatalf("path-like asset name was accepted: %q", name)
+		}
+	}
+	if desc, ok := buildDescriptor("agent", "1.2.3", "printmaster-agent-v1.2.3-windows-amd64.exe"); !ok || desc.fileName == "" {
+		t.Fatal("valid release asset was rejected")
+	}
+}
+
 func TestIntakeWorkerCachesArtifacts(t *testing.T) {
 	t.Parallel()
 
@@ -31,7 +100,7 @@ func TestIntakeWorkerCachesArtifacts(t *testing.T) {
                     {
                         "name": "printmaster-server-v0.9.16-windows-amd64.exe",
                         "browser_download_url": "` + downloadURL + `",
-                        "size": 12,
+                        "size": 11,
                         "updated_at": "2025-11-20T12:00:00Z"
                     }
                 ]

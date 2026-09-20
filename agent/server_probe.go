@@ -146,6 +146,35 @@ func normalizeServerURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// validateOnboardingServerURL normalizes an onboarding target and prevents
+// join credentials from being sent over a remotely reachable plaintext
+// connection. Loopback HTTP remains available for local development only.
+func validateOnboardingServerURL(raw string) (string, error) {
+	u, err := normalizeServerURL(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("server_url must not include credentials")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("server_url must not include a query or fragment")
+	}
+	if !strings.EqualFold(u.Scheme, "https") && !isLoopbackHost(u.Hostname()) {
+		return "", fmt.Errorf("server_url must use HTTPS; HTTP is allowed only for loopback development")
+	}
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func defaultPortForScheme(scheme string) string {
 	switch strings.ToLower(scheme) {
 	case "http":

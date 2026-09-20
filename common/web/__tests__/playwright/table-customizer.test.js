@@ -12,7 +12,9 @@ const path = require('path');
 
 const indexHtml = path.resolve(__dirname, '../../../../server/web/index.html');
 const styleCss = path.resolve(__dirname, '../../../../server/web/style.css');
+const v2Css = path.resolve(__dirname, '../../../../server/web/v2.css');
 const appJs = path.resolve(__dirname, '../../../../server/web/app.js');
+const v2Js = path.resolve(__dirname, '../../../../server/web/v2.js');
 const rbacJs = path.resolve(__dirname, '../../../../server/web/rbac.js');
 const contextMenuJs = path.resolve(__dirname, '../../../../server/web/context-menu.js');
 const tableCustomizerJs = path.resolve(__dirname, '../../../../server/web/table-customizer.js');
@@ -50,6 +52,7 @@ function startAppFixtureServer() {
       }
       const staticRoutes = {
         '/static/style.css': { file: styleCss, type: 'text/css' },
+        '/static/v2.css': { file: v2Css, type: 'text/css' },
         '/static/shared.css': { file: sharedCss, type: 'text/css' },
         '/static/shared.js': { file: sharedJs, type: 'application/javascript' },
         '/static/cards.js': { file: cardsJs, type: 'application/javascript' },
@@ -57,6 +60,7 @@ function startAppFixtureServer() {
         '/static/utils/charts.js': { file: chartsJs, type: 'application/javascript' },
         '/static/utils/formatters.js': { file: formattersJs, type: 'application/javascript' },
         '/static/app.js': { file: appJs, type: 'application/javascript' },
+        '/static/v2.js': { file: v2Js, type: 'application/javascript' },
         '/static/rbac.js': { file: rbacJs, type: 'application/javascript' },
         '/static/context-menu.js': { file: contextMenuJs, type: 'application/javascript' },
         '/static/table-customizer.js': { file: tableCustomizerJs, type: 'application/javascript' },
@@ -249,7 +253,7 @@ test('devices table: column customizer visibility toggling', async ({ page }) =>
   await page.route('**/api/**', createApiHandler());
   
   // Load app
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
   
   // Navigate to devices tab
@@ -366,7 +370,7 @@ test('devices table: column reordering via drag and drop', async ({ page }) => {
   });
   await page.route('**/api/**', createApiHandler());
   
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
   await page.locator('#desktop_tabs [data-target="devices"]').first().click();
   await page.waitForSelector('[data-serial="ABC123"]', { timeout: 10000 });
@@ -423,7 +427,7 @@ test('devices table: reset and localStorage persistence', async ({ page }) => {
   });
   await page.route('**/api/**', createApiHandler());
   
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
   await page.locator('#desktop_tabs [data-target="devices"]').first().click();
   await page.waitForSelector('[data-serial="ABC123"]', { timeout: 10000 });
@@ -492,7 +496,7 @@ test('agents table: column customizer works independently', async ({ page }) => 
   });
   await page.route('**/api/**', createApiHandler());
   
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="agents"]', { timeout: 10000 });
   
   // Navigate to agents tab (usually default, but click to be sure)
@@ -572,7 +576,7 @@ test('devices table: column header sorting', async ({ page }) => {
   });
   await page.route('**/api/**', createApiHandler());
   
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
   await page.locator('#desktop_tabs [data-target="devices"]').first().click();
   await page.waitForSelector('[data-serial="ABC123"]', { timeout: 10000 });
@@ -627,7 +631,7 @@ test('devices table: export button exists', async ({ page }) => {
   });
   await page.route('**/api/**', createApiHandler());
   
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
   await page.locator('#desktop_tabs [data-target="devices"]').first().click();
   await page.waitForSelector('[data-serial="ABC123"]', { timeout: 10000 });
@@ -670,7 +674,7 @@ test('devices table: picker dropdown positioning and closing', async ({ page }) 
   });
   await page.route('**/api/**', createApiHandler());
   
-  await page.goto(`${global.__PM_BASE_URL__}/app`, { waitUntil: 'networkidle' });
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'networkidle' });
   await page.waitForSelector('#desktop_tabs .tab[data-target="devices"]', { timeout: 10000 });
   await page.locator('#desktop_tabs [data-target="devices"]').first().click();
   await page.waitForSelector('[data-serial="ABC123"]', { timeout: 10000 });
@@ -703,4 +707,43 @@ test('devices table: picker dropdown positioning and closing', async ({ page }) 
   // Verify no pickers remain
   const pickerCount = await page.locator('.column-picker-dropdown').count();
   expect(pickerCount).toBe(0);
+});
+
+// ========== PrintMaster V2 Shell =============
+
+test('V2 shell uses the shared Turkish navigation and keeps V1 reversible', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.removeItem('pm_ui_version');
+    window.EventSource = class {
+      constructor() { this.readyState = 1; }
+      addEventListener() {}
+      close() {}
+    };
+    window.WebSocket = class {
+      constructor() {}
+      addEventListener() {}
+      close() {}
+    };
+  });
+  await page.route('**/api/**', createApiHandler());
+
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v2`, { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('#pm-v2-sidebar')).toHaveCount(1);
+  await expect(page.locator('#pm-v2-sidebar .pm-v2-nav-item')).toHaveCount(7);
+  await expect(page.locator('.header-flex h1')).toHaveText('PrintMaster Filo Yönetimi');
+  await expect(page.locator('html')).toHaveClass(/pm-ui-v2/);
+  await expect(page.locator('html')).toHaveAttribute('lang', 'tr');
+  await expect(page.locator('#devices_search')).toHaveAttribute('placeholder', 'Seri, IP veya model ara…');
+
+  if ((page.viewportSize()?.width || 1920) < 768) {
+    await expect(page.locator('.pm-v2-top-search')).toBeHidden();
+    await expect(page.locator('.pm-v2-mobile-menu')).toBeVisible();
+  } else {
+    await expect(page.locator('.pm-v2-top-search')).toBeVisible();
+    await expect(page.locator('#pm-v2-sidebar')).toBeVisible();
+  }
+
+  await page.goto(`${global.__PM_BASE_URL__}/app?ui=v1`, { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('#pm-v2-sidebar')).toHaveCount(0);
+  await expect(page.locator('.pm-v2-switcher-floating')).toHaveCount(0);
 });

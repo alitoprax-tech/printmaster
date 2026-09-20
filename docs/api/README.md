@@ -261,15 +261,16 @@ The agent UI supports multiple authentication modes:
 
 | Mode | Behavior |
 |------|----------|
-| `local` | No login required; admin tasks require loopback access |
+| `local` | Local mode still requires an authenticated agent session; loopback alone is not an identity |
 | `server` | Delegates authentication to central server |
-| `disabled` | No authentication (development only) |
+| `disabled` | Treated as local mode; unauthenticated access is not enabled |
 
 Configure in `config.toml`:
 ```toml
 [web.auth]
 mode = "local"
-allow_local_admin = true
+# This legacy key is ignored. Use the server session/callback flow instead.
+allow_local_admin = false
 ```
 
 ### Server API

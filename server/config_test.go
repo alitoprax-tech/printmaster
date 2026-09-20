@@ -216,6 +216,15 @@ level = "debug"
 	})
 }
 
+func TestSecurityConfigRejectsOversizedPassword(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	if err := cfg.Security.ValidatePassword(strings.Repeat("A", maxPasswordLength+1)); err == nil {
+		t.Fatal("expected oversized password to be rejected")
+	}
+}
+
 func TestLoadConfig_TrustedProxiesEnvOverride(t *testing.T) {
 	// NOTE: Do not run in parallel; environment variables are process-wide.
 	configPath := filepath.Join(t.TempDir(), "nonexistent.toml")
@@ -266,6 +275,9 @@ func TestDefaultConfig(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultConfig()
+	if cfg.Server.SelfUpdateEnabled {
+		t.Fatal("self-update must be disabled by default")
+	}
 
 	// Verify server defaults
 	if cfg.Server.HTTPPort != 9090 {
@@ -276,6 +288,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Server.BehindProxy {
 		t.Error("Server.BehindProxy should be false")
+	}
+	if cfg.Server.BindAddress != "127.0.0.1" {
+		t.Errorf("Server.BindAddress = %q, want loopback-only default", cfg.Server.BindAddress)
 	}
 
 	// Verify TLS defaults

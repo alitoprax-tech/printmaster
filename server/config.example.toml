@@ -20,14 +20,22 @@
   
   # Trusted proxies for client IP header parsing.
   # Can be IP addresses, CIDR ranges, or hostnames (resolved at startup).
-  # Defaults to private network ranges when behind_proxy=true.
-  # trusted_proxies = ["nginx", "10.0.0.0/8"]
+  # Defaults to loopback only. Configure the actual reverse-proxy address or
+  # CIDR explicitly when the proxy connects over a container/private network.
+  # trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]
   
-  # Bind address (0.0.0.0 = all interfaces, 127.0.0.1 = localhost only)
-  bind_address = "0.0.0.0"
+  # Bind address (loopback by default; set 0.0.0.0 only behind a firewall/reverse proxy)
+  bind_address = "127.0.0.1"
 
   # Allow the server to download and stage signed updates when supported
-  self_update_enabled = true
+  # Keep disabled in production until the service/broker update path has passed
+  # an installation-specific acceptance test.
+  self_update_enabled = false
+
+  # Browser-facing printer/agent proxy is disabled until it is deployed on a
+  # separate origin with one-time access tickets. Do not enable it on the panel
+  # domain: printer-controlled HTML must not share the management session.
+  browser_proxy_enabled = false
 
 [security]
   # Enable authentication rate limiting to block brute force attacks
@@ -67,7 +75,7 @@
     accept_tos = false
 
 [database]
-  # Database driver: "sqlite" (default), "postgres", or "mysql"
+  # Database driver: "sqlite" (default) or "postgres". MySQL is not implemented.
   # driver = "postgres"
   
   # SQLite database file path (only used when driver = "sqlite")
@@ -77,9 +85,9 @@
   # host = "localhost"
   # port = 5432
   # user = "printmaster"
-  # password = "changeme"
+  # password = "<set-via-secret>"
   # name = "printmaster"
-  # ssl_mode = "prefer"
+  # ssl_mode = "verify-full"
   
   # TimescaleDB support (PostgreSQL only)
   # When using TimescaleDB, set to true for automatic:

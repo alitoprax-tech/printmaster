@@ -44,16 +44,18 @@ func Dial(urlStr string, reqHeader http.Header, tlsCfg *tls.Config, handshakeTim
 	if err != nil {
 		return nil, resp, err
 	}
+	c.SetReadLimit(8 << 20)
 	return &Conn{c: c}, resp, nil
 }
 
-// UpgradeHTTP upgrades an incoming HTTP request to a websocket Conn using a permissive upgrader.
+// UpgradeHTTP requires the same origin for browsers; native clients omit Origin.
 func UpgradeHTTP(w http.ResponseWriter, r *http.Request) (*Conn, error) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{HandshakeTimeout: 10 * time.Second}
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return nil, err
 	}
+	c.SetReadLimit(8 << 20)
 	return &Conn{c: c}, nil
 }
 

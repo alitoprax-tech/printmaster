@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	webutil "printmaster/common/web"
 	"printmaster/server/reports"
 	"printmaster/server/storage"
 	"strconv"
@@ -83,6 +84,9 @@ func (rs *ReportStore) UpdateReportRun(ctx context.Context, run *storage.ReportR
 
 // handleReports handles GET /api/v1/reports and POST /api/v1/reports
 func handleReports(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	switch r.Method {
@@ -130,7 +134,7 @@ func handleReports(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		// Create report
 		var report storage.ReportDefinition
-		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &report, 1<<20); err != nil {
 			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -157,6 +161,9 @@ func handleReports(w http.ResponseWriter, r *http.Request) {
 
 // handleReport handles GET/PUT/DELETE /api/v1/reports/{id}
 func handleReport(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	// Extract ID from path
@@ -173,7 +180,7 @@ func handleReport(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch {
-		case strings.HasPrefix(subPath, "/run"):
+		case subPath == "/run":
 			handleReportRun(w, r, id)
 		case strings.HasPrefix(subPath, "/schedules"):
 			handleReportSchedules(w, r, id)
@@ -209,7 +216,7 @@ func handleReport(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		var report storage.ReportDefinition
-		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &report, 1<<20); err != nil {
 			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -239,6 +246,9 @@ func handleReport(w http.ResponseWriter, r *http.Request) {
 
 // handleReportRun handles POST /api/v1/reports/{id}/run
 func handleReportRun(w http.ResponseWriter, r *http.Request, reportID int64) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	if r.Method != http.MethodPost {
@@ -269,6 +279,9 @@ func handleReportRun(w http.ResponseWriter, r *http.Request, reportID int64) {
 
 // handleReportRuns handles GET /api/v1/reports/{id}/runs
 func handleReportRuns(w http.ResponseWriter, r *http.Request, reportID int64) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	if r.Method != http.MethodGet {
@@ -306,6 +319,9 @@ func handleReportRuns(w http.ResponseWriter, r *http.Request, reportID int64) {
 
 // handleReportRunsCollection handles GET /api/v1/report-runs (list all runs)
 func handleReportRunsCollection(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	if r.Method != http.MethodGet {
@@ -347,6 +363,9 @@ func handleReportRunsCollection(w http.ResponseWriter, r *http.Request) {
 
 // handleReportSchedules handles GET/POST /api/v1/reports/{id}/schedules
 func handleReportSchedules(w http.ResponseWriter, r *http.Request, reportID int64) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	switch r.Method {
@@ -366,7 +385,7 @@ func handleReportSchedules(w http.ResponseWriter, r *http.Request, reportID int6
 
 	case http.MethodPost:
 		var schedule storage.ReportSchedule
-		if err := json.NewDecoder(r.Body).Decode(&schedule); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &schedule, 1<<20); err != nil {
 			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -394,6 +413,9 @@ func handleReportSchedules(w http.ResponseWriter, r *http.Request, reportID int6
 
 // handleReportSchedulesCollection handles GET /api/v1/report-schedules (list all schedules)
 func handleReportSchedulesCollection(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	if r.Method != http.MethodGet {
@@ -418,6 +440,9 @@ func handleReportSchedulesCollection(w http.ResponseWriter, r *http.Request) {
 
 // handleSchedule handles GET/PUT/DELETE /api/v1/report-schedules/{id}
 func handleSchedule(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	// Extract ID
@@ -446,7 +471,7 @@ func handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		var schedule storage.ReportSchedule
-		if err := json.NewDecoder(r.Body).Decode(&schedule); err != nil {
+		if err := webutil.DecodeJSONBody(nil, r, &schedule, 1<<20); err != nil {
 			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -481,6 +506,9 @@ func handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 // handleReportRunResult handles GET /api/v1/report-runs/{id}
 func handleReportRunResult(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	if r.Method != http.MethodGet {
@@ -547,6 +575,9 @@ func handleReportRunResult(w http.ResponseWriter, r *http.Request) {
 
 // handleReportTypes handles GET /api/v1/reports/types
 func handleReportTypes(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -563,6 +594,9 @@ func handleReportTypes(w http.ResponseWriter, r *http.Request) {
 
 // handleReportSummary handles GET /api/v1/reports/summary
 func handleReportSummary(w http.ResponseWriter, r *http.Request) {
+	if !requireReportAdmin(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	if r.Method != http.MethodGet {

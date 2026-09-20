@@ -350,7 +350,7 @@ func (l *Logger) log(level LogLevel, msg string, context ...interface{}) {
 // writeToFile writes a log entry to the current log file
 func (l *Logger) writeToFile(entry LogEntry) {
 	// Ensure log directory exists
-	if err := os.MkdirAll(l.logDir, 0755); err != nil {
+	if err := os.MkdirAll(l.logDir, 0700); err != nil {
 		return
 	}
 
@@ -359,8 +359,13 @@ func (l *Logger) writeToFile(entry LogEntry) {
 		// Use component name in filename (agent.log, server.log, etc.)
 		logFileName := l.component + ".log"
 		filename := filepath.Join(l.logDir, logFileName)
-		f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
+			return
+		}
+		// Tighten permissions on files created by older releases as well.
+		if err := os.Chmod(filename, 0600); err != nil {
+			_ = f.Close()
 			return
 		}
 		l.currentFile = f

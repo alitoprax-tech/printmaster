@@ -5,8 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"runtime"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -69,21 +70,22 @@ func (api *HealthAPI) HandleHealth(w http.ResponseWriter, r *http.Request) {
 // HandleVersion handles GET /api/version - returns server version information.
 // This endpoint is public (no authentication required).
 func (api *HealthAPI) HandleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	// Keep the unauthenticated endpoint useful for compatibility checks while
+	// avoiding build paths, commit IDs, runtime versions and uptime details that
+	// make internet-facing instances easy to fingerprint.
 	resp := map[string]interface{}{
 		"version":          api.version,
-		"build_time":       api.buildTime,
-		"git_commit":       api.gitCommit,
-		"build_type":       api.buildType,
 		"protocol_version": api.protocolVersion,
-		"go_version":       runtime.Version(),
-		"os":               runtime.GOOS,
-		"arch":             runtime.GOARCH,
-		"uptime":           time.Since(api.processStart).String(),
 	}
 	if api.tenancyChecker != nil {
 		resp["tenancy_enabled"] = api.tenancyChecker()
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(resp)
 }
 
@@ -132,9 +134,9 @@ func RunHealthCheck(cfg HealthCheckConfig) error {
 		}
 	}
 
-	// Ultimate fallback to defaults if nothing configured
+	// Do not mistake an unrelated service on the default port for this instance.
 	if len(attempts) == 0 {
-		attempts = append(attempts, healthAttempt{URL: "http://127.0.0.1:9090/health"})
+		return fmt.Errorf("no health endpoints to probe")
 	}
 
 	var errs []string
@@ -158,8 +160,13 @@ func RunHealthCheck(cfg HealthCheckConfig) error {
 func probeHealthEndpoint(endpoint string, insecure bool) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	if insecure {
+		if !isLoopbackHealthEndpoint(endpoint) {
+			return fmt.Errorf("insecure health probes are restricted to loopback")
+		}
 		// Skip TLS verification for self-signed/local certs used by the server.
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec
+		// #nosec G402 -- the endpoint is checked above and is fixed loopback;
+		// self-signed certificates are accepted only for this local probe.
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
@@ -181,7 +188,7 @@ func probeHealthEndpoint(endpoint string, insecure bool) error {
 		Status string `json:"status"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
 		return fmt.Errorf("failed to decode response: %w", err)
 	}
 
@@ -190,4 +197,13 @@ func probeHealthEndpoint(endpoint string, insecure bool) error {
 	}
 
 	return nil
+}
+
+func isLoopbackHealthEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }

@@ -40,7 +40,11 @@ func init() {
 // CreateTenant registers a new tenant. If ID is empty a random one is generated.
 func (s *InMemoryStore) CreateTenant(t Tenant) (Tenant, error) {
 	if t.ID == "" {
-		t.ID = randomHex(8)
+		var err error
+		t.ID, err = randomHex(8)
+		if err != nil {
+			return Tenant{}, err
+		}
 	}
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now().UTC()
@@ -147,12 +151,12 @@ func (s *InMemoryStore) ValidateToken(token string) (JoinToken, error) {
 }
 
 // helper
-func randomHex(n int) string {
+func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		return "runtoken"
+		return "", err
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // Errors

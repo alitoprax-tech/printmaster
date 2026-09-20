@@ -115,15 +115,46 @@
     
     // Simple HTML escaping for card content
     function escapeHtmlCards(str) {
-        if (!str) return '';
-        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // Web UI values originate in device responses or tenant-editable fields.
+    // Keep the UI useful for ordinary HTTP/HTTPS printer pages while rejecting
+    // scriptable schemes before a value is rendered or opened.
+    function safeWebUIURL(value) {
+        if (!value) return '';
+        try {
+            const raw = String(value).trim();
+            const url = new URL(raw, window.location.origin);
+            if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+            if (!url.hostname && url.origin !== window.location.origin) return '';
+            return url.href;
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function cssEscapeCards(value) {
+        const text = String(value === null || value === undefined ? '' : value);
+        try {
+            if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(text);
+        } catch (e) {}
+        // CSS.escape fallback: hex-escape every non-selector-safe character.
+        return text.replace(/[^a-zA-Z0-9_-]/g, ch => '\\' + ch.charCodeAt(0).toString(16) + ' ');
     }
 
     function renderSavedCard(item) {
         const device = (item && item.printer_info) || {};
         const serial = item && item.serial ? item.serial : '';
-    const toners = buildTonerLevels(device);
-        const lifeCount = device.page_count || device.total_mono_impressions || 0;
+    const toners = buildTonerLevels(device) || {};
+        const rawLifeCount = Number(device.page_count ?? device.total_mono_impressions ?? 0);
+        const lifeCount = Number.isFinite(rawLifeCount) && rawLifeCount >= 0 ? Math.floor(rawLifeCount) : 0;
 
         const graphId = 'usage-graph-' + (serial || (device.ip||'')).toString().replace(/[^a-zA-Z0-9]/g,'_');
         const usageGraphHTML = '<div id="' + graphId + '" class="usage-graph-container">' +
@@ -146,30 +177,30 @@
         const deviceKey = serial || ipVal || '';
         
         // Determine WebUI URL - use IPP-USB proxy for USB devices
-        let webUIUrl = item && item.web_ui_url ? item.web_ui_url : '';
-        const isUSB = item && (item.is_usb || item.device_type === 'usb');
+        let webUIUrl = safeWebUIURL(item && item.web_ui_url ? item.web_ui_url : '');
+        const isUSB = Boolean(item && (item.is_usb === true || String(item.device_type || '').toLowerCase() === 'usb'));
         if (isUSB && serial && !webUIUrl) {
             // USB devices use the unified /proxy/ endpoint (same as network devices)
             // The agent automatically routes USB serials to IPP-USB proxy
             webUIUrl = '/proxy/' + encodeURIComponent(serial) + '/';
         }
 
-        return `<div class="saved-device-card card-entering" data-device-key="${deviceKey}" data-make="${device.manufacturer||''}" data-model="${device.model||''}" data-ip="${device.ip||''}" data-serial="${serial}" data-device-type="${item&&item.device_type||''}" data-source-type="${item&&item.source_type||''}" data-is-usb="${isUSB}">` +
+        return `<div class="saved-device-card card-entering" data-device-key="${escapeHtmlCards(deviceKey)}" data-make="${escapeHtmlCards(device.manufacturer||'')}" data-model="${escapeHtmlCards(device.model||'')}" data-ip="${escapeHtmlCards(device.ip||'')}" data-serial="${escapeHtmlCards(serial)}" data-device-type="${escapeHtmlCards(item&&item.device_type||'')}" data-source-type="${escapeHtmlCards(item&&item.source_type||'')}" data-is-usb="${isUSB}">` +
             `<div class="saved-device-card-header"><div class="saved-device-card-main">` +
-            `<h5 class="saved-device-card-title">${device.manufacturer||'Unknown'} ${device.model||''}</h5>` +
+            `<h5 class="saved-device-card-title">${escapeHtmlCards(device.manufacturer||'Unknown')} ${escapeHtmlCards(device.model||'')}</h5>` +
             `${capabilitiesHTML}` +
             `${deviceSourceBadgesHTML}` +
-            `<p class="saved-device-card-subtitle copyable" data-copy="${serial}">Serial: ${serial}${clipIcon}</p>` +
-            `<p class="saved-device-card-subtitle"><span class="copyable" data-copy="${ipVal}" style="display:inline-flex;align-items:center;gap:4px;">IP: ${ipVal}${clipIcon}</span>` + (macVal?`<span class="copyable" data-copy="${macVal}" style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;"> • MAC: ${macVal}${clipIcon}</span>`:'') + `</p>` +
+            `<p class="saved-device-card-subtitle copyable" data-copy="${escapeHtmlCards(serial)}">Serial: ${escapeHtmlCards(serial)}${clipIcon}</p>` +
+            `<p class="saved-device-card-subtitle"><span class="copyable" data-copy="${escapeHtmlCards(ipVal)}" style="display:inline-flex;align-items:center;gap:4px;">IP: ${escapeHtmlCards(ipVal)}${clipIcon}</span>` + (macVal?`<span class="copyable" data-copy="${escapeHtmlCards(macVal)}" style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;"> • MAC: ${escapeHtmlCards(macVal)}${clipIcon}</span>`:'') + `</p>` +
             `</div><div style="display:flex;gap:8px;flex-wrap:wrap;">` +
-            (webUIUrl ? `<button class="primary" style="font-size:12px" data-action="webui" data-webui-url="${webUIUrl}" data-serial="${serial}">WebUI</button>` : '') +
-            `<button data-action="details" data-ip="${device.ip||''}" data-serial="${serial}" data-source="saved">Details</button>` +
-            `<button class="delete" data-action="delete" data-serial="${serial}">Delete</button>` +
+            (webUIUrl ? `<button class="primary" style="font-size:12px" data-action="webui" data-webui-url="${escapeHtmlCards(webUIUrl)}" data-serial="${escapeHtmlCards(serial)}">WebUI</button>` : '') +
+            `<button data-action="details" data-ip="${escapeHtmlCards(device.ip||'')}" data-serial="${escapeHtmlCards(serial)}" data-source="saved">Details</button>` +
+            `<button class="delete" data-action="delete" data-serial="${escapeHtmlCards(serial)}">Delete</button>` +
             `</div></div>` +
             `<div class="saved-device-card-grid"><div class="saved-device-card-inner-panel">` +
             `<div class="saved-device-card-section"><div class="saved-device-card-section-title">Device Info</div>` +
-            `<div class="saved-device-card-row"><span class="saved-device-card-label">Asset #</span><span class="saved-device-card-value editable-field" data-action="edit" data-serial="${serial}" data-field="asset_number" data-current="${item&&item.asset_number?item.asset_number:''}">${item&&item.asset_number?item.asset_number:'(click to add)'}</span></div>` +
-            `<div class="saved-device-card-row"><span class="saved-device-card-label">Location</span><span class="saved-device-card-value editable-field" data-action="edit" data-serial="${serial}" data-field="location" data-current="${item&&item.location?item.location:''}">${item&&item.location?item.location:'(click to add)'}</span></div>` +
+            `<div class="saved-device-card-row"><span class="saved-device-card-label">Asset #</span><span class="saved-device-card-value editable-field" data-action="edit" data-serial="${escapeHtmlCards(serial)}" data-field="asset_number" data-current="${escapeHtmlCards(item&&item.asset_number?item.asset_number:'')}">${escapeHtmlCards(item&&item.asset_number?item.asset_number:'(click to add)')}</span></div>` +
+            `<div class="saved-device-card-row"><span class="saved-device-card-label">Location</span><span class="saved-device-card-value editable-field" data-action="edit" data-serial="${escapeHtmlCards(serial)}" data-field="location" data-current="${escapeHtmlCards(item&&item.location?item.location:'')}">${escapeHtmlCards(item&&item.location?item.location:'(click to add)')}</span></div>` +
             `<div class="saved-device-card-row"><span class="saved-device-card-label">Total Pages</span><span class="saved-device-card-value">${(lifeCount||0).toLocaleString()}</span></div>` +
             `</div>${consumablesSection}</div>${usageGraphHTML}</div></div>`;
     }
@@ -220,7 +251,7 @@
 
             const pctTextColor = (nameLower.includes('yellow') ? '#000' : '#fff');
             let html = '<div style="margin-top:6px">';
-            html += '<div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px">' + icon + ' ' + name + '</div>';
+            html += '<div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px">' + icon + ' ' + escapeHtmlCards(name) + '</div>';
             html += '<div style="background:#001f22;border:1px solid rgba(255,255,255,0.06);padding:6px;border-radius:8px;max-width:100%;width:100%;position:relative">';
             html += '<div style="width:' + pct + '%;background:' + color + ';height:18px;border-radius:6px;box-shadow:inset 0 -2px 4px rgba(0,0,0,0.4)"></div>';
             html += '<div style="position:absolute;left:8px;top:2px;font-size:12px;color:' + pctTextColor + '">' + (pct !== '' ? pct + '%' : 'n/a') + '</div>';
@@ -228,7 +259,7 @@
             return html;
         } else {
             // Text description (e.g., part numbers, status messages)
-            return '<div style="margin-top:6px;display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px"><div style="color:var(--muted)">' + name + ':</div><div>' + value + '</div></div>';
+            return '<div style="margin-top:6px;display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px"><div style="color:var(--muted)">' + escapeHtmlCards(name) + ':</div><div>' + escapeHtmlCards(value) + '</div></div>';
         }
     }
 
@@ -495,15 +526,15 @@
                 else if (nl.includes('yellow') || nl === 'y') color = '#fbc02d';
 
                 return '<div class="mini-consumable">'
-                    + '<div class="mini-consumable-label">' + nameShort + '</div>'
+                    + '<div class="mini-consumable-label">' + escapeHtmlCards(nameShort) + '</div>'
                     + '<div class="mini-consumable-bar"><div style="width:' + pct + '%;background:' + color + ';height:100%"></div></div>'
                     + '<div class="mini-consumable-pct">' + pct + '%</div>'
                     + '</div>';
             }
             // fallback textual mini entry
             return '<div class="mini-consumable">'
-                + '<div class="mini-consumable-label">' + nameShort + '</div>'
-                + '<div class="mini-consumable-pct">' + (value || '') + '</div>'
+                + '<div class="mini-consumable-label">' + escapeHtmlCards(nameShort) + '</div>'
+                + '<div class="mini-consumable-pct">' + escapeHtmlCards(value || '') + '</div>'
                 + '</div>';
         }
 
@@ -655,7 +686,11 @@
 
             if (action === 'open-direct') {
                 const url = btn.getAttribute('data-webui-url');
-                window.open(url, '_blank');
+                const safeURL = safeWebUIURL(url);
+                if (safeURL) {
+                    const opened = window.open(safeURL, '_blank', 'noopener,noreferrer');
+                    if (opened) opened.opener = null;
+                }
                 return;
             }
 
@@ -796,45 +831,59 @@
         // Helper renderers
         function renderInfoCard(title, content, opts = {}) {
             if (!content) return '';
-            const extraClass = opts.className ? ' ' + opts.className : '';
+            const extraClass = opts.className ? ' ' + escapeHtmlCards(opts.className) : '';
             return '<section class="device-details-card' + extraClass + '">' +
-                '<div class="device-details-card-title">' + title + '</div>' +
+                '<div class="device-details-card-title">' + escapeHtmlCards(title) + '</div>' +
                 '<div class="device-details-card-content">' + content + '</div>' +
                 '</section>';
         }
 
         function renderMetricStat(label, primary, secondary) {
             return '<div class="device-metric-pill">' +
-                '<div class="device-metric-label">' + label + '</div>' +
-                '<div class="device-metric-value">' + primary + '</div>' +
-                (secondary ? '<div class="device-metric-subtext">' + secondary + '</div>' : '') +
+                '<div class="device-metric-label">' + escapeHtmlCards(label) + '</div>' +
+                '<div class="device-metric-value">' + escapeHtmlCards(primary) + '</div>' +
+                (secondary ? '<div class="device-metric-subtext">' + escapeHtmlCards(secondary) + '</div>' : '') +
                 '</div>';
         }
 
         function renderRow(label, value) {
             if (!value && value !== 0) return '';
             return '<div style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px;padding:4px 0">' +
-                '<div style="color:var(--muted);white-space:nowrap">' + label + ':</div>' +
-                '<div style="word-break:break-word">' + value + '</div>' +
+                '<div style="color:var(--muted);white-space:nowrap">' + escapeHtmlCards(label) + ':</div>' +
+                '<div style="word-break:break-word">' + escapeHtmlCards(value) + '</div>' +
                 '</div>';
         }
 
         // Editable row helper - shows value as text with an edit button
         function renderEditableRow(label, field, value, opts = { type: 'text', readonly: false, placeholder: '' }) {
             const safeVal = (value === undefined || value === null) ? '' : String(value);
-            const displayVal = safeVal || '<span style="color:var(--muted);font-style:italic">Not set</span>';
+            const displayVal = safeVal ? escapeHtmlCards(safeVal) : '<span style="color:var(--muted);font-style:italic">Not set</span>';
             const serial = p.serial || p.Serial || '';
 
-            let row = '<div style="display:grid;grid-template-columns:auto 1fr auto;gap:4px 8px;align-items:center;padding:4px 0" data-field-row="' + field + '">';
-            row += '<div style="color:var(--muted)">' + label + ':</div>';
-            row += '<div id="field_' + field + '_display" style="word-break:break-word">' + displayVal + '</div>';
+            let row = '<div style="display:grid;grid-template-columns:auto 1fr auto;gap:4px 8px;align-items:center;padding:4px 0" data-field-row="' + escapeHtmlCards(field) + '">';
+            row += '<div style="color:var(--muted)">' + escapeHtmlCards(label) + ':</div>';
+            row += '<div id="field_' + escapeHtmlCards(field) + '_display" style="word-break:break-word">' + displayVal + '</div>';
             if (!opts.readonly) {
-                row += '<button class="edit-field-btn" data-field="' + field + '" data-serial="' + serial + '" data-current="' + safeVal.replace(/"/g, '&quot;') + '" data-label="' + label + '" title="Edit ' + label + '">✏️</button>';
+                row += '<button class="edit-field-btn" data-field="' + escapeHtmlCards(field) + '" data-serial="' + escapeHtmlCards(serial) + '" data-current="' + escapeHtmlCards(safeVal) + '" data-label="' + escapeHtmlCards(label) + '" title="Edit ' + escapeHtmlCards(label) + '">✏️</button>';
             } else {
                 row += '<div style="width:28px"></div>'; // Spacer for alignment
             }
             row += '</div>';
             return row;
+        }
+
+        function setEditableDisplay(element, value) {
+            if (!element) return;
+            element.textContent = '';
+            if (value) {
+                element.textContent = String(value);
+                return;
+            }
+            const placeholder = document.createElement('span');
+            placeholder.style.color = 'var(--muted)';
+            placeholder.style.fontStyle = 'italic';
+            placeholder.textContent = 'Not set';
+            element.appendChild(placeholder);
         }
 
         // Build HTML (kept intentionally similar to agent implementation)
@@ -862,22 +911,22 @@
         deviceInfo += renderEditableRow('Location', 'location', p.location);
         deviceInfo += renderEditableRow('Description', 'description', p.description, { type: 'textarea' });
         // Web UI with proxy buttons and edit
-        const webUIVal = p.web_ui_url || p.webui || '';
+        const webUIVal = safeWebUIURL(p.web_ui_url || p.webui || '');
         const serial = p.serial || p.Serial || '';
         let webUiRow = '<div style="display:grid;grid-template-columns:auto 1fr auto;gap:4px 8px;align-items:center" data-field-row="web_ui_url">';
         webUiRow += '<div style="color:var(--muted)">Web UI:</div>';
         webUiRow += '<div style="display:flex;gap:4px;align-items:center">';
-        webUiRow += '<span id="field_web_ui_url_display" style="flex:1;word-break:break-all">' + (webUIVal || '<span style="color:var(--muted);font-style:italic">Not set</span>') + '</span>';
+        webUiRow += '<span id="field_web_ui_url_display" style="flex:1;word-break:break-all">' + (webUIVal ? escapeHtmlCards(webUIVal) : '<span style="color:var(--muted);font-style:italic">Not set</span>') + '</span>';
         if (webUIVal) {
-            webUiRow += '<button style="font-size:11px;padding:2px 6px" data-action="open-direct" data-webui-url="' + webUIVal + '">Direct</button>';
-            webUiRow += '<button style="font-size:11px;padding:2px 6px;background:#268bd2;color:#fff" data-action="open-proxy" data-serial="' + serial + '">Proxy</button>';
+            webUiRow += '<button style="font-size:11px;padding:2px 6px" data-action="open-direct" data-webui-url="' + escapeHtmlCards(webUIVal) + '">Direct</button>';
+            webUiRow += '<button style="font-size:11px;padding:2px 6px;background:#268bd2;color:#fff" data-action="open-proxy" data-serial="' + escapeHtmlCards(serial) + '">Proxy</button>';
         }
         webUiRow += '</div>';
-        webUiRow += '<button class="edit-field-btn" data-field="web_ui_url" data-serial="' + serial + '" data-current="' + webUIVal.replace(/"/g, '&quot;') + '" data-label="Web UI URL" title="Edit Web UI URL">✏️</button>';
+        webUiRow += '<button class="edit-field-btn" data-field="web_ui_url" data-serial="' + escapeHtmlCards(serial) + '" data-current="' + escapeHtmlCards(webUIVal) + '" data-label="Web UI URL" title="Edit Web UI URL">✏️</button>';
         webUiRow += '</div>';
         deviceInfo += webUiRow;
-        if (p.last_seen) deviceInfo += '<div style="color:var(--muted);font-size:12px;margin-top:6px">Last Seen: ' + new Date(p.last_seen).toLocaleString() + '</div>';
-        if (p.first_seen) deviceInfo += '<div style="color:var(--muted);font-size:12px">First Seen: ' + new Date(p.first_seen).toLocaleString() + '</div>';
+        if (p.last_seen) deviceInfo += '<div style="color:var(--muted);font-size:12px;margin-top:6px">Last Seen: ' + escapeHtmlCards(new Date(p.last_seen).toLocaleString()) + '</div>';
+        if (p.first_seen) deviceInfo += '<div style="color:var(--muted);font-size:12px">First Seen: ' + escapeHtmlCards(new Date(p.first_seen).toLocaleString()) + '</div>';
         deviceInfo += '</div>';
         html += renderInfoCard('Device Info', deviceInfo);
 
@@ -886,8 +935,8 @@
             const metricsHtml = '<div class="device-metrics-card-content">' +
                 '<div id="printer_metrics_summary" class="device-metrics-summary-placeholder">Loading metrics summary...</div>' +
                 '<div class="device-metrics-actions">' +
-                '<button class="primary" data-action="metrics" data-serial="' + p.serial + '">Open Metrics</button>' +
-                '<button style="font-size:12px;padding:6px 10px" data-action="metrics" data-serial="' + p.serial + '" data-preset="7day">Last 7 Days</button>' +
+                '<button class="primary" data-action="metrics" data-serial="' + escapeHtmlCards(p.serial) + '">Open Metrics</button>' +
+                '<button style="font-size:12px;padding:6px 10px" data-action="metrics" data-serial="' + escapeHtmlCards(p.serial) + '" data-preset="7day">Last 7 Days</button>' +
                 '</div>' +
                 '<div class="device-metrics-note">Full charts live in the Metrics tab.</div>' +
                 '</div>';
@@ -984,9 +1033,9 @@
                         const it = ifs[k];
                         interfacesSection += '<div class="device-details-expando-row">';
                         interfacesSection += '<div class="device-details-grid">';
-                        if (it.descr) interfacesSection += '<div>Interface</div><div>' + it.descr + '</div>';
-                        if (it.mac) interfacesSection += '<div>MAC</div><div style="font-family:monospace;font-size:12px">' + it.mac + '</div>';
-                        if (it.speed) interfacesSection += '<div>Speed</div><div>' + it.speed + '</div>';
+                        if (it.descr) interfacesSection += '<div>Interface</div><div>' + escapeHtmlCards(it.descr) + '</div>';
+                        if (it.mac) interfacesSection += '<div>MAC</div><div style="font-family:monospace;font-size:12px">' + escapeHtmlCards(it.mac) + '</div>';
+                        if (it.speed) interfacesSection += '<div>Speed</div><div>' + escapeHtmlCards(it.speed) + '</div>';
                         interfacesSection += '</div></div>';
                     });
                     interfacesSection += '</details>';
@@ -1002,7 +1051,7 @@
                 paperSection += '<details class="device-details-expando" open>';
                 paperSection += '<summary>Loaded Trays</summary>';
                 paperSection += '<div class="device-details-list">';
-                p.paper_tray_status.forEach(t => paperSection += '<div class="device-details-list-item">' + t + '</div>');
+                 p.paper_tray_status.forEach(t => paperSection += '<div class="device-details-list-item">' + escapeHtmlCards(t) + '</div>');
                 paperSection += '</div></details>';
             }
         } catch (e) { /* ignore */ }
@@ -1015,7 +1064,7 @@
                 statusSection += '<details class="device-details-expando" open>';
                 statusSection += '<summary>Active Alerts</summary>';
                 statusSection += '<div class="device-details-list">';
-                p.status_messages.forEach(s => statusSection += '<div class="device-details-list-item">' + s + '</div>');
+                 p.status_messages.forEach(s => statusSection += '<div class="device-details-list-item">' + escapeHtmlCards(s) + '</div>');
                 statusSection += '</div></details>';
             }
         } catch (e) { /* ignore */ }
@@ -1069,24 +1118,28 @@
 
                 const latest = history[history.length - 1];
                 const oldest = history[0];
+                const safeMetricNumber = (value) => {
+                    const number = Number(value);
+                    return Number.isFinite(number) ? number : 0;
+                };
                 const durationMs = new Date(latest.timestamp).getTime() - new Date(oldest.timestamp).getTime();
                 const durationDays = Math.max(1, durationMs / (24 * 60 * 60 * 1000));
 
-                const lifetimePages = latest.page_count || 0;
-                const periodPages = lifetimePages - (oldest.page_count || 0);
+                const lifetimePages = safeMetricNumber(latest.page_count);
+                const periodPages = lifetimePages - safeMetricNumber(oldest.page_count);
                 const avgPages = (periodPages / durationDays).toFixed(1);
                 let statsHtml = '<div class="device-metrics-summary-grid">';
                 statsHtml += renderMetricStat('Lifetime Pages', lifetimePages.toLocaleString(), 'All-time total');
                 statsHtml += renderMetricStat('7-day Delta', periodPages.toLocaleString(), 'vs earliest sample');
                 statsHtml += renderMetricStat('Avg / Day', avgPages, Math.max(1, Math.round(durationDays)) + ' day window');
                 if (latest.mono_pages !== undefined || latest.mono_impressions !== undefined) {
-                    const lifetimeMono = latest.mono_pages || latest.mono_impressions || 0;
-                    const periodMono = lifetimeMono - (oldest.mono_pages || oldest.mono_impressions || 0);
-                    const monoSummary = (periodMono.toLocaleString ? periodMono.toLocaleString() : periodMono) + ' this period';
-                    statsHtml += renderMetricStat('Mono Pages', (lifetimeMono.toLocaleString ? lifetimeMono.toLocaleString() : lifetimeMono), monoSummary);
+                    const lifetimeMono = safeMetricNumber(latest.mono_pages ?? latest.mono_impressions);
+                    const periodMono = lifetimeMono - safeMetricNumber(oldest.mono_pages ?? oldest.mono_impressions);
+                    const monoSummary = periodMono.toLocaleString() + ' this period';
+                    statsHtml += renderMetricStat('Mono Pages', lifetimeMono.toLocaleString(), monoSummary);
                 }
                 statsHtml += '</div>';
-                statsHtml += '<div class="device-metrics-footnote">Last sample ' + new Date(latest.timestamp).toLocaleString() + '</div>';
+                statsHtml += '<div class="device-metrics-footnote">Last sample ' + escapeHtmlCards(new Date(latest.timestamp).toLocaleString()) + '</div>';
 
                 const summaryElFinal = document.getElementById('printer_metrics_summary');
                 if (summaryElFinal) summaryElFinal.innerHTML = statsHtml;
@@ -1173,9 +1226,7 @@
 
                     // Update the display value in the UI
                     const displayEl = document.getElementById('field_' + field + '_display');
-                    if (displayEl) {
-                        displayEl.innerHTML = newValue || '<span style="color:var(--muted);font-style:italic">Not set</span>';
-                    }
+                    setEditableDisplay(displayEl, newValue);
                     // Update the data-current attribute for future edits
                     btn.setAttribute('data-current', newValue);
                     // Also update the device object in memory
@@ -1230,9 +1281,9 @@
                     diffs.forEach(d => {
                         const label = d.field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
                         diffHtml += '<div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:6px;background:rgba(0,0,0,0.1);border-radius:4px">';
-                        diffHtml += '<div><div style="color:var(--muted);font-size:11px;text-transform:uppercase">' + label + '</div>';
+                        diffHtml += '<div><div style="color:var(--muted);font-size:11px;text-transform:uppercase">' + escapeHtmlCards(label) + '</div>';
                         diffHtml += '<div style="font-size:12px"><span style="color:var(--muted);text-decoration:line-through">' + (d.current ? escapeHtmlCards(d.current) : '<i>empty</i>') + '</span> → <span style="color:var(--highlight)">' + escapeHtmlCards(d.proposed) + '</span></div></div>';
-                        diffHtml += '<button class="apply-single-btn" data-field="' + d.field + '" data-value="' + String(d.proposed).replace(/"/g, '&quot;') + '" style="font-size:11px;padding:4px 8px">Apply</button>';
+                        diffHtml += '<button class="apply-single-btn" data-field="' + escapeHtmlCards(d.field) + '" data-value="' + escapeHtmlCards(d.proposed) + '" style="font-size:11px;padding:4px 8px">Apply</button>';
                         diffHtml += '</div>';
                     });
                     diffHtml += '</div>';
@@ -1270,9 +1321,7 @@
                                     applyBtn.style.color = '#fff';
                                     // Update display
                                     const displayEl = document.getElementById('field_' + field + '_display');
-                                    if (displayEl) {
-                                        displayEl.innerHTML = value ? escapeHtmlCards(value) : '<span style="color:var(--muted);font-style:italic">Not set</span>';
-                                    }
+                                    setEditableDisplay(displayEl, value);
                                     p[field] = value;
                                     window.__pm_shared.showToast(field.replace(/_/g, ' ') + ' updated', 'success');
                                 } catch (err) {
@@ -1410,7 +1459,7 @@
                         if (!r.ok) { deleteBtn.disabled = false; deleteBtn.textContent = 'Delete Device'; window.__pm_shared.showToast('Delete failed', 'error'); return; }
                         deleteBtn.textContent = 'Deleted ✓';
                         window.__pm_shared.showToast('Device deleted successfully', 'success');
-                        const cardToRemove = document.querySelector('.saved-device-card[data-serial="' + (p.serial || p.Serial) + '"]');
+                        const cardToRemove = document.querySelector('.saved-device-card[data-serial="' + cssEscapeCards(p.serial || p.Serial) + '"]');
                         if (cardToRemove) {
                                     try {
                                         cardToRemove.classList.add('removing');
@@ -1446,7 +1495,7 @@
                     try {
                         await window.__pm_shared.saveDiscoveredDevice(p.IP || p.ip, true, false);
                         saveBtn.textContent = 'Saved ✓'; actionsEl.appendChild(statusLine);
-                        const cardToRemove = document.querySelector('.device-card[data-ip="' + (p.IP || p.ip) + '"]'); if (cardToRemove) cardToRemove.classList.add('removing');
+                        const cardToRemove = document.querySelector('.device-card[data-ip="' + cssEscapeCards(p.IP || p.ip) + '"]'); if (cardToRemove) cardToRemove.classList.add('removing');
                         setTimeout(async () => {
                             try {
                                 let dots = 0; statusLine.textContent = 'Gathering additional details';
@@ -1531,21 +1580,21 @@
 
         const savedClass = isSaved ? ' saved' : '';
 
-    const saveBtn = isSaved ? '<button class="btn small" disabled>Saved</button>' : '<button class="btn primary small save-device-btn" data-ip="' + ip + '">Save</button>';
-    const proxyBtn = serial ? '<button class="btn small" data-action="open-proxy" data-serial="' + encodeURIComponent(serial) + '">Proxy</button>' : '';
+    const saveBtn = isSaved ? '<button class="btn small" disabled>Saved</button>' : '<button class="btn primary small save-device-btn" data-ip="' + escapeHtmlCards(ip) + '">Save</button>';
+    const proxyBtn = serial ? '<button class="btn small" data-action="open-proxy" data-serial="' + escapeHtmlCards(serial) + '">Proxy</button>' : '';
 
         let html = '';
-        html += '<div class="device-card' + savedClass + '" data-device-key="' + deviceKey + '" data-ip="' + ip + '" data-serial="' + serial + '" data-make="' + (make || '') + '" data-model="' + (model || '') + '">';
+        html += '<div class="device-card' + savedClass + '" data-device-key="' + escapeHtmlCards(deviceKey) + '" data-ip="' + escapeHtmlCards(ip) + '" data-serial="' + escapeHtmlCards(serial) + '" data-make="' + escapeHtmlCards(make || '') + '" data-model="' + escapeHtmlCards(model || '') + '">';
         html += '<div class="printer-card-header">';
         html += '<div style="display:flex;justify-content:space-between;align-items:center">';
         html += '<div style="display:flex;flex-direction:column">';
-        html += '<strong>' + (make ? (make + ' ') : '') + (model || '') + '</strong>';
-        html += '<span style="color:var(--muted);font-size:12px">' + ip + '</span>';
+        html += '<strong>' + escapeHtmlCards(make ? (make + ' ') : '') + escapeHtmlCards(model || '') + '</strong>';
+        html += '<span style="color:var(--muted);font-size:12px">' + escapeHtmlCards(ip) + '</span>';
         html += '</div>'; // left
         html += '<div style="display:flex;gap:8px">' + saveBtn + proxyBtn + '</div>';
         html += '</div></div>';
         html += '<div class="printer-card-body">';
-        if (serial) html += '<div><strong>Serial:</strong> <code>' + serial + '</code></div>';
+        if (serial) html += '<div><strong>Serial:</strong> <code>' + escapeHtmlCards(serial) + '</code></div>';
         html += '</div></div>';
 
         return html;
@@ -1580,14 +1629,14 @@
             cardHtml += '<span class="spinner" style="display:inline-block"></span>';
             cardHtml += '<span style="color:var(--accent);font-weight:500">Discovering...</span>';
             cardHtml += '</div>';
-            cardHtml += '<span style="color:var(--muted);font-size:12px">' + method + '</span>';
+            cardHtml += '<span style="color:var(--muted);font-size:12px">' + escapeHtmlCards(method) + '</span>';
             cardHtml += '</div></div>';
 
             cardHtml += '<div class="printer-card-body">';
-            cardHtml += '<div style="margin-bottom:8px"><strong>IP:</strong> <code>' + ip + '</code></div>';
+            cardHtml += '<div style="margin-bottom:8px"><strong>IP:</strong> <code>' + escapeHtmlCards(ip) + '</code></div>';
 
             if (serial) {
-                cardHtml += '<div style="margin-bottom:8px"><strong>Serial:</strong> <code>' + serial + '</code></div>';
+                cardHtml += '<div style="margin-bottom:8px"><strong>Serial:</strong> <code>' + escapeHtmlCards(serial) + '</code></div>';
                 if (status === 'gathering_details') {
                     cardHtml += '<div style="color:var(--muted);font-size:12px">🔍 Gathering manufacturer, model, and details...</div>';
                 }
@@ -1617,4 +1666,3 @@
     // renderCapabilities).
 
 })();
-

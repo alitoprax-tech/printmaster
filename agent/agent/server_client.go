@@ -18,22 +18,28 @@ import (
 	"time"
 
 	pmsettings "printmaster/common/settings"
+	"printmaster/common/updateauth"
 )
 
 // ServerClient handles uploading agent data to the central PrintMaster server
 // This is the agent's HTTP client for server communication
 type ServerClient struct {
+	updateKeys         updateauth.Keyring
+	updateKeyError     error
 	BaseURL            string
 	AgentID            string
 	AgentName          string // User-friendly agent name
 	Token              string
 	HTTPClient         *http.Client
 	InsecureSkipVerify bool
+	tlsConfigError     error
 	mu                 sync.RWMutex
 	lastHeartbeat      time.Time
 	lastDeviceUpload   time.Time
 	lastMetricsUpload  time.Time
 }
+
+const maxServerResponseBytes = 2 << 20
 
 // SettingsSnapshot mirrors the server's managed settings payload.
 type SettingsSnapshot struct {
@@ -59,57 +65,51 @@ func NewServerClient(baseURL, agentID, token string) *ServerClient {
 
 // NewServerClientWithName creates a new server client with agent name
 func NewServerClientWithName(baseURL, agentID, agentName, token, caCertPath string, insecureSkipVerify bool) *ServerClient {
+	updateKeys, updateKeyError := updateauth.LoadKeyring(os.Getenv("PRINTMASTER_UPDATE_TRUST_FILE"))
 	// Use agent package logger for structured logging when available
 	Info(fmt.Sprintf("NewServerClientWithName baseURL=%s insecureSkipVerify=%v caCertPath=%s", baseURL, insecureSkipVerify, caCertPath))
-	var tlsConfig *tls.Config
-
-	if caCertPath != "" {
-		// Validate CA cert path to prevent path traversal attacks
-		cleanPath := filepath.Clean(caCertPath)
-		if strings.Contains(cleanPath, "..") {
-			Warn(fmt.Sprintf("Invalid CA certificate path (path traversal attempt): %s", caCertPath))
-			caCertPath = "" // Fall back to system CA
-		} else {
-			caCertPath = cleanPath
-		}
-	}
-
-	if caCertPath != "" {
-		// Custom CA (self-signed server certificate)
-		caCert, err := os.ReadFile(caCertPath)
-		if err == nil {
-			caCertPool := x509.NewCertPool()
-			if caCertPool.AppendCertsFromPEM(caCert) {
-				tlsConfig = &tls.Config{
-					RootCAs:            caCertPool,
-					MinVersion:         tls.VersionTLS12,
-					InsecureSkipVerify: insecureSkipVerify,
-				}
-			}
-		}
-	}
-
-	if tlsConfig == nil {
-		// Use system CA pool (works with Let's Encrypt and other public CAs)
-		tlsConfig = &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: insecureSkipVerify,
-		}
-	}
+	tlsConfig, tlsConfigError := buildServerTLSConfig(caCertPath, insecureSkipVerify)
 
 	return &ServerClient{
-		BaseURL:            baseURL,
-		AgentID:            agentID,
-		AgentName:          agentName,
-		Token:              token,
-		InsecureSkipVerify: insecureSkipVerify,
+		updateKeys:     updateKeys,
+		updateKeyError: updateKeyError,
+		BaseURL:        baseURL,
+		AgentID:        agentID,
+		AgentName:      agentName,
+		Token:          token,
+		// Never expose a client which silently disables certificate validation.
+		InsecureSkipVerify: false,
+		tlsConfigError:     tlsConfigError,
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:       30 * time.Second,
+			CheckRedirect: sameOriginRedirect,
 			Transport: &http.Transport{
 				TLSClientConfig: tlsConfig,
 			},
 		},
 	}
+}
+
+func buildServerTLSConfig(caCertPath string, insecureSkipVerify bool) (*tls.Config, error) {
+	if insecureSkipVerify {
+		return nil, fmt.Errorf("insecure TLS verification is not permitted")
+	}
+	if strings.TrimSpace(caCertPath) == "" {
+		return &tls.Config{MinVersion: tls.VersionTLS12}, nil
+	}
+	cleanPath := filepath.Clean(caCertPath)
+	if strings.Contains(cleanPath, "..") {
+		return nil, fmt.Errorf("invalid CA certificate path")
+	}
+	caCert, err := os.ReadFile(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("read custom CA certificate: %w", err)
+	}
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("custom CA certificate contains no valid PEM certificates")
+	}
+	return &tls.Config{RootCAs: caCertPool, MinVersion: tls.VersionTLS12}, nil
 }
 
 // NewServerClientWithCA creates a new server client with optional custom CA certificate
@@ -124,7 +124,7 @@ func NewServerClientWithCAAndSkipVerify(baseURL, agentID, token, caCertPath stri
 
 // IsInsecureSkipVerify returns whether this client was configured to skip TLS verification.
 func (c *ServerClient) IsInsecureSkipVerify() bool {
-	return c.InsecureSkipVerify
+	return false
 }
 
 // SetToken updates the authentication token
@@ -537,6 +537,9 @@ func (c *ServerClient) GetStats() map[string]interface{} {
 
 // doRequest performs an HTTP request with optional authentication
 func (c *ServerClient) doRequest(ctx context.Context, method, path string, reqBody, respBody interface{}, requireAuth bool) error {
+	if c.tlsConfigError != nil {
+		return fmt.Errorf("server TLS configuration rejected: %w", c.tlsConfigError)
+	}
 	url := c.BaseURL + path
 
 	// Encode request body
@@ -583,10 +586,14 @@ func (c *ServerClient) doRequest(ctx context.Context, method, path string, reqBo
 	}
 	defer httpResp.Body.Close()
 
-	// Read response body
-	respData, err := io.ReadAll(httpResp.Body)
+	// Read response body with a hard cap. Server responses are JSON control
+	// messages; an unexpectedly large response must not exhaust the agent.
+	respData, err := io.ReadAll(io.LimitReader(httpResp.Body, maxServerResponseBytes+1))
 	if err != nil {
 		return fmt.Errorf("failed to read response: %w", err)
+	}
+	if len(respData) > maxServerResponseBytes {
+		return fmt.Errorf("server response exceeds %d bytes", maxServerResponseBytes)
 	}
 
 	// Check status code
@@ -662,22 +669,7 @@ func getGitCommit() string {
 }
 
 // UpdateManifest represents a signed manifest for an available update.
-type UpdateManifest struct {
-	ManifestVersion string    `json:"manifest_version"`
-	Component       string    `json:"component"`
-	Version         string    `json:"version"`
-	MinorLine       string    `json:"minor_line"`
-	Platform        string    `json:"platform"`
-	Arch            string    `json:"arch"`
-	Channel         string    `json:"channel"`
-	SHA256          string    `json:"sha256"`
-	SizeBytes       int64     `json:"size_bytes"`
-	SourceURL       string    `json:"source_url"`
-	DownloadURL     string    `json:"download_url,omitempty"`
-	PublishedAt     time.Time `json:"published_at,omitempty"`
-	GeneratedAt     time.Time `json:"generated_at"`
-	Signature       string    `json:"signature,omitempty"`
-}
+type UpdateManifest = updateauth.Manifest
 
 // GetLatestManifest fetches the latest update manifest from the server.
 func (c *ServerClient) GetLatestManifest(ctx context.Context, component, platform, arch, channel string) (*UpdateManifest, error) {
@@ -718,6 +710,12 @@ func (c *ServerClient) GetLatestManifest(ctx context.Context, component, platfor
 	if resp.Manifest == nil {
 		return nil, fmt.Errorf("no manifest returned")
 	}
+	if c.updateKeyError != nil {
+		return nil, fmt.Errorf("update trust configuration: %w", c.updateKeyError)
+	}
+	if err := c.updateKeys.Verify(resp.Manifest, updateauth.Target{Component: component, Platform: platform, Arch: arch, Channel: channel}, time.Now().UTC()); err != nil {
+		return nil, fmt.Errorf("untrusted update manifest: %w", err)
+	}
 
 	return resp.Manifest, nil
 }
@@ -735,6 +733,18 @@ func (c *ServerClient) DownloadArtifactWithProgress(ctx context.Context, manifes
 	if manifest == nil {
 		return 0, fmt.Errorf("manifest required")
 	}
+	if c.tlsConfigError != nil {
+		return 0, fmt.Errorf("server TLS configuration rejected: %w", c.tlsConfigError)
+	}
+	if c.updateKeyError != nil {
+		return 0, fmt.Errorf("update trust configuration: %w", c.updateKeyError)
+	}
+	if err := c.updateKeys.Verify(manifest, updateauth.Target{Component: "agent", Platform: runtime.GOOS, Arch: runtime.GOARCH, Channel: manifest.Channel}, time.Now().UTC()); err != nil {
+		return 0, err
+	}
+	if resumeFrom < 0 || resumeFrom > manifest.SizeBytes {
+		return 0, fmt.Errorf("invalid resume offset")
+	}
 
 	downloadURL := manifest.DownloadURL
 	if downloadURL == "" {
@@ -751,6 +761,10 @@ func (c *ServerClient) DownloadArtifactWithProgress(ctx context.Context, manifes
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || req.URL.User != nil || req.URL.Scheme != base.Scheme || !strings.EqualFold(req.URL.Host, base.Host) {
+		return 0, fmt.Errorf("update download must use the enrolled server origin")
+	}
 
 	// Add authorization
 	c.mu.RLock()
@@ -765,7 +779,11 @@ func (c *ServerClient) DownloadArtifactWithProgress(ctx context.Context, manifes
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 	}
 
-	resp, err := c.HTTPClient.Do(req)
+	downloadClient := *c.HTTPClient
+	downloadClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return fmt.Errorf("update download redirects are disabled")
+	}
+	resp, err := downloadClient.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("download request failed: %w", err)
 	}
@@ -792,19 +810,25 @@ func (c *ServerClient) DownloadArtifactWithProgress(ctx context.Context, manifes
 	defer file.Close()
 
 	// Use progress reader if callback is provided and we know the total size
-	var reader io.Reader = resp.Body
 	totalSize := manifest.SizeBytes
 	if resumeFrom > 0 && resp.StatusCode == http.StatusPartialContent {
 		// For resumed downloads, remaining size is total - already downloaded
 		totalSize = manifest.SizeBytes - resumeFrom
 	}
+	var reader io.Reader = io.LimitReader(resp.Body, totalSize+1)
 	if progressCb != nil && totalSize > 0 {
-		reader = newProgressReader(resp.Body, totalSize, progressCb)
+		reader = newProgressReader(reader, totalSize, progressCb)
 	}
 
 	written, err := io.Copy(file, reader)
 	if err != nil {
 		return resumeFrom + written, fmt.Errorf("download interrupted: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return resumeFrom + written, err
+	}
+	if err := updateauth.VerifyFile(destPath, manifest); err != nil {
+		return resumeFrom + written, err
 	}
 
 	return resumeFrom + written, nil

@@ -1,6 +1,31 @@
 // PrintMaster Server - Web UI JavaScript
 
 const DEFAULT_ROLE_PRIORITY = { admin: 3, operator: 2, viewer: 1 };
+const ALERT_SEVERITY_KEYS = ['critical', 'warning', 'info'];
+const ALERT_CHANNEL_TYPES = ['email', 'webhook', 'slack', 'teams', 'discord', 'telegram', 'pagerduty', 'pushover', 'ntfy'];
+
+function safeClassToken(value, allowed, fallback) {
+    const token = String(value || '').toLowerCase();
+    return Array.isArray(allowed) && allowed.includes(token) ? token : (fallback || 'unknown');
+}
+
+function safeNumericID(value) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? String(number) : '';
+}
+
+function safeDownloadURL(value) {
+    if (!value || typeof value !== 'string') return '';
+    try {
+        const parsed = new URL(value, window.location.origin);
+        if (parsed.origin === window.location.origin && (parsed.protocol === window.location.protocol || parsed.protocol === 'https:')) {
+            return parsed.href;
+        }
+    } catch (err) {
+        // Ignore malformed or unsafe URLs supplied by the API.
+    }
+    return '';
+}
 const BASE_TAB_LABELS = {
     dashboard: 'Dashboard',
     agents: 'Agents',
@@ -1236,7 +1261,12 @@ function ensureMobileBottomTab(tabId, label, iconSvg) {
     item.className = 'mobile-tab-item';
     item.dataset.target = tabId;
     item.setAttribute('aria-label', label);
-    item.innerHTML = iconSvg + `<span>${label}</span>`;
+    // Icons come from the fixed local tab map; keep the user-visible label as
+    // text so a future caller cannot turn a dynamic label into HTML.
+    item.innerHTML = iconSvg;
+    const labelEl = document.createElement('span');
+    labelEl.textContent = label;
+    item.appendChild(labelEl);
 
     item.addEventListener('click', () => {
         switchTab(tabId);
@@ -1598,8 +1628,8 @@ function renderSessions(sessions) {
         return;
     }
     const rows = sessions.map(s => {
-        const created = s.created_at ? new Date(s.created_at).toLocaleString() : 'N/A';
-        const expires = s.expires_at ? new Date(s.expires_at).toLocaleString() : 'N/A';
+        const created = escapeHtml(s.created_at ? new Date(s.created_at).toLocaleString() : 'N/A');
+        const expires = escapeHtml(s.expires_at ? new Date(s.expires_at).toLocaleString() : 'N/A');
         const username = escapeHtml(s.username || `User #${s.user_id}`);
         return `<tr>
             <td>${username}</td>
@@ -1838,13 +1868,17 @@ async function loadRecentAlertsPreview() {
         }
 
         // Render recent alerts as compact list
-        recentContainer.innerHTML = alerts.map(alert => `
-            <div class="recent-alert-item ${alert.severity}" data-alert-id="${alert.id}">
-                <span class="alert-severity-dot ${alert.severity}"></span>
+        recentContainer.innerHTML = alerts.map(alert => {
+            const severity = safeClassToken(alert.severity, ALERT_SEVERITY_KEYS, 'info');
+            const alertID = escapeHtml(alert.id || '');
+            return `
+            <div class="recent-alert-item ${severity}" data-alert-id="${alertID}">
+                <span class="alert-severity-dot ${severity}"></span>
                 <span class="alert-title">${escapeHtml(alert.title || 'Untitled')}</span>
                 <span class="alert-time">${formatRelativeTime(alert.triggered_at)}</span>
             </div>
-        `).join('');
+        `;
+        }).join('');
     } catch (err) {
         console.error('Failed to load recent alerts:', err);
         recentContainer.innerHTML = '<div class="muted-text">Failed to load recent alerts</div>';
@@ -2019,11 +2053,13 @@ function cleanupAlertsInfiniteScroll() {
 }
 
 function renderAlertCard(alert) {
-    const severityClass = alert.severity || 'info';
+    const severityClass = ['critical', 'warning', 'info'].includes(String(alert.severity || '').toLowerCase())
+        ? String(alert.severity).toLowerCase() : 'info';
+    const alertID = escapeHtml(alert.id || '');
     const statusBadge = alert.status === 'acknowledged' ? '<span class="badge badge-warning">Acknowledged</span>' :
         alert.status === 'suppressed' ? '<span class="badge badge-muted">Suppressed</span>' : '';
-    const timeAgo = formatRelativeTime(alert.triggered_at);
-    const scope = alert.scope || 'device';
+    const timeAgo = escapeHtml(formatRelativeTime(alert.triggered_at));
+    const scope = String(alert.scope || 'device');
 
     let scopeIcon = '';
     switch (scope) {
@@ -2035,12 +2071,12 @@ function renderAlertCard(alert) {
     }
 
     const details = [];
-    if (alert.device_serial) details.push(`Device: ${alert.device_serial}`);
-    if (alert.agent_id) details.push(`Agent: ${alert.agent_id.substring(0, 8)}...`);
-    if (alert.site_id) details.push(`Site: ${alert.site_id}`);
+    if (alert.device_serial) details.push(`Device: ${escapeHtml(alert.device_serial)}`);
+    if (alert.agent_id) details.push(`Agent: ${escapeHtml(String(alert.agent_id).substring(0, 8))}...`);
+    if (alert.site_id) details.push(`Site: ${escapeHtml(alert.site_id)}`);
 
     return `
-        <div class="alert-card alert-${severityClass}" data-alert-id="${alert.id}">
+        <div class="alert-card alert-${severityClass}" data-alert-id="${alertID}">
             <div class="alert-card-header">
                 <span class="alert-severity-indicator ${severityClass}"></span>
                 <span class="alert-scope-icon">${scopeIcon}</span>
@@ -2053,8 +2089,8 @@ function renderAlertCard(alert) {
                 ${details.length > 0 ? `<p class="alert-details muted-text">${details.join(' ‚Ä¢ ')}</p>` : ''}
             </div>
             <div class="alert-card-actions">
-                ${alert.status !== 'acknowledged' ? `<button class="btn btn-sm alert-action-btn" data-action="acknowledge" data-alert-id="${alert.id}">Acknowledge</button>` : ''}
-                <button class="btn btn-sm btn-success alert-action-btn" data-action="resolve" data-alert-id="${alert.id}">Resolve</button>
+                ${alert.status !== 'acknowledged' ? `<button class="btn btn-sm alert-action-btn" data-action="acknowledge" data-alert-id="${alertID}">Acknowledge</button>` : ''}
+                <button class="btn btn-sm btn-success alert-action-btn" data-action="resolve" data-alert-id="${alertID}">Resolve</button>
             </div>
         </div>
     `;
@@ -2139,8 +2175,9 @@ function renderAlertHistoryRow(a) {
         ? `<span class="ah-time-date">${formatDateShort(triggeredAt)}</span>${formatTimeShort(triggeredAt)}`
         : '<span class="ah-time">‚Äî</span>';
 
-    const severityClass = `ah-severity-${(a.severity || 'info').toLowerCase()}`;
-    const severityHtml = `<span class="ah-severity ${severityClass}">${escapeHtml((a.severity || 'info').toUpperCase())}</span>`;
+    const severity = safeClassToken(a.severity, ALERT_SEVERITY_KEYS, 'info');
+    const severityClass = `ah-severity-${severity}`;
+    const severityHtml = `<span class="ah-severity ${severityClass}">${escapeHtml(severity.toUpperCase())}</span>`;
 
     const scopeIcon = getScopeIcon(a.scope);
     const scopeHtml = `<span class="ah-scope">${scopeIcon}${escapeHtml(a.scope || 'device')}</span>`;
@@ -2330,16 +2367,18 @@ async function loadRecentReports() {
                         ${runs.map(run => {
                 const typeCode = run.report_type || 'unknown';
                 const typeDisplay = typeDisplayNames[typeCode] || typeCode;
+                const runID = safeNumericID(run.id);
+                const startedAt = escapeHtml(run.started_at ? new Date(run.started_at).toLocaleString() : 'N/A');
                 return `
                             <tr>
                                 <td>${escapeHtml(run.report_name || 'Report #' + run.report_id)}</td>
-                                <td><span class="badge">${typeDisplay}</span></td>
-                                <td><span class="badge badge-${run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : 'warning'}">${run.status}</span></td>
-                                <td>${new Date(run.started_at).toLocaleString()}</td>
+                                <td><span class="badge">${escapeHtml(typeDisplay)}</span></td>
+                                <td><span class="badge badge-${run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : 'warning'}">${escapeHtml(run.status || 'unknown')}</span></td>
+                                <td>${startedAt}</td>
                                 <td>
-                                    ${run.status === 'completed' ? `
-                                        <button class="btn btn-sm" onclick="downloadReportRun(${run.id}, 'csv')">CSV</button>
-                                        <button class="btn btn-sm" onclick="downloadReportRun(${run.id}, 'json')">JSON</button>
+                                    ${run.status === 'completed' && runID ? `
+                                        <button class="btn btn-sm" onclick="downloadReportRun(${runID}, 'csv')">CSV</button>
+                                        <button class="btn btn-sm" onclick="downloadReportRun(${runID}, 'json')">JSON</button>
                                     ` : ''}
                                 </td>
                             </tr>
@@ -2548,12 +2587,16 @@ function showReportDownloadModal(run) {
 
     const info = document.getElementById('report_download_info');
     if (info) {
+        const reportType = escapeHtml(run && run.report_type ? String(run.report_type) : 'Report');
+        const rowCountValue = Number(run && run.row_count);
+        const rowCount = Number.isFinite(rowCountValue) && rowCountValue >= 0 ? String(Math.floor(rowCountValue)) : '0';
+        const generatedAt = escapeHtml(new Date(run && (run.completed_at || run.started_at)).toLocaleString());
         info.innerHTML = `
             <p style="margin:0 0 8px;color:var(--text);">Your report has been generated.</p>
             <p style="margin:0;color:var(--muted);font-size:13px;">
-                Type: ${run.report_type || 'Report'} ‚Ä¢ 
-                Rows: ${run.row_count || 0} ‚Ä¢ 
-                Generated: ${new Date(run.completed_at || run.started_at).toLocaleString()}
+                Type: ${reportType} ‚Ä¢
+                Rows: ${rowCount} ‚Ä¢
+                Generated: ${generatedAt}
             </p>
         `;
     }
@@ -2564,13 +2607,17 @@ function showReportDownloadModal(run) {
 
     if (csvBtn) {
         csvBtn.onclick = () => {
-            downloadReportRun(run.id, 'csv');
+            const runID = safeNumericID(run && run.id);
+            if (!runID) return;
+            downloadReportRun(runID, 'csv');
             modal.style.display = 'none';
         };
     }
     if (jsonBtn) {
         jsonBtn.onclick = () => {
-            downloadReportRun(run.id, 'json');
+            const runID = safeNumericID(run && run.id);
+            if (!runID) return;
+            downloadReportRun(runID, 'json');
             modal.style.display = 'none';
         };
     }
@@ -2734,30 +2781,34 @@ async function loadAlertRules() {
                         <div class="config-empty-state-text">Create your first alert rule to start monitoring your printer fleet.</div>
                     </div>`;
             } else {
-                rulesContainer.innerHTML = rules.map(rule => `
-                    <div class="config-item" data-rule-id="${rule.id}">
+                rulesContainer.innerHTML = rules.map(rule => {
+                    const ruleSeverity = safeClassToken(rule.severity, ALERT_SEVERITY_KEYS, 'info');
+                    const ruleID = safeNumericID(rule.id);
+                    return `
+                    <div class="config-item" data-rule-id="${escapeHtml(ruleID)}">
                         <div class="config-item-header">
                             <div class="config-item-icon">${getRuleTypeIcon(rule.type)}</div>
                             <div class="config-item-info">
                                 <div class="config-item-name">
                                     ${escapeHtml(rule.name)}
-                                    <span class="badge badge-${rule.severity}">${rule.severity}</span>
+                                    <span class="badge badge-${ruleSeverity}">${escapeHtml(ruleSeverity)}</span>
                                     <span class="config-item-status ${rule.enabled ? 'enabled' : 'disabled'}">${rule.enabled ? 'Enabled' : 'Disabled'}</span>
                                 </div>
                                 <div class="config-item-details">
-                                    <span>${formatRuleType(rule.type)}</span>
+                                    <span>${escapeHtml(formatRuleType(rule.type))}</span>
                                     <span class="config-item-details-divider">‚Ä¢</span>
-                                    <span>Scope: ${rule.scope || 'All'}</span>
+                                    <span>Scope: ${escapeHtml(rule.scope || 'All')}</span>
                                     ${rule.description ? `<span class="config-item-details-divider">‚Ä¢</span><span>${escapeHtml(rule.description)}</span>` : ''}
                                 </div>
                             </div>
                         </div>
                         <div class="config-item-actions">
-                            <button class="btn btn-sm" onclick="editAlertRule(${rule.id})">Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteAlertRule(${rule.id})">Delete</button>
+                            <button class="btn btn-sm" onclick="editAlertRule(${ruleID})">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteAlertRule(${ruleID})">Delete</button>
                         </div>
                     </div>
-                `).join('');
+                `;
+                }).join('');
             }
         } catch (err) {
             console.error('Failed to load alert rules:', err);
@@ -2785,26 +2836,30 @@ async function loadAlertRules() {
                         <div class="config-empty-state-text">Add a notification channel to receive alerts via email, Slack, Discord, and more.</div>
                     </div>`;
             } else {
-                channelsContainer.innerHTML = channels.map(ch => `
-                    <div class="config-item" data-channel-id="${ch.id}">
+                channelsContainer.innerHTML = channels.map(ch => {
+                    const channelType = safeClassToken(ch.type, ALERT_CHANNEL_TYPES, 'webhook');
+                    const channelID = safeNumericID(ch.id);
+                    return `
+                    <div class="config-item" data-channel-id="${escapeHtml(channelID)}">
                         <div class="config-item-header">
-                            <div class="config-item-icon channel-${ch.type}">${getChannelIcon(ch.type)}</div>
+                            <div class="config-item-icon channel-${channelType}">${getChannelIcon(channelType)}</div>
                             <div class="config-item-info">
                                 <div class="config-item-name">
                                     ${escapeHtml(ch.name)}
-                                    <span class="badge">${ch.type}</span>
+                                    <span class="badge">${escapeHtml(channelType)}</span>
                                     <span class="config-item-status ${ch.enabled ? 'enabled' : 'disabled'}">${ch.enabled ? 'Enabled' : 'Disabled'}</span>
                                 </div>
                                 <div class="config-item-details">${getChannelSummary(ch)}</div>
                             </div>
                         </div>
                         <div class="config-item-actions">
-                            <button class="btn btn-sm btn-outline" onclick="testNotificationChannel(${ch.id})" title="Send test notification">Test</button>
-                            <button class="btn btn-sm" onclick="editNotificationChannel(${ch.id})">Edit</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteNotificationChannel(${ch.id})">Delete</button>
+                            <button class="btn btn-sm btn-outline" onclick="testNotificationChannel(${channelID})" title="Send test notification">Test</button>
+                            <button class="btn btn-sm" onclick="editNotificationChannel(${channelID})">Edit</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteNotificationChannel(${channelID})">Delete</button>
                         </div>
                     </div>
-                `).join('');
+                `;
+                }).join('');
             }
         } catch (err) {
             console.error('Failed to load notification channels:', err);
@@ -2832,11 +2887,12 @@ async function loadAlertRules() {
                     </div>`;
             } else {
                 escalationContainer.innerHTML = policies.map(p => {
+                    const policyID = safeNumericID(p.id);
                     const stepsSummary = (p.steps || []).length > 0
                         ? `${p.steps.length} step${p.steps.length !== 1 ? 's' : ''}`
                         : 'No steps';
                     return `
-                        <div class="config-item" data-policy-id="${p.id}">
+                        <div class="config-item" data-policy-id="${escapeHtml(policyID)}">
                             <div class="config-item-header">
                                 <div class="config-item-icon">
                                     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/><path d="m8.93 6.588-2.29.287-.082.38.45.083c.294.07.352.176.288.469l-.738 3.468c-.194.897.105 1.319.808 1.319.545 0 1.178-.252 1.465-.598l.088-.416c-.2.176-.492.246-.686.246-.275 0-.375-.193-.304-.533L8.93 6.588zM9 4.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0z"/></svg>
@@ -2851,8 +2907,8 @@ async function loadAlertRules() {
                                 </div>
                             </div>
                             <div class="config-item-actions">
-                                <button class="btn btn-sm" onclick="editEscalationPolicy(${p.id})">Edit</button>
-                                <button class="btn btn-sm btn-danger" onclick="deleteEscalationPolicy(${p.id})">Delete</button>
+                                <button class="btn btn-sm" onclick="editEscalationPolicy(${policyID})">Edit</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteEscalationPolicy(${policyID})">Delete</button>
                             </div>
                         </div>
                     `;
@@ -2883,11 +2939,12 @@ async function loadAlertRules() {
                     </div>`;
             } else {
                 maintenanceContainer.innerHTML = windows.map(w => {
-                    const startDate = new Date(w.start_time).toLocaleString();
-                    const endDate = new Date(w.end_time).toLocaleString();
+                    const windowID = safeNumericID(w.id);
+                    const startDate = escapeHtml(new Date(w.start_time).toLocaleString());
+                    const endDate = escapeHtml(new Date(w.end_time).toLocaleString());
                     const isActive = new Date() >= new Date(w.start_time) && new Date() <= new Date(w.end_time);
                     return `
-                        <div class="config-item ${isActive ? 'active-window' : ''}" data-window-id="${w.id}">
+                        <div class="config-item ${isActive ? 'active-window' : ''}" data-window-id="${escapeHtml(windowID)}">
                             <div class="config-item-header">
                                 <div class="config-item-icon" style="${isActive ? 'background:rgba(203,75,22,0.12);color:var(--warning);' : ''}">
                                     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M5.5 10.5A.5.5 0 0 1 6 10h4a.5.5 0 0 1 0 1H6a.5.5 0 0 1-.5-.5z"/><path d="M3.5 0a.5.5 0 0 1 .5.5V1h8V.5a.5.5 0 0 1 1 0V1h1a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3a2 2 0 0 1 2-2h1V.5a.5.5 0 0 1 .5-.5zM2 2a1 1 0 0 0-1 1v1h14V3a1 1 0 0 0-1-1H2zm13 3H1v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V5z"/></svg>
@@ -2902,13 +2959,13 @@ async function loadAlertRules() {
                                         <span>${startDate}</span>
                                         <span class="config-item-details-divider">‚Üí</span>
                                         <span>${endDate}</span>
-                                        ${w.scope ? `<span class="config-item-details-divider">‚Ä¢</span><span>Scope: ${w.scope}</span>` : ''}
+                                        ${w.scope ? `<span class="config-item-details-divider">‚Ä¢</span><span>Scope: ${escapeHtml(w.scope)}</span>` : ''}
                                     </div>
                                 </div>
                             </div>
                             <div class="config-item-actions">
-                                <button class="btn btn-sm" onclick="editMaintenanceWindow(${w.id})">Edit</button>
-                                <button class="btn btn-sm btn-danger" onclick="deleteMaintenanceWindow(${w.id})">Delete</button>
+                                <button class="btn btn-sm" onclick="editMaintenanceWindow(${windowID})">Edit</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteMaintenanceWindow(${windowID})">Delete</button>
                             </div>
                         </div>
                     `;
@@ -2941,9 +2998,10 @@ async function loadAlertRules() {
                     </div>`;
             } else {
                 schedulesContainer.innerHTML = schedules.map(s => {
-                    const nextRun = s.next_run ? new Date(s.next_run).toLocaleString() : 'Not scheduled';
+                    const scheduleID = safeNumericID(s.id);
+                    const nextRun = escapeHtml(s.next_run ? new Date(s.next_run).toLocaleString() : 'Not scheduled');
                     return `
-                        <div class="config-item" data-schedule-id="${s.id}">
+                        <div class="config-item" data-schedule-id="${escapeHtml(scheduleID)}">
                             <div class="config-item-header">
                                 <div class="config-item-icon">
                                     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M4 11a1 1 0 1 1 2 0v1a1 1 0 1 1-2 0v-1zm6-4a1 1 0 1 1 2 0v5a1 1 0 1 1-2 0V7zM7 9a1 1 0 0 1 2 0v3a1 1 0 1 1-2 0V9z"/><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/></svg>
@@ -2951,20 +3009,20 @@ async function loadAlertRules() {
                                 <div class="config-item-info">
                                     <div class="config-item-name">
                                         ${escapeHtml(s.name)}
-                                        <span class="badge">${s.frequency}</span>
-                                        <span class="badge">${s.report_type}</span>
+                        <span class="badge">${escapeHtml(s.frequency || '')}</span>
+                        <span class="badge">${escapeHtml(s.report_type || '')}</span>
                                         <span class="config-item-status ${s.enabled ? 'enabled' : 'disabled'}">${s.enabled ? 'Enabled' : 'Disabled'}</span>
                                     </div>
                                     <div class="config-item-details">
                                         <span>Next run: ${nextRun}</span>
                                         <span class="config-item-details-divider">‚Ä¢</span>
-                                        <span>Format: ${s.output_format || 'csv'}</span>
+                                        <span>Format: ${escapeHtml(s.output_format || 'csv')}</span>
                                     </div>
                                 </div>
                             </div>
                             <div class="config-item-actions">
-                                <button class="btn btn-sm btn-outline" onclick="runScheduleNow(${s.id})">Run Now</button>
-                                <button class="btn btn-sm btn-danger" onclick="deleteReportSchedule(${s.id})">Delete</button>
+                                <button class="btn btn-sm btn-outline" onclick="runScheduleNow(${scheduleID})">Run Now</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteReportSchedule(${scheduleID})">Delete</button>
                             </div>
                         </div>
                     `;
@@ -3089,14 +3147,14 @@ function getChannelSummary(channel) {
         case 'webhook':
             return `URL: ${escapeHtml(config.url || 'Not configured')}`;
         case 'slack':
-            const slackChannel = config.channel ? ` (${config.channel})` : '';
+            const slackChannel = config.channel ? ` (${escapeHtml(String(config.channel))})` : '';
             return `Slack webhook${slackChannel}`;
         case 'teams':
             return 'Microsoft Teams webhook';
         case 'pagerduty':
-            return `PagerDuty (${config.severity || 'warning'} severity)`;
+            return `PagerDuty (${escapeHtml(String(config.severity || 'warning'))} severity)`;
         default:
-            return channel.type;
+            return escapeHtml(String(channel.type || 'unknown'));
     }
 }
 
@@ -3409,7 +3467,11 @@ function addEscalationStep(afterMinutes = 15, channelId = '') {
     // Build channel options from cached channels
     const channelOptions = (cachedNotificationChannels || [])
         .filter(ch => ch.enabled)
-        .map(ch => `<option value="${ch.id}" ${ch.id == channelId ? 'selected' : ''}>${escapeHtml(ch.name)} (${ch.type})</option>`)
+        .map(ch => {
+            const id = Number.isFinite(Number(ch.id)) ? String(Number(ch.id)) : '';
+            const type = safeClassToken(ch.type, ALERT_CHANNEL_TYPES, 'webhook');
+            return `<option value="${escapeHtml(id)}" ${ch.id == channelId ? 'selected' : ''}>${escapeHtml(ch.name)} (${escapeHtml(type)})</option>`;
+        })
         .join('');
 
     stepDiv.innerHTML = `
@@ -3634,13 +3696,14 @@ async function loadChannelsForAlertRule(selectedIds = []) {
 
         container.innerHTML = channels.map(ch => {
             const isChecked = selected.includes(ch.id);
-            const icon = getChannelIcon(ch.type);
+            const channelType = safeClassToken(ch.type, ALERT_CHANNEL_TYPES, 'webhook');
+            const icon = getChannelIcon(channelType);
             return `
                 <label class="channel-checkbox-item">
-                    <input type="checkbox" name="alert_rule_channel" value="${ch.id}" ${isChecked ? 'checked' : ''} />
+                    <input type="checkbox" name="alert_rule_channel" value="${escapeHtml(ch.id)}" ${isChecked ? 'checked' : ''} />
                     <span class="channel-checkbox-icon">${icon}</span>
                     <span class="channel-checkbox-name">${escapeHtml(ch.name)}</span>
-                    <span class="channel-checkbox-type">${ch.type}</span>
+                    <span class="channel-checkbox-type">${escapeHtml(channelType)}</span>
                 </label>
             `;
         }).join('');
@@ -4513,7 +4576,7 @@ async function loadServerSettings(forceRefresh = false) {
     } catch (err) {
         serverSettingsVM.lastError = err;
         const message = err && err.message ? err.message : err;
-        container.innerHTML = `<div style="color:var(--danger);">Failed to load server settings: ${message}</div>`;
+        container.innerHTML = `<div style="color:var(--danger);">Failed to load server settings: ${escapeHtml(message)}</div>`;
         window.__pm_shared.error('Failed to load server settings', err);
     } finally {
         serverSettingsVM.loading = false;
@@ -5482,6 +5545,20 @@ function renderDashboardSummary() {
     }
 }
 
+// Dashboard counts and percentages originate in API/database records. Keep
+// malformed values out of HTML text and CSS declarations.
+function safeDashboardMetric(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= Number.MAX_SAFE_INTEGER
+        ? Math.floor(number).toLocaleString()
+        : '0';
+}
+
+function safeDashboardPercent(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, Math.min(100, number)) : 0;
+}
+
 function renderDashboardTree() {
     const container = document.getElementById('dashboard_tree');
     if (!container || !dashboardData) return;
@@ -5595,27 +5672,29 @@ function buildDashboardTreeHTML(tenants) {
 
 function buildTenantNodeHTML(tenant, isMatch) {
     const nodeId = `tenant-${tenant.id}`;
+    const safeNodeId = escapeHtml(nodeId);
+    const safeTenantID = escapeHtml(tenant.id || '');
     const isExpanded = dashboardExpandedNodes.has(nodeId);
     const sites = tenant.sites || [];
     const unassignedAgents = (tenant.agents || []).filter(a => dashboardFilters.agentStatus.has(a.status));
     const hasChildren = sites.length > 0 || unassignedAgents.length > 0;
     const m = tenant.metrics || {};
 
-    let html = `<li class="dashboard-tree-node" data-node-id="${nodeId}">`;
-    html += `<div class="dashboard-tree-row${isMatch ? ' match' : ''}" data-type="tenant" data-id="${tenant.id}">`;
+    let html = `<li class="dashboard-tree-node" data-node-id="${safeNodeId}">`;
+    html += `<div class="dashboard-tree-row${isMatch ? ' match' : ''}" data-type="tenant" data-id="${safeTenantID}">`;
     html += `<button class="dashboard-tree-toggle${isExpanded ? ' expanded' : ''}${hasChildren ? '' : ' no-children'}" aria-expanded="${isExpanded}">‚ñ∂</button>`;
     html += `<span class="dashboard-tree-icon tenant">üè¢</span>`;
     html += `<div class="dashboard-tree-content">`;
     html += `<span class="dashboard-tree-name">${highlightMatch(escapeHtml(tenant.name))}</span>`;
     html += `</div>`;
     html += `<div class="dashboard-tree-metrics">`;
-    if (m.site_count > 0) {
-        html += `<span class="dashboard-tree-metric" title="Sites">${m.site_count} sites</span>`;
+    if (Number(m.site_count) > 0) {
+        html += `<span class="dashboard-tree-metric" title="Sites">${safeDashboardMetric(m.site_count)} sites</span>`;
     }
-    html += `<span class="dashboard-tree-metric" title="Agents">${m.agent_count || 0} agents</span>`;
-    html += `<span class="dashboard-tree-metric" title="Devices">${m.device_count || 0} devices</span>`;
-    if (m.critical_supplies > 0) {
-        html += `<span class="dashboard-tree-metric critical" title="Critical supplies">‚ö†Ô∏è ${m.critical_supplies}</span>`;
+    html += `<span class="dashboard-tree-metric" title="Agents">${safeDashboardMetric(m.agent_count)} agents</span>`;
+    html += `<span class="dashboard-tree-metric" title="Devices">${safeDashboardMetric(m.device_count)} devices</span>`;
+    if (Number(m.critical_supplies) > 0) {
+        html += `<span class="dashboard-tree-metric critical" title="Critical supplies">‚ö†Ô∏è ${safeDashboardMetric(m.critical_supplies)}</span>`;
     }
     html += `</div>`;
     html += `</div>`;
@@ -5658,6 +5737,9 @@ function buildTenantNodeHTML(tenant, isMatch) {
 
 function buildSiteNodeHTML(site, tenantId) {
     const nodeId = `site-${site.id}`;
+    const safeNodeId = escapeHtml(nodeId);
+    const safeSiteID = escapeHtml(site.id || '');
+    const safeTenantID = escapeHtml(tenantId || '');
     const isExpanded = dashboardExpandedNodes.has(nodeId);
     const siteMatches = matchesSearch(site.name) || matchesSearch(site.description) || matchesSearch(site.address);
 
@@ -5686,8 +5768,8 @@ function buildSiteNodeHTML(site, tenantId) {
     const hasChildren = filteredAgents.length > 0;
     const m = site.metrics || {};
 
-    let html = `<li class="dashboard-tree-node" data-node-id="${nodeId}">`;
-    html += `<div class="dashboard-tree-row${siteMatches ? ' match' : ''}" data-type="site" data-id="${site.id}" data-tenant="${tenantId}">`;
+    let html = `<li class="dashboard-tree-node" data-node-id="${safeNodeId}">`;
+    html += `<div class="dashboard-tree-row${siteMatches ? ' match' : ''}" data-type="site" data-id="${safeSiteID}" data-tenant="${safeTenantID}">`;
     html += `<button class="dashboard-tree-toggle${isExpanded ? ' expanded' : ''}${hasChildren ? '' : ' no-children'}" aria-expanded="${isExpanded}">‚ñ∂</button>`;
     html += `<span class="dashboard-tree-icon site">üìç</span>`;
     html += `<div class="dashboard-tree-content">`;
@@ -5697,10 +5779,10 @@ function buildSiteNodeHTML(site, tenantId) {
     }
     html += `</div>`;
     html += `<div class="dashboard-tree-metrics">`;
-    html += `<span class="dashboard-tree-metric" title="Agents">${m.agent_count || 0} agents</span>`;
-    html += `<span class="dashboard-tree-metric" title="Devices">${m.device_count || 0} devices</span>`;
-    if (m.critical_supplies > 0) {
-        html += `<span class="dashboard-tree-metric critical" title="Critical supplies">‚ö†Ô∏è ${m.critical_supplies}</span>`;
+    html += `<span class="dashboard-tree-metric" title="Agents">${safeDashboardMetric(m.agent_count)} agents</span>`;
+    html += `<span class="dashboard-tree-metric" title="Devices">${safeDashboardMetric(m.device_count)} devices</span>`;
+    if (Number(m.critical_supplies) > 0) {
+        html += `<span class="dashboard-tree-metric critical" title="Critical supplies">‚ö†Ô∏è ${safeDashboardMetric(m.critical_supplies)}</span>`;
     }
     html += `</div>`;
     html += `</div>`;
@@ -5721,6 +5803,10 @@ function buildSiteNodeHTML(site, tenantId) {
 
 function buildAgentNodeHTML(agent, tenantId, siteId) {
     const nodeId = `agent-${agent.agent_id}`;
+    const safeNodeId = escapeHtml(nodeId);
+    const safeAgentID = escapeHtml(agent.agent_id || '');
+    const safeTenantID = escapeHtml(tenantId || '');
+    const safeSiteID = siteId ? escapeHtml(siteId) : '';
     const isExpanded = dashboardExpandedNodes.has(nodeId);
     const agentMatches = matchesSearch(agent.name) || matchesSearch(agent.agent_id);
 
@@ -5747,23 +5833,24 @@ function buildAgentNodeHTML(agent, tenantId, siteId) {
 
     const hasChildren = filteredDevices.length > 0;
     const m = agent.metrics || {};
-    const statusClass = agent.status || 'offline';
+    const statusClass = ['active', 'degraded', 'offline'].includes(String(agent.status || '').toLowerCase())
+        ? String(agent.status).toLowerCase() : 'offline';
 
-    let html = `<li class="dashboard-tree-node" data-node-id="${nodeId}">`;
-    html += `<div class="dashboard-tree-row${agentMatches ? ' match' : ''}" data-type="agent" data-id="${agent.agent_id}" data-tenant="${tenantId}"${siteId ? ` data-site="${siteId}"` : ''}>`;
+    let html = `<li class="dashboard-tree-node" data-node-id="${safeNodeId}">`;
+    html += `<div class="dashboard-tree-row${agentMatches ? ' match' : ''}" data-type="agent" data-id="${safeAgentID}" data-tenant="${safeTenantID}"${safeSiteID ? ` data-site="${safeSiteID}"` : ''}>`;
     html += `<button class="dashboard-tree-toggle${isExpanded ? ' expanded' : ''}${hasChildren ? '' : ' no-children'}" aria-expanded="${isExpanded}">‚ñ∂</button>`;
     html += `<span class="dashboard-tree-icon agent">üíª</span>`;
     html += `<div class="dashboard-tree-content">`;
     html += `<span class="dashboard-tree-name">${highlightMatch(escapeHtml(getAgentDisplayName(agent)))}</span>`;
-    html += `<span class="dashboard-status-badge ${statusClass}"><span class="dashboard-status-dot"></span>${statusClass}</span>`;
+    html += `<span class="dashboard-status-badge ${statusClass}"><span class="dashboard-status-dot"></span>${escapeHtml(statusClass)}</span>`;
     html += `</div>`;
     html += `<div class="dashboard-tree-metrics">`;
-    html += `<span class="dashboard-tree-metric" title="Devices">${m.device_count || 0} devices</span>`;
+    html += `<span class="dashboard-tree-metric" title="Devices">${safeDashboardMetric(m.device_count)} devices</span>`;
     if (agent.version) {
         html += `<span class="dashboard-tree-metric" title="Version">v${escapeHtml(agent.version)}</span>`;
     }
-    if (m.critical_supplies > 0) {
-        html += `<span class="dashboard-tree-metric critical" title="Critical supplies">‚ö†Ô∏è ${m.critical_supplies}</span>`;
+    if (Number(m.critical_supplies) > 0) {
+        html += `<span class="dashboard-tree-metric critical" title="Critical supplies">‚ö†Ô∏è ${safeDashboardMetric(m.critical_supplies)}</span>`;
     }
     html += `</div>`;
     html += `</div>`;
@@ -5788,13 +5875,19 @@ function buildAgentNodeHTML(agent, tenantId, siteId) {
 }
 
 function buildDeviceNodeHTML(device, agentId, isMatch) {
-    const supplyLevel = device.lowest_supply >= 0 ? device.lowest_supply : -1;
-    const supplyStatus = device.supply_status || 'unknown';
-    const deviceStatus = device.status || 'healthy';
+    const rawSupplyLevel = Number(device.lowest_supply);
+    const supplyLevel = Number.isFinite(rawSupplyLevel) && rawSupplyLevel >= 0
+        ? safeDashboardPercent(rawSupplyLevel) : -1;
+    const supplyStatus = ['critical', 'low', 'ok', 'healthy', 'unknown'].includes(String(device.supply_status || '').toLowerCase())
+        ? String(device.supply_status).toLowerCase() : 'unknown';
+    const deviceStatus = ['healthy', 'warning', 'critical', 'offline', 'unknown'].includes(String(device.status || '').toLowerCase())
+        ? String(device.status).toLowerCase() : 'healthy';
+    const safeSerial = escapeHtml(device.serial || '');
+    const safeAgentID = escapeHtml(agentId || '');
     const displayName = [device.manufacturer, device.model].filter(Boolean).join(' ') || 'Unknown Device';
 
     let html = `<li class="dashboard-tree-node">`;
-    html += `<div class="dashboard-tree-row${isMatch ? ' match' : ''}" data-type="device" data-serial="${device.serial}" data-agent="${agentId}">`;
+    html += `<div class="dashboard-tree-row${isMatch ? ' match' : ''}" data-type="device" data-serial="${safeSerial}" data-agent="${safeAgentID}">`;
     html += `<span class="dashboard-tree-toggle no-children"></span>`;
     html += `<span class="dashboard-tree-icon device">üñ®Ô∏è</span>`;
     html += `<div class="dashboard-tree-content">`;
@@ -5805,7 +5898,7 @@ function buildDeviceNodeHTML(device, agentId, isMatch) {
 
     // Status badge
     if (deviceStatus !== 'healthy') {
-        html += `<span class="dashboard-status-badge ${deviceStatus}">${deviceStatus}</span>`;
+        html += `<span class="dashboard-status-badge ${deviceStatus}">${escapeHtml(deviceStatus)}</span>`;
     }
 
     // Supply indicator
@@ -5816,8 +5909,8 @@ function buildDeviceNodeHTML(device, agentId, isMatch) {
         html += `</div>`;
     }
 
-    if (device.page_count > 0) {
-        html += `<span class="dashboard-tree-metric" title="Page count">${device.page_count.toLocaleString()} pages</span>`;
+    if (Number(device.page_count) > 0) {
+        html += `<span class="dashboard-tree-metric" title="Page count">${safeDashboardMetric(device.page_count)} pages</span>`;
     }
     html += `</div>`;
     html += `</div>`;
@@ -5950,7 +6043,7 @@ async function loadSelfUpdateRuns() {
         // Render runs table (only if not in container)
         if (runsContainer && !isContainer) {
             if (runsResp.error) {
-                runsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load history: ${runsResp.error}</div>`;
+                runsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load history: ${escapeHtml(runsResp.error)}</div>`;
             } else {
                 const runs = Array.isArray(runsResp.runs) ? runsResp.runs : [];
                 renderSelfUpdateRuns(runsContainer, runs);
@@ -5964,7 +6057,7 @@ async function loadSelfUpdateRuns() {
         const artifactsContainer = document.getElementById('releases_artifacts_container');
         if (artifactsContainer) {
             if (artifactsResp.error) {
-                artifactsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load artifacts: ${artifactsResp.error}</div>`;
+                artifactsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load artifacts: ${escapeHtml(artifactsResp.error)}</div>`;
             } else {
                 const artifacts = Array.isArray(artifactsResp.artifacts) ? artifactsResp.artifacts : [];
                 renderReleaseArtifacts(artifactsContainer, artifacts, isContainer);
@@ -5973,17 +6066,17 @@ async function loadSelfUpdateRuns() {
     } catch (err) {
         const message = err && err.message ? err.message : err;
         if (statusCard) {
-            statusCard.innerHTML = `<div style="color:var(--danger);">Failed to load status: ${message}</div>`;
+            statusCard.innerHTML = `<div style="color:var(--danger);">Failed to load status: ${escapeHtml(message)}</div>`;
         }
         if (runsContainer) {
-            runsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load history: ${message}</div>`;
+            runsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load history: ${escapeHtml(message)}</div>`;
         }
     }
 }
 
 function renderSelfUpdateStatus(container, status) {
     if (!status || status.error) {
-        container.innerHTML = `<div style="color:var(--danger);">Failed to load status: ${status?.error || 'Unknown error'}</div>`;
+        container.innerHTML = `<div style="color:var(--danger);">Failed to load status: ${escapeHtml(status?.error || 'Unknown error')}</div>`;
         return;
     }
 
@@ -6002,12 +6095,12 @@ function renderSelfUpdateStatus(container, status) {
                     <span style="font-weight:600;">Auto-Update:</span>
                     ${enabledBadge}
                 </div>
-                ${status.disabled_reason ? `<div style="color:var(--muted);font-size:12px;">Reason: ${status.disabled_reason}</div>` : ''}
+                ${status.disabled_reason ? `<div style="color:var(--muted);font-size:12px;">Reason: ${escapeHtml(status.disabled_reason)}</div>` : ''}
                 <div style="display:flex;flex-wrap:wrap;gap:16px;font-size:13px;color:var(--muted);">
-                    <span><strong>Version:</strong> ${status.current_version || 'Unknown'}</span>
-                    <span><strong>Channel:</strong> ${status.channel || 'stable'}</span>
-                    <span><strong>Platform:</strong> ${status.platform || '?'}/${status.arch || '?'}</span>
-                    <span><strong>Check Interval:</strong> ${status.check_interval || '?'}</span>
+                    <span><strong>Version:</strong> ${escapeHtml(status.current_version || 'Unknown')}</span>
+                    <span><strong>Channel:</strong> ${escapeHtml(status.channel || 'stable')}</span>
+                    <span><strong>Platform:</strong> ${escapeHtml(status.platform || '?')}/${escapeHtml(status.arch || '?')}</span>
+                    <span><strong>Check Interval:</strong> ${escapeHtml(status.check_interval || '?')}</span>
                 </div>
             </div>
             <div style="display:flex;gap:8px;align-items:center;">
@@ -6074,22 +6167,22 @@ function renderSelfUpdateRuns(container, runs) {
             'in_progress': 'var(--highlight)',
         };
         const color = colors[status] || 'var(--muted)';
-        return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:${color}20;color:${color};">${status}</span>`;
+        return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:${color}20;color:${color};">${escapeHtml(status || 'unknown')}</span>`;
     };
 
     const formatTime = (ts) => {
         if (!ts) return '‚Äî';
         const d = new Date(ts);
-        return d.toLocaleString();
+        return escapeHtml(d.toLocaleString());
     };
 
     const rows = runs.map(run => `
         <tr>
             <td style="padding:8px;border-bottom:1px solid var(--border);">${formatTime(run.started_at)}</td>
-            <td style="padding:8px;border-bottom:1px solid var(--border);">${run.from_version || '‚Äî'}</td>
-            <td style="padding:8px;border-bottom:1px solid var(--border);">${run.to_version || '‚Äî'}</td>
+            <td style="padding:8px;border-bottom:1px solid var(--border);">${escapeHtml(run.from_version || '‚Äî')}</td>
+            <td style="padding:8px;border-bottom:1px solid var(--border);">${escapeHtml(run.to_version || '‚Äî')}</td>
             <td style="padding:8px;border-bottom:1px solid var(--border);">${statusBadge(run.status)}</td>
-            <td style="padding:8px;border-bottom:1px solid var(--border);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${run.message || ''}">${run.message || '‚Äî'}</td>
+            <td style="padding:8px;border-bottom:1px solid var(--border);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(run.message || '')}">${escapeHtml(run.message || '‚Äî')}</td>
             <td style="padding:8px;border-bottom:1px solid var(--border);">${formatTime(run.finished_at)}</td>
         </tr>
     `).join('');
@@ -6189,14 +6282,21 @@ function handleReleaseSyncProgress(data) {
 
         let progressHtml = `<div style="font-size:13px;color:var(--text);margin-bottom:8px;">${escapeHtml(data.message || 'Syncing...')}</div>`;
 
-        if (data.phase === 'downloading' && data.total_files > 0) {
-            const pct = data.percent_complete || 0;
-            const completedBytes = formatBytes(data.completed_bytes || 0);
-            const totalBytes = formatBytes(data.total_bytes || 0);
+        const totalFiles = Number.isFinite(Number(data.total_files)) && Number(data.total_files) >= 0
+            ? Math.floor(Number(data.total_files)) : 0;
+        const completedFiles = Number.isFinite(Number(data.completed_files)) && Number(data.completed_files) >= 0
+            ? Math.floor(Number(data.completed_files)) : 0;
+        const rawPercent = Number(data.percent_complete);
+        const pct = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, rawPercent)) : 0;
+        const safeBytes = (value) => Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
+
+        if (data.phase === 'downloading' && totalFiles > 0) {
+            const completedBytes = formatBytes(safeBytes(data.completed_bytes));
+            const totalBytes = formatBytes(safeBytes(data.total_bytes));
 
             progressHtml += `
                 <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px;">
-                    <span>File ${data.completed_files + 1} of ${data.total_files}${data.current_file ? ': ' + escapeHtml(data.current_file) : ''}</span>
+                    <span>File ${completedFiles + 1} of ${totalFiles}${data.current_file ? ': ' + escapeHtml(data.current_file) : ''}</span>
                     <span>${completedBytes} / ${totalBytes}</span>
                 </div>
                 <div style="background:var(--bg);border-radius:4px;height:8px;overflow:hidden;">
@@ -6217,8 +6317,8 @@ function handleReleaseSyncProgress(data) {
 
     // Update button text
     if (btn) {
-        if (data.phase === 'downloading' && data.percent_complete !== undefined) {
-            btn.textContent = `Syncing... ${data.percent_complete}%`;
+        if (data.phase === 'downloading') {
+            btn.textContent = `Syncing... ${pct}%`;
         } else {
             btn.textContent = 'Syncing...';
         }
@@ -6317,14 +6417,14 @@ async function loadReleaseArtifacts() {
 
         const artifactsResp = await fetchJSON('/api/v1/releases/artifacts');
         if (artifactsResp.error) {
-            artifactsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load artifacts: ${artifactsResp.error}</div>`;
+                artifactsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load artifacts: ${escapeHtml(artifactsResp.error)}</div>`;
         } else {
             const artifacts = Array.isArray(artifactsResp.artifacts) ? artifactsResp.artifacts : [];
             renderReleaseArtifacts(artifactsContainer, artifacts, releaseArtifactsIsContainer);
         }
     } catch (err) {
         const message = err && err.message ? err.message : err;
-        artifactsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load artifacts: ${message}</div>`;
+        artifactsContainer.innerHTML = `<div style="color:var(--danger);">Failed to load artifacts: ${escapeHtml(message)}</div>`;
     }
 }
 
@@ -6358,7 +6458,7 @@ function renderReleaseArtifacts(container, artifacts, isContainer = false) {
             'server': 'var(--success)'
         };
         const color = colors[component] || 'var(--muted)';
-        return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:${color}20;color:${color};">${component}</span>`;
+        return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:${color}20;color:${color};">${escapeHtml(component || 'unknown')}</span>`;
     };
 
     const platformArchBadge = (platform, arch, cached) => {
@@ -6367,10 +6467,10 @@ function renderReleaseArtifacts(container, artifacts, isContainer = false) {
             'linux': 'Linux',
             'darwin': 'macOS'
         };
-        const label = platformAbbr[platform] || platform;
+        const label = platformAbbr[platform] || platform || 'unknown';
         const cachedStyle = cached ? 'color:var(--text);' : 'color:var(--muted);opacity:0.6;';
         const title = cached ? `${platform}/${arch} - Cached` : `${platform}/${arch} - Not cached`;
-        return `<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;background:var(--bg-secondary);${cachedStyle}" title="${title}">${label}/${arch}</span>`;
+        return `<span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;margin-right:4px;background:var(--bg-secondary);${cachedStyle}" title="${escapeHtml(title)}">${escapeHtml(label)}/${escapeHtml(arch || '?')}</span>`;
     };
 
     // Group artifacts by component, version, and channel
@@ -6432,9 +6532,9 @@ function renderReleaseArtifacts(container, artifacts, isContainer = false) {
         return `
             <tr>
                 <td style="padding:8px 12px;border-bottom:1px solid var(--border);">${componentBadge(g.component)}</td>
-                <td style="padding:8px 12px;border-bottom:1px solid var(--border);font-family:monospace;font-weight:600;">${g.version}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid var(--border);font-family:monospace;font-weight:600;">${escapeHtml(g.version)}</td>
                 <td style="padding:8px 12px;border-bottom:1px solid var(--border);">${platformBadges}</td>
-                <td style="padding:8px 12px;border-bottom:1px solid var(--border);">${g.channel}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid var(--border);">${escapeHtml(g.channel)}</td>
                 <td style="padding:8px 12px;border-bottom:1px solid var(--border);">${formatTime(g.published_at)}</td>
             </tr>
         `;
@@ -6711,7 +6811,8 @@ async function loadServerStatus() {
 
         const data = await response.json();
         const el = document.getElementById('server_status');
-        if (el) el.innerHTML = `<span style="color:var(--success);">‚óè Online</span> v${data.version}`;
+        const version = escapeHtml(data && data.version ? data.version : 'unknown');
+        if (el) el.innerHTML = `<span style="color:var(--success);">‚óè Online</span> v${version}`;
         else window.__pm_shared.warn('server_status element not found in DOM');
 
         // Store tenancy_enabled flag globally for other UI components
@@ -6838,10 +6939,12 @@ function renderPendingRegistrations() {
         const ip = escapeHtml(reg.ip || 'Unknown');
         const expiredTenant = escapeHtml(reg.expired_tenant_id || 'Unknown');
         const createdAt = reg.created_at ? formatRelativeTime(new Date(reg.created_at)) : 'Unknown';
-        const statusClass = (reg.status || 'pending').toLowerCase();
+        const statusClass = safeClassToken(reg.status, ['pending', 'approved', 'rejected'], 'pending');
+        const registrationID = Number.isFinite(Number(reg.id)) ? String(Number(reg.id)) : '';
+        const createdTitle = reg.created_at ? escapeHtml(new Date(reg.created_at).toLocaleString()) : '';
 
         return `
-            <tr data-reg-id="${reg.id}">
+            <tr data-reg-id="${escapeHtml(registrationID)}">
                 <td>
                     <div style="font-weight:500;">${agentName}</div>
                     <div style="font-size:11px;color:var(--muted);">${escapeHtml(reg.agent_id || '')}</div>
@@ -6849,12 +6952,12 @@ function renderPendingRegistrations() {
                 <td>${platform}</td>
                 <td>${ip}</td>
                 <td>${expiredTenant}</td>
-                <td title="${reg.created_at ? new Date(reg.created_at).toLocaleString() : ''}">${createdAt}</td>
+                <td title="${createdTitle}">${escapeHtml(createdAt)}</td>
                 <td><span class="status-badge ${statusClass}">${escapeHtml(reg.status || 'pending')}</span></td>
                 <td class="actions-col">
                     ${reg.status === 'pending' ? `
-                        <button class="action-btn approve" data-action="approve" data-id="${reg.id}" data-tenant="${escapeHtml(reg.expired_tenant_id || '')}">Approve</button>
-                        <button class="action-btn reject" data-action="reject" data-id="${reg.id}">Reject</button>
+                        <button class="action-btn approve" data-action="approve" data-id="${escapeHtml(registrationID)}" data-tenant="${escapeHtml(reg.expired_tenant_id || '')}">Approve</button>
+                        <button class="action-btn reject" data-action="reject" data-id="${escapeHtml(registrationID)}">Reject</button>
                     ` : '‚Äî'}
                 </td>
             </tr>
@@ -7824,7 +7927,11 @@ async function loadUsers() {
         const users = await r.json();
         renderUsers(users);
     } catch (err) {
-        el.innerHTML = '<div style="color:var(--danger)">Error loading users: ' + escapeHtml(err.message || err) + '</div>';
+        el.textContent = '';
+        const errorEl = document.createElement('div');
+        errorEl.style.color = 'var(--danger)';
+        errorEl.textContent = 'Error loading users: ' + (err && err.message ? err.message : String(err || 'unknown error'));
+        el.appendChild(errorEl);
     }
 }
 
@@ -7839,7 +7946,8 @@ function renderUsers(list) {
     // Role badge styling
     const roleBadge = (role) => {
         const r = (role || 'viewer').toLowerCase();
-        return `<span class="role-badge role-${r}">${escapeHtml(r)}</span>`;
+        const safeRole = ['admin', 'operator', 'viewer'].includes(r) ? r : 'viewer';
+        return `<span class="role-badge role-${safeRole}">${escapeHtml(safeRole)}</span>`;
     };
 
     const rows = list.map(u => {
@@ -7851,7 +7959,7 @@ function renderUsers(list) {
         const idAttr = escapeHtml(u.id || '');
         const usernameAttr = escapeHtml(u.username || '');
         const createdAt = u.created_at ? formatRelativeTime(new Date(u.created_at)) : '';
-        const initial = (u.username || 'U')[0].toUpperCase();
+        const initial = escapeHtml(String((u.username || 'U')[0]).toUpperCase());
         return `
             <tr data-user-id="${idAttr}">
                 <td>
@@ -7865,7 +7973,7 @@ function renderUsers(list) {
                 </td>
                 <td>${roleBadge(role)}</td>
                 <td>${tenantMarkup}</td>
-                <td class="user-created-col">${createdAt ? `<span title="${u.created_at}">${createdAt}</span>` : '‚Äî'}</td>
+                <td class="user-created-col">${createdAt ? `<span title="${escapeHtml(u.created_at || '')}">${escapeHtml(createdAt)}</span>` : '‚Äî'}</td>
                 <td class="actions-col">
                     <div class="table-actions">
                         <button class="btn-icon" data-action="user-sessions" data-id="${idAttr}" data-username="${usernameAttr}" title="View Sessions">
@@ -8776,7 +8884,7 @@ async function toggleTenantSites(tenantId, btn) {
                 container.setAttribute('data-loaded', 'true');
                 wireSitesTreeEvents(container, tenantId);
             } catch (e) {
-                container.innerHTML = `<div class="error-text">Failed to load: ${e.message}</div>`;
+                container.innerHTML = `<div class="error-text">Failed to load: ${escapeHtml(e.message || e)}</div>`;
             }
         }
     }
@@ -8799,17 +8907,12 @@ async function fetchAgentsForTenant(tenantId) {
 }
 
 function renderSitesTree(tenantId, sites, agents) {
-    // Escape a value for safe interpolation inside a single-quoted attribute
-    // JS string literal (e.g. onclick="fn('${...}')"). Escape backslashes
-    // before quotes, otherwise the backslash inserted to escape a quote would
-    // itself be re-escaped.
-    const escapeAttrJsString = (s) => String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-
+    const safeTenantId = escapeHtml(tenantId || '');
     if (sites.length === 0 && agents.length === 0) {
         return `
             <div class="sites-tree-empty">
                 <span>No sites configured.</span>
-                <button class="btn btn-xs btn-primary" onclick="openSiteModal('${escapeAttrJsString(tenantId)}', null)">+ Add Site</button>
+                <button class="btn btn-xs btn-primary" data-site-action="add" data-tenant-id="${safeTenantId}">+ Add Site</button>
             </div>
         `;
     }
@@ -8835,24 +8938,23 @@ function renderSitesTree(tenantId, sites, agents) {
 
     // Toolbar
     html += `<div class="sites-tree-toolbar">
-        <button class="btn btn-xs btn-primary" onclick="openSiteModal('${escapedTenantId}', null)">+ Add Site</button>
+        <button class="btn btn-xs btn-primary" data-site-action="add" data-tenant-id="${safeTenantId}">+ Add Site</button>
     </div>`;
 
     // Sites with their agents
     sites.forEach(site => {
         const siteAgentList = siteAgents[site.id] || [];
-        // Escape backslashes first, then single quotes to prevent injection via \'
-        const escapedSiteName = escapeHtml(site.name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        const escapedSiteId = escapeAttrJsString(site.id);
+        const safeSiteId = escapeHtml(site.id || '');
+        const safeSiteName = escapeHtml(site.name || '');
         html += `
-            <div class="site-node" data-site-id="${site.id}">
+            <div class="site-node" data-site-id="${safeSiteId}">
                 <div class="site-header">
                     <span class="site-icon">üìç</span>
                     <span class="site-name">${escapeHtml(site.name)}</span>
-                    <span class="site-meta">${siteAgentList.length} agents, ${site.device_count || 0} devices</span>
+                    <span class="site-meta">${siteAgentList.length} agents, ${safeDashboardMetric(site.device_count)} devices</span>
                     <div class="site-actions">
-                        <button class="btn btn-xs" onclick="openSiteModal('${escapedTenantId}', '${escapedSiteId}')">Edit</button>
-                        <button class="btn btn-xs btn-danger" onclick="deleteSiteInline('${escapedTenantId}', '${escapedSiteId}', '${escapedSiteName}')">√ó</button>
+                        <button class="btn btn-xs" data-site-action="edit" data-tenant-id="${safeTenantId}" data-site-id="${safeSiteId}">Edit</button>
+                        <button class="btn btn-xs btn-danger" data-site-action="delete" data-tenant-id="${safeTenantId}" data-site-id="${safeSiteId}" data-site-name="${safeSiteName}">√ó</button>
                     </div>
                 </div>
                 <div class="site-agents">
@@ -8860,7 +8962,7 @@ function renderSitesTree(tenantId, sites, agents) {
                         <div class="agent-leaf">
                             <span class="agent-icon">üñ•Ô∏è</span>
                             <span class="agent-name">${escapeHtml(a.name || a.hostname || a.agent_id || 'Agent ' + a.id)}</span>
-                            <span class="agent-status ${a.status || 'unknown'}">${a.status || 'unknown'}</span>
+                            <span class="agent-status ${AGENT_STATUS_KEYS.includes((a.status || '').toLowerCase()) ? (a.status || '').toLowerCase() : 'offline'}">${escapeHtml(a.status || 'unknown')}</span>
                         </div>
                     `).join('')}
                     ${siteAgentList.length === 0 ? '<div class="no-agents-text">No agents assigned</div>' : ''}
@@ -8883,7 +8985,7 @@ function renderSitesTree(tenantId, sites, agents) {
                         <div class="agent-leaf">
                             <span class="agent-icon">üñ•Ô∏è</span>
                             <span class="agent-name">${escapeHtml(a.name || a.hostname || a.agent_id || 'Agent ' + a.id)}</span>
-                            <span class="agent-status ${a.status || 'unknown'}">${a.status || 'unknown'}</span>
+                            <span class="agent-status ${AGENT_STATUS_KEYS.includes((a.status || '').toLowerCase()) ? (a.status || '').toLowerCase() : 'offline'}">${escapeHtml(a.status || 'unknown')}</span>
                         </div>
                     `).join('')}
                 </div>
@@ -8896,7 +8998,19 @@ function renderSitesTree(tenantId, sites, agents) {
 }
 
 function wireSitesTreeEvents(container, tenantId) {
-    // Events are wired via onclick attributes for simplicity
+    if (!container) return;
+    container.querySelectorAll('[data-site-action]').forEach(button => {
+        button.addEventListener('click', () => {
+            const action = button.dataset.siteAction;
+            const scopedTenantId = button.dataset.tenantId || tenantId;
+            const siteId = button.dataset.siteId || '';
+            if (action === 'add' || action === 'edit') {
+                openSiteModal(scopedTenantId, action === 'edit' ? siteId : null);
+            } else if (action === 'delete') {
+                deleteSiteInline(scopedTenantId, siteId, button.dataset.siteName || siteId);
+            }
+        });
+    });
 }
 
 async function deleteSiteInline(tenantId, siteId, siteName) {
@@ -8993,7 +9107,8 @@ function renderSitesList(sites) {
     }
 
     const rows = sites.map(site => {
-        const agentBadge = `<span class="site-agents-badge">${site.agent_count || 0} agent${site.agent_count !== 1 ? 's' : ''}</span>`;
+        const agentCount = Number(site.agent_count);
+        const agentBadge = `<span class="site-agents-badge">${safeDashboardMetric(site.agent_count)} agent${agentCount === 1 ? '' : 's'}</span>`;
         const rulesBadge = site.filter_rules && site.filter_rules.length > 0
             ? `<span class="site-rules-badge">${site.filter_rules.length} rule${site.filter_rules.length !== 1 ? 's' : ''}</span>`
             : '';
@@ -9123,9758 +9238,5112 @@ async function loadSiteAgentsList(selectedAgentIds) {
             return;
         }
 
-        const selectedSet = new Set(selectedAgentIds);
-        const items = tenantAgents.map(agent => {
-            const checked = selectedSet.has(agent.agent_id) ? 'checked' : '';
-            const status = agent.status || 'unknown';
-            return `
-                <label class="site-agent-item">
-                    <input type="checkbox" value="${escapeHtml(agent.agent_id)}" ${checked} />
-                    <span class="agent-name">${escapeHtml(getAgentDisplayName(agent))}</span>
-                    <span class="agent-meta">${escapeHtml(status)}</span>
-                </label>
-            `;
-        }).join('');
-
-        container.innerHTML = items;
-    } catch (err) {
-        container.innerHTML = `<div style="color:var(--danger);">Failed to load agents: ${escapeHtml(err.message || err)}</div>`;
-    }
-}
-
-function renderSiteFilterRules() {
-    const container = document.getElementById('site_filter_rules');
-    if (!currentSiteFilterRules || currentSiteFilterRules.length === 0) {
-        container.innerHTML = '';
-        return;
-    }
-
-    const ruleTypes = [
-        { value: 'ip_range', label: 'IP Range (CIDR)', placeholder: '192.168.1.0/24' },
-        { value: 'ip_prefix', label: 'IP Prefix', placeholder: '192.168.1.' },
-        { value: 'hostname_pattern', label: 'Hostname Pattern', placeholder: 'printer-*' },
-        { value: 'serial_pattern', label: 'Serial Pattern', placeholder: 'HP*' }
-    ];
-
-    const html = currentSiteFilterRules.map((rule, index) => {
-        const typeOptions = ruleTypes.map(t =>
-            `<option value="${t.value}" ${rule.type === t.value ? 'selected' : ''}>${t.label}</option>`
-        ).join('');
-        const placeholder = ruleTypes.find(t => t.value === rule.type)?.placeholder || '';
-
-        return `
-            <div class="site-filter-rule" data-index="${index}">
-                <select class="rule-type">${typeOptions}</select>
-                <input type="text" class="rule-pattern" value="${escapeHtml(rule.pattern)}" placeholder="${placeholder}" autocomplete="off" data-1p-ignore data-lpignore="true" />
-                <button type="button" class="remove-rule-btn" title="Remove rule">&times;</button>
-            </div>
-        `;
-    }).join('');
-
-    container.innerHTML = html;
-
-    // Wire up change/remove handlers
-    container.querySelectorAll('.site-filter-rule').forEach(el => {
-        const index = parseInt(el.getAttribute('data-index'), 10);
-        el.querySelector('.rule-type').addEventListener('change', e => {
-            currentSiteFilterRules[index].type = e.target.value;
-        });
-        el.querySelector('.rule-pattern').addEventListener('input', e => {
-            currentSiteFilterRules[index].pattern = e.target.value;
-        });
-        el.querySelector('.remove-rule-btn').addEventListener('click', () => {
-            currentSiteFilterRules.splice(index, 1);
-            renderSiteFilterRules();
-        });
-    });
-}
-
-function addSiteFilterRule() {
-    currentSiteFilterRules.push({ type: 'ip_prefix', pattern: '' });
-    renderSiteFilterRules();
-}
-
-function closeSiteModal() {
-    const modal = document.getElementById('site_modal');
-    if (modal) modal.style.display = 'none';
-    currentSiteEditId = null;
-    currentSiteFilterRules = [];
-}
-
-async function saveSite() {
-    const name = document.getElementById('site_name').value.trim();
-    const address = document.getElementById('site_address').value.trim();
-    const description = document.getElementById('site_description').value.trim();
-    const errEl = document.getElementById('site_error');
-
-    errEl.textContent = '';
-
-    if (!name) {
-        errEl.textContent = 'Site name is required';
-        return;
-    }
-
-    // Collect selected agents
-    const agentCheckboxes = document.querySelectorAll('#site_agents_list input[type="checkbox"]:checked');
-    const selectedAgentIds = Array.from(agentCheckboxes).map(cb => cb.value);
-
-    // Filter out empty pattern rules
-    const filterRules = currentSiteFilterRules.filter(r => r.pattern && r.pattern.trim());
-
-    const payload = {
-        name,
-        address,
-        description,
-        filter_rules: filterRules
-    };
-
-    try {
-        let siteId = currentSiteEditId;
-
-        if (currentSiteEditId) {
-            // Update existing site
-            const r = await fetch(`/api/v1/tenants/${encodeURIComponent(currentSitesTenantId)}/sites/${encodeURIComponent(currentSiteEditId)}`, {
-                method: 'PUT',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            if (!r.ok) throw new Error(await r.text());
-        } else {
-            // Create new site
-            const r = await fetch(`/api/v1/tenants/${encodeURIComponent(currentSitesTenantId)}/sites`, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            if (!r.ok) throw new Error(await r.text());
-            const newSite = await r.json();
-            siteId = newSite.id;
-        }
-
-        // Update agent assignments
-        await fetch(`/api/v1/tenants/${encodeURIComponent(currentSitesTenantId)}/sites/${encodeURIComponent(siteId)}/agents`, {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ agent_ids: selectedAgentIds })
-        });
-
-        closeSiteModal();
-        window.__pm_shared.showToast(currentSiteEditId ? 'Site updated' : 'Site created', 'success');
-        // Refresh both the list modal (if open) and the tree view
-        await loadSitesList(currentSitesTenantId);
-        await refreshTenantSitesTree(currentSitesTenantId);
-    } catch (err) {
-        errEl.textContent = err.message || 'Failed to save site';
-    }
-}
-
-async function deleteSite(siteId) {
-    try {
-        const r = await fetch(`/api/v1/tenants/${encodeURIComponent(currentSitesTenantId)}/sites/${encodeURIComponent(siteId)}`, {
-            method: 'DELETE'
-        });
-        if (!r.ok) throw new Error(await r.text());
-        window.__pm_shared.showToast('Site deleted', 'success');
-        await loadSitesList(currentSitesTenantId);
-        await refreshTenantSitesTree(currentSitesTenantId);
-    } catch (err) {
-        window.__pm_shared.showAlert('Failed to delete site: ' + (err.message || err), 'Error', true, false);
-    }
-}
-
-// Wire up sites modal event listeners
-function initSitesUI() {
-    // Sites list modal
-    const sitesListModal = document.getElementById('sites_list_modal');
-    if (sitesListModal) {
-        document.getElementById('sites_list_modal_close_x').addEventListener('click', closeSitesListModal);
-        document.getElementById('sites_list_add_btn').addEventListener('click', () => openSiteEditModal(null));
-    }
-
-    // Site edit modal
-    const siteModal = document.getElementById('site_modal');
-    if (siteModal) {
-        document.getElementById('site_modal_close_x').addEventListener('click', closeSiteModal);
-        document.getElementById('site_cancel').addEventListener('click', closeSiteModal);
-        document.getElementById('site_save').addEventListener('click', saveSite);
-        document.getElementById('site_add_rule_btn').addEventListener('click', addSiteFilterRule);
-    }
-}
-
-async function handleCreateToken(tenantID) {
-    // Open the unified Add Agent modal and preselect the tenant
-    try {
-        openAddAgentModal({ tenantID });
-    } catch (err) {
-        window.__pm_shared.showAlert('Failed to open Add Agent modal: ' + (err && err.message ? err.message : err), 'Error', true, false);
-    }
-}
-
-async function showTokensList(tenantID) {
-    try {
-        const r = await fetch('/api/v1/join-tokens?tenant_id=' + encodeURIComponent(tenantID));
-        if (!r.ok) throw new Error(await r.text());
-        const tokens = await r.json();
-        renderTokenModal(tenantID, tokens);
-    } catch (err) {
-        window.__pm_shared.showAlert('Failed to load tokens: ' + (err.message || err), 'Error', true, false);
-    }
-}
-
-function renderTokenModal(tenantID, tokens) {
-    if (!Array.isArray(tokens) || tokens.length === 0) {
-        window.__pm_shared.showAlert('No tokens for tenant: ' + escapeHtml(tenantID), 'Tokens', false, false);
-        return;
-    }
-
-    let html = '<div style="max-height: 400px; overflow-y: auto;">';
-    html += '<table style="width: 100%; border-collapse: collapse; font-size: 13px;">';
-    html += '<thead><tr style="background: var(--bg-secondary); text-align: left;">';
-    html += '<th style="padding: 8px; border-bottom: 1px solid var(--border);">ID</th>';
-    html += '<th style="padding: 8px; border-bottom: 1px solid var(--border);">Type</th>';
-    html += '<th style="padding: 8px; border-bottom: 1px solid var(--border);">Status</th>';
-    html += '<th style="padding: 8px; border-bottom: 1px solid var(--border);">Used At</th>';
-    html += '<th style="padding: 8px; border-bottom: 1px solid var(--border);">Expires</th>';
-    html += '</tr></thead><tbody>';
-
-    tokens.forEach(t => {
-        const isRevoked = t.revoked;
-        const isUsed = !!t.used_at;
-        const isExpired = t.expires_at && new Date(t.expires_at) < new Date();
-
-        let status = '<span style="color: var(--success);">Active</span>';
-        if (isRevoked) status = '<span style="color: var(--danger);">Revoked</span>';
-        else if (isUsed && t.one_time) status = '<span style="color: var(--muted);">Used</span>';
-        else if (isExpired) status = '<span style="color: var(--warning);">Expired</span>';
-
-        html += `<tr style="border-bottom: 1px solid var(--border);">`;
-        html += `<td style="padding: 8px; font-family: monospace;">${escapeHtml(t.id)}</td>`;
-        html += `<td style="padding: 8px;">${t.one_time ? 'One-time' : 'Reusable'}</td>`;
-        html += `<td style="padding: 8px;">${status}</td>`;
-        html += `<td style="padding: 8px;">${t.used_at ? window.__pm_shared.formatDateTime(t.used_at) : '-'}</td>`;
-        html += `<td style="padding: 8px;">${t.expires_at ? window.__pm_shared.formatDateTime(t.expires_at) : 'Never'}</td>`;
-        html += `</tr>`;
-    });
-    html += '</tbody></table></div>';
-
-    // Ask user if they want to revoke a token via input modal
-    window.__pm_shared.showAlert(html, 'Tokens for tenant: ' + escapeHtml(tenantID), false, false, true);
-    showInputModal('Revoke token', 'Enter the token ID to revoke (leave empty to cancel)', '').then(id => {
-        if (!id) return;
-        revokeToken(id.trim()).then(() => {
-            window.__pm_shared.showToast('Revoked ' + id.trim(), 'success');
-            showTokensList(tenantID);
-        }).catch(err => {
-            window.__pm_shared.showAlert('Failed to revoke: ' + (err.message || err), 'Error', true, false);
-        });
-    }).catch(() => { });
-}
-
-async function revokeToken(id) {
-    const r = await fetch('/api/v1/join-token/revoke', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
-    if (!r.ok) throw new Error(await r.text());
-    return r.json();
-}
-
-// escapeHtml is now in utils/formatters.js
-
-// compareVersions, formatBytes, formatDateTime, formatRelativeTime, formatNumber
-// are now in utils/formatters.js
-
-function initAgentsUI() {
-    if (agentsVM.uiInitialized) {
-        return;
-    }
-    agentsVM.uiInitialized = true;
-
-    // Sidebar toggle
-    const sidebarToggle = document.getElementById('agents_sidebar_toggle');
-    const sidebar = document.getElementById('agents_sidebar');
-    if (sidebarToggle && sidebar) {
-        sidebarToggle.addEventListener('click', () => {
-            sidebar.classList.toggle('collapsed');
-        });
-
-        // Start collapsed on mobile for cleaner UX
-        if (window.innerWidth <= 900) {
-            sidebar.classList.add('collapsed');
-        }
-    }
-
-    const searchInput = document.getElementById('agents_search');
-    if (searchInput) {
-        searchInput.value = agentsVM.filters.query;
-        searchInput.addEventListener('input', debounce((event) => {
-            agentsVM.filters.query = (event.target.value || '').trim();
-            applyAgentFilters();
-        }, 200));
-    }
-
-    const versionSelect = document.getElementById('agents_version_filter');
-    if (versionSelect) {
-        versionSelect.addEventListener('change', (event) => {
-            agentsVM.filters.version = event.target.value || '';
-            applyAgentFilters();
-        });
-    }
-
-    const platformSelect = document.getElementById('agents_platform_filter');
-    if (platformSelect) {
-        platformSelect.addEventListener('change', (event) => {
-            agentsVM.filters.platform = event.target.value || '';
-            applyAgentFilters();
-        });
-    }
-
-    const tenantSelect = document.getElementById('agents_tenant_filter');
-    if (tenantSelect) {
-        tenantSelect.value = agentsVM.filters.tenantId;
-        tenantSelect.addEventListener('change', (event) => {
-            agentsVM.filters.tenantId = event.target.value || '';
-            applyAgentFilters();
-        });
-    }
-
-    const sortSelect = document.getElementById('agents_sort_select');
-    if (sortSelect) {
-        sortSelect.value = agentsVM.filters.sortKey;
-        sortSelect.addEventListener('change', (event) => {
-            setAgentSort(event.target.value, agentsVM.filters.sortDir);
-        });
-    }
-
-    const sortDirBtn = document.getElementById('agents_sort_dir_btn');
-    if (sortDirBtn) {
-        sortDirBtn.addEventListener('click', () => {
-            const nextDir = agentsVM.filters.sortDir === 'asc' ? 'desc' : 'asc';
-            setAgentSort(agentsVM.filters.sortKey, nextDir);
-        });
-    }
-
-    const viewToggle = document.getElementById('agents_view_toggle');
-    if (viewToggle) {
-        viewToggle.addEventListener('click', (event) => {
-            const btn = event.target.closest('[data-view]');
-            if (!btn) return;
-            setAgentsView(btn.getAttribute('data-view'));
-        });
-    }
-
-    const statusFilter = document.getElementById('agents_status_filter');
-    if (statusFilter) {
-        statusFilter.addEventListener('click', (event) => {
-            const btn = event.target.closest('[data-status]');
-            if (!btn) return;
-            toggleAgentStatusFilter(btn.getAttribute('data-status'));
-        });
-    }
-
-    const resetBtn = document.getElementById('agents_reset_filters');
-    if (resetBtn) {
-        resetBtn.addEventListener('click', resetAgentFilters);
-    }
-
-    // Check for updates toggle
-    const checkUpdatesToggle = document.getElementById('agents_check_updates_toggle');
-    if (checkUpdatesToggle) {
-        // Load saved preference from localStorage
-        const savedPref = localStorage.getItem('agents_check_updates_on_load');
-        if (savedPref !== null) {
-            agentsVM.checkUpdatesOnLoad = savedPref === 'true';
-        }
-        checkUpdatesToggle.checked = agentsVM.checkUpdatesOnLoad;
-        checkUpdatesToggle.addEventListener('change', (event) => {
-            agentsVM.checkUpdatesOnLoad = event.target.checked;
-            localStorage.setItem('agents_check_updates_on_load', event.target.checked ? 'true' : 'false');
-        });
-    }
-
-    // Check all for updates button
-    const checkUpdatesBtn = document.getElementById('agents_check_updates_btn');
-    if (checkUpdatesBtn) {
-        checkUpdatesBtn.addEventListener('click', () => {
-            checkAgentsForUpdates();
-        });
-    }
-
-    const chips = document.getElementById('agents_active_filters');
-    if (chips && !chips.dataset.bound) {
-        chips.dataset.bound = 'true';
-        chips.addEventListener('click', (event) => {
-            const btn = event.target.closest('button[data-filter]');
-            if (!btn) return;
-            handleAgentFilterChipRemove(btn.getAttribute('data-filter'));
-        });
-    }
-
-    const table = document.getElementById('agents_table');
-    if (table) {
-        const head = table.querySelector('thead');
-        if (head && !head.dataset.bound) {
-            head.dataset.bound = 'true';
-            head.addEventListener('click', handleAgentTableSortClick);
-        }
-        // Add click handler for clickable rows (file-explorer style selection)
-        const tbody = table.querySelector('tbody');
-        if (tbody && !tbody.dataset.rowClickBound) {
-            tbody.dataset.rowClickBound = 'true';
-            tbody.addEventListener('click', (event) => {
-                // Don't trigger row click if clicking on a button or actions column
-                if (event.target.closest('button') || event.target.closest('.table-actions') || event.target.closest('.actions-col')) {
-                    return;
-                }
-                const row = event.target.closest('tr.agent-row-clickable');
-                if (!row) return;
-                const agentId = row.getAttribute('data-agent-id');
-                if (agentId) {
-                    // File-explorer style: click selects, double-click opens details
-                    handleAgentSelection(agentId, event);
-                }
-            });
-            // Double-click opens agent details
-            tbody.addEventListener('dblclick', (event) => {
-                if (event.target.closest('button') || event.target.closest('.table-actions') || event.target.closest('.actions-col')) {
-                    return;
-                }
-                const row = event.target.closest('tr.agent-row-clickable');
-                if (!row) return;
-                const agentId = row.getAttribute('data-agent-id');
-                if (agentId) {
-                    viewAgentDetails(agentId);
-                }
-            });
-        }
-    }
-
-    // Add click handler for clickable agent cards (file-explorer style selection)
-    const cardsContainer = document.getElementById('agents_cards');
-    if (cardsContainer && !cardsContainer.dataset.cardClickBound) {
-        cardsContainer.dataset.cardClickBound = 'true';
-        cardsContainer.addEventListener('click', (event) => {
-            // Don't trigger card click if clicking on a button or actions area
-            if (event.target.closest('button') || event.target.closest('.device-card-actions')) {
-                return;
-            }
-            const card = event.target.closest('.agent-card-clickable');
-            if (!card) return;
-            const agentId = card.getAttribute('data-agent-id');
-            if (agentId) {
-                // File-explorer style: click selects, double-click opens details
-                handleAgentSelection(agentId, event);
-            }
-        });
-        // Double-click opens agent details
-        cardsContainer.addEventListener('dblclick', (event) => {
-            if (event.target.closest('button') || event.target.closest('.device-card-actions')) {
-                return;
-            }
-            const card = event.target.closest('.agent-card-clickable');
-            if (!card) return;
-            const agentId = card.getAttribute('data-agent-id');
-            if (agentId) {
-                viewAgentDetails(agentId);
-            }
-        });
-    }
-
-    syncAgentsViewToggle();
-    syncAgentSortControls();
-    syncAgentQuickFilters();
-    syncTenantFilterOptions('agents');
-    initAgentsTableCustomizer();
-
-    // Initialize context menu for agents table and cards
-    if (window.PMContextMenu) {
-        const agentsTable = document.getElementById('agents_table');
-        if (agentsTable) {
-            window.PMContextMenu.initAgentContextMenu(agentsTable);
-        }
-        const agentsCards = document.getElementById('agents_cards');
-        if (agentsCards) {
-            window.PMContextMenu.initAgentContextMenu(agentsCards);
-        }
-    }
-}
-
-function initAgentsTableCustomizer() {
-    if (agentsVM.tableCustomizer) return;
-
-    // Only initialize if TableCustomizer is available
-    if (typeof window.TableCustomizer === 'undefined') {
-        console.warn('TableCustomizer not available');
-        return;
-    }
-
-    // Create customizer instance
-    agentsVM.tableCustomizer = new window.TableCustomizer('agents', {
-        columnDefs: window.AGENTS_COLUMN_DEFINITIONS || [],
-        persistConfig: true,
-        enableResize: true,
-        enableReorder: true,
-        enableColumnMenu: true,
-        enableExport: true,
-        onSort: (sortState) => {
-            // Sync with agentsVM filters
-            if (sortState.key) {
-                agentsVM.filters.sortKey = sortState.key;
-                agentsVM.filters.sortDir = sortState.dir;
-                syncAgentSortControls();
-                applyAgentFilters();
-            }
-        },
-        onColumnChange: () => {
-            // Re-render table when columns change
-            renderAgentsTableHeader();
-            if (agentsVM.view === 'table') {
-                renderAgentTable(agentsVM.filtered);
-            }
-        },
-        onExport: () => {
-            // Export current filtered data
-            if (agentsVM.tableCustomizer) {
-                const timestamp = new Date().toISOString().split('T')[0];
-                agentsVM.tableCustomizer.exportToCSV(agentsVM.filtered, `printmaster-agents-${timestamp}.csv`);
-                window.__pm_shared?.showToast?.('Agents exported to CSV', 'success');
-            }
-        }
-    });
-
-    // Render toolbar
-    const toolbarContainer = document.getElementById('agents_table_customizer_toolbar');
-    if (toolbarContainer) {
-        toolbarContainer.innerHTML = agentsVM.tableCustomizer.renderToolbar();
-        agentsVM.tableCustomizer.bindToolbarEvents(toolbarContainer);
-    }
-
-    // Render initial header
-    renderAgentsTableHeader();
-
-    // Expose helper functions on window for use by column renderers
-    window.renderAgentStatusBadge = renderAgentStatusBadge;
-    window.renderAgentVersionCell = renderAgentVersionCell;
-    window.getAgentDisplayName = getAgentDisplayName;
-}
-
-function renderAgentsLoading() {
-    const cards = document.getElementById('agents_cards');
-    if (cards) {
-        cards.classList.remove('hidden');
-        cards.innerHTML = '<div class="muted-text">Loading agents‚Ä¶</div>';
-    }
-    const wrapper = document.getElementById('agents_table_wrapper');
-    if (wrapper) {
-        const tbody = wrapper.querySelector('tbody');
-        if (tbody) {
-            const visibleColumns = agentsVM.tableCustomizer
-                ? agentsVM.tableCustomizer.getVisibleColumns().length
-                : 8;
-            tbody.innerHTML = `<tr><td colspan="${visibleColumns}" class="muted-text">Loading agents‚Ä¶</td></tr>`;
-        }
-    }
-    const metrics = document.getElementById('agents_overview_metrics');
-    if (metrics && !agentsVM.metrics.summary) {
-        metrics.innerHTML = '<div class="metric-card loading">Loading agent metrics‚Ä¶</div>';
-    }
-}
-
-function renderAgentsError(error) {
-    const message = error && error.message ? error.message : 'Unknown error';
-    const cards = document.getElementById('agents_cards');
-    if (cards) {
-        cards.classList.remove('hidden');
-        cards.innerHTML = `<div class="error-text">Failed to load agents: ${escapeHtml(message)}</div>`;
-    }
-    const wrapper = document.getElementById('agents_table_wrapper');
-    if (wrapper) {
-        const tbody = wrapper.querySelector('tbody');
-        if (tbody) {
-            const visibleColumns = agentsVM.tableCustomizer
-                ? agentsVM.tableCustomizer.getVisibleColumns().length
-                : 8;
-            tbody.innerHTML = `<tr><td colspan="${visibleColumns}" class="error-text">Failed to load agents: ${escapeHtml(message)}</td></tr>`;
-        }
-    }
-    const stats = document.getElementById('agents_stats');
-    if (stats) {
-        stats.innerHTML = `<div class="error-text">Failed to load agents: ${escapeHtml(message)}</div>`;
-    }
-}
-
-function refreshAgentMetrics() {
-    if (!Array.isArray(agentsVM.items) || agentsVM.items.length === 0) {
-        agentsVM.metrics.summary = null;
-        renderAgentsOverview();
-        return;
-    }
-    const now = Date.now();
-    if (agentsVM.metrics.summary && agentsVM.metrics.lastFetched && (now - agentsVM.metrics.lastFetched.getTime()) < AGENTS_METRICS_MAX_AGE_MS) {
-        renderAgentsOverview();
-        return;
-    }
-    agentsVM.metrics.summary = computeAgentMetrics(agentsVM.items);
-    agentsVM.metrics.lastFetched = new Date();
-    renderAgentsOverview();
-}
-
-function computeAgentMetrics(list) {
-    const summary = {
-        total: list.length,
-        active: 0,
-        degraded: 0,
-        offline: 0,
-        versions: {},
-        platforms: {},
-    };
-    list.forEach(agent => {
-        const meta = agent.__meta || {};
-        const statusKey = meta.statusKey || 'offline';
-        summary[statusKey] = (summary[statusKey] || 0) + 1;
-        const version = meta.versionLabel || agent.version || 'Unknown';
-        summary.versions[version] = (summary.versions[version] || 0) + 1;
-        const platform = meta.platformLabel || agent.platform || 'Unknown';
-        summary.platforms[platform] = (summary.platforms[platform] || 0) + 1;
-    });
-    const versionEntries = Object.entries(summary.versions).sort((a, b) => b[1] - a[1]);
-    summary.primaryVersion = versionEntries.length ? versionEntries[0][0] : 'Unknown';
-    summary.primaryVersionShare = versionEntries.length ? (versionEntries[0][1] / Math.max(1, summary.total)) : 0;
-    summary.outdated = summary.total - (versionEntries.length ? versionEntries[0][1] : 0);
-    return summary;
-}
-
-function renderAgentsOverview() {
-    const container = document.getElementById('agents_overview_metrics');
-    if (!container) return;
-    if (!agentsVM.metrics.summary) {
-        container.innerHTML = '<div class="metric-card loading">No agent metrics yet.</div>';
-        return;
-    }
-    const summary = agentsVM.metrics.summary;
-    const platforms = Object.entries(summary.platforms || {}).sort((a, b) => b[1] - a[1]).slice(0, 3);
-    container.innerHTML = `
-        <div class="metric-card">
-            <div class="card-title">Agents Online</div>
-            <div class="metric-kpi-value">${formatNumber(summary.active || 0)}</div>
-            <div class="metric-kpi-label">Active of ${formatNumber(summary.total)}</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Connection Mix</div>
-            <div class="metric-kpi-value">${formatNumber(summary.degraded || 0)}</div>
-            <div class="metric-kpi-label">Degraded (HTTP fallback)</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Version Alignment</div>
-            <div class="metric-kpi-value">${escapeHtml(summary.primaryVersion || 'Unknown')}</div>
-            <div class="metric-kpi-label">${Math.round((summary.primaryVersionShare || 0) * 100)}% on this build</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Top Platforms</div>
-            <div class="metric-kpi-value">${platforms.length ? escapeHtml(platforms[0][0]) : '‚Äî'}</div>
-            <div class="metric-kpi-label">Most common OS</div>
-        </div>
-    `;
-}
-
-function refreshAgentFilters() {
-    const versions = new Set();
-    const platforms = new Set();
-    agentsVM.items.forEach(agent => {
-        if (agent.version) {
-            versions.add(agent.version);
-        }
-        if (agent.platform) {
-            platforms.add(agent.platform);
-        }
-    });
-    const versionSelect = document.getElementById('agents_version_filter');
-    if (versionSelect) {
-        const current = agentsVM.filters.version;
-        const options = ['<option value="">All Versions</option>', ...Array.from(versions).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })).map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)].join('');
-        versionSelect.innerHTML = options;
-        if (current && versions.has(current)) {
-            versionSelect.value = current;
-        } else {
-            versionSelect.value = '';
-            agentsVM.filters.version = '';
-        }
-    }
-    const platformSelect = document.getElementById('agents_platform_filter');
-    if (platformSelect) {
-        const current = agentsVM.filters.platform;
-        const options = ['<option value="">All Platforms</option>', ...Array.from(platforms).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })).map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`)].join('');
-        platformSelect.innerHTML = options;
-        if (current && platforms.has(current)) {
-            platformSelect.value = current;
-        } else {
-            platformSelect.value = '';
-            agentsVM.filters.platform = '';
-        }
-    }
-}
-
-function applyAgentFilters() {
-    if (!Array.isArray(agentsVM.items)) {
-        return;
-    }
-    const totalStatuses = buildAgentStatusCounts();
-    const filteredStatuses = buildAgentStatusCounts();
-    const filtered = [];
-    agentsVM.items.forEach(agent => {
-        const meta = agent.__meta || {};
-        const statusKey = meta.statusKey || 'offline';
-        if (totalStatuses[statusKey] !== undefined) {
-            totalStatuses[statusKey] += 1;
-        }
-        if (matchesAgentFilters(agent, agentsVM.filters)) {
-            filtered.push(agent);
-            if (filteredStatuses[statusKey] !== undefined) {
-                filteredStatuses[statusKey] += 1;
-            }
-        }
-    });
-    agentsVM.filtered = sortAgents(filtered);
-    agentsVM.stats.total = agentsVM.items.length;
-    agentsVM.stats.filtered = agentsVM.filtered.length;
-    agentsVM.stats.totalStatuses = totalStatuses;
-    agentsVM.stats.filteredStatuses = filteredStatuses;
-    renderAgentsInlineStats();
-    renderAgentsActiveFilters();
-    syncAgentQuickFilters();
-    if (agentsVM.view === 'table') {
-        renderAgentTable(agentsVM.filtered);
-    } else {
-        renderAgentCards(agentsVM.filtered);
-    }
-    syncAgentTableSortIndicators();
-}
-
-function matchesAgentFilters(agent, filters) {
-    const meta = agent.__meta || {};
-    const query = (filters.query || '').toLowerCase();
-    if (query && (!meta.search || meta.search.indexOf(query) === -1)) {
-        return false;
-    }
-    if (filters.version && (agent.version || '') !== filters.version) {
-        return false;
-    }
-    if (filters.platform && (agent.platform || '') !== filters.platform) {
-        return false;
-    }
-    const tenantId = agent.tenant_id || meta.tenantId || '';
-    if (filters.tenantId && tenantId !== filters.tenantId) {
-        return false;
-    }
-    if (filters.statuses && filters.statuses.size > 0 && !filters.statuses.has(meta.statusKey || 'offline')) {
-        return false;
-    }
-    return true;
-}
-
-function sortAgents(list) {
-    const key = agentsVM.filters.sortKey || 'last_seen';
-    const dir = agentsVM.filters.sortDir === 'asc' ? 1 : -1;
-    return list.slice().sort((a, b) => {
-        const aVal = getAgentSortValue(a, key);
-        const bVal = getAgentSortValue(b, key);
-        if (aVal < bVal) return -1 * dir;
-        if (aVal > bVal) return 1 * dir;
-        const aName = (a.name || a.hostname || a.agent_id || '').toLowerCase();
-        const bName = (b.name || b.hostname || b.agent_id || '').toLowerCase();
-        if (aName < bName) return -1;
-        if (aName > bName) return 1;
-        return 0;
-    });
-}
-
-function getAgentSortValue(agent, key) {
-    const meta = agent.__meta || {};
-    switch (key) {
-        case 'name':
-            return getAgentDisplayName(agent).toLowerCase();
-        case 'status':
-            return AGENT_STATUS_ORDER[meta.statusKey || 'offline'] || 0;
-        case 'version':
-            return (agent.version || '').toLowerCase();
-        case 'platform':
-            return (agent.platform || '').toLowerCase();
-        case 'tenant':
-            return formatTenantDisplay(agent.tenant_id || meta.tenantId || '').toLowerCase();
-        case 'last_seen':
-        default:
-            return meta.lastSeenMs || 0;
-    }
-}
-
-function renderAgentsInlineStats() {
-    const container = document.getElementById('agents_stats');
-    if (!container) return;
-    const statuses = agentsVM.stats.filteredStatuses || {};
-    container.innerHTML = `
-        <div><strong>Total:</strong> ${formatNumber(agentsVM.stats.total || 0)}</div>
-        <div><strong>Showing:</strong> ${formatNumber(agentsVM.stats.filtered || 0)}</div>
-        <div>
-            <span class="status-pill healthy">Active ${formatNumber(statuses.active || 0)}</span>
-            <span class="status-pill warning">Degraded ${formatNumber(statuses.degraded || 0)}</span>
-            <span class="status-pill error">Offline ${formatNumber(statuses.offline || 0)}</span>
-        </div>
-    `;
-}
-
-function renderAgentsActiveFilters() {
-    const container = document.getElementById('agents_active_filters');
-    if (!container) return;
-    const chips = [];
-    const filters = agentsVM.filters;
-    if (filters.query) {
-        chips.push(buildFilterChip('Search', filters.query, 'search'));
-    }
-    if (filters.version) {
-        chips.push(buildFilterChip('Version', filters.version, 'version'));
-    }
-    if (filters.platform) {
-        chips.push(buildFilterChip('Platform', filters.platform, 'platform'));
-    }
-    if (filters.tenantId) {
-        chips.push(buildFilterChip('Tenant', formatTenantDisplay(filters.tenantId), 'tenant'));
-    }
-    if (filters.statuses && filters.statuses.size > 0 && filters.statuses.size < AGENT_STATUS_KEYS.length) {
-        chips.push(buildFilterChip('Status', Array.from(filters.statuses).map(s => AGENT_STATUS_LABELS[s] || s).join(', '), 'statuses'));
-    }
-    if (chips.length === 0) {
-        container.innerHTML = '';
-        container.classList.add('hidden');
-        return;
-    }
-    container.classList.remove('hidden');
-    container.innerHTML = chips.join('');
-}
-
-function handleAgentFilterChipRemove(filterKey) {
-    switch (filterKey) {
-        case 'search':
-            agentsVM.filters.query = '';
-            const searchInput = document.getElementById('agents_search');
-            if (searchInput) searchInput.value = '';
-            break;
-        case 'version':
-            agentsVM.filters.version = '';
-            const versionSelect = document.getElementById('agents_version_filter');
-            if (versionSelect) versionSelect.value = '';
-            break;
-        case 'platform':
-            agentsVM.filters.platform = '';
-            const platformSelect = document.getElementById('agents_platform_filter');
-            if (platformSelect) platformSelect.value = '';
-            break;
-        case 'tenant':
-            agentsVM.filters.tenantId = '';
-            const tenantSelect = document.getElementById('agents_tenant_filter');
-            if (tenantSelect) tenantSelect.value = '';
-            break;
-        case 'statuses':
-            agentsVM.filters.statuses = new Set(AGENT_STATUS_KEYS);
-            break;
-        default:
-            return;
-    }
-    applyAgentFilters();
-}
-
-function syncAgentQuickFilters() {
-    document.querySelectorAll('#agents_status_filter [data-status]').forEach(btn => {
-        const key = btn.getAttribute('data-status');
-        const active = agentsVM.filters.statuses.has(key);
-        btn.classList.toggle('active', active);
-        const baseLabel = btn.getAttribute('data-label') || btn.textContent.trim();
-        const count = agentsVM.stats.totalStatuses?.[key] || 0;
-        btn.innerHTML = `${escapeHtml(baseLabel)} <span class="pill-count">${formatNumber(count)}</span>`;
-    });
-}
-
-function toggleAgentStatusFilter(statusKey) {
-    if (!AGENT_STATUS_KEYS.includes(statusKey)) return;
-    const next = new Set(agentsVM.filters.statuses || AGENT_STATUS_KEYS);
-    if (next.has(statusKey)) {
-        next.delete(statusKey);
-    } else {
-        next.add(statusKey);
-    }
-    if (next.size === 0) {
-        AGENT_STATUS_KEYS.forEach(key => next.add(key));
-    }
-    agentsVM.filters.statuses = next;
-    applyAgentFilters();
-}
-
-function resetAgentFilters() {
-    agentsVM.filters.query = '';
-    agentsVM.filters.version = '';
-    agentsVM.filters.platform = '';
-    agentsVM.filters.tenantId = '';
-    agentsVM.filters.statuses = new Set(AGENT_STATUS_KEYS);
-    const searchInput = document.getElementById('agents_search');
-    if (searchInput) searchInput.value = '';
-    const versionSelect = document.getElementById('agents_version_filter');
-    if (versionSelect) versionSelect.value = '';
-    const platformSelect = document.getElementById('agents_platform_filter');
-    if (platformSelect) platformSelect.value = '';
-    const tenantSelect = document.getElementById('agents_tenant_filter');
-    if (tenantSelect) tenantSelect.value = '';
-    applyAgentFilters();
-}
-
-function setAgentsView(view) {
-    const nextView = AGENTS_VIEW_OPTIONS.includes(view) ? view : 'cards';
-    if (agentsVM.view === nextView) {
-        return;
-    }
-    agentsVM.view = nextView;
-    persistUIState(SERVER_UI_STATE_KEYS.AGENTS_VIEW, nextView);
-    syncAgentsViewToggle();
-    if (agentsVM.view === 'table') {
-        renderAgentTable(agentsVM.filtered);
-    } else {
-        renderAgentCards(agentsVM.filtered);
-    }
-}
-
-function syncAgentsViewToggle() {
-    const toggle = document.getElementById('agents_view_toggle');
-    if (!toggle) return;
-    toggle.querySelectorAll('[data-view]').forEach(btn => {
-        const view = btn.getAttribute('data-view');
-        const active = view === agentsVM.view;
-        btn.classList.toggle('active', active);
-        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
-    });
-}
-
-function setAgentSort(key, dir) {
-    const nextKey = AGENTS_SORT_KEYS.includes(key) ? key : 'last_seen';
-    const nextDir = dir === 'asc' ? 'asc' : 'desc';
-    if (agentsVM.filters.sortKey === nextKey && agentsVM.filters.sortDir === nextDir) {
-        return;
-    }
-    agentsVM.filters.sortKey = nextKey;
-    agentsVM.filters.sortDir = nextDir;
-    persistUIState(SERVER_UI_STATE_KEYS.AGENTS_SORT_KEY, nextKey);
-    persistUIState(SERVER_UI_STATE_KEYS.AGENTS_SORT_DIR, nextDir);
-    syncAgentSortControls();
-    applyAgentFilters();
-}
-
-function syncAgentSortControls() {
-    const sortSelect = document.getElementById('agents_sort_select');
-    if (sortSelect && sortSelect.value !== agentsVM.filters.sortKey) {
-        sortSelect.value = agentsVM.filters.sortKey;
-    }
-    const sortDirBtn = document.getElementById('agents_sort_dir_btn');
-    const sortDirIcon = document.getElementById('agents_sort_dir_icon');
-    if (sortDirBtn) {
-        sortDirBtn.dataset.dir = agentsVM.filters.sortDir;
-        sortDirBtn.setAttribute('aria-label', agentsVM.filters.sortDir === 'asc' ? 'Sort ascending' : 'Sort descending');
-    }
-    if (sortDirIcon) {
-        sortDirIcon.textContent = agentsVM.filters.sortDir === 'asc' ? '‚Üë' : '‚Üì';
-    }
-}
-
-function syncAgentTableSortIndicators() {
-    const head = document.querySelector('#agents_table thead');
-    if (!head) return;
-    head.querySelectorAll('th[data-sort-key]').forEach(th => {
-        const key = th.getAttribute('data-sort-key');
-        if (key === agentsVM.filters.sortKey) {
-            th.classList.add('sorted');
-            th.setAttribute('aria-sort', agentsVM.filters.sortDir === 'asc' ? 'ascending' : 'descending');
-        } else {
-            th.classList.remove('sorted');
-            th.removeAttribute('aria-sort');
-        }
-    });
-}
-
-function handleAgentTableSortClick(event) {
-    const target = event.target.closest('th[data-sort-key]');
-    if (!target) {
-        return;
-    }
-    const key = target.getAttribute('data-sort-key');
-    if (!key) {
-        return;
-    }
-    const nextDir = (agentsVM.filters.sortKey === key && agentsVM.filters.sortDir === 'asc') ? 'desc' : 'asc';
-    setAgentSort(key, nextDir);
-}
-
-function renderAgentCards(agents) {
-    const cards = document.getElementById('agents_cards');
-    const wrapper = document.getElementById('agents_table_wrapper');
-    if (!cards) return;
-    if (wrapper) {
-        wrapper.classList.add('hidden');
-    }
-    cards.classList.remove('hidden');
-    if (!agents || agents.length === 0) {
-        cards.innerHTML = '<div class="muted-text">No agents match the current filters.</div>';
-        return;
-    }
-    cards.innerHTML = agents.map(agent => renderAgentCard(agent)).join('');
-}
-
-function renderAgentVersionCell(agent, forTable = false) {
-    const currentVersion = agent.version || '';
-    const latestVersion = agentsVM.latestVersion;
-    const displayVersion = escapeHtml(currentVersion || 'N/A');
-    const agentId = agent.agent_id || '';
-
-    // Check if there's an active update for this agent
-    const updateState = agentsVM.updateState[agentId];
-    if (updateState) {
-        const rawStatus = updateState.status || '';
-        const status = (() => {
-            switch (rawStatus) {
-                case 'pending':
-                    return 'checking';
-                case 'staging':
-                case 'applying':
-                    return 'ready';
-                case 'succeeded':
-                    return 'complete';
-                case 'rolled_back':
-                    return 'failed';
-                default:
-                    return rawStatus;
-            }
-        })();
-
-        // Calculate smooth progress percentage based on phase
-        const smoothProgress = getSmoothedUpdateProgress(agentId, status, updateState);
-
-        // Show progress button for active states
-        if (status === 'checking' || status === 'downloading' || status === 'ready' || status === 'restarting' || status === 'verifying') {
-            const canCancel = status !== 'ready' && status !== 'restarting' && status !== 'verifying';
-            const cancelBtn = canCancel
-                ? `<button class="update-btn cancel" data-action="cancel-update" data-agent-id="${escapeHtml(agentId)}" title="Cancel update">‚úï</button>`
-                : '';
-            // Progress button with fill effect
-            const progressBtn = `<button class="update-btn progress-btn" data-agent-id="${escapeHtml(agentId)}" disabled style="--progress: ${smoothProgress}%">${Math.round(smoothProgress)}%</button>`;
-            const content = `${progressBtn}${cancelBtn}`;
-            if (forTable) {
-                return `<div style="display:flex;align-items:center;gap:6px;">${displayVersion} ${content}</div>`;
-            }
-            return `${displayVersion} ${content}`;
-        }
-
-        // Show failed state briefly
-        if (status === 'failed') {
-            const errorMsg = updateState.error || 'Failed';
-            const content = `<span class="update-error" title="${escapeHtml(errorMsg)}">‚úï Failed</span>`;
-            if (forTable) {
-                return `<div style="display:flex;align-items:center;gap:6px;">${displayVersion} ${content}</div>`;
-            }
-            return `${displayVersion} ${content}`;
-        }
-
-        // Skipped update (policy or already current)
-        if (status === 'skipped') {
-            const content = `<span class="update-progress">Skipped</span>`;
-            if (forTable) {
-                return `<div style="display:flex;align-items:center;gap:6px;">${displayVersion} ${content}</div>`;
-            }
-            return `${displayVersion} ${content}`;
-        }
-
-        // Show complete state briefly
-        if (status === 'complete') {
-            const content = `<span class="update-complete">‚úì Updated</span>`;
-            if (forTable) {
-                return `<div style="display:flex;align-items:center;gap:6px;">${displayVersion} ${content}</div>`;
-            }
-            return `${displayVersion} ${content}`;
-        }
-    }
-
-    // Check if update is available (normal state) - only show if latest is actually newer
-    if (latestVersion && currentVersion && currentVersion !== 'N/A' && compareVersions(latestVersion, currentVersion) > 0) {
-        // Check for WebSocket connection using connection_type field
-        const connectionType = (agent.connection_type || '').toLowerCase();
-        const canUpdate = connectionType === 'ws';
-        const tooltip = canUpdate ? `Update available: ${latestVersion}` : 'Agent not connected via WebSocket';
-        const buttonClass = canUpdate ? 'update-btn' : 'update-btn disabled';
-        const updateBtn = `<button class="${buttonClass}" data-action="update-agent" data-agent-id="${escapeHtml(agentId)}" title="${escapeHtml(tooltip)}" ${canUpdate ? '' : 'disabled'}>‚Üë ${escapeHtml(latestVersion)}</button>`;
-        if (forTable) {
-            return `<div style="display:flex;align-items:center;gap:6px;">${displayVersion} ${updateBtn}</div>`;
-        }
-        return `${displayVersion} ${updateBtn}`;
-    }
-    return displayVersion;
-}
-
-// Calculate smoothed progress for update animations
-// Phases: checking (0-5%), downloading (5-55%), ready/installing (55-85%), restarting (85-95%), verifying (95-99%)
-function getSmoothedUpdateProgress(agentId, status, updateState) {
-    const now = Date.now();
-    const startTime = updateState.timestamp || now;
-    const elapsed = now - startTime;
-
-    // Initialize or get animation state
-    if (!agentsVM.updateAnimations) {
-        agentsVM.updateAnimations = {};
-    }
-    let anim = agentsVM.updateAnimations[agentId];
-    if (!anim || anim.status !== status) {
-        // Status changed, start new animation from current display progress or phase start
-        const phaseStart = getPhaseStartPercent(status);
-        const previousProgress = anim ? anim.displayProgress : phaseStart;
-        anim = {
-            status,
-            startTime: now,
-            startProgress: Math.max(previousProgress, phaseStart),
-            displayProgress: Math.max(previousProgress, phaseStart)
-        };
-        agentsVM.updateAnimations[agentId] = anim;
-    }
-
-    const phaseEnd = getPhaseEndPercent(status);
-    const phaseDuration = getPhaseDuration(status);
-
-    // For downloading, use actual progress from agent (scaled to 5-55% range)
-    if (status === 'downloading') {
-        const rawProgress = updateState.progress || 0;
-        const targetProgress = 5 + (rawProgress * 0.5); // Scale 0-100% to 5-55%
-        // Smooth towards target
-        const progressDiff = targetProgress - anim.displayProgress;
-        anim.displayProgress += progressDiff * 0.3; // Ease towards target
-        return Math.min(anim.displayProgress, phaseEnd);
-    }
-
-    // For other phases, animate time-based towards phase end
-    const phaseElapsed = now - anim.startTime;
-    const phaseProgress = Math.min(phaseElapsed / phaseDuration, 1);
-    // Ease out cubic for smooth deceleration at phase end
-    const easedProgress = 1 - Math.pow(1 - phaseProgress, 3);
-    const targetProgress = anim.startProgress + (phaseEnd - anim.startProgress) * easedProgress * 0.95; // Don't quite reach end
-
-    // Smooth update
-    const diff = targetProgress - anim.displayProgress;
-    anim.displayProgress += diff * 0.2;
-
-    return Math.min(Math.max(anim.displayProgress, 0), 99);
-}
-
-function getPhaseStartPercent(status) {
-    switch (status) {
-        case 'checking': return 0;
-        case 'downloading': return 5;
-        case 'ready': return 55;
-        case 'restarting': return 85;
-        case 'verifying': return 95;
-        default: return 0;
-    }
-}
-
-function getPhaseEndPercent(status) {
-    switch (status) {
-        case 'checking': return 5;
-        case 'downloading': return 55;
-        case 'ready': return 85;
-        case 'restarting': return 95;
-        case 'verifying': return 99;
-        default: return 100;
-    }
-}
-
-function getPhaseDuration(status) {
-    switch (status) {
-        case 'checking': return 3000; // 3s for checking
-        case 'downloading': return 30000; // 30s typical download
-        case 'ready': return 10000; // 10s for install/staging
-        case 'restarting': return 15000; // 15s for restart
-        case 'verifying': return 5000; // 5s for verification
-        default: return 10000;
-    }
-}
-
-function renderAgentsTableHeader() {
-    const thead = document.getElementById('agents_table_header');
-    if (!thead) return;
-
-    if (!agentsVM.tableCustomizer) {
-        // Fallback to static headers if customizer not available
-        // Actions column removed - using context menu instead (right-click)
-        thead.innerHTML = `
-            <th data-sort-key="name">Agent</th>
-            <th data-sort-key="tenant">Tenant</th>
-            <th data-sort-key="status">Status</th>
-            <th data-sort-key="connection">Connection</th>
-            <th data-sort-key="platform">Platform</th>
-            <th data-sort-key="version">Version</th>
-            <th data-sort-key="last_seen">Last Seen</th>
-        `;
-        return;
-    }
-
-    // Use table customizer to render dynamic headers
-    thead.innerHTML = agentsVM.tableCustomizer.renderHeader();
-
-    // Bind header events (sorting, resize handles)
-    const table = document.getElementById('agents_table');
-    if (table) {
-        const theadElement = table.querySelector('thead');
-        if (theadElement) {
-            agentsVM.tableCustomizer.bindHeaderEvents(theadElement);
-        }
-    }
-}
-
-function renderAgentTable(agents) {
-    const cards = document.getElementById('agents_cards');
-    const wrapper = document.getElementById('agents_table_wrapper');
-    if (!wrapper) return;
-    if (cards) {
-        cards.classList.add('hidden');
-    }
-    wrapper.classList.remove('hidden');
-    const tbody = wrapper.querySelector('tbody');
-    if (!tbody) return;
-
-    // Calculate visible column count for colspan
-    const visibleColumns = agentsVM.tableCustomizer
-        ? agentsVM.tableCustomizer.getVisibleColumns().length
-        : 8;
-
-    if (!agents || agents.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="${visibleColumns}" class="muted-text">No agents match the current filters.</td></tr>`;
-        return;
-    }
-
-    // Use table customizer if available
-    if (agentsVM.tableCustomizer) {
-        const rows = agents.map(agent => {
-            const meta = agent.__meta || {};
-            return `
-                <tr data-agent-id="${escapeHtml(agent.agent_id || '')}" class="agent-row-clickable" title="Click to view details, right-click for actions">
-                    ${agentsVM.tableCustomizer.renderRow(agent, meta)}
-                </tr>
-            `;
-        }).join('');
-        tbody.innerHTML = rows;
-        return;
-    }
-
-    // Fallback to original rendering if no customizer
-    // Actions column removed - using context menu instead (right-click)
-    const rows = agents.map(agent => {
-        const meta = agent.__meta || {};
-        const tenantLabel = formatTenantDisplay(agent.tenant_id || meta.tenantId || '');
-        return `
-            <tr data-agent-id="${escapeHtml(agent.agent_id || '')}" class="agent-row-clickable" title="Click to view details, right-click for actions">
-                <td>
-                    <div class="table-primary">${escapeHtml(getAgentDisplayName(agent))}</div>
-                    <div class="muted-text">${escapeHtml(agent.hostname || '')}</div>
-                </td>
-                <td>${escapeHtml(tenantLabel)}</td>
-                <td>${renderAgentStatusBadge(meta)}</td>
-                <td>${escapeHtml(agent.platform || 'Unknown')}</td>
-                <td>${renderAgentVersionCell(agent, true)}</td>
-                <td title="${escapeHtml(meta.lastSeenTooltip || 'Never')}">${escapeHtml(meta.lastSeenRelative || 'Never')}</td>
-            </tr>
-        `;
-    }).join('');
-    tbody.innerHTML = rows;
-}
-
-function renderAgentCard(agent) {
-    const meta = agent.__meta || {};
-    const registeredDate = agent.registered_at ? new Date(agent.registered_at) : null;
-    const statusColor = AGENT_STATUS_COLORS[meta.statusKey || 'offline'] || 'var(--muted)';
-    const tenantLabel = formatTenantDisplay(agent.tenant_id || meta.tenantId || '');
-    return `
-        <div class="device-card agent-card-clickable" data-agent-id="${escapeHtml(agent.agent_id || '')}" data-agent-name="${escapeHtml(getAgentDisplayName(agent))}" title="Click to view details, right-click for actions">
-            <div class="device-card-header">
-                <div>
-                    <div style="display:flex;align-items:center;gap:8px">
-                        <div class="device-card-title">${escapeHtml(getAgentDisplayName(agent))}</div>
-                        <span class="agent-joined-bubble" style="margin-left:8px;display:${registeredDate ? 'inline-flex' : 'none'};align-items:center;padding:2px 6px;border-radius:12px;background:var(--panel);font-size:12px;color:var(--muted);border:1px solid var(--border);">${registeredDate ? 'Joined' : ''}</span>
-                    </div>
-                    <div class="device-card-subtitle">
-                        <span class="copyable" data-copy="${escapeHtml(agent.hostname || '')}" title="Click to copy Hostname">${escapeHtml(agent.hostname || 'N/A')}</span>
-                        <span style="margin-left:8px;color:var(--muted);font-size:12px;" class="copyable" data-copy="${escapeHtml(agent.agent_id || '')}" title="Click to copy Agent ID">${escapeHtml(agent.agent_id || '')}</span>
-                    </div>
-                </div>
-            </div>
-            <div class="device-card-info">
-                <div class="device-card-row">
-                    <span class="device-card-label">Status</span>
-                    <span class="device-card-value agent-status-value">${renderAgentStatusBadge(meta)}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">IP Address</span>
-                    <span class="device-card-value copyable" data-copy="${escapeHtml(agent.ip || '')}" title="Click to copy">${escapeHtml(agent.ip || 'N/A')}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Platform</span>
-                    <span class="device-card-value">${escapeHtml(agent.platform || 'Unknown')}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Tenant</span>
-                    <span class="device-card-value">${escapeHtml(tenantLabel)}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Version</span>
-                    <span class="device-card-value agent-version-cell">${renderAgentVersionCell(agent, false)}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Last Seen</span>
-                    <span class="device-card-value agent-last-seen" title="${escapeHtml(meta.lastSeenTooltip || 'Never')}">${escapeHtml(meta.lastSeenRelative || 'Never')}</span>
-                </div>
-                ${registeredDate ? `
-                <div class="device-card-row">
-                    <span class="device-card-label">Registered</span>
-                    <span class="device-card-value" title="${registeredDate.toLocaleString()}">${registeredDate.toLocaleDateString()}</span>
-                </div>` : ''}
-            </div>
-            <div class="device-card-hint muted-text" style="font-size:11px;padding:8px 12px;text-align:center;border-top:1px solid var(--border);">
-                Right-click for actions
-            </div>
-        </div>
-    `;
-}
-
-function renderAgentStatusBadge(meta) {
-    const code = meta.statusKey || 'offline';
-    const label = AGENT_STATUS_LABELS[code] || meta.statusLabel || 'Unknown';
-    const tone = code === 'active' ? 'healthy' : code === 'offline' ? 'error' : 'warning';
-    return `<span class="status-pill ${tone}">${escapeHtml(label)}</span>`;
-}
-
-function findAgentCardElement(agentId) {
-    const cards = document.getElementById('agents_cards');
-    if (!cards) return null;
-    const safeId = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(agentId || '') : String(agentId || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    return cards.querySelector(`[data-agent-id="${safeId}"]`);
-}
-
-function setAgentJoined(agentId, joined) {
-    const card = findAgentCardElement(agentId);
-    if (!card) return;
-    const bubble = card.querySelector('.agent-joined-bubble');
-    if (!bubble) return;
-    if (joined) {
-        bubble.style.display = 'inline-flex';
-        bubble.textContent = 'Joined';
-    } else {
-        bubble.style.display = 'none';
-        bubble.textContent = '';
-    }
-}
-
-function upsertAgentRecord(record) {
-    if (!record) return;
-    if (!Array.isArray(agentsVM.items)) {
-        agentsVM.items = [];
-    }
-    let updated = false;
-    agentsVM.items = agentsVM.items.map(agent => {
-        if (agent.agent_id && record.agent_id && agent.agent_id === record.agent_id) {
-            updated = true;
-            return enrichSingleAgent({ ...agent, ...record });
-        }
-        return agent;
-    });
-    if (!updated) {
-        agentsVM.items.push(enrichSingleAgent(record));
-    }
-    agentsVM.stats.total = agentsVM.items.length;
-    patchAgentDirectory(record);
-    refreshAgentFilters();
-    refreshAgentMetrics();
-    applyAgentFilters();
-}
-
-function updateAgentConnection(agentId, connType) {
-    const index = agentsVM.items.findIndex(agent => agent.agent_id === agentId);
-    if (index === -1) {
-        loadAgents(true);
-        return;
-    }
-    const next = enrichSingleAgent({ ...agentsVM.items[index], connection_type: connType });
-    agentsVM.items.splice(index, 1, next);
-    patchAgentDirectory(next);
-    refreshAgentMetrics();
-    applyAgentFilters();
-}
-
-function updateAgentHeartbeat(agentId, status, lastSeen) {
-    const index = agentsVM.items.findIndex(agent => agent.agent_id === agentId);
-    if (index === -1) {
-        loadAgents(true);
-        return;
-    }
-    const updates = { ...agentsVM.items[index], status: status || agentsVM.items[index].status };
-    if (lastSeen) {
-        updates.last_seen = lastSeen;
-    }
-    const next = enrichSingleAgent(updates);
-    agentsVM.items.splice(index, 1, next);
-    patchAgentDirectory(next);
-    refreshAgentMetrics();
-    applyAgentFilters();
-}
-
-// Fetch a single agent's data and update the list
-async function fetchSingleAgent(agentId) {
-    try {
-        const response = await fetch(`/api/v1/agents/${agentId}`);
-        if (!response.ok) {
-            window.__pm_shared.warn('Failed to fetch single agent:', response.status);
-            return null;
-        }
-        const agentData = await response.json();
-        if (agentData) {
-            const index = agentsVM.items.findIndex(a => a.agent_id === agentId);
-            const enriched = enrichSingleAgent(agentData);
-            if (index !== -1) {
-                agentsVM.items.splice(index, 1, enriched);
-            } else {
-                agentsVM.items.push(enriched);
-            }
-            patchAgentDirectory(enriched);
-            refreshAgentMetrics();
-            applyAgentFilters();
-            refreshAgentVersionCell(agentId);
-            return enriched;
-        }
-    } catch (err) {
-        window.__pm_shared.warn('Error fetching single agent:', err);
-    }
-    return null;
-}
-
-// Handle agent reconnecting after an update restart
-async function handleAgentReconnectAfterUpdate(agentId, updateState) {
-    const agentName = agentsVM.items.find(a => a.agent_id === agentId)?.name || agentId;
-
-    // Transition to "verifying" state
-    agentsVM.updateState[agentId] = {
-        ...updateState,
-        status: 'verifying',
-        message: 'Agent reconnected, verifying update...',
-        timestamp: Date.now()
-    };
-    refreshAgentVersionCell(agentId);
-
-    // Small delay to let agent settle after restart
-    await new Promise(r => setTimeout(r, 1500));
-
-    // Fetch fresh agent data
-    const updatedAgent = await fetchSingleAgent(agentId);
-    if (!updatedAgent) {
-        // Couldn't fetch - clear state with warning
-        window.__pm_shared.showToast(`${agentName}: Reconnected but couldn't verify update`, 'warning');
-        delete agentsVM.updateState[agentId];
-        refreshAgentVersionCell(agentId);
-        return;
-    }
-
-    const newVersion = updatedAgent.version;
-    const previousVersion = updateState.previousVersion;
-    const targetVersion = updateState.targetVersion;
-
-    // Check if version changed
-    if (previousVersion && newVersion && newVersion !== previousVersion) {
-        // Version changed - update succeeded!
-        const versionMatch = targetVersion && newVersion === targetVersion;
-        window.__pm_shared.showToast(
-            `${agentName}: Update complete! ${previousVersion} ‚Üí ${newVersion}`,
-            'success'
-        );
-        agentsVM.updateState[agentId] = {
-            ...updateState,
-            status: 'complete',
-            message: versionMatch ? 'Update verified' : `Updated to ${newVersion}`,
-            timestamp: Date.now()
-        };
-        refreshAgentVersionCell(agentId);
-        // Clear state after showing success
-        setTimeout(() => {
-            delete agentsVM.updateState[agentId];
-            refreshAgentVersionCell(agentId);
-        }, 3000);
-    } else if (previousVersion && newVersion === previousVersion) {
-        // Same version - update may have failed or was a no-op
-        window.__pm_shared.showToast(
-            `${agentName}: Reconnected with same version (${newVersion})`,
-            'warning'
-        );
-        delete agentsVM.updateState[agentId];
-        refreshAgentVersionCell(agentId);
-    } else {
-        // Couldn't determine - clear state
-        window.__pm_shared.showToast(`${agentName}: Reconnected (version: ${newVersion || 'unknown'})`, 'info');
-        delete agentsVM.updateState[agentId];
-        refreshAgentVersionCell(agentId);
-    }
-}
-
-function enrichAgents(list) {
-    if (!Array.isArray(list)) return [];
-    return list.map(item => enrichSingleAgent(item));
-}
-
-function enrichSingleAgent(agent) {
-    if (!agent || typeof agent !== 'object') {
-        return agent;
-    }
-    // Derive status from connection_type: ws=active, http=degraded, none/missing=offline
-    const statusKey = normalizeAgentStatusFromConnection(agent.connection_type);
-    const statusLabel = AGENT_STATUS_LABELS[statusKey] || statusKey;
-    const lastSeenIso = agent.last_seen || agent.last_heartbeat || agent.updated_at;
-    const lastSeenDate = lastSeenIso ? new Date(lastSeenIso) : null;
-    const tenantId = agent.tenant_id || '';
-    const tenantLabel = tenantId ? tenantDisplayNameById(tenantId) : '';
-    return {
-        ...agent,
-        __meta: {
-            statusKey,
-            statusLabel,
-            versionLabel: agent.version || 'Unknown',
-            platformLabel: agent.platform || 'Unknown',
-            lastSeenRelative: lastSeenDate ? formatRelativeTime(lastSeenDate) : 'Never',
-            lastSeenTooltip: lastSeenDate ? lastSeenDate.toLocaleString() : 'Never',
-            lastSeenMs: lastSeenDate ? lastSeenDate.getTime() : 0,
-            tenantId,
-            search: buildAgentSearchBlob(agent, tenantLabel || tenantId),
-        }
-    };
-}
-
-function buildAgentSearchBlob(agent, tenantLabel) {
-    const parts = [
-        agent.agent_id,
-        agent.name,
-        agent.hostname,
-        agent.ip,
-        agent.platform,
-        agent.version,
-        agent.connection_type,
-        tenantLabel,
-        agent.tenant_id,
-    ].filter(Boolean);
-    return parts.join(' ').toLowerCase();
-}
-
-function normalizeAgentStatusFromConnection(connectionType) {
-    const conn = (connectionType || '').toLowerCase();
-    if (conn === 'ws' || conn.includes('websocket')) {
-        return 'active';
-    }
-    if (conn === 'http' || conn.includes('http')) {
-        return 'degraded';
-    }
-    return 'offline';
-}
-
-function buildAgentStatusCounts() {
-    const map = {};
-    AGENT_STATUS_KEYS.forEach(key => { map[key] = 0; });
-    return map;
-}
-
-// Device helpers for server UI
-function addOrUpdateDeviceCard(device) {
-    const container = document.getElementById('devices_cards');
-    if (!container) return;
-    const serial = device.serial || '';
-    if (!serial) {
-        // fallback: reload full devices
-        loadDevices();
-        return;
-    }
-    const existing = container.querySelector(`[data-serial="${serial}"]`);
-    const cardHtml = renderServerDeviceCard(device);
-    if (existing) {
-        existing.outerHTML = cardHtml;
-    } else {
-        // insert at top
-        container.insertAdjacentHTML('afterbegin', cardHtml);
-    }
-}
-
-// ====== Selection Helpers (file-explorer style) ======
-
-/**
- * Updates visual selection state for agent rows/cards
- */
-function updateAgentSelectionUI() {
-    // Update table rows
-    document.querySelectorAll('tr.agent-row-clickable').forEach(row => {
-        const agentId = row.getAttribute('data-agent-id');
-        if (agentsVM.selection.selectedIds.has(agentId)) {
-            row.classList.add('agent-row-selected');
-        } else {
-            row.classList.remove('agent-row-selected');
-        }
-    });
-    // Update cards
-    document.querySelectorAll('.agent-card-clickable').forEach(card => {
-        const agentId = card.getAttribute('data-agent-id');
-        if (agentsVM.selection.selectedIds.has(agentId)) {
-            card.classList.add('agent-card-selected');
-        } else {
-            card.classList.remove('agent-card-selected');
-        }
-    });
-}
-
-/**
- * Updates visual selection state for device rows/cards
- */
-function updateDeviceSelectionUI() {
-    // Update table rows
-    document.querySelectorAll('tr.device-row-clickable').forEach(row => {
-        const serial = row.getAttribute('data-serial');
-        const ip = row.getAttribute('data-ip');
-        const id = serial || ip;
-        if (devicesVM.selection.selectedIds.has(id)) {
-            row.classList.add('device-row-selected');
-        } else {
-            row.classList.remove('device-row-selected');
-        }
-    });
-    // Update cards
-    document.querySelectorAll('.device-card-clickable').forEach(card => {
-        const serial = card.getAttribute('data-serial');
-        const ip = card.getAttribute('data-ip');
-        const id = serial || ip;
-        if (devicesVM.selection.selectedIds.has(id)) {
-            card.classList.add('device-card-selected');
-        } else {
-            card.classList.remove('device-card-selected');
-        }
-    });
-}
-
-/**
- * Handles agent selection with file-explorer style modifiers
- * @param {string} agentId - The agent ID being clicked
- * @param {MouseEvent} event - The click event for modifier key detection
- */
-function handleAgentSelection(agentId, event) {
-    const selection = agentsVM.selection;
-
-    if (event.shiftKey && selection.lastSelected) {
-        // Shift+click: select range
-        const filtered = agentsVM.filtered;
-        const ids = filtered.map(a => a.id);
-        const lastIdx = ids.indexOf(selection.lastSelected);
-        const currIdx = ids.indexOf(agentId);
-
-        if (lastIdx !== -1 && currIdx !== -1) {
-            const start = Math.min(lastIdx, currIdx);
-            const end = Math.max(lastIdx, currIdx);
-            // Clear selection if not ctrl pressed, then select range
-            if (!event.ctrlKey && !event.metaKey) {
-                selection.selectedIds.clear();
-            }
-            for (let i = start; i <= end; i++) {
-                selection.selectedIds.add(ids[i]);
-            }
-        }
-    } else if (event.ctrlKey || event.metaKey) {
-        // Ctrl+click: toggle individual selection
-        if (selection.selectedIds.has(agentId)) {
-            selection.selectedIds.delete(agentId);
-        } else {
-            selection.selectedIds.add(agentId);
-        }
-        selection.lastSelected = agentId;
-    } else {
-        // Normal click: clear selection, select only this one
-        selection.selectedIds.clear();
-        selection.selectedIds.add(agentId);
-        selection.lastSelected = agentId;
-    }
-
-    updateAgentSelectionUI();
-}
-
-/**
- * Handles device selection with file-explorer style modifiers
- * @param {string} deviceId - The device ID (serial or IP) being clicked
- * @param {MouseEvent} event - The click event for modifier key detection
- */
-function handleDeviceSelection(deviceId, event) {
-    const selection = devicesVM.selection;
-
-    if (event.shiftKey && selection.lastSelected) {
-        // Shift+click: select range
-        const filtered = devicesVM.filtered;
-        const ids = filtered.map(d => d.serial || d.ip);
-        const lastIdx = ids.indexOf(selection.lastSelected);
-        const currIdx = ids.indexOf(deviceId);
-
-        if (lastIdx !== -1 && currIdx !== -1) {
-            const start = Math.min(lastIdx, currIdx);
-            const end = Math.max(lastIdx, currIdx);
-            // Clear selection if not ctrl pressed, then select range
-            if (!event.ctrlKey && !event.metaKey) {
-                selection.selectedIds.clear();
-            }
-            for (let i = start; i <= end; i++) {
-                selection.selectedIds.add(ids[i]);
-            }
-        }
-    } else if (event.ctrlKey || event.metaKey) {
-        // Ctrl+click: toggle individual selection
-        if (selection.selectedIds.has(deviceId)) {
-            selection.selectedIds.delete(deviceId);
-        } else {
-            selection.selectedIds.add(deviceId);
-        }
-        selection.lastSelected = deviceId;
-    } else {
-        // Normal click: clear selection, select only this one
-        selection.selectedIds.clear();
-        selection.selectedIds.add(deviceId);
-        selection.lastSelected = deviceId;
-    }
-
-    updateDeviceSelectionUI();
-}
-
-/**
- * Clears all agent selections
- */
-function clearAgentSelection() {
-    agentsVM.selection.selectedIds.clear();
-    agentsVM.selection.lastSelected = null;
-    updateAgentSelectionUI();
-}
-
-/**
- * Clears all device selections
- */
-function clearDeviceSelection() {
-    devicesVM.selection.selectedIds.clear();
-    devicesVM.selection.lastSelected = null;
-    updateDeviceSelectionUI();
-}
-
-// ====== Agent Details ======
-async function viewAgentDetails(agentId) {
-    try {
-        // Show modal overlay immediately with loading state
-        const overlay = document.getElementById('agent_details_overlay');
-        const body = document.getElementById('agent_details_body');
-        const title = document.getElementById('agent_details_title');
-
-        overlay.style.display = 'flex';
-        body.innerHTML = '<div style="color:var(--muted);text-align:center;padding:40px;">Loading agent details...</div>';
-        title.textContent = 'Agent Details';
-
-        const response = await fetch(`/api/v1/agents/${agentId}`);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const agent = await response.json();
-        renderAgentDetailsModal(agent);
-    } catch (error) {
-        window.__pm_shared.error('Failed to load agent details:', error);
-        const body = document.getElementById('agent_details_body');
-        body.innerHTML = `<div style="color:var(--error);text-align:center;padding:40px;">Failed to load agent details: ${escapeHtml(error.message)}</div>`;
-        window.__pm_shared.showToast('Failed to load agent details', 'error');
-    }
-}
-
-function renderAgentDetailsModal(agent) {
-    const title = document.getElementById('agent_details_title');
-    const body = document.getElementById('agent_details_body');
-
-    title.textContent = `Agent: ${getAgentDisplayName(agent)}`;
-
-    const lastSeenDate = agent.last_seen ? new Date(agent.last_seen) : null;
-    const registeredDate = agent.registered_at ? new Date(agent.registered_at) : null;
-    const lastHeartbeatDate = agent.last_heartbeat ? new Date(agent.last_heartbeat) : null;
-    const lastDeviceSyncDate = agent.last_device_sync ? new Date(agent.last_device_sync) : null;
-    const lastMetricsSyncDate = agent.last_metrics_sync ? new Date(agent.last_metrics_sync) : null;
-    const connectionType = (agent.connection_type || '').toLowerCase();
-    const commandEnabled = connectionType === 'ws';
-    const commandDisabledAttr = commandEnabled ? '' : 'disabled title="Requires active WebSocket connection"';
-    const commandHint = commandEnabled
-        ? 'Commands are delivered instantly over the active WebSocket tunnel.'
-        : 'Agent must be connected via WebSocket to receive remote commands.';
-
-    // Calculate uptime
-    let uptimeText = 'N/A';
-    if (registeredDate && lastSeenDate) {
-        const uptimeMs = lastSeenDate - registeredDate;
-        const days = Math.floor(uptimeMs / (1000 * 60 * 60 * 24));
-        const hours = Math.floor((uptimeMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-        uptimeText = `${days}d ${hours}h`;
-    }
-
-    const statusColors = {
-        'active': 'var(--success)',
-        'degraded': 'var(--warning)',
-        'offline': 'var(--error)'
-    };
-    const statusColor = statusColors[agent.status] || 'var(--muted)';
-
-    body.innerHTML = `
-        <div class="agent-details-grid">
-            <!-- Basic Info -->
-            <div class="panel">
-                <h4 style="margin-top:0;color:var(--highlight);font-size:14px;">Basic Information</h4>
-                    <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-                    <div class="device-card-row">
-                        <span class="device-card-label">Agent ID</span>
-                        <span class="device-card-value copyable" data-copy="${agent.agent_id}" title="Click to copy">
-                            ${agent.agent_id}
-                        </span>
-                    </div>
-                    <div class="device-card-row">
-                        <span class="device-card-label">Name</span>
-                        <span class="device-card-value" id="agent_details_name_display">${agent.name || ''}</span>
-                        <span style="margin-left:8px;"><button id="agent_details_edit_name_btn">Edit</button></span>
-                    </div>
-                    <div class="device-card-row">
-                        <span class="device-card-label">Hostname</span>
-                        <span class="device-card-value copyable" data-copy="${agent.hostname || ''}" title="Click to copy">
-                            ${agent.hostname || 'N/A'}
-                        </span>
-                    </div>
-                    <div class="device-card-row">
-                        <span class="device-card-label">IP Address</span>
-                        <span class="device-card-value copyable" data-copy="${agent.ip || ''}" title="Click to copy">
-                            ${agent.ip || 'N/A'}
-                        </span>
-                    </div>
-                    <div class="device-card-row">
-                        <span class="device-card-label">Status</span>
-                        <span class="device-card-value" style="color:${statusColor}">
-                            ‚óè ${agent.status || 'unknown'}
-                        </span>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- System Info -->
-            <div class="panel">
-                <h4 style="margin-top:0;color:var(--highlight);font-size:14px;">System Information</h4>
-                <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-                    <div class="device-card-row">
-                        <span class="device-card-label">Platform</span>
-                        <span class="device-card-value">${agent.platform || 'Unknown'}</span>
-                    </div>
-                    ${agent.os_version ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">OS Version</span>
-                        <span class="device-card-value">${agent.os_version}</span>
-                    </div>
-                    ` : ''}
-                    ${agent.architecture ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Architecture</span>
-                        <span class="device-card-value">${agent.architecture}</span>
-                    </div>
-                    ` : ''}
-                    ${agent.num_cpu ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">CPUs</span>
-                        <span class="device-card-value">${agent.num_cpu}</span>
-                    </div>
-                    ` : ''}
-                    ${agent.total_memory_mb ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Memory</span>
-                        <span class="device-card-value">${(agent.total_memory_mb / 1024).toFixed(2)} GB</span>
-                    </div>
-                    ` : ''}
-                </div>
-            </div>
-            
-            <!-- Version Info -->
-            <div class="panel">
-                <h4 style="margin-top:0;color:var(--highlight);font-size:14px;">Version Information</h4>
-                <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-                    <div class="device-card-row">
-                        <span class="device-card-label">Agent Version</span>
-                        <span class="device-card-value">${agent.version || 'N/A'}</span>
-                    </div>
-                    <div class="device-card-row">
-                        <span class="device-card-label">Protocol Version</span>
-                        <span class="device-card-value">${agent.protocol_version || 'N/A'}</span>
-                    </div>
-                    ${agent.go_version ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Go Version</span>
-                        <span class="device-card-value">${agent.go_version}</span>
-                    </div>
-                    ` : ''}
-                    ${agent.build_type ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Build Type</span>
-                        <span class="device-card-value">${agent.build_type}</span>
-                    </div>
-                    ` : ''}
-                    ${agent.git_commit && agent.git_commit !== 'unknown' ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Git Commit</span>
-                        <span class="device-card-value copyable" data-copy="${agent.git_commit}" title="Click to copy">
-                            ${agent.git_commit.substring(0, 8)}...
-                        </span>
-                    </div>
-                    ` : ''}
-                </div>
-            </div>
-            
-            <!-- Activity -->
-            <div class="panel">
-                <h4 style="margin-top:0;color:var(--highlight);font-size:14px;">Activity</h4>
-                <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-                    ${registeredDate ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Registered</span>
-                        <span class="device-card-value" title="${registeredDate.toLocaleString()}">
-                            ${registeredDate.toLocaleDateString()}
-                        </span>
-                    </div>
-                    ` : ''}
-                    ${lastSeenDate ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Last Seen</span>
-                        <span class="device-card-value" title="${lastSeenDate.toLocaleString()}">
-                            ${lastSeenDate.toLocaleString()}
-                        </span>
-                    </div>
-                    ` : ''}
-                    ${lastHeartbeatDate ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Last Heartbeat</span>
-                        <span class="device-card-value" title="${lastHeartbeatDate.toLocaleString()}">
-                            ${lastHeartbeatDate.toLocaleString()}
-                        </span>
-                    </div>
-                    ` : ''}
-                    <div class="device-card-row">
-                        <span class="device-card-label">Uptime</span>
-                        <span class="device-card-value">${uptimeText}</span>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Data Sync -->
-            <div class="panel">
-                <h4 style="margin-top:0;color:var(--highlight);font-size:14px;">Data Synchronization</h4>
-                <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-                    <div class="device-card-row">
-                        <span class="device-card-label">Devices</span>
-                        <span class="device-card-value">${agent.device_count || 0}</span>
-                    </div>
-                    ${lastDeviceSyncDate ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Last Device Sync</span>
-                        <span class="device-card-value" title="${lastDeviceSyncDate.toLocaleString()}">
-                            ${lastDeviceSyncDate.toLocaleString()}
-                        </span>
-                    </div>
-                    ` : `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Last Device Sync</span>
-                        <span class="device-card-value" style="color:var(--muted);">Never</span>
-                    </div>
-                    `}
-                    ${lastMetricsSyncDate ? `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Last Metrics Sync</span>
-                        <span class="device-card-value" title="${lastMetricsSyncDate.toLocaleString()}">
-                            ${lastMetricsSyncDate.toLocaleString()}
-                        </span>
-                    </div>
-                    ` : `
-                    <div class="device-card-row">
-                        <span class="device-card-label">Last Metrics Sync</span>
-                        <span class="device-card-value" style="color:var(--muted);">Never</span>
-                    </div>
-                    `}
-                </div>
-            </div>
-        </div>
-        
-        <!-- WS Diagnostics -->
-        <div style="margin-top:16px;">
-            <div class="panel">
-                <h4 style="margin-top:0;color:var(--highlight);font-size:14px;">WebSocket Diagnostics</h4>
-                <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-                    <div class="device-card-row">
-                        <span class="device-card-label">Ping Failures</span>
-                        <span class="device-card-value">${agent.ws_ping_failures || 0}</span>
-                    </div>
-                    <div class="device-card-row">
-                        <span class="device-card-label">Disconnect Events</span>
-                        <span class="device-card-value">${agent.ws_disconnect_events || 0}</span>
-                    </div>
-                    <div style="color:var(--muted);font-size:12px;">These counts are diagnostics from the server's WebSocket subsystem. They help indicate flaky connections or network issues.</div>
-                </div>
-            </div>
-        </div>
-        <!-- Action Buttons -->
-        <div style="margin-top: 20px; display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap;">
-            <button id="agent_check_update_btn" data-agent-id="${agent.agent_id}" ${commandDisabledAttr}>
-                Check for Update
-            </button>
-            <button id="agent_force_update_btn" data-agent-id="${agent.agent_id}" ${commandDisabledAttr}>
-                Force Reinstall
-            </button>
-            <button data-action="open-agent" data-agent-id="${agent.agent_id}" ${commandDisabledAttr}>
-                Open Agent UI
-            </button>
-        </div>
-        <div class="agent-update-feedback">
-            <div id="agent_update_hint" class="agent-update-hint${commandEnabled ? '' : ' error'}">${escapeHtml(commandHint)}</div>
-            <div id="agent_update_status" class="agent-update-status" role="status" aria-live="polite"></div>
-        </div>
-    `;
-    // Attach inline editor handlers now that DOM nodes are present
-    try { _attachAgentDetailsNameEditor(agent); } catch (e) { window.__pm_shared && window.__pm_shared.warn && window.__pm_shared.warn('attach editor failed', e); }
-    // Attach check for update handler
-    try { _attachAgentUpdateHandler(agent); } catch (e) { window.__pm_shared && window.__pm_shared.warn && window.__pm_shared.warn('attach update handler failed', e); }
-}
-
-// After rendering the agent details modal we attach a small inline handler
-// to allow editing the agent's user-friendly name. This toggles an input
-// in the modal and sends a POST to update the name on the server, then
-// updates the UI card in-place.
-function _attachAgentDetailsNameEditor(agent) {
-    try {
-        const editBtn = document.getElementById('agent_details_edit_name_btn');
-        if (!editBtn) return;
-        editBtn.addEventListener('click', () => {
-            const displayEl = document.getElementById('agent_details_name_display');
-            if (!displayEl) return;
-            const current = displayEl.textContent || '';
-            // Create edit UI with proper mobile-friendly input styling
-            // Use flex-start to prevent mobile cursor position bugs with flex-end
-            displayEl.innerHTML = `<span style="display:flex;align-items:center;gap:6px;justify-content:flex-start;width:100%;">
-                <input id="agent_details_name_input" value="${(agent.name || '').replace(/"/g, '&quot;')}" 
-                    style="flex:1;min-width:120px;max-width:200px;text-align:left;direction:ltr;font-size:14px;padding:4px 8px;" 
-                    autocomplete="off" data-1p-ignore data-lpignore="true" />
-                <button id="agent_details_save_name">Save</button>
-                <button id="agent_details_cancel_name">Cancel</button>
-            </span>`;
-
-            // Focus the input and select all text so user can immediately type to replace
-            const inputEl = document.getElementById('agent_details_name_input');
-            if (inputEl) {
-                inputEl.focus();
-                inputEl.select();
-            }
-
-            const saveBtn = document.getElementById('agent_details_save_name');
-            const cancelBtn = document.getElementById('agent_details_cancel_name');
-            if (cancelBtn) cancelBtn.addEventListener('click', () => { displayEl.textContent = current; });
-
-            if (saveBtn) saveBtn.addEventListener('click', async () => {
-                const input = document.getElementById('agent_details_name_input');
-                if (!input) return;
-                const newName = input.value.trim();
-                try {
-                    const res = await fetch(`/api/v1/agents/${encodeURIComponent(agent.agent_id)}`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ name: newName })
-                    });
-                    if (!res.ok) throw new Error('HTTP ' + res.status);
-                    const updated = await res.json();
-                    // Update modal display
-                    const title = document.getElementById('agent_details_title');
-                    const nameDisplay = document.getElementById('agent_details_name_display');
-                    if (nameDisplay) nameDisplay.textContent = updated.name || '';
-                    if (title) title.textContent = `Agent: ${updated.name || updated.hostname || updated.agent_id}`;
-                    // Update agent card in list
-                    try { upsertAgentRecord(updated); } catch (e) { }
-                    window.__pm_shared.showToast('Agent name updated', 'success');
-                } catch (err) {
-                    window.__pm_shared.showToast('Failed to update agent name', 'error');
-                    // restore display
-                    displayEl.textContent = current;
-                }
-            });
-        });
-    } catch (e) {
-        window.__pm_shared.warn('Failed to attach agent details name editor', e);
-    }
-}
-
-function _attachAgentUpdateHandler(agent) {
-    try {
-        const canSendCommands = (agent.connection_type || '').toLowerCase() === 'ws';
-        const statusEl = document.getElementById('agent_update_status');
-        const requireWsMessage = 'Requires active WebSocket connection';
-
-        const setStatus = (message, tone = 'info') => {
-            if (!statusEl) return;
-            statusEl.textContent = message || '';
-            statusEl.classList.remove('status-info', 'status-success', 'status-error');
-            if (!message) {
-                return;
-            }
-            const cls = tone === 'success' ? 'status-success' : tone === 'error' ? 'status-error' : 'status-info';
-            statusEl.classList.add(cls);
-        };
-
-        const checkBtn = document.getElementById('agent_check_update_btn');
-        if (checkBtn) {
-            const resetCheckButton = () => {
-                checkBtn.disabled = !canSendCommands;
-                checkBtn.textContent = 'Check for Update';
-                if (!canSendCommands) {
-                    checkBtn.title = requireWsMessage;
-                } else {
-                    checkBtn.removeAttribute('title');
-                }
-            };
-            resetCheckButton();
-            checkBtn.addEventListener('click', async () => {
-                if (!canSendCommands) {
-                    setStatus('Connect via WebSocket to send update commands.', 'error');
-                    return;
-                }
-                checkBtn.disabled = true;
-                checkBtn.textContent = 'Checking...';
-                setStatus('Contacting agent‚Ä¶', 'info');
-                try {
-                    const res = await fetch(`/api/v1/agents/command/${encodeURIComponent(agent.agent_id)}`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ command: 'check_update' })
-                    });
-                    if (!res.ok) {
-                        const txt = await res.text();
-                        throw new Error(txt || 'Request failed');
-                    }
-                    const data = await res.json();
-                    if (data.success) {
-                        const summary = data.message || 'Update check triggered';
-                        window.__pm_shared.showToast(summary, 'success');
-                        setStatus(`${summary} at ${new Date().toLocaleTimeString()}`, 'success');
-                    } else {
-                        const msg = data.error || 'Failed to trigger update check';
-                        window.__pm_shared.showToast(msg, 'error');
-                        setStatus(msg, 'error');
-                    }
-                } catch (err) {
-                    window.__pm_shared.showToast('Failed to send command: ' + (err.message || err), 'error');
-                    setStatus('Failed to send command: ' + (err.message || err), 'error');
-                } finally {
-                    resetCheckButton();
-                }
-            });
-        }
-
-        const forceBtn = document.getElementById('agent_force_update_btn');
-        if (forceBtn) {
-            const resetForceButton = (label) => {
-                forceBtn.disabled = !canSendCommands;
-                forceBtn.textContent = label || 'Force Reinstall';
-                if (!canSendCommands) {
-                    forceBtn.title = requireWsMessage;
-                } else {
-                    forceBtn.removeAttribute('title');
-                }
-            };
-            resetForceButton();
-            forceBtn.addEventListener('click', async () => {
-                if (!window.confirm('Force reinstall this agent? The service will restart and may temporarily disconnect.')) {
-                    return;
-                }
-                if (!canSendCommands) {
-                    setStatus('Connect via WebSocket to send update commands.', 'error');
-                    return;
-                }
-                forceBtn.disabled = true;
-                const previousLabel = forceBtn.textContent;
-                forceBtn.textContent = 'Forcing...';
-                setStatus('Contacting agent‚Ä¶', 'info');
-                try {
-                    const res = await fetch(`/api/v1/agents/command/${encodeURIComponent(agent.agent_id)}`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            command: 'force_update',
-                            data: { reason: 'server_ui_force_reinstall' }
-                        })
-                    });
-                    if (!res.ok) {
-                        const txt = await res.text();
-                        throw new Error(txt || 'Request failed');
-                    }
-                    const data = await res.json();
-                    if (data.success) {
-                        const summary = data.message || 'Forced reinstall triggered';
-                        window.__pm_shared.showToast(summary, 'success');
-                        setStatus(`${summary} at ${new Date().toLocaleTimeString()}`, 'success');
-                    } else {
-                        const msg = data.error || 'Failed to force reinstall';
-                        window.__pm_shared.showToast(msg, 'error');
-                        setStatus(msg, 'error');
-                    }
-                } catch (err) {
-                    window.__pm_shared.showToast('Failed to send force reinstall: ' + (err.message || err), 'error');
-                    setStatus('Failed to send force reinstall: ' + (err.message || err), 'error');
-                } finally {
-                    resetForceButton(previousLabel);
-                }
-            });
-        }
-    } catch (e) {
-        window.__pm_shared.warn('Failed to attach agent update handler', e);
-    }
-}
-
-// ====== Update Agent (from agent list/cards) ======
-
-// Handle update progress events from SSE
-function handleAgentUpdateProgress(data) {
-    const agentId = data.agent_id;
-    if (!agentId) return;
-
-    // Normalize status values emitted by agent auto-update pipeline
-    const rawStatus = (data.status || 'unknown').toLowerCase();
-    const status = (() => {
-        switch (rawStatus) {
-            case 'pending':
-                return 'checking';
-            case 'staging':
-            case 'applying':
-                return 'ready'; // installing phase
-            case 'succeeded':
-                return 'complete';
-            case 'rolled_back':
-                return 'failed';
-            case 'skipped':
-                return 'skipped';
-            default:
-                return rawStatus;
-        }
-    })();
-
-    const progress = data.progress || 0;
-    const message = data.message || '';
-    const targetVersion = data.target_version || '';
-    const errorMsg = data.error || '';
-
-    // Update state tracking - preserve previousVersion and _shownToasts if already set
-    const existingState = agentsVM.updateState[agentId] || {};
-    const agent = agentsVM.items.find(a => a.agent_id === agentId);
-    const previousVersion = existingState.previousVersion || agent?.version || '';
-    const shownToasts = existingState._shownToasts || {};
-
-    agentsVM.updateState[agentId] = {
-        status,
-        progress,
-        message,
-        targetVersion,
-        previousVersion,
-        error: errorMsg,
-        timestamp: Date.now(),
-        _shownToasts: shownToasts  // Preserve toast tracking across updates
-    };
-
-    // Start animation loop if an update is active
-    if (status === 'checking' || status === 'downloading' || status === 'ready' ||
-        status === 'restarting' || status === 'verifying') {
-        startUpdateProgressAnimation();
-    }
-
-    // Show toast notifications for key events
-    const agentName = agent?.name || agent?.hostname || agentId;
-
-    switch (status) {
-        case 'checking':
-            // No toast for checking, just UI update
-            break;
-        case 'downloading':
-            // Only show "Downloading..." toast once per update cycle
-            if (!shownToasts.downloading) {
-                window.__pm_shared.showToast(`${agentName}: Downloading update...`, 'info');
-                shownToasts.downloading = true;
-            }
-            break;
-        case 'ready':
-            if (!shownToasts.ready) {
-                window.__pm_shared.showToast(`${agentName}: Update downloaded, preparing to install...`, 'info');
-                shownToasts.ready = true;
-            }
-            break;
-        case 'restarting':
-            if (!shownToasts.restarting) {
-                window.__pm_shared.showToast(`${agentName}: Restarting to apply update...`, 'info');
-                shownToasts.restarting = true;
-            }
-            // Store previous version for comparison when agent reconnects
-            if (agent?.version && !agentsVM.updateState[agentId].previousVersion) {
-                agentsVM.updateState[agentId].previousVersion = agent.version;
-            }
-            // Fallback: if we never hear back after restart, clear the state and refresh
-            if (!shownToasts.restartTimeout) {
-                shownToasts.restartTimeout = true;
-                setTimeout(() => {
-                    const st = agentsVM.updateState[agentId];
-                    if (st && st.status === 'restarting') {
-                        window.__pm_shared.showToast(`${agentName}: Update timed out waiting for reconnect`, 'warning');
-                        delete agentsVM.updateState[agentId];
-                        refreshAgentVersionCell(agentId);
-                        // Fetch just this agent's data instead of all agents
-                        fetchSingleAgent(agentId);
-                    }
-                }, 30000); // Increased to 30s to allow for slower restarts
-            }
-            break;
-        case 'complete':
-            window.__pm_shared.showToast(`${agentName}: Update complete!`, 'success');
-            // Clear state after a delay to let UI update
-            setTimeout(() => {
-                delete agentsVM.updateState[agentId];
-                if (agentsVM.updateAnimations) delete agentsVM.updateAnimations[agentId];
-                refreshAgentVersionCell(agentId);
-            }, 3000);
-            // Reload agents to get new version
-            setTimeout(() => loadAgents(), 2000);
-            break;
-        case 'failed':
-            window.__pm_shared.showToast(`${agentName}: Update failed - ${errorMsg || message}`, 'error');
-            // Clear state after showing error
-            setTimeout(() => {
-                delete agentsVM.updateState[agentId];
-                if (agentsVM.updateAnimations) delete agentsVM.updateAnimations[agentId];
-                refreshAgentVersionCell(agentId);
-            }, 5000);
-            break;
-        case 'idle':
-            // Agent returned to idle, clear any pending state
-            delete agentsVM.updateState[agentId];
-            if (agentsVM.updateAnimations) delete agentsVM.updateAnimations[agentId];
-            break;
-    }
-
-    // Refresh the version cell for this agent
-    refreshAgentVersionCell(agentId);
-}
-
-// Refresh the version cell display for a specific agent
-function refreshAgentVersionCell(agentId) {
-    const agent = agentsVM.items.find(a => a.agent_id === agentId);
-    if (!agent) return;
-
-    // Update in table view
-    const tableRow = document.querySelector(`tr[data-agent-id="${agentId}"]`);
-    if (tableRow) {
-        // First try to find by data-column-id (table customizer)
-        let versionCell = tableRow.querySelector('td[data-column-id="version"]');
-        if (!versionCell) {
-            // Fallback: try to find by position (legacy non-customizer render)
-            // In the fallback renderer, version is the 6th column (index 5)
-            const cells = tableRow.querySelectorAll('td');
-            if (cells.length >= 6) {
-                versionCell = cells[5];
-            }
-        }
-        if (versionCell) {
-            versionCell.innerHTML = renderAgentVersionCell(agent, true);
-        }
-    }
-    // Update in card view
-    const card = document.querySelector(`.device-card[data-agent-id="${agentId}"]`);
-    if (card) {
-        const versionSpan = card.querySelector('.agent-version-cell');
-        if (versionSpan) {
-            versionSpan.innerHTML = renderAgentVersionCell(agent, false);
-        }
-    }
-}
-
-// Animation loop for smooth progress updates
-let updateProgressAnimationFrame = null;
-function startUpdateProgressAnimation() {
-    if (updateProgressAnimationFrame) return; // Already running
-
-    function animate() {
-        // Check if any updates are in progress
-        const activeUpdates = Object.keys(agentsVM.updateState || {}).filter(id => {
-            const state = agentsVM.updateState[id];
-            const status = state?.status;
-            return status === 'checking' || status === 'downloading' || status === 'ready' ||
-                status === 'restarting' || status === 'verifying' ||
-                status === 'pending' || status === 'staging' || status === 'applying';
-        });
-
-        if (activeUpdates.length === 0) {
-            // No active updates, stop animation
-            updateProgressAnimationFrame = null;
-            // Clean up animation state
-            if (agentsVM.updateAnimations) {
-                agentsVM.updateAnimations = {};
-            }
-            return;
-        }
-
-        // Update progress for each active update
-        activeUpdates.forEach(agentId => {
-            // Update the progress button directly without full re-render
-            const progressBtn = document.querySelector(`.update-btn.progress-btn[data-agent-id="${agentId}"]`);
-            if (progressBtn) {
-                const updateState = agentsVM.updateState[agentId];
-                const rawStatus = updateState?.status || '';
-                const status = (() => {
-                    switch (rawStatus) {
-                        case 'pending': return 'checking';
-                        case 'staging':
-                        case 'applying': return 'ready';
-                        default: return rawStatus;
-                    }
-                })();
-                const smoothProgress = getSmoothedUpdateProgress(agentId, status, updateState);
-                progressBtn.style.setProperty('--progress', `${smoothProgress}%`);
-                progressBtn.textContent = `${Math.round(smoothProgress)}%`;
-            }
-        });
-
-        // Continue animation
-        updateProgressAnimationFrame = requestAnimationFrame(animate);
-    }
-
-    updateProgressAnimationFrame = requestAnimationFrame(animate);
-}
-
-// Stop animation when no updates are active
-function stopUpdateProgressAnimation() {
-    if (updateProgressAnimationFrame) {
-        cancelAnimationFrame(updateProgressAnimationFrame);
-        updateProgressAnimationFrame = null;
-    }
-}
-
-// Cancel an in-progress update
-async function cancelAgentUpdate(agentId) {
-    if (!agentId) return;
-
-    const state = agentsVM.updateState[agentId];
-    if (!state || state.status === 'restarting') {
-        window.__pm_shared.showToast('Cannot cancel update at this stage', 'warning');
-        return;
-    }
-
-    try {
-        const response = await fetch(`/api/v1/agents/command/${agentId}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: 'cancel_update' })
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-
-        window.__pm_shared.showToast('Cancel request sent', 'info');
-    } catch (error) {
-        window.__pm_shared.error('Failed to cancel update:', error);
-        window.__pm_shared.showToast('Failed to cancel update: ' + (error.message || error), 'error');
-    }
-}
-
-async function updateAgent(agentId) {
-    if (!agentId) {
-        window.__pm_shared.showToast('No agent ID provided', 'error');
-        return;
-    }
-
-    // Set initial updating state
-    agentsVM.updateState[agentId] = {
-        status: 'checking',
-        progress: 0,
-        message: 'Sending update command...',
-        targetVersion: agentsVM.latestVersion || '',
-        error: '',
-        timestamp: Date.now()
-    };
-    refreshAgentVersionCell(agentId);
-    // Start smooth animation loop
-    startUpdateProgressAnimation();
-
-    try {
-        const response = await fetch(`/api/v1/agents/command/${agentId}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: 'check_update' })
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-
-        const result = await response.json();
-        if (result.success) {
-            // Update state to show we're waiting for agent response
-            agentsVM.updateState[agentId] = {
-                ...agentsVM.updateState[agentId],
-                message: 'Waiting for agent...',
-            };
-            refreshAgentVersionCell(agentId);
-        } else {
-            // Command failed
-            agentsVM.updateState[agentId] = {
-                ...agentsVM.updateState[agentId],
-                status: 'failed',
-                error: result.message || 'Unknown error',
-            };
-            refreshAgentVersionCell(agentId);
-            window.__pm_shared.showToast('Update command failed: ' + (result.message || 'unknown'), 'warning');
-            setTimeout(() => {
-                delete agentsVM.updateState[agentId];
-                refreshAgentVersionCell(agentId);
-            }, 5000);
-        }
-    } catch (error) {
-        window.__pm_shared.error('Failed to send update command:', error);
-        agentsVM.updateState[agentId] = {
-            ...agentsVM.updateState[agentId],
-            status: 'failed',
-            error: error.message || String(error),
-        };
-        refreshAgentVersionCell(agentId);
-        window.__pm_shared.showToast('Failed to send update command: ' + (error.message || error), 'error');
-        setTimeout(() => {
-            delete agentsVM.updateState[agentId];
-            refreshAgentVersionCell(agentId);
-        }, 5000);
-    }
-}
-
-// Expose server-specific agent UI helpers to the shared namespace so the
-// delegated card handlers (loaded earlier) call the rich renderer instead
-// of the generic fallback in `common/web/shared.js` which shows raw JSON.
-try {
-    window.__pm_shared = window.__pm_shared || {};
-    window.__pm_shared.viewAgentDetails = viewAgentDetails;
-    window.__pm_shared.renderAgentDetailsModal = renderAgentDetailsModal;
-    // Also expose delete/open helpers if present so shared callers use server implementations
-    window.__pm_shared.deleteAgent = window.__pm_shared.deleteAgent || deleteAgent;
-    window.__pm_shared.openAgentUI = window.__pm_shared.openAgentUI || openAgentUI;
-    window.__pm_shared.updateAgent = window.__pm_shared.updateAgent || updateAgent;
-    window.__pm_shared.cancelAgentUpdate = window.__pm_shared.cancelAgentUpdate || cancelAgentUpdate;
-    // Always override device helpers so cards and shared UI use the server proxy endpoint
-    window.__pm_shared.openDeviceUI = openDeviceUI;
-    window.__pm_shared.openDeviceMetrics = window.__pm_shared.openDeviceMetrics || openDeviceMetrics;
-    window.__pm_shared.openFleetSettingsForTenant = openFleetSettingsForTenant;
-    window.__pm_shared.openFleetSettingsForAgent = openFleetSettingsForAgent;
-} catch (e) { console.warn('Failed to expose server UI helpers to shared namespace', e); }
-
-// ====== Delete Agent ======
-async function deleteAgent(agentId, displayName) {
-    window.__pm_shared.log('deleteAgent called:', agentId, displayName);
-
-    const confirmed = await window.__pm_shared.showConfirm(
-        `Are you sure you want to delete agent "${displayName}"?\n\nThis will permanently remove the agent and all its associated devices and metrics. This action cannot be undone.`,
-        'Delete Agent',
-        true
-    );
-
-    window.__pm_shared.log('User confirmed:', confirmed);
-
-    if (!confirmed) {
-        return;
-    }
-
-    try {
-        window.__pm_shared.log('Sending DELETE request to:', `/api/v1/agents/${agentId}`);
-        const response = await fetch(`/api/v1/agents/${agentId}`, {
-            method: 'DELETE'
-        });
-
-        window.__pm_shared.log('Response status:', response.status, response.statusText);
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            window.__pm_shared.error('Delete failed:', errorText);
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-
-        const result = await response.json();
-        window.__pm_shared.log('Delete successful:', result);
-
-        window.__pm_shared.showToast(`Agent "${displayName}" deleted successfully`, 'success');
-
-        // Remove agent card with animation
-        const card = document.querySelector(`[data-agent-id="${agentId}"]`);
-        if (card) {
-            card.classList.add('removing');
-            setTimeout(() => {
-                // Reload agents list
-                loadAgents();
-            }, 400); // Match animation duration
-        } else {
-            // Card not found, just reload
-            loadAgents();
-        }
-    } catch (error) {
-        window.__pm_shared.error('Failed to delete agent:', error);
-        window.__pm_shared.showToast(`Failed to delete agent: ${error.message}`, 'error');
-    }
-}
-
-// ====== Restart Agent ======
-async function restartAgent(agentId, displayName) {
-    window.__pm_shared.log('restartAgent called:', agentId, displayName);
-
-    const confirmed = await window.__pm_shared.showConfirm(
-        `Are you sure you want to restart agent "${displayName || agentId}"?\n\nThe agent will temporarily disconnect and should reconnect within a few seconds.`,
-        'Restart Agent',
-        { confirmText: 'Restart', confirmClass: 'btn-warning' }
-    );
-
-    if (!confirmed) {
-        return;
-    }
-
-    try {
-        const response = await fetch(`/api/v1/agents/command/${agentId}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: 'restart' })
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-
-        const result = await response.json();
-        if (result.success) {
-            window.__pm_shared.showToast('Restart command sent. Agent will reconnect shortly.', 'success');
-        } else {
-            window.__pm_shared.showToast('Failed to send restart command: ' + (result.message || 'unknown'), 'warning');
-        }
-    } catch (error) {
-        window.__pm_shared.error('Failed to restart agent:', error);
-        window.__pm_shared.showToast(`Failed to restart agent: ${error.message}`, 'error');
-    }
-}
-
-// Expose restartAgent to shared namespace
-try {
-    window.__pm_shared.restartAgent = restartAgent;
-} catch (e) { console.warn('Failed to expose restartAgent to shared namespace', e); }
-
-// ====== Delete Device ======
-/**
- * Delete a device from the server (and optionally from the agent).
- * Shows a confirmation modal with options to delete metrics history
- * and to also delete from the agent's database.
- */
-async function deleteDevice(serial, agentId) {
-    window.__pm_shared.log('deleteDevice called:', serial, agentId);
-
-    // Create custom confirmation modal with checkboxes
-    const result = await showDeleteDeviceConfirm(serial, agentId);
-
-    if (!result.confirmed) {
-        window.__pm_shared.log('Delete device cancelled');
-        return;
-    }
-
-    try {
-        window.__pm_shared.log('Sending delete request:', {
-            serial,
-            agent_id: agentId,
-            delete_metrics: result.deleteMetrics,
-            delete_from_agent: result.deleteFromAgent
-        });
-
-        const response = await fetch('/api/v1/devices/delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                serial: serial,
-                agent_id: agentId,
-                delete_metrics: result.deleteMetrics,
-                delete_from_agent: result.deleteFromAgent
-            })
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            window.__pm_shared.error('Delete failed:', errorText);
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-
-        const responseData = await response.json();
-        window.__pm_shared.log('Delete successful:', responseData);
-
-        let message = `Device "${serial}" deleted successfully`;
-        if (responseData.deleted_from_agent) {
-            message += ' (also removed from agent)';
-        }
-        if (responseData.deleted_metrics) {
-            message += ' with metrics history';
-        }
-        window.__pm_shared.showToast(message, 'success');
-
-        // Remove device from UI with animation
-        const card = document.querySelector(`[data-serial="${serial}"]`);
-        const row = document.querySelector(`tr[data-serial="${serial}"]`);
-        const target = card || row;
-
-        if (target) {
-            target.classList.add('removing');
-            setTimeout(() => {
-                // Reload devices list
-                loadDevices();
-            }, 400);
-        } else {
-            // Element not found, just reload
-            loadDevices();
-        }
-
-        // Close any open device modal
-        const modal = document.getElementById('printer_details_modal');
-        if (modal && modal.style.display !== 'none') {
-            modal.style.display = 'none';
-        }
-
-    } catch (error) {
-        window.__pm_shared.error('Failed to delete device:', error);
-        window.__pm_shared.showToast(`Failed to delete device: ${error.message}`, 'error');
-    }
-}
-
-/**
- * Show custom delete device confirmation modal with checkboxes
- * @param {string} serial - Device serial number
- * @param {string} agentId - ID of the agent that owns the device
- * @returns {Promise<{confirmed: boolean, deleteMetrics: boolean, deleteFromAgent: boolean}>}
- */
-function showDeleteDeviceConfirm(serial, agentId) {
-    return new Promise((resolve) => {
-        // Helper to escape HTML
-        const safeEscape = (s) => (typeof escapeHtml === 'function' ? escapeHtml(s) : String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;"));
-
-        const wrapper = document.createElement('div');
-        wrapper.className = 'modal-overlay';
-        wrapper.style.display = 'flex';
-        const uid = 'delete_device_confirm_' + Date.now();
-        wrapper.id = uid;
-
-        const hasAgent = agentId && agentId !== '';
-        const deleteMetricsId = `${uid}_delete_metrics`;
-        const deleteFromAgentId = `${uid}_delete_from_agent`;
-
-        wrapper.innerHTML = `
-            <div class="modal-content" style="max-width:520px;">
-                <div class="modal-header">
-                    <h3 class="modal-title">Delete Device</h3>
-                    <button class="modal-close-x" title="Close">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <p style="margin-bottom:16px;">Are you sure you want to delete device <strong>${safeEscape(serial)}</strong>?</p>
-                    <p style="margin-bottom:16px;color:var(--text-muted);font-size:13px;">This will permanently remove the device from the server database.</p>
-                    
-                    <div style="background:var(--bg-tertiary);border-radius:8px;padding:12px;margin-bottom:12px;">
-                        <div style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;margin-bottom:10px;width:100%;">
-                            <input type="checkbox" id="${deleteMetricsId}" style="margin-top:3px;cursor:pointer;flex-shrink:0;">
-                            <label for="${deleteMetricsId}" style="cursor:pointer;">
-                                <span style="font-weight:500;">Also delete metrics history</span>
-                                <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
-                                    Remove all historical page counts, toner levels, and other metrics data for this device
-                                </div>
-                            </label>
-                        </div>
-                        
-                        ${hasAgent ? `
-                        <div style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;width:100%;">
-                            <input type="checkbox" id="${deleteFromAgentId}" style="margin-top:3px;cursor:pointer;flex-shrink:0;">
-                            <label for="${deleteFromAgentId}" style="cursor:pointer;">
-                                <span style="font-weight:500;">Also delete from agent</span>
-                                <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
-                                    Remove the device from the agent's local database as well. The device may be re-discovered on the next scan.
-                                </div>
-                            </label>
-                        </div>
-                        ` : `
-                        <div style="font-size:12px;color:var(--text-muted);font-style:italic;">
-                            This device has no associated agent, so it will only be deleted from the server.
-                        </div>
-                        `}
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="modal-button modal-button-secondary" data-action="cancel">Cancel</button>
-                    <button class="modal-button modal-button-danger" data-action="confirm">Delete Device</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(wrapper);
-
-        const btnConfirm = wrapper.querySelector('[data-action="confirm"]');
-        const btnCancel = wrapper.querySelector('[data-action="cancel"]');
-        const closeX = wrapper.querySelector('.modal-close-x');
-        const chkMetrics = wrapper.querySelector(`#${deleteMetricsId}`);
-        const chkAgent = wrapper.querySelector(`#${deleteFromAgentId}`);
-
-        function cleanup() {
-            try { btnConfirm && btnConfirm.removeEventListener('click', onConfirm); } catch (e) { }
-            try { btnCancel && btnCancel.removeEventListener('click', onCancel); } catch (e) { }
-            try { closeX && closeX.removeEventListener('click', onCancel); } catch (e) { }
-            try { wrapper.removeEventListener('click', onBackdrop); } catch (e) { }
-            // Hide immediately so Playwright sees it as gone, then remove on next frame
-            // to let WebKit's backdrop-filter compositor layer settle before the next
-            // action (synchronous removal causes brief layout instability in WebKit).
-            wrapper.style.visibility = 'hidden';
-            wrapper.style.pointerEvents = 'none';
-            requestAnimationFrame(() => {
-                try { wrapper.parentNode && wrapper.parentNode.removeChild(wrapper); } catch (e) { }
-            });
-        }
-
-        function onConfirm() {
-            const deleteMetrics = chkMetrics ? chkMetrics.checked : false;
-            const deleteFromAgent = chkAgent ? chkAgent.checked : false;
-            cleanup();
-            resolve({ confirmed: true, deleteMetrics, deleteFromAgent });
-        }
-
-        function onCancel() {
-            cleanup();
-            resolve({ confirmed: false, deleteMetrics: false, deleteFromAgent: false });
-        }
-
-        function onBackdrop(e) {
-            if (e.target === wrapper) onCancel();
-        }
-
-        btnConfirm && btnConfirm.addEventListener('click', onConfirm);
-        btnCancel && btnCancel.addEventListener('click', onCancel);
-        closeX && closeX.addEventListener('click', onCancel);
-        wrapper.addEventListener('click', onBackdrop);
-    });
-}
-
-// Expose deleteDevice to shared namespace
-try {
-    window.__pm_shared.deleteDevice = deleteDevice;
-} catch (e) { console.warn('Failed to expose deleteDevice to shared namespace', e); }
-
-// ====== Devices Management ======
-function initDevicesUI() {
-    if (devicesVM.uiInitialized) {
-        return;
-    }
-    devicesVM.uiInitialized = true;
-
-    // Initialize Table Customizer
-    initDevicesTableCustomizer();
-
-    // Sidebar toggle
-    const sidebarToggle = document.getElementById('devices_sidebar_toggle');
-    const sidebar = document.querySelector('.devices-sidebar');
-    if (sidebarToggle && sidebar) {
-        sidebarToggle.addEventListener('click', () => {
-            sidebar.classList.toggle('collapsed');
-        });
-
-        // Start collapsed on mobile for cleaner UX
-        if (window.innerWidth <= 900) {
-            sidebar.classList.add('collapsed');
-        }
-    }
-
-    const searchInput = document.getElementById('devices_search');
-    if (searchInput) {
-        searchInput.value = devicesVM.filters.query;
-        const handleSearch = debounce((event) => {
-            devicesVM.filters.query = (event.target.value || '').trim();
-            applyDeviceFilters();
-        }, 200);
-        searchInput.addEventListener('input', handleSearch);
-    }
-
-    const agentSelect = document.getElementById('devices_agent_filter');
-    if (agentSelect) {
-        agentSelect.value = devicesVM.filters.agentId;
-        agentSelect.addEventListener('change', (event) => {
-            devicesVM.filters.agentId = event.target.value || '';
-            applyDeviceFilters();
-        });
-    }
-
-    const tenantSelect = document.getElementById('devices_tenant_filter');
-    if (tenantSelect) {
-        tenantSelect.value = devicesVM.filters.tenantId;
-        tenantSelect.addEventListener('change', (event) => {
-            devicesVM.filters.tenantId = event.target.value || '';
-            applyDeviceFilters();
-        });
-    }
-
-    const manufacturerSelect = document.getElementById('devices_manufacturer_filter');
-    if (manufacturerSelect) {
-        manufacturerSelect.addEventListener('change', (event) => {
-            devicesVM.filters.manufacturer = event.target.value || '';
-            applyDeviceFilters();
-        });
-    }
-
-    const sortSelect = document.getElementById('devices_sort_select');
-    if (sortSelect) {
-        sortSelect.value = devicesVM.filters.sortKey;
-        sortSelect.addEventListener('change', (event) => {
-            setDeviceSort(event.target.value, devicesVM.filters.sortDir);
-        });
-    }
-
-    const sortDirBtn = document.getElementById('devices_sort_dir_btn');
-    if (sortDirBtn) {
-        sortDirBtn.addEventListener('click', () => {
-            const nextDir = devicesVM.filters.sortDir === 'asc' ? 'desc' : 'asc';
-            setDeviceSort(devicesVM.filters.sortKey, nextDir);
-        });
-    }
-
-    const viewToggle = document.getElementById('devices_view_toggle');
-    if (viewToggle) {
-        viewToggle.addEventListener('click', (event) => {
-            const btn = event.target.closest('[data-view]');
-            if (!btn) return;
-            setDevicesView(btn.getAttribute('data-view'));
-        });
-    }
-
-    const statusFilter = document.getElementById('devices_status_filter');
-    if (statusFilter) {
-        statusFilter.addEventListener('click', (event) => {
-            const btn = event.target.closest('[data-status]');
-            if (!btn) return;
-            toggleStatusFilter(btn.getAttribute('data-status'));
-        });
-    }
-
-    const consumableFilter = document.getElementById('devices_consumable_filter');
-    if (consumableFilter) {
-        consumableFilter.addEventListener('click', (event) => {
-            const btn = event.target.closest('[data-band]');
-            if (!btn) return;
-            toggleConsumableFilter(btn.getAttribute('data-band'));
-        });
-    }
-
-    const resetBtn = document.getElementById('devices_reset_filters');
-    if (resetBtn) {
-        resetBtn.addEventListener('click', resetDeviceFilters);
-    }
-
-    const chips = document.getElementById('devices_active_filters');
-    if (chips && !chips.dataset.bound) {
-        chips.dataset.bound = 'true';
-        chips.addEventListener('click', (event) => {
-            const btn = event.target.closest('button[data-filter]');
-            if (!btn) return;
-            handleFilterChipRemove(btn.getAttribute('data-filter'));
-        });
-    }
-
-    const table = document.getElementById('devices_table');
-    if (table) {
-        const head = table.querySelector('thead');
-        if (head && !head.dataset.bound) {
-            head.dataset.bound = 'true';
-            // Bind customizer header events (includes sorting and resizing)
-            if (devicesVM.tableCustomizer) {
-                devicesVM.tableCustomizer.bindHeaderEvents(head);
-            }
-        }
-        // Add click handler for clickable rows (file-explorer style selection)
-        const tbody = table.querySelector('tbody');
-        if (tbody && !tbody.dataset.rowClickBound) {
-            tbody.dataset.rowClickBound = 'true';
-            tbody.addEventListener('click', (event) => {
-                // Don't trigger row click if clicking on a button or actions column
-                if (event.target.closest('button') || event.target.closest('.table-actions') || event.target.closest('.actions-col')) {
-                    return;
-                }
-                const row = event.target.closest('tr.device-row-clickable');
-                if (!row) return;
-                const serial = row.getAttribute('data-serial');
-                const ip = row.getAttribute('data-ip');
-                const deviceId = serial || ip;
-                if (deviceId) {
-                    // File-explorer style: click selects, double-click opens details
-                    handleDeviceSelection(deviceId, event);
-                }
-            });
-            // Double-click opens device details
-            tbody.addEventListener('dblclick', (event) => {
-                if (event.target.closest('button') || event.target.closest('.table-actions') || event.target.closest('.actions-col')) {
-                    return;
-                }
-                const row = event.target.closest('tr.device-row-clickable');
-                if (!row) return;
-                const serial = row.getAttribute('data-serial');
-                const ip = row.getAttribute('data-ip');
-                const lookup = serial || ip;
-                if (lookup) {
-                    window.__pm_shared.showPrinterDetails(lookup, 'saved');
-                }
-            });
-        }
-    }
-
-    // Add click handler for clickable device cards (file-explorer style selection)
-    const cardsContainer = document.getElementById('devices_cards');
-    if (cardsContainer && !cardsContainer.dataset.cardClickBound) {
-        cardsContainer.dataset.cardClickBound = 'true';
-        cardsContainer.addEventListener('click', (event) => {
-            // Don't trigger card click if clicking on a button or actions area
-            if (event.target.closest('button') || event.target.closest('.device-card-actions')) {
-                return;
-            }
-            const card = event.target.closest('.device-card-clickable');
-            if (!card) return;
-            const serial = card.getAttribute('data-serial');
-            const ip = card.getAttribute('data-ip');
-            const deviceId = serial || ip;
-            if (deviceId) {
-                // File-explorer style: click selects, double-click opens details
-                handleDeviceSelection(deviceId, event);
-            }
-        });
-        // Double-click opens device details
-        cardsContainer.addEventListener('dblclick', (event) => {
-            if (event.target.closest('button') || event.target.closest('.device-card-actions')) {
-                return;
-            }
-            const card = event.target.closest('.device-card-clickable');
-            if (!card) return;
-            const serial = card.getAttribute('data-serial');
-            const ip = card.getAttribute('data-ip');
-            const lookup = serial || ip;
-            if (lookup) {
-                window.__pm_shared.showPrinterDetails(lookup, 'saved');
-            }
-        });
-    }
-
-    syncDevicesViewToggle();
-    syncDeviceSortControls();
-    syncDevicesAgentFilterOptions();
-    refreshDeviceFilters();
-    syncDeviceQuickFilters();
-    renderDevicesOverview();
-    syncTenantFilterOptions('devices');
-
-    // Initialize context menu for devices table and cards
-    if (window.PMContextMenu) {
-        const devicesTable = document.getElementById('devices_table');
-        if (devicesTable) {
-            window.PMContextMenu.initDeviceContextMenu(devicesTable);
-        }
-        const devicesCards = document.getElementById('devices_cards');
-        if (devicesCards) {
-            window.PMContextMenu.initDeviceContextMenu(devicesCards);
-        }
-    }
-}
-
-/**
- * Initialize the devices table customizer
- */
-function initDevicesTableCustomizer() {
-    if (devicesVM.tableCustomizer) return;
-
-    // Only initialize if TableCustomizer is available
-    if (typeof window.TableCustomizer === 'undefined') {
-        console.warn('TableCustomizer not available');
-        return;
-    }
-
-    // Create customizer instance
-    devicesVM.tableCustomizer = new window.TableCustomizer('devices', {
-        columnDefs: window.DEVICES_COLUMN_DEFINITIONS || [],
-        persistConfig: true,
-        enableResize: true,
-        enableReorder: true,
-        enableColumnMenu: true,
-        enableExport: true,
-        onSort: (sortState) => {
-            // Sync with devicesVM filters
-            if (sortState.key) {
-                devicesVM.filters.sortKey = sortState.key;
-                devicesVM.filters.sortDir = sortState.dir;
-                persistUIState(SERVER_UI_STATE_KEYS.DEVICES_SORT_KEY, sortState.key);
-                persistUIState(SERVER_UI_STATE_KEYS.DEVICES_SORT_DIR, sortState.dir);
-                syncDeviceSortControls();
-                applyDeviceFilters();
-            }
-        },
-        onColumnChange: () => {
-            // Re-render table when columns change
-            renderDevicesTableHeader();
-            if (devicesVM.view === 'table') {
-                renderDeviceTable(devicesVM.filtered);
-            }
-        },
-        onExport: () => {
-            // Export current filtered data
-            if (devicesVM.tableCustomizer) {
-                const timestamp = new Date().toISOString().split('T')[0];
-                devicesVM.tableCustomizer.exportToCSV(devicesVM.filtered, `printmaster-devices-${timestamp}.csv`);
-                window.__pm_shared?.showToast?.('Devices exported to CSV', 'success');
-            }
-        }
-    });
-
-    // Render toolbar
-    const toolbarContainer = document.getElementById('devices_table_customizer_toolbar');
-    if (toolbarContainer) {
-        toolbarContainer.innerHTML = devicesVM.tableCustomizer.renderToolbar();
-        devicesVM.tableCustomizer.bindToolbarEvents(toolbarContainer);
-    }
-
-    // Render initial header
-    renderDevicesTableHeader();
-
-    // Expose helper functions on shared for use by column renderers
-    window.__pm_shared.renderDeviceStatusBadge = renderDeviceStatusBadge;
-    window.__pm_shared.renderTonerBars = renderTonerBars;
-}
-
-async function loadDevices(force = false) {
-    initDevicesUI();
-    if (devicesVM.loading && !force) {
-        return;
-    }
-    devicesVM.loading = true;
-    renderDevicesLoading();
-    const metricsPromise = fetchFleetMetricsSnapshot().catch(err => {
-        window.__pm_shared.warn('Failed to fetch fleet metrics for devices tab', err);
-        return null;
-    });
-    const agentsPromise = ensureAgentDirectory();
-    const tenantPromise = ensureTenantDirectory();
-    try {
-        const response = await fetch('/api/v1/devices/list');
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        await agentsPromise;
-        await tenantPromise;
-        const devices = await response.json();
-        devicesVM.items = enrichDevices(Array.isArray(devices) ? devices : []);
-        devicesVM.stats.total = devicesVM.items.length;
-        devicesVM.error = null;
-        devicesVM.loaded = true;
-        refreshDeviceFilters();
-        applyDeviceFilters();
-    } catch (error) {
-        devicesVM.error = error;
-        renderDevicesError(error);
-    } finally {
-        devicesVM.loading = false;
-    }
-
-    metricsPromise.then(snapshot => {
-        if (snapshot) {
-            devicesVM.metrics.summary = snapshot.summary;
-            devicesVM.metrics.aggregated = snapshot.aggregated;
-            devicesVM.metrics.lastFetched = snapshot.fetchedAt || new Date();
-        }
-        renderDevicesOverview();
-    });
-}
-
-function renderDevicesLoading() {
-    const cards = document.getElementById('devices_cards');
-    if (cards) {
-        cards.classList.remove('hidden');
-        cards.innerHTML = '<div class="muted-text">Loading devices‚Ä¶</div>';
-    }
-    const wrapper = document.getElementById('devices_table_wrapper');
-    if (wrapper) {
-        const tbody = wrapper.querySelector('tbody');
-        if (tbody) {
-            const visibleColCount = devicesVM.tableCustomizer?.getVisibleColumns()?.length || 12;
-            tbody.innerHTML = `<tr><td colspan="${visibleColCount}" class="muted-text">Loading devices‚Ä¶</td></tr>`;
-        }
-    }
-}
-
-function renderDevicesError(error) {
-    const message = error && error.message ? error.message : 'Unknown error';
-    const cards = document.getElementById('devices_cards');
-    if (cards) {
-        cards.classList.remove('hidden');
-        cards.innerHTML = `<div class="error-text">Failed to load devices: ${escapeHtml(message)}</div>`;
-    }
-    const wrapper = document.getElementById('devices_table_wrapper');
-    if (wrapper) {
-        const tbody = wrapper.querySelector('tbody');
-        if (tbody) {
-            const visibleColCount = devicesVM.tableCustomizer?.getVisibleColumns()?.length || 12;
-            tbody.innerHTML = `<tr><td colspan="${visibleColCount}" class="error-text">Failed to load devices: ${escapeHtml(message)}</td></tr>`;
-        }
-    }
-}
-
-async function fetchFleetMetricsSnapshot() {
-    const now = Date.now();
-    if (metricsVM.summary && metricsVM.aggregated && metricsVM.lastFetched) {
-        const age = now - metricsVM.lastFetched.getTime();
-        if (age < DEVICES_METRICS_MAX_AGE_MS) {
-            return {
-                summary: metricsVM.summary,
-                aggregated: metricsVM.aggregated,
-                fetchedAt: metricsVM.lastFetched,
-            };
-        }
-    }
-    const range = metricsVM.range || METRICS_DEFAULT_RANGE;
-    const since = new Date(now - getMetricsRangeWindow(range));
-    const params = new URLSearchParams({ since: since.toISOString() });
-    const [summaryResp, aggregatedResp] = await Promise.all([
-        fetch('/api/metrics'),
-        fetch(`/api/metrics/aggregated?${params.toString()}`)
-    ]);
-    if (!summaryResp.ok) {
-        throw new Error('Summary request failed: HTTP ' + summaryResp.status);
-    }
-    if (!aggregatedResp.ok) {
-        throw new Error('Aggregated request failed: HTTP ' + aggregatedResp.status);
-    }
-    const summary = await summaryResp.json();
-    const aggregated = await aggregatedResp.json();
-    return { summary, aggregated, fetchedAt: new Date() };
-}
-
-function renderDevicesOverview() {
-    const container = document.getElementById('devices_overview_metrics');
-    if (!container) return;
-    if (!devicesVM.metrics.summary || !devicesVM.metrics.aggregated) {
-        container.innerHTML = '<div class="metric-card loading">Fleet metrics unavailable.</div>';
-        return;
-    }
-    const totals = devicesVM.metrics.aggregated?.fleet?.totals || {};
-    const statuses = devicesVM.metrics.aggregated?.fleet?.statuses || {};
-    const history = devicesVM.metrics.aggregated?.fleet?.history?.total_impressions || [];
-    const throughput = calculateThroughput(history);
-    const rangeLabel = metricsRangeLabel(metricsVM.range || METRICS_DEFAULT_RANGE);
-    container.innerHTML = `
-        <div class="metric-card">
-            <div class="card-title">Agents</div>
-            <div class="metric-kpi-value">${formatNumber(totals.agents || devicesVM.metrics.summary.agents_count || 0)}</div>
-            <div class="metric-kpi-label">Connected</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Devices</div>
-            <div class="metric-kpi-value">${formatNumber(totals.devices || devicesVM.metrics.summary.devices_count || 0)}</div>
-            <div class="metric-kpi-label">Managed fleet</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Throughput (${rangeLabel})</div>
-            <div class="metric-kpi-value">${formatNumber(Math.round(throughput))}</div>
-            <div class="metric-kpi-label">Estimated pages/hour</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Alerts</div>
-            ${renderMetricsStatusChips(statuses)}
-            <div class="metric-footnote">${devicesVM.metrics.lastFetched ? 'Updated ' + formatRelativeTime(devicesVM.metrics.lastFetched) : ''}</div>
-        </div>
-    `;
-}
-
-function refreshDeviceFilters() {
-    const manufacturerSelect = document.getElementById('devices_manufacturer_filter');
-    if (!manufacturerSelect) return;
-    const manufacturers = Array.from(new Set((devicesVM.items || []).map(d => (d.manufacturer || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-    let options = '<option value="">All Manufacturers</option>';
-    manufacturers.forEach(name => {
-        options += `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`;
-    });
-    manufacturerSelect.innerHTML = options;
-    if (devicesVM.filters.manufacturer && manufacturers.includes(devicesVM.filters.manufacturer)) {
-        manufacturerSelect.value = devicesVM.filters.manufacturer;
-    } else {
-        manufacturerSelect.value = '';
-        if (devicesVM.filters.manufacturer) {
-            devicesVM.filters.manufacturer = '';
-        }
-    }
-}
-
-function syncDevicesAgentFilterOptions() {
-    if (!devicesVM.uiInitialized) return;
-    const select = document.getElementById('devices_agent_filter');
-    if (!select) return;
-    const agents = agentDirectory.items.slice().sort((a, b) => {
-        const aName = (a.name || a.hostname || a.agent_id || '').toLowerCase();
-        const bName = (b.name || b.hostname || b.agent_id || '').toLowerCase();
-        if (aName < bName) return -1;
-        if (aName > bName) return 1;
-        return 0;
-    });
-    let options = '<option value="">All Agents</option>';
-    agents.forEach(agent => {
-        const label = getAgentDisplayName(agent);
-        options += `<option value="${escapeHtml(agent.agent_id)}">${escapeHtml(label)}</option>`;
-    });
-    select.innerHTML = options;
-    select.value = devicesVM.filters.agentId || '';
-}
-
-function applyDeviceFilters() {
-    if (!Array.isArray(devicesVM.items)) {
-        return;
-    }
-    const filters = devicesVM.filters;
-    const totalStatuses = createStatusCountMap();
-    const filteredStatuses = createStatusCountMap();
-    const filtered = [];
-    devicesVM.items.forEach(device => {
-        const statusKey = device.__meta?.status?.code || 'healthy';
-        if (totalStatuses[statusKey] !== undefined) {
-            totalStatuses[statusKey] += 1;
-        }
-        if (matchesDeviceFilters(device, filters)) {
-            filtered.push(device);
-            if (filteredStatuses[statusKey] !== undefined) {
-                filteredStatuses[statusKey] += 1;
-            }
-        }
-    });
-    devicesVM.filtered = sortDevices(filtered);
-    devicesVM.stats.filtered = devicesVM.filtered.length;
-    devicesVM.stats.total = devicesVM.items.length;
-    devicesVM.stats.totalStatuses = totalStatuses;
-    devicesVM.stats.filteredStatuses = filteredStatuses;
-    renderDevicesStats();
-    renderDevicesActiveFilters();
-    syncDeviceQuickFilters();
-    if (devicesVM.view === 'table') {
-        renderDeviceTable(devicesVM.filtered);
-    } else {
-        renderDeviceCards(devicesVM.filtered);
-    }
-    syncDeviceTableSortIndicators();
-}
-
-function matchesDeviceFilters(device, filters) {
-    if (!device || !device.__meta) return true;
-    const meta = device.__meta;
-    const query = (filters.query || '').toLowerCase();
-    if (query && (!meta.search || meta.search.indexOf(query) === -1)) {
-        return false;
-    }
-    if (filters.agentId && device.agent_id !== filters.agentId) {
-        return false;
-    }
-    const tenantId = meta.tenantId || device.tenant_id || '';
-    if (filters.tenantId && tenantId !== filters.tenantId) {
-        return false;
-    }
-    if (filters.manufacturer && (device.manufacturer || '').trim() !== filters.manufacturer) {
-        return false;
-    }
-    if (filters.statuses && filters.statuses.size > 0 && !filters.statuses.has(meta.status?.code || 'healthy')) {
-        return false;
-    }
-    if (filters.consumables && filters.consumables.size > 0 && !filters.consumables.has(meta.consumable?.code || 'unknown')) {
-        return false;
-    }
-    return true;
-}
-
-function sortDevices(list) {
-    const key = devicesVM.filters.sortKey || 'last_seen';
-    const dir = devicesVM.filters.sortDir === 'asc' ? 1 : -1;
-    const sorted = list.slice();
-    sorted.sort((a, b) => {
-        const aVal = getDeviceSortValue(a, key);
-        const bVal = getDeviceSortValue(b, key);
-        if (aVal < bVal) return -1 * dir;
-        if (aVal > bVal) return 1 * dir;
-        const aSerial = (a.serial || '').toLowerCase();
-        const bSerial = (b.serial || '').toLowerCase();
-        if (aSerial < bSerial) return -1;
-        if (aSerial > bSerial) return 1;
-        return 0;
-    });
-    return sorted;
-}
-
-function getDeviceSortValue(device, key) {
-    const meta = device.__meta || {};
-    switch (key) {
-        case 'manufacturer':
-            return ((device.manufacturer || '') + ' ' + (device.model || '')).toLowerCase();
-        case 'agent':
-            return (meta.agentName || '').toLowerCase();
-        case 'tenant':
-            return formatTenantDisplay(meta.tenantId || device.tenant_id || '').toLowerCase();
-        case 'status':
-            return DEVICE_STATUS_ORDER[meta.status?.code || 'healthy'] || 0;
-        case 'location':
-            return (meta.location || '').toLowerCase();
-        case 'ip':
-            return buildSortableIpValue(device.ip);
-        case 'last_seen':
-        default:
-            return meta.lastSeenMs || 0;
-    }
-}
-
-function buildSortableIpValue(rawValue) {
-    if (!rawValue) return 'zzz';
-    let value = String(rawValue).trim();
-    if (!value) return 'zzz';
-
-    if (value.startsWith('[') && value.includes(']')) {
-        value = value.slice(1, value.indexOf(']'));
-    }
-
-    const ipv4PortMatch = value.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/);
-    const ipv4Candidate = ipv4PortMatch ? ipv4PortMatch[1] : value;
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ipv4Candidate)) {
-        const octets = ipv4Candidate.split('.').map(part => {
-            const num = parseInt(part, 10);
-            if (!Number.isFinite(num) || num < 0 || num > 255) {
-                return null;
-            }
-            return String(num).padStart(3, '0');
-        });
-        if (!octets.includes(null)) {
-            return 'v4-' + octets.join('.');
-        }
-    }
-
-    return 'v6-' + value.toLowerCase();
-}
-
-function renderDeviceCards(devices, append = false) {
-    const cards = document.getElementById('devices_cards');
-    const tableWrapper = document.getElementById('devices_table_wrapper');
-    if (!cards) return;
-    if (tableWrapper) {
-        tableWrapper.classList.add('hidden');
-    }
-    cards.classList.remove('hidden');
-
-    if (!devices || devices.length === 0) {
-        cards.innerHTML = '<div class="muted-text">No devices match the current filters.</div>';
-        cleanupDevicesInfiniteScroll();
-        return;
-    }
-
-    // Progressive rendering - only render a page at a time
-    if (!append) {
-        devicesVM.render.displayed = 0;
-        cards.innerHTML = '';
-    }
-
-    const startIdx = devicesVM.render.displayed;
-    const endIdx = Math.min(startIdx + devicesVM.render.pageSize, devices.length);
-    const pageDevices = devices.slice(startIdx, endIdx);
-
-    // Remove existing sentinel
-    const existingSentinel = document.getElementById('devices_load_more_sentinel');
-    if (existingSentinel) existingSentinel.remove();
-
-    // Render this page
-    const html = pageDevices.map(device => renderServerDeviceCard(device)).join('');
-    cards.insertAdjacentHTML('beforeend', html);
-    devicesVM.render.displayed = endIdx;
-
-    // Add sentinel if more items available
-    if (endIdx < devices.length) {
-        const sentinel = document.createElement('div');
-        sentinel.id = 'devices_load_more_sentinel';
-        sentinel.className = 'devices-load-sentinel';
-        sentinel.innerHTML = '<div class="loading-spinner"></div><span class="muted-text">Loading more devices...</span>';
-        cards.appendChild(sentinel);
-        setupDevicesInfiniteScroll();
-    } else {
-        cleanupDevicesInfiniteScroll();
-    }
-}
-
-/**
- * Render the devices table header using the customizer
- */
-function renderDevicesTableHeader() {
-    const headerRow = document.getElementById('devices_table_header');
-    if (!headerRow) return;
-
-    if (devicesVM.tableCustomizer) {
-        headerRow.innerHTML = devicesVM.tableCustomizer.renderHeader();
-        // Re-bind header events for sorting/resizing
-        const thead = headerRow.closest('thead');
-        if (thead) {
-            devicesVM.tableCustomizer.bindHeaderEvents(thead);
-        }
-    } else {
-        // Fallback to static header
-        // Actions column removed - using context menu instead (right-click)
-        headerRow.innerHTML = `
-            <th data-sort-key="manufacturer">Device</th>
-            <th data-sort-key="status">Status</th>
-            <th data-sort-key="consumables">Consumables</th>
-            <th data-sort-key="agent">Agent</th>
-            <th data-sort-key="tenant">Tenant</th>
-            <th data-sort-key="ip">Network</th>
-            <th data-sort-key="location">Location</th>
-            <th data-sort-key="last_seen">Last Seen</th>
-        `;
-    }
-}
-
-function renderDeviceTable(devices, append = false) {
-    const cards = document.getElementById('devices_cards');
-    const wrapper = document.getElementById('devices_table_wrapper');
-    if (!wrapper) return;
-    if (cards) {
-        cards.classList.add('hidden');
-    }
-    wrapper.classList.remove('hidden');
-
-    // Initialize horizontal scroll indicators for the table
-    const tableWrapper = wrapper.querySelector('.table-wrapper');
-    if (tableWrapper) {
-        initTableScrollIndicators(tableWrapper);
-    }
-
-    const tbody = wrapper.querySelector('tbody');
-    if (!tbody) return;
-
-    // Get visible columns count for colspan
-    const visibleColCount = devicesVM.tableCustomizer?.getVisibleColumns()?.length || 9;
-
-    if (!devices || devices.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="${visibleColCount}" class="muted-text">No devices match the current filters.</td></tr>`;
-        cleanupDevicesInfiniteScroll();
-        return;
-    }
-
-    // Progressive rendering - only render a page at a time
-    if (!append) {
-        devicesVM.render.displayed = 0;
-        tbody.innerHTML = '';
-    }
-
-    const startIdx = devicesVM.render.displayed;
-    const endIdx = Math.min(startIdx + devicesVM.render.pageSize, devices.length);
-    const pageDevices = devices.slice(startIdx, endIdx);
-
-    // Remove existing sentinel
-    const existingSentinel = document.getElementById('devices_load_more_sentinel');
-    if (existingSentinel) existingSentinel.remove();
-
-    // Use customizer to render rows if available
-    const rows = pageDevices.map(device => {
-        const meta = device.__meta || {};
-        const serial = escapeHtml(device.serial || '');
-        const ip = escapeHtml(device.ip || '');
-
-        let rowContent;
-        if (devicesVM.tableCustomizer) {
-            rowContent = devicesVM.tableCustomizer.renderRow(device, meta);
-        } else {
-            // Fallback to legacy rendering
-            const tenantLabel = formatTenantDisplay(meta.tenantId || device.tenant_id || '');
-            rowContent = `
-                <td>
-                    <div class="table-primary">${escapeHtml((device.manufacturer || 'Unknown') + ' ' + (device.model || ''))}</div>
-                    <div class="muted-text">Serial ${escapeHtml(device.serial || '‚Äî')}</div>
-                </td>
-                <td>
-                    ${renderDeviceStatusBadge(meta.status)}
-                </td>
-                <td>
-                    ${renderTonerBars(meta.tonerData)}
-                </td>
-                <td>${escapeHtml(meta.agentName || 'Unassigned')}</td>
-                <td>${escapeHtml(tenantLabel)}</td>
-                <td>
-                    <div class="table-primary">${escapeHtml(device.ip || 'N/A')}</div>
-                    ${device.hostname ? `<div class="muted-text">${escapeHtml(device.hostname)}</div>` : ''}
-                </td>
-                <td>${escapeHtml(meta.location || '‚Äî')}</td>
-                <td title="${escapeHtml(meta.lastSeenTooltip || 'Never')}">${escapeHtml(meta.lastSeenRelative || 'Never')}</td>
-            `;
-        }
-
-        return `<tr data-serial="${serial}" data-ip="${ip}" data-agent-id="${escapeHtml(device.agent_id || '')}" class="device-row-clickable" title="Click to view details, right-click for actions">${rowContent}</tr>`;
-    }).join('');
-
-    tbody.insertAdjacentHTML('beforeend', rows);
-    devicesVM.render.displayed = endIdx;
-
-    // Add sentinel row if more items available
-    if (endIdx < devices.length) {
-        const sentinelRow = document.createElement('tr');
-        sentinelRow.id = 'devices_load_more_sentinel';
-        sentinelRow.className = 'devices-load-sentinel';
-        sentinelRow.innerHTML = `<td colspan="${visibleColCount}" style="text-align:center;padding:16px;"><div class="loading-spinner" style="display:inline-block;margin-right:8px;"></div><span class="muted-text">Loading more devices...</span></td>`;
-        tbody.appendChild(sentinelRow);
-        setupDevicesInfiniteScroll();
-    } else {
-        cleanupDevicesInfiniteScroll();
-    }
-}
-
-// Setup IntersectionObserver for devices infinite scroll
-function setupDevicesInfiniteScroll() {
-    cleanupDevicesInfiniteScroll();
-
-    const sentinel = document.getElementById('devices_load_more_sentinel');
-    if (!sentinel) return;
-
-    devicesVM.render.observer = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting && devicesVM.render.displayed < devicesVM.filtered.length) {
-                loadMoreDevices();
-            }
-        });
-    }, {
-        root: null,
-        rootMargin: '200px',
-        threshold: 0
-    });
-
-    devicesVM.render.observer.observe(sentinel);
-}
-
-// Cleanup the devices infinite scroll observer
-function cleanupDevicesInfiniteScroll() {
-    if (devicesVM.render.observer) {
-        devicesVM.render.observer.disconnect();
-        devicesVM.render.observer = null;
-    }
-}
-
-// Load more devices for infinite scroll
-function loadMoreDevices() {
-    if (devicesVM.view === 'table') {
-        renderDeviceTable(devicesVM.filtered, true);
-    } else {
-        renderDeviceCards(devicesVM.filtered, true);
-    }
-}
-
-function renderServerDeviceCard(device) {
-    const meta = device.__meta || {};
-    const serial = escapeHtml(device.serial || '‚Äî');
-    const agentId = escapeHtml(device.agent_id || '');
-    const networkLabel = escapeHtml(device.ip || 'N/A');
-    const hostname = device.hostname ? ` ‚Ä¢ ${escapeHtml(device.hostname)}` : '';
-    const asset = device.asset_number ? `<span class="device-card-chip">Asset ${escapeHtml(device.asset_number)}</span>` : '';
-    const location = escapeHtml(meta.location || '‚Äî');
-    const tenantLabel = escapeHtml(formatTenantDisplay(meta.tenantId || device.tenant_id || ''));
-    const lastSeenText = escapeHtml(meta.lastSeenRelative || 'Never');
-    const lastSeenTitle = escapeHtml(meta.lastSeenTooltip || 'Never');
-    const agentName = escapeHtml(meta.agentName || 'Unassigned');
-    const capabilityBadges = renderDeviceCapabilityBadges(device);
-    return `
-        <div class="device-card device-card-clickable" data-serial="${serial}" data-ip="${escapeHtml(device.ip || '')}" data-agent-id="${agentId}" data-mac="${escapeHtml(device.mac || '')}" data-source="saved" title="Click to view details, right-click for actions">
-            <div class="device-card-header">
-                <div>
-                    <div class="device-card-title">${escapeHtml(device.manufacturer || 'Unknown')} ${escapeHtml(device.model || '')}</div>
-                    <div class="device-card-subtitle">Serial ${serial} ${asset}</div>
-                    <div class="device-card-subtitle">${agentName}</div>
-                    ${capabilityBadges ? `<div class="device-card-capabilities">${capabilityBadges}</div>` : ''}
-                </div>
-                <div class="device-card-status">
-                    ${renderDeviceStatusBadge(meta.status)}
-                    ${renderTonerBars(meta.tonerData)}
-                </div>
-            </div>
-            <div class="device-card-info">
-                <div class="device-card-row">
-                    <span class="device-card-label">Network</span>
-                    <span class="device-card-value copyable" data-copy="${escapeHtml(device.ip || '')}">${networkLabel}${hostname}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Tenant</span>
-                    <span class="device-card-value">${tenantLabel}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Location</span>
-                    <span class="device-card-value">${location}</span>
-                </div>
-                <div class="device-card-row">
-                    <span class="device-card-label">Last Seen</span>
-                    <span class="device-card-value" title="${lastSeenTitle}">${lastSeenText}</span>
-                </div>
-            </div>
-            <div class="device-card-hint muted-text" style="font-size:11px;padding:8px 12px;text-align:center;border-top:1px solid var(--border);">
-                Right-click for actions
-            </div>
-        </div>
-    `;
-}
-
-function renderDeviceStatusBadge(statusMeta) {
-    const code = statusMeta?.code || 'healthy';
-    const label = statusMeta?.label || code;
-    return `<span class="status-pill ${code}">${escapeHtml(label)}</span>`;
-}
-
-function renderDeviceCapabilityBadges(device) {
-    const badges = [];
-    const rd = device.raw_data || {};
-
-    // Device type badge (most descriptive)
-    if (rd.device_type) {
-        badges.push(`<span class="capability-badge type">${escapeHtml(rd.device_type)}</span>`);
-    } else {
-        // Fallback to individual capabilities
-        if (rd.is_color) {
-            badges.push('<span class="capability-badge color">Color</span>');
-        } else if (rd.is_mono) {
-            badges.push('<span class="capability-badge mono">Mono</span>');
-        }
-    }
-
-    // Function capabilities (only show if device_type not set, to avoid redundancy)
-    if (!rd.device_type) {
-        if (rd.is_copier) badges.push('<span class="capability-badge function">Copier</span>');
-        if (rd.is_scanner) badges.push('<span class="capability-badge function">Scanner</span>');
-        if (rd.is_fax) badges.push('<span class="capability-badge function">Fax</span>');
-    }
-
-    // Technology badge
-    if (rd.is_laser) {
-        badges.push('<span class="capability-badge tech">Laser</span>');
-    } else if (rd.is_inkjet) {
-        badges.push('<span class="capability-badge tech">Inkjet</span>');
-    }
-
-    // Duplex badge
-    if (rd.has_duplex) {
-        badges.push('<span class="capability-badge feature">Duplex</span>');
-    }
-
-    return badges.join('');
-}
-
-function renderDeviceConsumableBadge(consumableMeta) {
-    if (!consumableMeta) return '';
-    let text = DEVICE_CONSUMABLE_LABELS[consumableMeta.code || 'unknown'] || 'Unknown';
-    if (typeof consumableMeta.level === 'number') {
-        text += ` ${consumableMeta.level}%`;
-    }
-    return `<span class="consumable-pill" data-band="${consumableMeta.code || 'unknown'}">${escapeHtml(text)}</span>`;
-}
-
-// Map toner names to CSS colors
-// Toner color mapping, ink/toner filtering, and toner-bar rendering now live
-// in common/web/cards.js (window.__pm_shared_cards.getDeviceTonerBarData /
-// renderTonerBars) so agent and server share identical coloring and
-// mono/color filtering behavior.
-function getDeviceTonerData(device) {
-    return window.__pm_shared_cards.getDeviceTonerBarData(device);
-}
-
-function renderTonerBars(tonerData) {
-    return window.__pm_shared_cards.renderTonerBars(tonerData);
-}
-
-function renderDevicesStats() {
-    const container = document.getElementById('devices_stats');
-    if (!container) return;
-    const total = devicesVM.stats.total || 0;
-    const filtered = devicesVM.stats.filtered || 0;
-    const statuses = devicesVM.stats.filteredStatuses || {};
-    container.innerHTML = `
-        <div><strong>Total:</strong> ${formatNumber(total)}</div>
-        <div><strong>Showing:</strong> ${formatNumber(filtered)}</div>
-        <div>
-            <span class="status-pill healthy">Healthy ${formatNumber(statuses.healthy || 0)}</span>
-            <span class="status-pill warning">Warning ${formatNumber(statuses.warning || 0)}</span>
-            <span class="status-pill error">Error ${formatNumber(statuses.error || 0)}</span>
-            <span class="status-pill jam">Jam ${formatNumber(statuses.jam || 0)}</span>
-        </div>
-    `;
-}
-
-function renderDevicesActiveFilters() {
-    const container = document.getElementById('devices_active_filters');
-    if (!container) return;
-    const chips = [];
-    const filters = devicesVM.filters;
-    if (filters.query) {
-        chips.push(buildFilterChip('Search', filters.query, 'search'));
-    }
-    if (filters.agentId) {
-        const agent = getAgentInfo(filters.agentId);
-        const label = agent ? getAgentDisplayName(agent) : filters.agentId;
-        chips.push(buildFilterChip('Agent', label, 'agent'));
-    }
-    if (filters.tenantId) {
-        chips.push(buildFilterChip('Tenant', formatTenantDisplay(filters.tenantId), 'tenant'));
-    }
-    if (filters.manufacturer) {
-        chips.push(buildFilterChip('Manufacturer', filters.manufacturer, 'manufacturer'));
-    }
-    if (filters.statuses.size > 0 && filters.statuses.size < DEVICE_STATUS_KEYS.length) {
-        chips.push(buildFilterChip('Status', Array.from(filters.statuses).join(', '), 'statuses'));
-    }
-    if (filters.consumables.size > 0 && filters.consumables.size < DEVICE_CONSUMABLE_KEYS.length) {
-        chips.push(buildFilterChip('Consumables', Array.from(filters.consumables).join(', '), 'consumables'));
-    }
-    if (chips.length === 0) {
-        container.innerHTML = '';
-        container.classList.add('hidden');
-        return;
-    }
-    container.classList.remove('hidden');
-    container.innerHTML = chips.join('');
-}
-
-function buildFilterChip(label, value, key) {
-    return `<span class="filter-chip">${escapeHtml(label)}: ${escapeHtml(value)} <button type="button" data-filter="${key}" aria-label="Remove ${escapeHtml(label)} filter">√ó</button></span>`;
-}
-
-function handleFilterChipRemove(filterKey) {
-    switch (filterKey) {
-        case 'search': {
-            devicesVM.filters.query = '';
-            const searchInput = document.getElementById('devices_search');
-            if (searchInput) searchInput.value = '';
-            break;
-        }
-        case 'agent': {
-            devicesVM.filters.agentId = '';
-            const agentSelect = document.getElementById('devices_agent_filter');
-            if (agentSelect) agentSelect.value = '';
-            break;
-        }
-        case 'tenant': {
-            devicesVM.filters.tenantId = '';
-            const tenantSelect = document.getElementById('devices_tenant_filter');
-            if (tenantSelect) tenantSelect.value = '';
-            break;
-        }
-        case 'manufacturer': {
-            devicesVM.filters.manufacturer = '';
-            const manufacturerSelect = document.getElementById('devices_manufacturer_filter');
-            if (manufacturerSelect) manufacturerSelect.value = '';
-            break;
-        }
-        case 'statuses':
-            devicesVM.filters.statuses = new Set(DEVICE_STATUS_KEYS);
-            break;
-        case 'consumables':
-            devicesVM.filters.consumables = new Set(DEVICE_CONSUMABLE_KEYS);
-            break;
-        default:
-            return;
-    }
-    applyDeviceFilters();
-}
-
-function syncDeviceQuickFilters() {
-    const statusSet = devicesVM.filters.statuses;
-    document.querySelectorAll('#devices_status_filter [data-status]').forEach(btn => {
-        const key = btn.getAttribute('data-status');
-        const active = !statusSet || statusSet.has(key);
-        btn.classList.toggle('active', active);
-        const baseLabel = btn.getAttribute('data-label') || btn.textContent.trim();
-        const count = devicesVM.stats.totalStatuses?.[key] || 0;
-        btn.innerHTML = `${escapeHtml(baseLabel)} <span class="pill-count">${formatNumber(count)}</span>`;
-    });
-
-    const consumableSet = devicesVM.filters.consumables;
-    document.querySelectorAll('#devices_consumable_filter [data-band]').forEach(btn => {
-        const key = btn.getAttribute('data-band');
-        const active = !consumableSet || consumableSet.has(key);
-        btn.classList.toggle('active', active);
-        const baseLabel = btn.getAttribute('data-label') || btn.textContent.trim();
-        btn.innerHTML = `${escapeHtml(baseLabel)}`;
-    });
-}
-
-function toggleStatusFilter(statusKey) {
-    if (!DEVICE_STATUS_KEYS.includes(statusKey)) return;
-    const set = new Set(devicesVM.filters.statuses || DEVICE_STATUS_KEYS);
-    if (set.has(statusKey)) {
-        set.delete(statusKey);
-    } else {
-        set.add(statusKey);
-    }
-    if (set.size === 0) {
-        DEVICE_STATUS_KEYS.forEach(key => set.add(key));
-    }
-    devicesVM.filters.statuses = set;
-    applyDeviceFilters();
-}
-
-function toggleConsumableFilter(bandKey) {
-    if (!DEVICE_CONSUMABLE_KEYS.includes(bandKey)) return;
-    const set = new Set(devicesVM.filters.consumables || DEVICE_CONSUMABLE_KEYS);
-    if (set.has(bandKey)) {
-        set.delete(bandKey);
-    } else {
-        set.add(bandKey);
-    }
-    if (set.size === 0) {
-        DEVICE_CONSUMABLE_KEYS.forEach(key => set.add(key));
-    }
-    devicesVM.filters.consumables = set;
-    applyDeviceFilters();
-}
-
-function resetDeviceFilters() {
-    devicesVM.filters.query = '';
-    devicesVM.filters.agentId = '';
-    devicesVM.filters.tenantId = '';
-    devicesVM.filters.manufacturer = '';
-    devicesVM.filters.statuses = new Set(DEVICE_STATUS_KEYS);
-    devicesVM.filters.consumables = new Set(DEVICE_CONSUMABLE_KEYS);
-    const searchInput = document.getElementById('devices_search');
-    if (searchInput) searchInput.value = '';
-    const agentSelect = document.getElementById('devices_agent_filter');
-    if (agentSelect) agentSelect.value = '';
-    const tenantSelect = document.getElementById('devices_tenant_filter');
-    if (tenantSelect) tenantSelect.value = '';
-    const manufacturerSelect = document.getElementById('devices_manufacturer_filter');
-    if (manufacturerSelect) manufacturerSelect.value = '';
-    applyDeviceFilters();
-}
-
-function setDevicesView(view) {
-    const nextView = DEVICES_VIEW_OPTIONS.includes(view) ? view : 'cards';
-    if (devicesVM.view === nextView) {
-        return;
-    }
-    devicesVM.view = nextView;
-    persistUIState(SERVER_UI_STATE_KEYS.DEVICES_VIEW, nextView);
-    syncDevicesViewToggle();
-    applyDeviceFilters();
-}
-
-function syncDevicesViewToggle() {
-    const toggle = document.getElementById('devices_view_toggle');
-    if (!toggle) return;
-    toggle.querySelectorAll('[data-view]').forEach(btn => {
-        const view = btn.getAttribute('data-view');
-        const active = view === devicesVM.view;
-        btn.classList.toggle('active', active);
-        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
-    });
-}
-
-function setDeviceSort(key, dir) {
-    const nextKey = DEVICES_SORT_KEYS.includes(key) ? key : 'last_seen';
-    const nextDir = dir === 'asc' ? 'asc' : 'desc';
-    if (devicesVM.filters.sortKey === nextKey && devicesVM.filters.sortDir === nextDir) {
-        return;
-    }
-    devicesVM.filters.sortKey = nextKey;
-    devicesVM.filters.sortDir = nextDir;
-    persistUIState(SERVER_UI_STATE_KEYS.DEVICES_SORT_KEY, nextKey);
-    persistUIState(SERVER_UI_STATE_KEYS.DEVICES_SORT_DIR, nextDir);
-    syncDeviceSortControls();
-    applyDeviceFilters();
-}
-
-function syncDeviceSortControls() {
-    const sortSelect = document.getElementById('devices_sort_select');
-    if (sortSelect && sortSelect.value !== devicesVM.filters.sortKey) {
-        sortSelect.value = devicesVM.filters.sortKey;
-    }
-    const sortDirBtn = document.getElementById('devices_sort_dir_btn');
-    const sortDirIcon = document.getElementById('devices_sort_dir_icon');
-    if (sortDirBtn) {
-        sortDirBtn.dataset.dir = devicesVM.filters.sortDir;
-        sortDirBtn.setAttribute('aria-label', devicesVM.filters.sortDir === 'asc' ? 'Sort ascending' : 'Sort descending');
-    }
-    if (sortDirIcon) {
-        sortDirIcon.textContent = devicesVM.filters.sortDir === 'asc' ? '‚Üë' : '‚Üì';
-    }
-}
-
-function syncDeviceTableSortIndicators() {
-    const head = document.querySelector('#devices_table thead');
-    if (!head) return;
-
-    // Update customizer sort state if available
-    if (devicesVM.tableCustomizer) {
-        devicesVM.tableCustomizer.sortState.key = devicesVM.filters.sortKey;
-        devicesVM.tableCustomizer.sortState.dir = devicesVM.filters.sortDir;
-    }
-
-    head.querySelectorAll('th[data-sort-key]').forEach(th => {
-        const key = th.getAttribute('data-sort-key');
-        if (key === devicesVM.filters.sortKey) {
-            th.classList.add('sorted');
-            th.setAttribute('aria-sort', devicesVM.filters.sortDir === 'asc' ? 'ascending' : 'descending');
-        } else {
-            th.classList.remove('sorted');
-            th.removeAttribute('aria-sort');
-        }
-    });
-}
-
-function handleDeviceTableSortClick(event) {
-    const target = event.target.closest('th[data-sort-key]');
-    if (!target) {
-        return;
-    }
-    const key = target.getAttribute('data-sort-key');
-    if (!key) {
-        return;
-    }
-    const nextDir = (devicesVM.filters.sortKey === key && devicesVM.filters.sortDir === 'asc') ? 'desc' : 'asc';
-    setDeviceSort(key, nextDir);
-}
-
-function upsertDeviceRecord(record) {
-    if (!record) {
-        return;
-    }
-    if (!Array.isArray(devicesVM.items)) {
-        devicesVM.items = [];
-    }
-    const identifier = (item) => item.serial || item.device_id || item.id || item.uuid;
-    const recordId = identifier(record);
-    let updated = false;
-    devicesVM.items = devicesVM.items.map(device => {
-        const id = identifier(device);
-        if (recordId && id && id === recordId) {
-            updated = true;
-            return enrichSingleDevice({ ...device, ...record });
-        }
-        if (!recordId && device.ip && record.ip && device.ip === record.ip) {
-            updated = true;
-            return enrichSingleDevice({ ...device, ...record });
-        }
-        return device;
-    });
-    if (!updated) {
-        devicesVM.items.push(enrichSingleDevice(record));
-    }
-    devicesVM.stats.total = devicesVM.items.length;
-    devicesVM.loaded = true;
-    refreshDeviceFilters();
-}
-
-function enrichDevices(list) {
-    if (!Array.isArray(list)) return [];
-    return list.map(item => enrichSingleDevice(item));
-}
-
-function enrichSingleDevice(device) {
-    if (!device || typeof device !== 'object') {
-        return device;
-    }
-    const agent = getAgentInfo(device.agent_id);
-    const agentName = agent ? getAgentDisplayName(agent) : '';
-    const tenantId = device.tenant_id || (agent && agent.tenant_id) || '';
-    const tenantLabel = tenantId ? tenantDisplayNameById(tenantId) : '';
-    const lastSeenIso = device.last_seen || device.lastSeen || device.last_seen_at || device.updated_at || device.last_metrics_at;
-    const lastSeenDate = lastSeenIso ? new Date(lastSeenIso) : null;
-    const location = device.location || device.site || device.department || device.building || '';
-    const tonerLevels = getDeviceConsumableLevels(device);
-    const tonerData = getDeviceTonerData(device);
-    const status = classifyDeviceStatus(device);
-    const consumable = classifyConsumableBand(device, tonerLevels);
-    return {
-        ...device,
-        __meta: {
-            agentName,
-            tenantId,
-            search: buildDeviceSearchBlob(device, agentName, tenantLabel || tenantId),
-            location,
-            status,
-            consumable,
-            tonerData,
-            lastSeenRelative: lastSeenDate ? formatRelativeTime(lastSeenDate) : 'Never',
-            lastSeenTooltip: lastSeenDate ? lastSeenDate.toLocaleString() : 'Never',
-            lastSeenMs: lastSeenDate ? lastSeenDate.getTime() : 0,
-        }
-    };
-}
-
-function buildDeviceSearchBlob(device, agentName, tenantLabel) {
-    const parts = [
-        device.serial,
-        device.ip,
-        device.hostname,
-        device.manufacturer,
-        device.model,
-        device.asset_number,
-        device.location,
-        agentName,
-        tenantLabel,
-        device.tenant_id,
-    ].filter(Boolean);
-    return parts.join(' ').toLowerCase();
-}
-
-function classifyDeviceStatus(device) {
-    const meta = { code: 'healthy', label: 'Healthy' };
-    const severity = (device.status_severity || device.health_state || '').toLowerCase();
-    const composite = [device.status, device.state, device.health, device.connection_state].filter(Boolean).join(' ').toLowerCase();
-    if (composite.includes('jam')) {
-        return { code: 'jam', label: 'Paper Jam' };
-    }
-    if (severity.includes('error') || composite.includes('error') || composite.includes('offline') || composite.includes('down')) {
-        return { code: 'error', label: 'Error' };
-    }
-    if (severity.includes('warn') || composite.includes('warn') || composite.includes('degraded')) {
-        return { code: 'warning', label: 'Warning' };
-    }
-    if (composite.includes('ready') || composite.includes('idle')) {
-        return { code: 'healthy', label: 'Ready' };
-    }
-    return meta;
-}
-
-function classifyConsumableBand(device, tonerLevels) {
-    if (!tonerLevels || tonerLevels.length === 0) {
-        return { code: 'unknown', label: 'Unknown' };
-    }
-    const min = Math.min(...tonerLevels);
-    const code = bandForPercentage(min);
-    return { code, label: DEVICE_CONSUMABLE_LABELS[code] || 'Unknown', level: min };
-}
-
-function getDeviceConsumableLevels(device) {
-    return window.__pm_shared_cards.getDeviceTonerBarData(device).map(t => t.level);
-}
-
-function bandForPercentage(value) {
-    if (typeof value !== 'number') return 'unknown';
-    if (value <= 10) return 'critical';
-    if (value <= 25) return 'low';
-    if (value <= 60) return 'medium';
-    return 'high';
-}
-
-function getAgentInfo(agentId) {
-    if (!agentId) {
-        return null;
-    }
-    if (agentDirectory.byId.has(agentId)) {
-        return agentDirectory.byId.get(agentId);
-    }
-    return null;
-}
-
-async function ensureAgentDirectory(force = false) {
-    const now = Date.now();
-    if (!force && agentDirectory.items.length > 0 && (now - agentDirectory.lastFetched) < 30000) {
-        return agentDirectory.items;
-    }
-    try {
-        const response = await fetch('/api/v1/agents/list');
-        if (!response.ok) {
-            throw new Error('HTTP ' + response.status);
-        }
-        const agents = await response.json();
-        updateAgentDirectory(Array.isArray(agents) ? agents : []);
-        return agentDirectory.items;
-    } catch (err) {
-        window.__pm_shared.warn('ensureAgentDirectory failed', err);
-        return agentDirectory.items;
-    }
-}
-
-function updateAgentDirectory(list) {
-    if (!Array.isArray(list)) {
-        return;
-    }
-    agentDirectory.items = list.slice();
-    agentDirectory.byId = new Map();
-    agentDirectory.items.forEach(agent => {
-        if (agent && agent.agent_id) {
-            agentDirectory.byId.set(agent.agent_id, agent);
-        }
-    });
-    agentDirectory.lastFetched = Date.now();
-    syncDevicesAgentFilterOptions();
-}
-
-function patchAgentDirectory(agent) {
-    if (!agent || !agent.agent_id) {
-        return;
-    }
-    if (!agentDirectory.byId) {
-        agentDirectory.byId = new Map();
-    }
-    if (!agentDirectory.items) {
-        agentDirectory.items = [];
-    }
-    agentDirectory.byId.set(agent.agent_id, { ...agentDirectory.byId.get(agent.agent_id), ...agent });
-    let replaced = false;
-    agentDirectory.items = agentDirectory.items.map(existing => {
-        if (existing && existing.agent_id === agent.agent_id) {
-            replaced = true;
-            return { ...existing, ...agent };
-        }
-        return existing;
-    });
-    if (!replaced) {
-        agentDirectory.items.push(agent);
-    }
-    agentDirectory.lastFetched = Date.now();
-    syncDevicesAgentFilterOptions();
-}
-
-function normalizeTenantId(record) {
-    if (!record) return '';
-    return record.id || record.uuid || record.tenant_id || '';
-}
-
-function getTenantInfo(tenantId) {
-    if (!tenantId || !tenantDirectory.byId) {
-        return null;
-    }
-    return tenantDirectory.byId.get(tenantId) || null;
-}
-
-async function ensureTenantDirectory(force = false) {
-    const now = Date.now();
-    if (!force && tenantDirectory.items.length > 0 && (now - tenantDirectory.lastFetched) < 60000) {
-        return tenantDirectory.items;
-    }
-    try {
-        const response = await fetch('/api/v1/tenants');
-        if (!response.ok) {
-            throw new Error('HTTP ' + response.status);
-        }
-        const tenants = await response.json();
-        updateTenantDirectory(Array.isArray(tenants) ? tenants : []);
-        return tenantDirectory.items;
-    } catch (err) {
-        if (window.__pm_shared && typeof window.__pm_shared.warn === 'function') {
-            window.__pm_shared.warn('ensureTenantDirectory failed', err);
-        }
-        return tenantDirectory.items;
-    }
-}
-
-function updateTenantDirectory(list) {
-    if (!Array.isArray(list)) {
-        return;
-    }
-    tenantDirectory.items = list.slice();
-    tenantDirectory.byId = new Map();
-    tenantDirectory.items.forEach(tenant => {
-        const id = normalizeTenantId(tenant);
-        if (id) {
-            tenantDirectory.byId.set(id, tenant);
-        }
-    });
-    tenantDirectory.lastFetched = Date.now();
-    window._tenants = tenantDirectory.items;
-    syncTenantFilterOptions('agents');
-    syncTenantFilterOptions('devices');
-    applyAgentFilters();
-    applyDeviceFilters();
-}
-
-function syncTenantFilterOptions(scope) {
-    const selectId = scope === 'agents' ? 'agents_tenant_filter' : 'devices_tenant_filter';
-    const select = document.getElementById(selectId);
-    if (!select) return;
-    const filterValue = scope === 'agents' ? agentsVM.filters.tenantId : devicesVM.filters.tenantId;
-    const options = ['<option value="">All Tenants</option>'];
-    let hasMatch = false;
-    const sorted = tenantDirectory.items.slice().sort((a, b) => {
-        const aName = (a && (a.name || normalizeTenantId(a) || '')).toLowerCase();
-        const bName = (b && (b.name || normalizeTenantId(b) || '')).toLowerCase();
-        if (aName < bName) return -1;
-        if (aName > bName) return 1;
-        return 0;
-    });
-    sorted.forEach(tenant => {
-        const id = normalizeTenantId(tenant);
-        if (!id) return;
-        const label = tenant.name || tenant.display_name || id;
-        const selected = filterValue && id === filterValue ? ' selected' : '';
-        if (selected) {
-            hasMatch = true;
-        }
-        options.push(`<option value="${escapeHtml(id)}"${selected}>${escapeHtml(label)}</option>`);
-    });
-    if (filterValue && !hasMatch) {
-        options.push(`<option value="${escapeHtml(filterValue)}" selected>${escapeHtml(filterValue)}</option>`);
-    }
-    select.innerHTML = options.join('');
-    select.value = filterValue || '';
-}
-
-function createStatusCountMap() {
-    const map = {};
-    DEVICE_STATUS_KEYS.forEach(key => {
-        map[key] = 0;
-    });
-    return map;
-}
-
-// Show printer details modal by finding the device in the cached list first, then falling back to API
-async function showPrinterDetails(ipOrSerial, source) {
-    if (!ipOrSerial) return;
-    source = source || 'saved';
-    let device = null;
-    if (devicesVM.items && devicesVM.items.length > 0) {
-        device = devicesVM.items.find(d => d.ip === ipOrSerial || d.serial === ipOrSerial);
-    }
-    if (!device) {
-        try {
-            const res = await fetch('/api/v1/devices/list');
-            if (!res.ok) throw new Error('Failed to fetch devices');
-            const devices = await res.json();
-            if (Array.isArray(devices)) {
-                device = devices.find(d => (d.ip && d.ip === ipOrSerial) || (d.serial && d.serial === ipOrSerial));
-            }
-        } catch (err) {
-            window.__pm_shared.error('Fallback device fetch failed', err);
-        }
-    }
-    if (!device) {
-        window.__pm_shared.showToast('Device not found', 'error');
-        return;
-    }
-    const normalized = device.printer_info ? { ...device.printer_info, serial: device.serial || device.printer_info.serial } : device;
-    window.__pm_shared_cards.showPrinterDetailsData(normalized, source, null);
-}
-
-// ====== Utility Functions ======
-function copyToClipboard(text) {
-    if (!text) return;
-
-    navigator.clipboard.writeText(text).then(() => {
-        window.__pm_shared.showToast('Copied to clipboard', 'success', 1500);
-    }).catch(err => {
-        window.__pm_shared.error('Failed to copy:', err);
-    });
-}
-
-// ====== Proxy Functions ======
-function openAgentUI(agentId) {
-    // Open agent's web UI through WebSocket proxy in a new window
-    // Ensure agentId is URL-encoded to avoid embedding spaces or unsafe chars
-    const proxyUrl = `/api/v1/proxy/agent/${encodeURIComponent(agentId)}/`;
-    window.open(proxyUrl, `agent-ui-${encodeURIComponent(agentId)}`, 'width=1200,height=800');
-}
-
-function openDeviceUI(serialNumber) {
-    // Open device's web UI through WebSocket proxy in a new window
-    const proxyUrl = `/api/v1/proxy/device/${encodeURIComponent(serialNumber)}/`;
-    window.open(proxyUrl, `device-ui-${encodeURIComponent(serialNumber)}`, 'width=1200,height=800');
-}
-
-// Open the shared metrics modal for a device
-function openDeviceMetrics(serial) {
-    if (!serial) return;
-    if (typeof window.showMetricsModal === 'function') {
-        window.showMetricsModal({ serial });
-    } else {
-        // Fallback: navigate to devices list or show a toast
-        window.__pm_shared.showToast('Metrics UI not available', 'error');
-    }
-}
-
-// ====== Managed Settings UI ======
-const SETTINGS_SECTION_LABELS = {
-    discovery: 'Discovery',
-    snmp: 'SNMP',
-    features: 'Features',
-    spooler: 'Local Printer Tracking',
-    logging: 'Logging',
-    web: 'Web Server'
-};
-const SETTINGS_SECTION_ORDER = ['discovery', 'snmp', 'features', 'spooler', 'logging', 'web'];
-
-// Subsection groupings for discovery section
-// Fields are grouped in order - any field not listed goes to "Other"
-const DISCOVERY_SUBSECTIONS = [
-    {
-        key: 'ip_scanning',
-        label: 'IP Scanning',
-        fields: ['discovery.ip_scanning_enabled', 'discovery.subnet_scan', 'discovery.manual_ranges', 'discovery.ranges_text', 'discovery.concurrency']
-    },
-    {
-        key: 'probe_methods',
-        label: 'Probe Methods',
-        fields: ['discovery.arp_enabled', 'discovery.icmp_enabled', 'discovery.tcp_enabled', 'discovery.snmp_enabled', 'discovery.mdns_enabled']
-    },
-    {
-        key: 'auto_discovery',
-        label: 'Automatic Discovery',
-        fields: ['discovery.auto_discover_enabled', 'discovery.autosave_discovered_devices', 'discovery.show_discover_button_anyway', 'discovery.show_discovered_devices_anyway']
-    },
-    {
-        key: 'passive_listeners',
-        label: 'Passive Listeners',
-        fields: ['discovery.passive_discovery_enabled', 'discovery.auto_discover_live_mdns', 'discovery.auto_discover_live_wsd', 'discovery.auto_discover_live_ssdp', 'discovery.auto_discover_live_snmptrap', 'discovery.auto_discover_live_llmnr']
-    },
-    {
-        key: 'metrics',
-        label: 'Metrics Collection',
-        fields: ['discovery.metrics_rescan_enabled', 'discovery.metrics_rescan_interval_minutes']
-    }
-];
-
-const DEFAULT_UPDATE_POLICY_SPEC = {
-    update_check_days: 7,
-    version_pin_strategy: 'minor',
-    allow_major_upgrade: false,
-    target_version: '',
-    collect_telemetry: true,
-    maintenance_window: {
-        enabled: false,
-        timezone: 'UTC',
-        start_hour: 0,
-        start_min: 0,
-        end_hour: 6,
-        end_min: 0,
-        days_of_week: []
-    },
-    rollout_control: {
-        staggered: true,
-        max_concurrent: 0,
-        batch_size: 0,
-        delay_between_waves: 300,
-        jitter_seconds: 60,
-        emergency_abort: true
-    }
-};
-
-const POLICY_VERSION_PIN_OPTIONS = [
-    { value: 'major', label: 'Major (stay on v0.x)' },
-    { value: 'minor', label: 'Minor (stay on v0.9.x)' },
-    { value: 'patch', label: 'Patch (stay on v0.9.14)' }
-];
-
-const POLICY_DAYS_OF_WEEK = [
-    { value: 0, label: 'Sun' },
-    { value: 1, label: 'Mon' },
-    { value: 2, label: 'Tue' },
-    { value: 3, label: 'Wed' },
-    { value: 4, label: 'Thu' },
-    { value: 5, label: 'Fri' },
-    { value: 6, label: 'Sat' }
-];
-
-const settingsUIState = {
-    initialized: false,
-    loading: false,
-    loadingPromise: null,
-    scope: 'global',
-    schema: null,
-    groupedFields: {},
-    globalSnapshot: null,
-    globalDraft: null,
-    globalDirty: false,
-    globalSettingsDirty: false,
-    // Managed sections control (which categories are server-managed)
-    managedSections: new Set(['discovery', 'snmp', 'features', 'spooler']),
-    originalManagedSections: new Set(['discovery', 'snmp', 'features', 'spooler']),
-    managedSectionsDirty: false,
-    tenantList: [],
-    selectedTenantId: '',
-    tenantSnapshot: null,
-    tenantDraft: null,
-    tenantOverridesDraft: {},
-    tenantEnforcedSections: new Set(),
-    originalTenantEnforcedSections: new Set(),
-    tenantEnforcedSectionsDirty: false,
-    tenantDirty: false,
-    tenantSettingsDirty: false,
-
-    agentList: [],
-    selectedAgentId: '',
-    agentSnapshot: null,
-    agentBaseSnapshot: null,
-    agentDraft: null,
-    agentOverridesDraft: {},
-    agentEnforcedSections: new Set(),
-    agentDirty: false,
-    agentSettingsDirty: false,
-
-    saving: false,
-    eventsBound: false,
-    lockedKeys: new Set(), // Keys locked by environment variables
-    updatePolicy: {
-        global: createPolicyState(),
-        tenant: createPolicyState()
-    }
-};
-
-function resolveTenantId(record) {
-    if (!record) return '';
-    return record.id || record.uuid || record.tenant_id || '';
-}
-
-function normalizeTenantList(list) {
-    if (!Array.isArray(list)) return [];
-    const normalized = [];
-    list.forEach(item => {
-        const id = resolveTenantId(item);
-        if (!id) {
-            return;
-        }
-        normalized.push({ ...item, id });
-    });
-    return normalized;
-}
-
-function resolveAgentId(record) {
-    if (!record) return '';
-    return record.agent_id || record.agentId || record.id || '';
-}
-
-function normalizeAgentList(list) {
-    if (!Array.isArray(list)) return [];
-    const normalized = [];
-    list.forEach(item => {
-        const id = resolveAgentId(item);
-        if (!id) {
-            return;
-        }
-        normalized.push({ ...item, id });
-    });
-    return normalized;
-}
-
-function createPolicyState() {
-    return {
-        policy: clonePolicySpec(DEFAULT_UPDATE_POLICY_SPEC),
-        originalPolicy: clonePolicySpec(DEFAULT_UPDATE_POLICY_SPEC),
-        enabled: false,
-        originalEnabled: false,
-        dirty: false,
-        loaded: false
-    };
-}
-
-function clonePolicySpec(spec) {
-    return JSON.parse(JSON.stringify(spec || DEFAULT_UPDATE_POLICY_SPEC));
-}
-
-function normalizePolicySpec(spec) {
-    const normalized = clonePolicySpec(DEFAULT_UPDATE_POLICY_SPEC);
-    if (!spec || typeof spec !== 'object') {
-        return normalized;
-    }
-    if (Number.isFinite(Number(spec.update_check_days))) {
-        normalized.update_check_days = Number(spec.update_check_days);
-    }
-    if (typeof spec.version_pin_strategy === 'string') {
-        const value = spec.version_pin_strategy.toLowerCase();
-        normalized.version_pin_strategy = POLICY_VERSION_PIN_OPTIONS.some(opt => opt.value === value) ? value : normalized.version_pin_strategy;
-    }
-    if (typeof spec.allow_major_upgrade === 'boolean') {
-        normalized.allow_major_upgrade = spec.allow_major_upgrade;
-    }
-    if (typeof spec.target_version === 'string') {
-        normalized.target_version = spec.target_version;
-    }
-    if (typeof spec.collect_telemetry === 'boolean') {
-        normalized.collect_telemetry = spec.collect_telemetry;
-    }
-    if (spec.maintenance_window && typeof spec.maintenance_window === 'object') {
-        const mw = spec.maintenance_window;
-        if (typeof mw.enabled === 'boolean') normalized.maintenance_window.enabled = mw.enabled;
-        if (typeof mw.timezone === 'string') normalized.maintenance_window.timezone = mw.timezone;
-        if (Number.isFinite(Number(mw.start_hour))) normalized.maintenance_window.start_hour = Number(mw.start_hour);
-        if (Number.isFinite(Number(mw.start_min))) normalized.maintenance_window.start_min = Number(mw.start_min);
-        if (Number.isFinite(Number(mw.end_hour))) normalized.maintenance_window.end_hour = Number(mw.end_hour);
-        if (Number.isFinite(Number(mw.end_min))) normalized.maintenance_window.end_min = Number(mw.end_min);
-        if (Array.isArray(mw.days_of_week)) {
-            normalized.maintenance_window.days_of_week = normalizePolicyDays(mw.days_of_week);
-        }
-    }
-    if (spec.rollout_control && typeof spec.rollout_control === 'object') {
-        const rc = spec.rollout_control;
-        if (typeof rc.staggered === 'boolean') normalized.rollout_control.staggered = rc.staggered;
-        if (Number.isFinite(Number(rc.max_concurrent))) normalized.rollout_control.max_concurrent = Number(rc.max_concurrent);
-        if (Number.isFinite(Number(rc.batch_size))) normalized.rollout_control.batch_size = Number(rc.batch_size);
-        if (Number.isFinite(Number(rc.delay_between_waves))) normalized.rollout_control.delay_between_waves = Number(rc.delay_between_waves);
-        if (Number.isFinite(Number(rc.jitter_seconds))) normalized.rollout_control.jitter_seconds = Number(rc.jitter_seconds);
-        if (typeof rc.emergency_abort === 'boolean') normalized.rollout_control.emergency_abort = rc.emergency_abort;
-    }
-    return normalized;
-}
-
-function normalizePolicyDays(days) {
-    if (!Array.isArray(days)) {
-        return [];
-    }
-    const normalized = Array.from(new Set(days.map(val => Number(val)).filter(val => Number.isFinite(val) && val >= 0 && val <= 6))).sort((a, b) => a - b);
-    return normalized;
-}
-
-function getPolicyState(scope) {
-    if (!settingsUIState.updatePolicy) {
-        settingsUIState.updatePolicy = { global: createPolicyState(), tenant: createPolicyState() };
-    }
-    return settingsUIState.updatePolicy[scope] || null;
-}
-
-function applyPolicySnapshot(scope, enabled, policySpec) {
-    const state = getPolicyState(scope);
-    if (!state) return;
-    state.policy = clonePolicySpec(policySpec);
-    state.originalPolicy = clonePolicySpec(policySpec);
-    state.enabled = !!enabled;
-    state.originalEnabled = !!enabled;
-    state.dirty = false;
-    state.loaded = true;
-    syncSettingsDirtyFlags();
-}
-
-function recomputePolicyDirty(scope) {
-    const state = getPolicyState(scope);
-    if (!state) return;
-    const policyChanged = state.enabled && !deepEqual(state.policy, state.originalPolicy);
-    const enabledChanged = state.enabled !== state.originalEnabled;
-    state.dirty = policyChanged || enabledChanged;
-    syncSettingsDirtyFlags();
-}
-
-function resetPolicyDraft(scope) {
-    const state = getPolicyState(scope);
-    if (!state) return;
-    state.policy = clonePolicySpec(state.originalPolicy);
-    state.enabled = state.originalEnabled;
-    state.dirty = false;
-    syncSettingsDirtyFlags();
-}
-
-function syncSettingsDirtyFlags() {
-    const policy = settingsUIState.updatePolicy || {};
-    const globalPolicyDirty = policy.global ? policy.global.dirty : false;
-    const tenantPolicyDirty = policy.tenant ? policy.tenant.dirty : false;
-    // Include managedSectionsDirty in globalDirty check
-    settingsUIState.globalDirty = !!(settingsUIState.globalSettingsDirty || globalPolicyDirty || settingsUIState.managedSectionsDirty);
-    settingsUIState.tenantDirty = !!(settingsUIState.tenantSettingsDirty || settingsUIState.tenantEnforcedSectionsDirty || tenantPolicyDirty);
-    settingsUIState.agentDirty = !!(settingsUIState.agentSettingsDirty);
-}
-
-function getSettingsPayload(record) {
-    if (!record) return {};
-    return record.settings || record.Settings || {};
-}
-
-function getOverridesPayload(record) {
-    if (!record) return {};
-    return record.overrides || record.Overrides || {};
-}
-
-function getUpdatedAt(record) {
-    if (!record) return null;
-    return record.updated_at || record.updatedAt || record.UpdatedAt || null;
-}
-
-function getUpdatedBy(record) {
-    if (!record) return '';
-    return record.updated_by || record.updatedBy || record.UpdatedBy || '';
-}
-
-function getOverridesUpdatedAt(record) {
-    if (!record) return null;
-    return record.overrides_updated_at || record.overridesUpdatedAt || record.OverridesUpdatedAt || null;
-}
-
-function getOverridesUpdatedBy(record) {
-    if (!record) return '';
-    return record.overrides_updated_by || record.overridesUpdatedBy || record.OverridesUpdatedBy || '';
-}
-
-function resolveFieldValue(field, value) {
-    if (value === undefined || value === null) {
-        if (field && Object.prototype.hasOwnProperty.call(field, 'default')) {
-            return field.default;
-        }
-    }
-    return value;
-}
-
-function updateSettingsTenantDirectory(rawList) {
-    const normalized = normalizeTenantList(rawList);
-    const previousSelection = settingsUIState.selectedTenantId;
-    settingsUIState.tenantList = normalized;
-    const selectionStillValid = previousSelection && normalized.some(t => t.id === previousSelection);
-    if (!selectionStillValid) {
-        settingsUIState.selectedTenantId = normalized.length ? normalized[0].id : '';
-    }
-    if (!settingsUIState.selectedTenantId) {
-        settingsUIState.tenantSnapshot = null;
-        settingsUIState.tenantDraft = null;
-        settingsUIState.tenantOverridesDraft = {};
-        settingsUIState.tenantSettingsDirty = false;
-        applyPolicySnapshot('tenant', false, DEFAULT_UPDATE_POLICY_SPEC);
-        syncSettingsDirtyFlags();
-    }
-    if (!settingsUIState.initialized) {
-        return;
-    }
-    if (settingsUIState.scope === 'tenant' && !selectionStillValid && settingsUIState.selectedTenantId) {
-        loadTenantSnapshot(settingsUIState.selectedTenantId)
-            .then(() => renderSettingsUI())
-            .catch(err => reportSettingsError('Failed to refresh tenant overrides', err));
-        return;
-    }
-    renderSettingsUI();
-}
-
-function notifyManagedSettingsTenantDirectory(list) {
-    updateSettingsTenantDirectory(list);
-}
-
-async function initSettingsUI() {
-    const panel = document.getElementById('managed_settings_panel');
-    if (!panel) return;
-    if (settingsUIState.loading) {
-        return settingsUIState.loadingPromise;
-    }
-    if (settingsUIState.initialized) {
-        // For tenant-scoped users, always start on tenant scope (not global)
-        if (isTenantScopedUser() && settingsUIState.scope === 'global') {
-            settingsUIState.scope = 'tenant';
-        }
-        renderSettingsUI();
-        return;
-    }
-    settingsUIState.loading = true;
-    settingsUIState.loadingPromise = (async () => {
-        try {
-            // For tenant-scoped users, default to tenant scope
-            if (isTenantScopedUser()) {
-                settingsUIState.scope = 'tenant';
-            }
-            await bootstrapSettingsUI();
-            settingsUIState.initialized = true;
-            renderSettingsUI();
-        } catch (err) {
-            renderSettingsError(err);
-        } finally {
-            settingsUIState.loading = false;
-        }
-    })();
-    return settingsUIState.loadingPromise;
-}
-
-async function bootstrapSettingsUI() {
-    await loadSettingsSchema();
-    await loadSettingsSources(); // Fetch locked keys
-    await loadGlobalSettingsSnapshot();
-    await loadGlobalUpdatePolicy();
-    await loadTenantDirectory();
-    await loadAgentDirectoryForSettings();
-    if (settingsUIState.tenantList.length > 0) {
-        settingsUIState.selectedTenantId = settingsUIState.tenantList[0].id;
-        if (settingsUIState.selectedTenantId) {
-            await loadTenantSnapshot(settingsUIState.selectedTenantId);
-        }
-    }
-}
-
-async function loadSettingsSchema() {
-    try {
-        const schema = await fetchJSON('/api/v1/settings/schema');
-        settingsUIState.schema = schema;
-        settingsUIState.groupedFields = groupSchemaFields(schema && Array.isArray(schema.fields) ? schema.fields : []);
-    } catch (err) {
-        if (err && err.status === 404) {
-            throw new Error('Managed settings are disabled on this server build. Enable tenancy/features to use this tab.');
-        }
-        throw err;
-    }
-}
-
-async function loadSettingsSources() {
-    try {
-        const sources = await fetchJSON('/api/v1/server/settings/sources');
-        settingsUIState.lockedKeys = new Set(sources.locked_keys || []);
-        settingsUIState.effectiveValues = sources.effective_values || {};
-    } catch (err) {
-        // If endpoint doesn't exist or errors, assume no locks
-        settingsUIState.lockedKeys = new Set();
-        settingsUIState.effectiveValues = {};
-    }
-}
-
-function groupSchemaFields(fields) {
-    const groups = {};
-    fields.forEach(field => {
-        if (!field || !field.path) return;
-        const scope = (field.scope || '').toLowerCase();
-        if (scope === 'agent') {
-            return;
-        }
-        const section = field.path.split('.')[0];
-        if (!groups[section]) {
-            groups[section] = [];
-        }
-        groups[section].push(field);
-    });
-    return groups;
-}
-
-function orderedSettingsSections() {
-    const sections = [];
-    const seen = new Set();
-    SETTINGS_SECTION_ORDER.forEach(sectionKey => {
-        const group = settingsUIState.groupedFields[sectionKey];
-        if (group && group.length) {
-            sections.push(sectionKey);
-            seen.add(sectionKey);
-        }
-    });
-    Object.keys(settingsUIState.groupedFields).sort().forEach(sectionKey => {
-        const group = settingsUIState.groupedFields[sectionKey];
-        if (!seen.has(sectionKey) && group && group.length) {
-            sections.push(sectionKey);
-        }
-    });
-    return sections;
-}
-
-async function loadGlobalSettingsSnapshot() {
-    const snapshot = await fetchJSON('/api/v1/settings/global');
-    settingsUIState.globalSnapshot = snapshot;
-    settingsUIState.globalDraft = cloneSettings(getSettingsPayload(snapshot));
-    settingsUIState.globalSettingsDirty = false;
-    // Sync managed sections from snapshot
-    const managedArr = (snapshot && Array.isArray(snapshot.managed_sections))
-        ? snapshot.managed_sections
-        : ['discovery', 'snmp', 'features', 'spooler'];
-    settingsUIState.managedSections = new Set(managedArr);
-    settingsUIState.originalManagedSections = new Set(managedArr);
-    settingsUIState.managedSectionsDirty = false;
-    syncSettingsDirtyFlags();
-}
-
-async function loadGlobalUpdatePolicy() {
-    const state = getPolicyState('global');
-    if (!state) return;
-    try {
-        const resp = await fetchJSON('/api/v1/update-policies/global');
-        const policy = resp && resp.policy ? normalizePolicySpec(resp.policy) : clonePolicySpec(DEFAULT_UPDATE_POLICY_SPEC);
-        applyPolicySnapshot('global', true, policy);
-    } catch (err) {
-        if (err && err.status === 404) {
-            applyPolicySnapshot('global', false, DEFAULT_UPDATE_POLICY_SPEC);
-            return;
-        }
-        throw err;
-    }
-}
-
-// Load and render agent update policy in the Updates tab
-async function loadAgentUpdatePolicyForUpdatesTab() {
-    const root = document.getElementById('agent_update_policy_root');
-    if (!root) return;
-
-    root.innerHTML = '<div class="muted-text">Loading agent update policy‚Ä¶</div>';
-
-    try {
-        const resp = await fetchJSON('/api/v1/update-policies/global');
-        const policy = resp && resp.policy ? normalizePolicySpec(resp.policy) : clonePolicySpec(DEFAULT_UPDATE_POLICY_SPEC);
-        const enabled = resp && resp.enabled !== undefined ? resp.enabled : false;
-        renderAgentUpdatePolicyInUpdatesTab(root, enabled, policy);
-    } catch (err) {
-        if (err && err.status === 404) {
-            renderAgentUpdatePolicyInUpdatesTab(root, false, DEFAULT_UPDATE_POLICY_SPEC);
-            return;
-        }
-        root.innerHTML = `<div style="color:var(--danger);">Failed to load agent update policy: ${escapeHtml(err.message || err)}</div>`;
-    }
-}
-
-function renderAgentUpdatePolicyInUpdatesTab(root, enabled, policy) {
-    const canEdit = userCan('settings.fleet.write');
-
-    let html = `
-        <div class="settings-section-panel auto-update-policy" style="margin-bottom:0;">
-            <div class="settings-section-header">
-                <h5 style="margin:0 0 4px;">Default Agent Update Policy</h5>
-                <p style="margin:0;color:var(--muted);font-size:12px;">Control how agents check for updates, which versions they target, and how rollouts are staged. These settings apply to all tenants unless overridden in Fleet Settings.</p>
-            </div>
-            <div class="settings-field-list auto-update-field-list">
-    `;
-
-    // Policy enabled toggle
-    html += `
-        <div class="settings-field-row">
-            <div class="settings-field-label">
-                <div class="field-title">Enforce auto-update policy</div>
-                <div class="field-description">When enabled, agents will follow these update settings.</div>
-            </div>
-            <div class="settings-field-control">
-                <label class="mini-toggle-container settings-toggle">
-                    <input type="checkbox" id="updates_policy_enabled" ${enabled ? 'checked' : ''} ${!canEdit ? 'disabled' : ''} data-policy-field="enabled">
-                    <span class="settings-toggle-state">${enabled ? 'Enabled' : 'Disabled'}</span>
-                </label>
-            </div>
-        </div>
-    `;
-
-    if (enabled) {
-        const disabled = !canEdit ? 'disabled' : '';
-
-        // Check cadence
-        html += buildUpdatesTabPolicyRow('Check cadence (days)', 'Set to 0 to pause unattended update checks.',
-            `<input type="number" class="policy-input" id="updates_policy_check_days" value="${policy.update_check_days || 1}" min="0" max="365" ${disabled} data-policy-field="update_check_days" autocomplete="off" data-1p-ignore data-lpignore="true">`);
-
-        // Version pin strategy
-        const pinOptions = POLICY_VERSION_PIN_OPTIONS.map(opt =>
-            `<option value="${opt.value}" ${policy.version_pin_strategy === opt.value ? 'selected' : ''}>${opt.label}</option>`
-        ).join('');
-        html += buildUpdatesTabPolicyRow('Version pin strategy', 'Controls whether agents stay on major, minor, or patch lines.',
-            `<select class="policy-input" id="updates_policy_pin_strategy" ${disabled} data-policy-field="version_pin_strategy">${pinOptions}</select>`);
-
-        // Allow major upgrades
-        html += buildUpdatesTabPolicyRow('Allow major upgrades', 'When disabled, agents will not cross major version boundaries unless forced manually.',
-            `<label class="mini-toggle-container settings-toggle">
-                <input type="checkbox" id="updates_policy_major" ${policy.allow_major_upgrade ? 'checked' : ''} ${disabled} data-policy-field="allow_major_upgrade">
-                <span class="settings-toggle-state">${policy.allow_major_upgrade ? 'Enabled' : 'Disabled'}</span>
-            </label>`);
-
-        // Target version
-        html += buildUpdatesTabPolicyRow('Target version (optional)', 'Provide an exact semantic version to pin the fleet.',
-            `<input type="text" class="policy-input" id="updates_policy_target" value="${policy.target_version || ''}" placeholder="e.g., 1.2.3" ${disabled} data-policy-field="target_version" autocomplete="off" data-1p-ignore data-lpignore="true">`);
-
-        // Collect telemetry
-        html += buildUpdatesTabPolicyRow('Collect telemetry during rollout', 'Allows the server to gather anonymized update metrics.',
-            `<label class="mini-toggle-container settings-toggle">
-                <input type="checkbox" id="updates_policy_telemetry" ${policy.collect_telemetry ? 'checked' : ''} ${disabled} data-policy-field="collect_telemetry">
-                <span class="settings-toggle-state">${policy.collect_telemetry ? 'Enabled' : 'Disabled'}</span>
-            </label>`);
-    } else {
-        html += `<div class="muted-text" style="padding:8px 0;">No global auto-update policy is currently enforced. Agents will rely on their local override settings.</div>`;
-    }
-
-    html += `
-            </div>
-        </div>
-    `;
-
-    // Action buttons
-    if (canEdit) {
-        html += `
-            <div class="settings-actions" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
-                <div class="settings-status" id="updates_policy_status"></div>
-                <div class="settings-action-buttons">
-                    <button id="updates_policy_save_btn" class="primary" style="min-width:120px;">Save Policy</button>
-                </div>
-            </div>
-        `;
-    }
-
-    root.innerHTML = html;
-
-    // Bind events
-    const enabledToggle = document.getElementById('updates_policy_enabled');
-    if (enabledToggle) {
-        enabledToggle.addEventListener('change', () => {
-            const stateSpan = enabledToggle.parentElement.querySelector('.settings-toggle-state');
-            if (stateSpan) stateSpan.textContent = enabledToggle.checked ? 'Enabled' : 'Disabled';
-            // Re-render to show/hide policy fields
-            loadAgentUpdatePolicyForUpdatesTab();
-        });
-    }
-
-    // Bind toggle state updates for checkboxes
-    root.querySelectorAll('input[type="checkbox"][data-policy-field]').forEach(cb => {
-        if (cb.id === 'updates_policy_enabled') return; // Already handled
-        cb.addEventListener('change', () => {
-            const stateSpan = cb.parentElement.querySelector('.settings-toggle-state');
-            if (stateSpan) stateSpan.textContent = cb.checked ? 'Enabled' : 'Disabled';
-        });
-    });
-
-    // Bind save button
-    const saveBtn = document.getElementById('updates_policy_save_btn');
-    if (saveBtn) {
-        saveBtn.addEventListener('click', () => saveAgentUpdatePolicyFromUpdatesTab());
-    }
-}
-
-function buildUpdatesTabPolicyRow(label, description, controlHtml) {
-    return `
-        <div class="settings-field-row">
-            <div class="settings-field-label">
-                <div class="field-title">${escapeHtml(label)}</div>
-                <div class="field-description">${escapeHtml(description)}</div>
-            </div>
-            <div class="settings-field-control">
-                ${controlHtml}
-            </div>
-        </div>
-    `;
-}
-
-async function saveAgentUpdatePolicyFromUpdatesTab() {
-    const statusEl = document.getElementById('updates_policy_status');
-    const saveBtn = document.getElementById('updates_policy_save_btn');
-
-    if (saveBtn) saveBtn.disabled = true;
-    if (statusEl) {
-        statusEl.textContent = 'Saving‚Ä¶';
-        statusEl.style.color = 'var(--muted)';
-    }
-
-    try {
-        const enabled = document.getElementById('updates_policy_enabled')?.checked || false;
-
-        const policy = {
-            update_check_days: parseInt(document.getElementById('updates_policy_check_days')?.value || '1', 10),
-            version_pin_strategy: document.getElementById('updates_policy_pin_strategy')?.value || 'latest',
-            allow_major_upgrade: document.getElementById('updates_policy_major')?.checked || false,
-            target_version: document.getElementById('updates_policy_target')?.value || '',
-            collect_telemetry: document.getElementById('updates_policy_telemetry')?.checked || false,
-            maintenance_window: DEFAULT_UPDATE_POLICY_SPEC.maintenance_window,
-            rollout_control: DEFAULT_UPDATE_POLICY_SPEC.rollout_control
-        };
-
-        await fetchJSON('/api/v1/update-policies/global', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled, policy })
-        });
-
-        if (statusEl) {
-            statusEl.textContent = 'Saved successfully';
-            statusEl.style.color = 'var(--success)';
-        }
-
-        // Also update the fleet settings state if loaded
-        if (settingsUIState.updatePolicy && settingsUIState.updatePolicy.global) {
-            applyPolicySnapshot('global', enabled, policy);
-        }
-
-        setTimeout(() => {
-            if (statusEl) statusEl.textContent = '';
-        }, 3000);
-    } catch (err) {
-        if (statusEl) {
-            statusEl.textContent = `Error: ${err.message || err}`;
-            statusEl.style.color = 'var(--danger)';
-        }
-    } finally {
-        if (saveBtn) saveBtn.disabled = false;
-    }
-}
-
-async function loadTenantDirectory() {
-    try {
-        // For tenant-scoped users, they can't access /api/v1/tenants
-        // Instead, use their tenant_ids from auth and fetch individual tenant details
-        if (isTenantScopedUser()) {
-            const userTenantIds = getUserTenantIds();
-            if (userTenantIds.length === 0) {
-                settingsUIState.tenantList = [];
-                return;
-            }
-            // Build tenant list from user's allowed tenants
-            // We only need id and name for the dropdown
-            const tenantList = [];
-            for (const tid of userTenantIds) {
-                try {
-                    // Try to fetch tenant details - may not work for all tenant-scoped users
-                    const tenant = await fetchJSON(`/api/v1/tenants/${tid}`);
-                    tenantList.push(tenant);
-                } catch (fetchErr) {
-                    // If we can't fetch details, create a basic entry with just the ID
-                    tenantList.push({ id: tid, name: tid });
-                }
-            }
-            updateSettingsTenantDirectory(tenantList);
-            return;
-        }
-
-        const tenants = await fetchJSON('/api/v1/tenants');
-        updateSettingsTenantDirectory(tenants);
-    } catch (err) {
-        if (err && (err.status === 403 || err.status === 404)) {
-            // For 403, try to use user's tenant_ids as fallback
-            if (isTenantScopedUser()) {
-                const userTenantIds = getUserTenantIds();
-                const fallbackList = userTenantIds.map(tid => ({ id: tid, name: tid }));
-                updateSettingsTenantDirectory(fallbackList);
-                return;
-            }
-            settingsUIState.tenantList = [];
-            return;
-        }
-        throw err;
-    }
-}
-
-async function loadAgentDirectoryForSettings() {
-    try {
-        const agents = await fetchJSON('/api/v1/agents/list');
-        const normalized = normalizeAgentList(Array.isArray(agents) ? agents : []);
-        const previousSelection = settingsUIState.selectedAgentId;
-        settingsUIState.agentList = normalized;
-        const selectionStillValid = previousSelection && normalized.some(a => a.id === previousSelection);
-        if (!selectionStillValid) {
-            settingsUIState.selectedAgentId = normalized.length ? normalized[0].id : '';
-        }
-        if (!settingsUIState.selectedAgentId) {
-            settingsUIState.agentSnapshot = null;
-            settingsUIState.agentBaseSnapshot = null;
-            settingsUIState.agentDraft = null;
-            settingsUIState.agentOverridesDraft = {};
-            settingsUIState.agentEnforcedSections = new Set();
-            settingsUIState.agentSettingsDirty = false;
-            syncSettingsDirtyFlags();
-        }
-    } catch (err) {
-        if (err && (err.status === 403 || err.status === 404)) {
-            settingsUIState.agentList = [];
-            return;
-        }
-        throw err;
-    }
-}
-
-async function loadTenantSnapshot(tenantId) {
-    if (!tenantId) {
-        settingsUIState.tenantSnapshot = null;
-        settingsUIState.tenantDraft = null;
-        settingsUIState.tenantOverridesDraft = {};
-        settingsUIState.tenantSettingsDirty = false;
-        settingsUIState.tenantEnforcedSections = new Set();
-        settingsUIState.originalTenantEnforcedSections = new Set();
-        settingsUIState.tenantEnforcedSectionsDirty = false;
-        if (settingsUIState.updatePolicy && settingsUIState.updatePolicy.tenant) {
-            settingsUIState.updatePolicy.tenant = createPolicyState();
-        }
-        syncSettingsDirtyFlags();
-        return;
-    }
-    const snapshot = await fetchJSON(`/api/v1/settings/tenants/${encodeURIComponent(tenantId)}`);
-    settingsUIState.tenantSnapshot = snapshot;
-    const baseline = getSettingsPayload(settingsUIState.globalSnapshot);
-    const tenantSettings = snapshot ? getSettingsPayload(snapshot) : baseline;
-    settingsUIState.tenantDraft = cloneSettings(Object.keys(tenantSettings).length ? tenantSettings : baseline);
-    settingsUIState.tenantOverridesDraft = cloneSettings(getOverridesPayload(snapshot));
-    const enforcedArr = (snapshot && Array.isArray(snapshot.enforced_sections)) ? snapshot.enforced_sections : [];
-    settingsUIState.tenantEnforcedSections = new Set(enforcedArr);
-    settingsUIState.originalTenantEnforcedSections = new Set(enforcedArr);
-    settingsUIState.tenantEnforcedSectionsDirty = false;
-    settingsUIState.tenantSettingsDirty = false;
-    syncSettingsDirtyFlags();
-    await loadTenantUpdatePolicy(tenantId);
-}
-
-async function loadAgentSnapshot(agentId) {
-    if (!agentId) {
-        settingsUIState.agentSnapshot = null;
-        settingsUIState.agentBaseSnapshot = null;
-        settingsUIState.agentDraft = null;
-        settingsUIState.agentOverridesDraft = {};
-        settingsUIState.agentEnforcedSections = new Set();
-        settingsUIState.agentSettingsDirty = false;
-        syncSettingsDirtyFlags();
-        return;
-    }
-
-    const snapshot = await fetchJSON(`/api/v1/settings/agents/${encodeURIComponent(agentId)}`);
-    settingsUIState.agentSnapshot = snapshot;
-    settingsUIState.agentOverridesDraft = cloneSettings(getOverridesPayload(snapshot));
-
-    const tenantId = (snapshot && (snapshot.tenant_id || snapshot.tenantId)) ? (snapshot.tenant_id || snapshot.tenantId) : '';
-    const enforcedArr = (snapshot && Array.isArray(snapshot.enforced_sections)) ? snapshot.enforced_sections : [];
-    settingsUIState.agentEnforcedSections = new Set(enforcedArr);
-
-    // Base snapshot is the resolved tenant snapshot (no agent overrides), or global when unassigned.
-    if (tenantId) {
-        try {
-            settingsUIState.agentBaseSnapshot = await fetchJSON(`/api/v1/settings/tenants/${encodeURIComponent(tenantId)}`);
-        } catch (err) {
-            settingsUIState.agentBaseSnapshot = settingsUIState.globalSnapshot;
-        }
-    } else {
-        settingsUIState.agentBaseSnapshot = settingsUIState.globalSnapshot;
-    }
-
-    const baseSettings = getSettingsPayload(settingsUIState.agentBaseSnapshot) || {};
-    const effectiveSettings = snapshot ? getSettingsPayload(snapshot) : baseSettings;
-    settingsUIState.agentDraft = cloneSettings(Object.keys(effectiveSettings).length ? effectiveSettings : baseSettings);
-    settingsUIState.agentSettingsDirty = false;
-    syncSettingsDirtyFlags();
-}
-
-async function loadTenantUpdatePolicy(tenantId) {
-    const state = getPolicyState('tenant');
-    if (!state) return;
-    if (!tenantId) {
-        applyPolicySnapshot('tenant', false, DEFAULT_UPDATE_POLICY_SPEC);
-        return;
-    }
-    try {
-        const resp = await fetchJSON(`/api/v1/update-policies/${encodeURIComponent(tenantId)}`);
-        const policy = resp && resp.policy ? normalizePolicySpec(resp.policy) : clonePolicySpec(DEFAULT_UPDATE_POLICY_SPEC);
-        applyPolicySnapshot('tenant', true, policy);
-    } catch (err) {
-        if (err && err.status === 404) {
-            applyPolicySnapshot('tenant', false, DEFAULT_UPDATE_POLICY_SPEC);
-            return;
-        }
-        throw err;
-    }
-}
-
-function renderSettingsUI() {
-    bindSettingsEvents();
-    renderScopeButtons();
-    updateTenantSelect();
-    updateAgentSelect();
-    renderSettingsForm();
-    renderOverrideSummary();
-    updateActionButtons();
-    updateLastUpdatedMeta();
-}
-
-function renderSettingsError(err) {
-    const root = document.getElementById('settings_form_root');
-    if (root) {
-        let message = 'Managed settings are unavailable.';
-        if (err) {
-            if (err.status === 403) {
-                message = 'You do not have permission to view managed settings.';
-            } else if (err.status === 404) {
-                message = 'Managed settings are disabled on this server build.';
-            } else if (err.message) {
-                message = err.message;
-            }
-        }
-        root.innerHTML = `<div class="error-text">${escapeHtml(message)}</div>`;
-        window.__pm_shared.showToast(message, 'error', 5000);
-    }
-    const actions = document.querySelector('.settings-actions');
-    if (actions) {
-        actions.style.display = 'none';
-    }
-}
-
-function bindSettingsEvents() {
-    if (settingsUIState.eventsBound) return;
-    const formRoot = document.getElementById('settings_form_root');
-    if (formRoot) {
-        formRoot.addEventListener('input', handleSettingsFieldChange);
-        formRoot.addEventListener('change', handleSettingsFieldChange);
-        formRoot.addEventListener('click', handleSettingsFieldClick);
-        formRoot.addEventListener('input', handlePolicyFieldChange);
-        formRoot.addEventListener('change', handlePolicyFieldChange);
-    }
-    const saveBtn = document.getElementById('settings_save_btn');
-    if (saveBtn) saveBtn.addEventListener('click', handleSettingsSave);
-    const discardBtn = document.getElementById('settings_discard_btn');
-    if (discardBtn) discardBtn.addEventListener('click', handleDiscardChanges);
-    const resetBtn = document.getElementById('settings_reset_overrides_btn');
-    if (resetBtn) resetBtn.addEventListener('click', resetTenantOverrides);
-
-    const resetAgentBtn = document.getElementById('settings_reset_agent_overrides_btn');
-    if (resetAgentBtn) resetAgentBtn.addEventListener('click', resetAgentOverrides);
-
-    document.querySelectorAll('.settings-scope-btn').forEach(btn => {
-        btn.addEventListener('click', () => handleSettingsScopeChange(btn.dataset.scope));
-    });
-    const tenantSelect = document.getElementById('settings_tenant_select');
-    if (tenantSelect) tenantSelect.addEventListener('change', handleTenantSelect);
-
-    const agentSelect = document.getElementById('settings_agent_select');
-    if (agentSelect) agentSelect.addEventListener('change', handleAgentSelect);
-    settingsUIState.eventsBound = true;
-}
-
-function renderScopeButtons() {
-    const tenantScoped = isTenantScopedUser();
-    document.querySelectorAll('.settings-scope-btn').forEach(btn => {
-        const scope = btn.dataset.scope || 'global';
-
-        // Hide Global scope button for tenant-scoped users
-        if (scope === 'global' && tenantScoped) {
-            btn.style.display = 'none';
-            return;
-        }
-        btn.style.display = '';
-
-        // Update button text for tenant-scoped users
-        if (scope === 'tenant' && tenantScoped) {
-            btn.textContent = 'Defaults';
-        }
-
-        btn.classList.toggle('active', scope === settingsUIState.scope);
-    });
-}
-
-function updateTenantSelect() {
-    const select = document.getElementById('settings_tenant_select');
-    if (!select) return;
-    select.innerHTML = '';
-    if (!settingsUIState.tenantList.length) {
-        const opt = document.createElement('option');
-        opt.value = '';
-        opt.textContent = 'No tenants available';
-        select.appendChild(opt);
-        select.disabled = true;
-        return;
-    }
-    select.disabled = false;
-    settingsUIState.tenantList.forEach(tenant => {
-        const opt = document.createElement('option');
-        const tenantId = resolveTenantId(tenant);
-        opt.value = tenantId;
-        opt.textContent = tenant.name || tenantId;
-        if (tenantId === settingsUIState.selectedTenantId) {
-            opt.selected = true;
-        }
-        select.appendChild(opt);
-    });
-}
-
-function updateAgentSelect() {
-    const select = document.getElementById('settings_agent_select');
-    if (!select) return;
-    select.innerHTML = '';
-    if (!settingsUIState.agentList.length) {
-        const opt = document.createElement('option');
-        opt.value = '';
-        opt.textContent = 'No agents available';
-        select.appendChild(opt);
-        select.disabled = true;
-        return;
-    }
-    select.disabled = false;
-    settingsUIState.agentList.forEach(agent => {
-        const opt = document.createElement('option');
-        const agentId = resolveAgentId(agent);
-        const label = getAgentDisplayName(agent, agentId);
-        opt.value = agentId;
-        opt.textContent = label;
-        if (agentId === settingsUIState.selectedAgentId) {
-            opt.selected = true;
-        }
-        select.appendChild(opt);
-    });
-}
-
-function renderSettingsForm() {
-    const root = document.getElementById('settings_form_root');
-    if (!root) return;
-    if (!settingsUIState.schema || !settingsUIState.globalDraft) {
-        root.innerHTML = '<div class="muted-text">Managed settings are initializing‚Ä¶</div>';
-        return;
-    }
-    const scope = settingsUIState.scope;
-    let draft;
-    if (scope === 'global') {
-        draft = settingsUIState.globalDraft;
-    } else if (scope === 'tenant') {
-        draft = settingsUIState.tenantDraft || settingsUIState.globalDraft;
-    } else {
-        const base = getSettingsPayload(settingsUIState.agentBaseSnapshot || settingsUIState.globalSnapshot) || {};
-        draft = settingsUIState.agentDraft || cloneSettings(Object.keys(base).length ? base : settingsUIState.globalDraft);
-    }
-    root.innerHTML = '';
-
-    // Add section management controls at top when in global scope
-    if (scope === 'global') {
-        const controlPanel = renderManagedSectionsPanel();
-        if (controlPanel) {
-            root.appendChild(controlPanel);
-        }
-    } else if (scope === 'tenant') {
-        const enforcementPanel = renderTenantEnforcementPanel();
-        if (enforcementPanel) {
-            root.appendChild(enforcementPanel);
-        }
-    }
-
-    orderedSettingsSections().forEach(sectionKey => {
-        const fields = settingsUIState.groupedFields[sectionKey];
-        if (!fields || !fields.length) {
-            return;
-        }
-        // Check if this section is managed (only relevant for global scope)
-        const isSectionManaged = settingsUIState.managedSections.has(sectionKey);
-        const isSectionEnforced = scope === 'agent' && settingsUIState.agentEnforcedSections && settingsUIState.agentEnforcedSections.has(sectionKey);
-
-        const sectionEl = document.createElement('div');
-        sectionEl.className = 'settings-section-panel';
-        if (scope === 'global' && !isSectionManaged) {
-            sectionEl.classList.add('section-disabled');
-        }
-        if (scope === 'agent' && (!isSectionManaged || isSectionEnforced)) {
-            sectionEl.classList.add('section-disabled');
-        }
-        const header = document.createElement('div');
-        header.className = 'settings-section-header';
-        let managedBadge = '';
-        if ((scope === 'global' || scope === 'agent') && !isSectionManaged) {
-            managedBadge = '<span class="section-status-badge agent-controlled">Agent Controlled</span>';
-        } else if (scope === 'agent' && isSectionEnforced) {
-            managedBadge = '<span class="section-status-badge agent-controlled">Tenant Enforced</span>';
-        }
-        header.innerHTML = `<h4>${escapeHtml(SETTINGS_SECTION_LABELS[sectionKey] || sectionKey)}</h4>${managedBadge}`;
-        sectionEl.appendChild(header);
-
-        const list = document.createElement('div');
-        list.className = 'settings-field-list';
-
-        // Use subsections for discovery, otherwise render flat list
-        if (sectionKey === 'discovery') {
-            renderDiscoveryWithSubsections(list, fields, draft, scope, isSectionManaged, isSectionEnforced);
-        } else {
-            fields.forEach(field => {
-                const value = getValueByPath(draft, field.path);
-                const row = renderSettingsFieldRow(field, value, scope, isSectionManaged, isSectionEnforced);
-                if (row) {
-                    list.appendChild(row);
-                }
-            });
-        }
-        sectionEl.appendChild(list);
-        root.appendChild(sectionEl);
-    });
-    if (!root.children.length) {
-        root.innerHTML = '<div class="muted-text">No server-managed settings are available in this build.</div>';
-    }
-    if (scope === 'global' || scope === 'tenant') {
-        refreshPolicyPanel();
-    }
-}
-
-/**
- * Render the managed sections control panel
- */
-function renderManagedSectionsPanel() {
-    const panel = document.createElement('div');
-    panel.className = 'managed-sections-panel';
-    panel.innerHTML = `
-        <div class="managed-sections-header">
-            <h4>Section Management</h4>
-            <span class="managed-sections-hint">Control which settings categories are centrally managed vs agent-controlled</span>
-        </div>
-        <div class="managed-sections-toggles">
-            ${renderManagedSectionToggle('discovery', 'Discovery', 'IP scanning, probe methods, and auto-discovery behavior')}
-            ${renderManagedSectionToggle('snmp', 'SNMP', 'Community strings and SNMP protocol settings')}
-            ${renderManagedSectionToggle('features', 'Features', 'Feature flags and optional capabilities')}
-            ${renderManagedSectionToggle('spooler', 'Local Printers', 'USB/local printer tracking via OS spooler')}
-        </div>
-    `;
-    // Bind toggle events
-    panel.querySelectorAll('.managed-section-toggle input').forEach(input => {
-        input.addEventListener('change', (e) => {
-            handleManagedSectionToggle(e.target.dataset.section, e.target.checked);
-        });
-    });
-    return panel;
-}
-
-function renderTenantEnforcementPanel() {
-    const panel = document.createElement('div');
-    panel.className = 'managed-sections-panel';
-    const canEdit = userCan('settings.fleet.write');
-    const hasTenant = !!settingsUIState.selectedTenantId;
-    panel.innerHTML = `
-        <div class="managed-sections-header">
-            <h4>Agent Override Locks</h4>
-            <span class="managed-sections-hint">Lock a category so agents in this tenant cannot override it.</span>
-        </div>
-        <div class="managed-sections-toggles">
-            ${renderTenantEnforcementToggle('discovery', 'Discovery', 'Prevent per-agent changes to discovery behavior')}
-            ${renderTenantEnforcementToggle('snmp', 'SNMP', 'Prevent per-agent changes to SNMP settings')}
-            ${renderTenantEnforcementToggle('features', 'Features', 'Prevent per-agent changes to feature flags')}
-            ${renderTenantEnforcementToggle('spooler', 'Local Printers', 'Prevent per-agent changes to spooler settings')}
-        </div>
-    `;
-    panel.querySelectorAll('.tenant-enforcement-toggle input').forEach(input => {
-        input.addEventListener('change', (e) => {
-            handleTenantEnforcementToggle(e.target.dataset.section, e.target.checked);
-        });
-        input.disabled = !canEdit || !hasTenant;
-    });
-    if (!hasTenant) {
-        panel.classList.add('section-disabled');
-    }
-    return panel;
-}
-
-function renderTenantEnforcementToggle(sectionKey, label, description) {
-    const isEnforced = settingsUIState.tenantEnforcedSections && settingsUIState.tenantEnforcedSections.has(sectionKey);
-    return `
-        <label class="managed-section-toggle tenant-enforcement-toggle ${isEnforced ? 'active' : ''}">
-            <div class="toggle-content">
-                <span class="toggle-label">${escapeHtml(label)}</span>
-                <span class="toggle-description">${escapeHtml(description)}</span>
-            </div>
-            <div class="toggle-switch">
-                <input type="checkbox" data-section="${sectionKey}" ${isEnforced ? 'checked' : ''}>
-                <span class="toggle-slider"></span>
-            </div>
-        </label>
-    `;
-}
-
-function handleTenantEnforcementToggle(sectionKey, isEnforced) {
-    if (!settingsUIState.selectedTenantId) {
-        return;
-    }
-    if (!settingsUIState.tenantEnforcedSections) {
-        settingsUIState.tenantEnforcedSections = new Set();
-    }
-    if (isEnforced) {
-        settingsUIState.tenantEnforcedSections.add(sectionKey);
-    } else {
-        settingsUIState.tenantEnforcedSections.delete(sectionKey);
-    }
-    const originalSet = settingsUIState.originalTenantEnforcedSections || new Set();
-    const currentSet = settingsUIState.tenantEnforcedSections;
-    const changed = originalSet.size !== currentSet.size ||
-        [...originalSet].some(s => !currentSet.has(s)) ||
-        [...currentSet].some(s => !originalSet.has(s));
-    settingsUIState.tenantEnforcedSectionsDirty = changed;
-    syncSettingsDirtyFlags();
-    renderOverrideSummary();
-    updateActionButtons();
-}
-
-function renderManagedSectionToggle(sectionKey, label, description) {
-    const isManaged = settingsUIState.managedSections.has(sectionKey);
-    const canEdit = userCan('settings.fleet.write');
-    return `
-        <label class="managed-section-toggle ${isManaged ? 'active' : ''}">
-            <div class="toggle-content">
-                <span class="toggle-label">${escapeHtml(label)}</span>
-                <span class="toggle-description">${escapeHtml(description)}</span>
-            </div>
-            <div class="toggle-switch">
-                <input type="checkbox" data-section="${sectionKey}" ${isManaged ? 'checked' : ''} ${canEdit ? '' : 'disabled'}>
-                <span class="toggle-slider"></span>
-            </div>
-        </label>
-    `;
-}
-
-function handleManagedSectionToggle(sectionKey, isManaged) {
-    if (isManaged) {
-        settingsUIState.managedSections.add(sectionKey);
-    } else {
-        settingsUIState.managedSections.delete(sectionKey);
-    }
-    // Check if managed sections changed from original
-    const originalSet = settingsUIState.originalManagedSections;
-    const currentSet = settingsUIState.managedSections;
-    const changed = originalSet.size !== currentSet.size ||
-        [...originalSet].some(s => !currentSet.has(s)) ||
-        [...currentSet].some(s => !originalSet.has(s));
-    settingsUIState.managedSectionsDirty = changed;
-    syncSettingsDirtyFlags();
-    // Re-render to update section disabled states
-    renderSettingsForm();
-    updateActionButtons();
-}
-
-/**
- * Render discovery fields organized into logical subsections
- */
-function renderDiscoveryWithSubsections(container, fields, draft, scope, isSectionManaged = true, isSectionEnforced = false) {
-    const fieldMap = {};
-    fields.forEach(f => { fieldMap[f.path] = f; });
-    const rendered = new Set();
-
-    DISCOVERY_SUBSECTIONS.forEach((subsection, idx) => {
-        const subsectionFields = subsection.fields
-            .map(path => fieldMap[path])
-            .filter(f => f && !rendered.has(f.path));
-
-        if (!subsectionFields.length) return;
-
-        // Add subsection header
-        const subHeader = document.createElement('div');
-        subHeader.className = 'settings-subsection-header';
-        subHeader.textContent = subsection.label;
-        container.appendChild(subHeader);
-
-        // Add fields in this subsection
-        subsectionFields.forEach(field => {
-            rendered.add(field.path);
-            const value = getValueByPath(draft, field.path);
-            const row = renderSettingsFieldRow(field, value, scope, isSectionManaged, isSectionEnforced);
-            if (row) {
-                container.appendChild(row);
-            }
-        });
-    });
-
-    // Render any remaining fields not in a subsection
-    const remaining = fields.filter(f => !rendered.has(f.path));
-    if (remaining.length) {
-        const subHeader = document.createElement('div');
-        subHeader.className = 'settings-subsection-header';
-        subHeader.textContent = 'Other';
-        container.appendChild(subHeader);
-
-        remaining.forEach(field => {
-            const value = getValueByPath(draft, field.path);
-            const row = renderSettingsFieldRow(field, value, scope, isSectionManaged, isSectionEnforced);
-            if (row) {
-                container.appendChild(row);
-            }
-        });
-    }
-
-    // After rendering, update visibility of dependent fields
-    updateDependentFieldVisibility(container);
-}
-
-/**
- * Show/hide fields that depend on another field's boolean value.
- * Fields with data-depends-on are hidden when the dependency field is unchecked.
- */
-function updateDependentFieldVisibility(container) {
-    if (!container) container = document.getElementById('settings_form_root');
-    if (!container) return;
-
-    const dependentRows = container.querySelectorAll('[data-depends-on]');
-    dependentRows.forEach(row => {
-        const dependsOnPath = row.dataset.dependsOn;
-        // Find the input for the dependency field
-        const depInput = container.querySelector(`input[data-settings-path="${dependsOnPath}"]`);
-        if (depInput && depInput.type === 'checkbox') {
-            row.style.display = depInput.checked ? '' : 'none';
-        }
-    });
-}
-
-function renderSettingsFieldRow(field, value, scope, isSectionManaged = true, isSectionEnforced = false) {
-    const row = document.createElement('div');
-    row.className = 'settings-field-row';
-    row.dataset.fieldType = (field.type || 'text').toLowerCase();
-    row.dataset.settingsPath = field.path;
-
-    // Field dependencies: show/hide based on another field's value
-    const FIELD_DEPENDENCIES = {
-        'discovery.ranges_text': 'discovery.manual_ranges'
-    };
-    if (FIELD_DEPENDENCIES[field.path]) {
-        row.dataset.dependsOn = FIELD_DEPENDENCIES[field.path];
-    }
-
-    // Check if this field is locked by environment variable
-    const isLocked = settingsUIState.lockedKeys.has(field.path);
-    // Section not managed means fields are read-only indicators
-    const sectionNotManaged = (scope === 'global' || scope === 'agent') && !isSectionManaged;
-    const sectionTenantEnforced = scope === 'agent' && !!isSectionEnforced;
-
-    // For locked fields, use the effective runtime value instead of DB value
-    let displayValue = value;
-    if (isLocked && settingsUIState.effectiveValues && settingsUIState.effectiveValues.hasOwnProperty(field.path)) {
-        displayValue = settingsUIState.effectiveValues[field.path];
-    }
-
-    const label = document.createElement('div');
-    label.className = 'settings-field-label';
-    label.innerHTML = `
-        <div class="field-title">${escapeHtml(field.title || field.path)}</div>
-        <div class="field-description">${escapeHtml(field.description || '')}</div>
-    `;
-
-    const control = document.createElement('div');
-    control.className = 'settings-field-control';
-    const inputFragment = createInputForField(field, displayValue);
-    if (!inputFragment || !inputFragment.input || !inputFragment.element) {
-        return null;
-    }
-    const { input, element } = inputFragment;
-    const canEdit = userCan('settings.fleet.write');
-    // Disable input if user can't edit, no tenant selected (for tenant scope), locked by env, OR section not managed
-    input.disabled = !canEdit ||
-        (scope === 'tenant' && !settingsUIState.selectedTenantId) ||
-        (scope === 'agent' && !settingsUIState.selectedAgentId) ||
-        isLocked ||
-        sectionNotManaged ||
-        sectionTenantEnforced;
-    control.appendChild(element);
-
-    // Show lock badge if locked by environment variable
-    if (isLocked) {
-        const lockBadge = document.createElement('span');
-        lockBadge.className = 'settings-badge locked';
-        lockBadge.textContent = 'üîí ENV';
-        lockBadge.title = 'This setting is set by an environment variable and cannot be changed through managed settings';
-        control.appendChild(lockBadge);
-    }
-
-    if (scope === 'tenant' || scope === 'agent') {
-        const isOverride = hasOverride(pathToArray(field.path));
-        const badge = document.createElement('span');
-        badge.className = `settings-badge ${isOverride ? 'override' : 'inherited'}`;
-        badge.textContent = isOverride ? 'Override' : 'Inherited';
-        control.appendChild(badge);
-        if (isOverride && canEdit && !isLocked && !sectionNotManaged && !sectionTenantEnforced) {
-            const inheritBtn = document.createElement('button');
-            inheritBtn.type = 'button';
-            inheritBtn.className = 'ghost-btn inherit-btn';
-            inheritBtn.textContent = 'Inherit';
-            inheritBtn.dataset.inheritPath = field.path;
-            control.appendChild(inheritBtn);
-        }
-    }
-
-    row.appendChild(label);
-    row.appendChild(control);
-    return row;
-}
-
-function refreshPolicyPanel() {
-    const root = document.getElementById('settings_form_root');
-    if (!root) return;
-    const existing = document.getElementById('auto_update_policy_section');
-    if (existing) {
-        existing.remove();
-    }
-    renderUpdatePolicySection(root);
-}
-
-function renderUpdatePolicySection(root) {
-    if (!root) return;
-    const panel = document.createElement('div');
-    panel.className = 'settings-section-panel auto-update-policy';
-    panel.id = 'auto_update_policy_section';
-
-    const header = document.createElement('div');
-    header.className = 'settings-section-header';
-    header.innerHTML = `<h4>Auto-Update Policy</h4><p>Control how often agents check for updates, which versions they target, and how rollouts are staged.</p>`;
-    panel.appendChild(header);
-
-    const body = document.createElement('div');
-    body.className = 'settings-field-list auto-update-field-list';
-    const scope = settingsUIState.scope;
-    const policyState = getPolicyState(scope);
-    const canEdit = userCan('settings.fleet.write');
-
-    if (scope === 'tenant' && !settingsUIState.selectedTenantId) {
-        body.innerHTML = '<div class="muted-text">Select a customer to manage auto-update overrides.</div>';
-        panel.appendChild(body);
-        root.appendChild(panel);
-        return;
-    }
-
-    if (!policyState || !policyState.loaded) {
-        body.innerHTML = '<div class="muted-text">Loading auto-update policy‚Ä¶</div>';
-        panel.appendChild(body);
-        root.appendChild(panel);
-        return;
-    }
-
-    const toggleRow = document.createElement('div');
-    toggleRow.className = 'settings-field-row';
-    const toggleLabel = document.createElement('div');
-    toggleLabel.className = 'settings-field-label';
-    const toggleTitle = scope === 'global' ? 'Enforce auto-update policy' : 'Override global policy';
-    const toggleDescription = scope === 'global'
-        ? 'Applies to every tenant unless a specific override is configured.'
-        : 'Only configure when this customer needs a different cadence than the global defaults.';
-    toggleLabel.innerHTML = `<div class="field-title">${escapeHtml(toggleTitle)}</div><div class="field-description">${escapeHtml(toggleDescription)}</div>`;
-    const toggleControl = document.createElement('div');
-    toggleControl.className = 'settings-field-control';
-    const toggle = document.createElement('label');
-    toggle.className = 'mini-toggle-container settings-toggle';
-    const toggleInput = document.createElement('input');
-    toggleInput.type = 'checkbox';
-    toggleInput.checked = !!policyState.enabled;
-    toggleInput.disabled = !canEdit;
-    toggleInput.dataset.policyToggle = 'enabled';
-    toggleInput.dataset.policyScope = scope;
-    const toggleState = document.createElement('span');
-    toggleState.className = 'settings-toggle-state';
-    toggleState.textContent = policyState.enabled ? 'Enabled' : 'Disabled';
-    toggleInput.addEventListener('change', () => {
-        toggleState.textContent = toggleInput.checked ? 'Enabled' : 'Disabled';
-    });
-    toggle.appendChild(toggleInput);
-    toggle.appendChild(toggleState);
-    toggleControl.appendChild(toggle);
-    toggleRow.appendChild(toggleLabel);
-    toggleRow.appendChild(toggleControl);
-    body.appendChild(toggleRow);
-
-    if (!policyState.enabled) {
-        const inheritMsg = document.createElement('div');
-        inheritMsg.className = 'muted-text';
-        inheritMsg.textContent = scope === 'global'
-            ? 'No global auto-update policy is currently enforced. Agents will rely on their local override settings.'
-            : 'This customer currently inherits the global auto-update policy.';
-        body.appendChild(inheritMsg);
-        panel.appendChild(body);
-        root.appendChild(panel);
-        return;
-    }
-
-    appendPolicyInputs(body, scope, policyState, canEdit);
-    panel.appendChild(body);
-    root.appendChild(panel);
-}
-
-function appendPolicyInputs(container, scope, policyState, canEdit) {
-    const policy = policyState.policy || DEFAULT_UPDATE_POLICY_SPEC;
-    const disabled = !canEdit || !policyState.enabled;
-
-    container.appendChild(buildPolicyRow('Check cadence (days)', 'Set to 0 to pause unattended update checks.',
-        createPolicyNumberInput(scope, 'update_check_days', policy.update_check_days, disabled, 0, 365)));
-
-    container.appendChild(buildPolicyRow('Version pin strategy', 'Controls whether agents stay on major, minor, or patch lines.',
-        createPolicySelectInput(scope, 'version_pin_strategy', policy.version_pin_strategy, disabled, POLICY_VERSION_PIN_OPTIONS)));
-
-    container.appendChild(buildPolicyRow('Allow major upgrades', 'When disabled, agents will not cross major version boundaries unless forced manually.',
-        createPolicyCheckboxInput(scope, 'allow_major_upgrade', policy.allow_major_upgrade, disabled)));
-
-    container.appendChild(buildPolicyRow('Target version (optional)', 'Provide an exact semantic version to pin the fleet. Leave blank to follow the latest allowed version.',
-        createPolicyTextInput(scope, 'target_version', policy.target_version, disabled)));
-
-    container.appendChild(buildPolicyRow('Collect telemetry during rollout', 'Allows the server to gather anonymized update metrics for dashboards.',
-        createPolicyCheckboxInput(scope, 'collect_telemetry', policy.collect_telemetry, disabled)));
-
-    container.appendChild(buildPolicySubheader('Maintenance Window'));
-    const mwDisabled = disabled;
-    container.appendChild(buildPolicyRow('Window enabled', 'Restrict updates to a specific time window in the tenant\'s timezone.',
-        createPolicyCheckboxInput(scope, 'maintenance_window.enabled', policy.maintenance_window.enabled, mwDisabled)));
-
-    const maintenanceInputsDisabled = mwDisabled || !policy.maintenance_window.enabled;
-    container.appendChild(buildPolicyRow('Timezone', 'IANA timezone such as UTC or America/New_York.',
-        createPolicyTextInput(scope, 'maintenance_window.timezone', policy.maintenance_window.timezone, maintenanceInputsDisabled)));
-
-    const startWrapper = document.createElement('div');
-    startWrapper.className = 'policy-inline-inputs';
-    startWrapper.appendChild(createPolicyNumberInput(scope, 'maintenance_window.start_hour', policy.maintenance_window.start_hour, maintenanceInputsDisabled, 0, 23));
-    startWrapper.appendChild(document.createTextNode(' : '));
-    startWrapper.appendChild(createPolicyNumberInput(scope, 'maintenance_window.start_min', policy.maintenance_window.start_min, maintenanceInputsDisabled, 0, 59));
-    container.appendChild(buildPolicyRow('Start time (HH:MM)', '24-hour format.', startWrapper));
-
-    const endWrapper = document.createElement('div');
-    endWrapper.className = 'policy-inline-inputs';
-    endWrapper.appendChild(createPolicyNumberInput(scope, 'maintenance_window.end_hour', policy.maintenance_window.end_hour, maintenanceInputsDisabled, 0, 23));
-    endWrapper.appendChild(document.createTextNode(' : '));
-    endWrapper.appendChild(createPolicyNumberInput(scope, 'maintenance_window.end_min', policy.maintenance_window.end_min, maintenanceInputsDisabled, 0, 59));
-    container.appendChild(buildPolicyRow('End time (HH:MM)', '24-hour format.', endWrapper));
-
-    container.appendChild(buildPolicyRow('Days of week', 'Select one or more days for maintenance.',
-        createPolicyDaysControl(scope, policy.maintenance_window.days_of_week, maintenanceInputsDisabled)));
-
-    container.appendChild(buildPolicySubheader('Rollout Control'));
-    const rolloutDisabled = disabled;
-    container.appendChild(buildPolicyRow('Staggered rollout', 'Disabling pushes updates to all agents simultaneously.',
-        createPolicyCheckboxInput(scope, 'rollout_control.staggered', policy.rollout_control.staggered, rolloutDisabled)));
-    container.appendChild(buildPolicyRow('Max concurrent agents', 'Limit the number of agents updating at the same time (0 = auto).',
-        createPolicyNumberInput(scope, 'rollout_control.max_concurrent', policy.rollout_control.max_concurrent, rolloutDisabled, 0, 10000)));
-    container.appendChild(buildPolicyRow('Batch size', 'Number of agents per wave when staggering.',
-        createPolicyNumberInput(scope, 'rollout_control.batch_size', policy.rollout_control.batch_size, rolloutDisabled, 0, 10000)));
-    container.appendChild(buildPolicyRow('Delay between waves (seconds)', 'Pause between staggered batches.',
-        createPolicyNumberInput(scope, 'rollout_control.delay_between_waves', policy.rollout_control.delay_between_waves, rolloutDisabled, 0, 86400)));
-    container.appendChild(buildPolicyRow('Jitter (seconds)', 'Randomized delay added to reduce thundering herds.',
-        createPolicyNumberInput(scope, 'rollout_control.jitter_seconds', policy.rollout_control.jitter_seconds, rolloutDisabled, 0, 3600)));
-    container.appendChild(buildPolicyRow('Emergency abort available', 'Allow admins to stop an in-flight rollout from the UI.',
-        createPolicyCheckboxInput(scope, 'rollout_control.emergency_abort', policy.rollout_control.emergency_abort, rolloutDisabled)));
-}
-
-function buildPolicyRow(label, description, controlElement) {
-    const row = document.createElement('div');
-    row.className = 'settings-field-row';
-    const labelEl = document.createElement('div');
-    labelEl.className = 'settings-field-label';
-    labelEl.innerHTML = `<div class="field-title">${escapeHtml(label)}</div><div class="field-description">${escapeHtml(description || '')}</div>`;
-    const control = document.createElement('div');
-    control.className = 'settings-field-control';
-    control.appendChild(controlElement);
-    row.appendChild(labelEl);
-    row.appendChild(control);
-    return row;
-}
-
-function buildPolicySubheader(title) {
-    const divider = document.createElement('div');
-    divider.className = 'policy-subheader';
-    divider.textContent = title;
-    return divider;
-}
-
-function createPolicyNumberInput(scope, path, value, disabled, min, max) {
-    const input = document.createElement('input');
-    input.type = 'number';
-    input.value = value === null || value === undefined ? '' : value;
-    if (min !== undefined) input.min = min;
-    if (max !== undefined) input.max = max;
-    input.dataset.policyPath = path;
-    input.dataset.policyType = 'number';
-    input.dataset.policyScope = scope;
-    input.disabled = !!disabled;
-    return input;
-}
-
-function createPolicyTextInput(scope, path, value, disabled) {
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.value = value === null || value === undefined ? '' : value;
-    input.dataset.policyPath = path;
-    input.dataset.policyType = 'text';
-    input.dataset.policyScope = scope;
-    input.disabled = !!disabled;
-    return input;
-}
-
-function createPolicySelectInput(scope, path, value, disabled, options) {
-    const select = document.createElement('select');
-    (options || []).forEach(option => {
-        const opt = document.createElement('option');
-        opt.value = option.value;
-        opt.textContent = option.label;
-        if (option.value === value) {
-            opt.selected = true;
-        }
-        select.appendChild(opt);
-    });
-    select.dataset.policyPath = path;
-    select.dataset.policyType = 'text';
-    select.dataset.policyScope = scope;
-    select.disabled = !!disabled;
-    return select;
-}
-
-function createPolicyCheckboxInput(scope, path, checked, disabled) {
-    const toggle = document.createElement('label');
-    toggle.className = 'mini-toggle-container settings-toggle';
-    const input = document.createElement('input');
-    input.type = 'checkbox';
-    input.checked = !!checked;
-    input.disabled = !!disabled;
-    input.dataset.policyPath = path;
-    input.dataset.policyType = 'bool';
-    input.dataset.policyScope = scope;
-    const state = document.createElement('span');
-    state.className = 'settings-toggle-state';
-    state.textContent = checked ? 'Enabled' : 'Disabled';
-    input.addEventListener('change', () => {
-        state.textContent = input.checked ? 'Enabled' : 'Disabled';
-    });
-    toggle.appendChild(input);
-    toggle.appendChild(state);
-    return toggle;
-}
-
-function createPolicyDaysControl(scope, selectedDays, disabled) {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'policy-days-container';
-    wrapper.classList.toggle('disabled', !!disabled);
-    const daySet = new Set(Array.isArray(selectedDays) ? selectedDays : []);
-    POLICY_DAYS_OF_WEEK.forEach(day => {
-        const chip = document.createElement('label');
-        chip.className = 'policy-day-chip';
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.checked = daySet.has(day.value);
-        input.disabled = !!disabled;
-        input.dataset.policyScope = scope;
-        input.dataset.policyDay = String(day.value);
-        chip.appendChild(input);
-        const text = document.createElement('span');
-        text.textContent = day.label;
-        chip.appendChild(text);
-        syncPolicyDayChipState(input);
-        wrapper.appendChild(chip);
-    });
-    return wrapper;
-}
-
-function syncPolicyDayChipState(input) {
-    if (!input) return;
-    const chip = input.closest('.policy-day-chip');
-    if (!chip) return;
-    chip.classList.toggle('selected', !!input.checked);
-    chip.classList.toggle('disabled', input.disabled);
-}
-
-function handlePolicyFieldChange(event) {
-    const target = event.target;
-    if (!target || !target.dataset) {
-        return;
-    }
-    if (target.dataset.policyToggle) {
-        handlePolicyToggleChange(target);
-        return;
-    }
-    if (Object.prototype.hasOwnProperty.call(target.dataset, 'policyDay')) {
-        handlePolicyDayToggle(target);
-        return;
-    }
-    if (!target.dataset.policyPath) {
-        return;
-    }
-    const scope = resolvePolicyScope(target.dataset.policyScope);
-    const state = getPolicyState(scope);
-    if (!state || !state.policy) {
-        return;
-    }
-    const type = target.dataset.policyType || target.type || 'text';
-    const value = readInputValue(target, type);
-    setNestedValue(state.policy, target.dataset.policyPath, value);
-    recomputePolicyDirty(scope);
-    updateActionButtons();
-    if (target.dataset.policyPath === 'maintenance_window.enabled') {
-        refreshPolicyPanel();
-    }
-}
-
-function handlePolicyToggleChange(input) {
-    const scope = resolvePolicyScope(input.dataset.policyScope);
-    const state = getPolicyState(scope);
-    if (!state) return;
-    state.enabled = !!input.checked;
-    recomputePolicyDirty(scope);
-    updateActionButtons();
-    refreshPolicyPanel();
-}
-
-function handlePolicyDayToggle(input) {
-    const scope = resolvePolicyScope(input.dataset.policyScope);
-    const state = getPolicyState(scope);
-    if (!state) return;
-    const rawValue = Number(input.dataset.policyDay);
-    if (!Number.isFinite(rawValue)) {
-        return;
-    }
-    const current = getValueByPath(state.policy, 'maintenance_window.days_of_week');
-    const next = new Set(Array.isArray(current) ? current : []);
-    if (input.checked) {
-        next.add(rawValue);
-    } else {
-        next.delete(rawValue);
-    }
-    setNestedValue(state.policy, 'maintenance_window.days_of_week', Array.from(next).sort((a, b) => a - b));
-    recomputePolicyDirty(scope);
-    updateActionButtons();
-    syncPolicyDayChipState(input);
-}
-
-function resolvePolicyScope(scopeHint) {
-    if (scopeHint === 'global' || scopeHint === 'tenant') {
-        return scopeHint;
-    }
-    return settingsUIState.scope === 'tenant' ? 'tenant' : 'global';
-}
-
-function createInputForField(field, value) {
-    const type = (field.type || 'text').toLowerCase();
-    const resolvedValue = resolveFieldValue(field, value);
-    let input;
-    let element;
-    if (type === 'bool') {
-        input = document.createElement('input');
-        input.type = 'checkbox';
-        input.checked = !!resolvedValue;
-        const toggle = document.createElement('label');
-        toggle.className = 'mini-toggle-container settings-toggle';
-        toggle.title = field.title || field.path;
-        const state = document.createElement('span');
-        state.className = 'settings-toggle-state';
-        state.textContent = input.checked ? 'Enabled' : 'Disabled';
-        input.addEventListener('change', () => {
-            state.textContent = input.checked ? 'Enabled' : 'Disabled';
-        });
-        toggle.appendChild(input);
-        toggle.appendChild(state);
-        element = toggle;
-    } else if (type === 'number') {
-        input = document.createElement('input');
-        input.type = 'number';
-        input.value = resolvedValue === null || resolvedValue === undefined ? '' : resolvedValue;
-        if (field.min !== undefined) input.min = field.min;
-        if (field.max !== undefined) input.max = field.max;
-        element = input;
-    } else if (type === 'select' && Array.isArray(field.enum)) {
-        input = document.createElement('select');
-        field.enum.forEach(optionValue => {
-            const opt = document.createElement('option');
-            opt.value = optionValue;
-            opt.textContent = optionValue;
-            if (optionValue === resolvedValue) {
-                opt.selected = true;
-            }
-            input.appendChild(opt);
-        });
-        element = input;
-    } else if (type === 'textarea') {
-        input = document.createElement('textarea');
-        input.value = resolvedValue === null || resolvedValue === undefined ? '' : resolvedValue;
-        input.rows = 4;
-        input.className = 'settings-textarea';
-        input.placeholder = field.description || '';
-        element = input;
-    } else {
-        input = document.createElement('input');
-        input.type = 'text';
-        input.value = resolvedValue === null || resolvedValue === undefined ? '' : resolvedValue;
-        element = input;
-    }
-    input.dataset.settingsPath = field.path;
-    input.dataset.fieldType = (field.type || 'text').toLowerCase();
-    return { input, element };
-}
-
-function handleSettingsFieldChange(event) {
-    const target = event.target;
-    if (!target || !target.dataset || !target.dataset.settingsPath) {
-        return;
-    }
-    const path = target.dataset.settingsPath;
-    const fieldType = target.dataset.fieldType || 'text';
-    const newValue = readInputValue(target, fieldType);
-    if (settingsUIState.scope === 'global') {
-        updateGlobalDraft(path, newValue);
-    } else if (settingsUIState.scope === 'tenant') {
-        updateTenantDraft(path, newValue);
-    } else {
-        updateAgentDraft(path, newValue);
-    }
-
-    // Update visibility of fields that depend on this checkbox
-    if (fieldType === 'bool') {
-        updateDependentFieldVisibility();
-    }
-}
-
-function handleSettingsFieldClick(event) {
-    const target = event.target;
-    if (target && target.dataset && target.dataset.inheritPath) {
-        event.preventDefault();
-        if (settingsUIState.scope === 'tenant') {
-            clearTenantOverride(target.dataset.inheritPath);
-        } else if (settingsUIState.scope === 'agent') {
-            clearAgentOverride(target.dataset.inheritPath);
-        }
-    }
-}
-
-function readInputValue(input, fieldType) {
-    switch (fieldType) {
-        case 'bool':
-            return !!input.checked;
-        case 'number':
-            return input.value === '' ? null : Number(input.value);
-        default:
-            return input.value;
-    }
-}
-
-function updateGlobalDraft(path, value) {
-    setNestedValue(settingsUIState.globalDraft, path, value);
-    const baseline = getSettingsPayload(settingsUIState.globalSnapshot);
-    settingsUIState.globalSettingsDirty = !deepEqual(settingsUIState.globalDraft, baseline);
-    syncSettingsDirtyFlags();
-    updateActionButtons();
-}
-
-function updateTenantDraft(path, value) {
-    if (!settingsUIState.tenantDraft) {
-        settingsUIState.tenantDraft = cloneSettings(settingsUIState.globalDraft);
-    }
-    setNestedValue(settingsUIState.tenantDraft, path, value);
-    const baseValue = getValueByPath(getSettingsPayload(settingsUIState.globalSnapshot), path);
-    if (valuesEqual(value, baseValue)) {
-        deleteNestedValue(settingsUIState.tenantOverridesDraft, path);
-    } else {
-        setNestedValue(settingsUIState.tenantOverridesDraft, path, value);
-    }
-    const originalOverrides = getOverridesPayload(settingsUIState.tenantSnapshot);
-    settingsUIState.tenantSettingsDirty = !deepEqual(settingsUIState.tenantOverridesDraft, originalOverrides);
-    renderOverrideSummary();
-    syncSettingsDirtyFlags();
-    updateActionButtons();
-}
-
-function updateAgentDraft(path, value) {
-    const section = String(path || '').split('.')[0];
-    if (settingsUIState.agentEnforcedSections && settingsUIState.agentEnforcedSections.has(section)) {
-        return;
-    }
-    if (!settingsUIState.agentDraft) {
-        const baseSettings = getSettingsPayload(settingsUIState.agentBaseSnapshot) || {};
-        settingsUIState.agentDraft = cloneSettings(baseSettings);
-    }
-    setNestedValue(settingsUIState.agentDraft, path, value);
-    const baseValue = getValueByPath(getSettingsPayload(settingsUIState.agentBaseSnapshot), path);
-    if (valuesEqual(value, baseValue)) {
-        deleteNestedValue(settingsUIState.agentOverridesDraft, path);
-    } else {
-        setNestedValue(settingsUIState.agentOverridesDraft, path, value);
-    }
-    const originalOverrides = getOverridesPayload(settingsUIState.agentSnapshot);
-    settingsUIState.agentSettingsDirty = !deepEqual(settingsUIState.agentOverridesDraft, originalOverrides);
-    renderOverrideSummary();
-    syncSettingsDirtyFlags();
-    updateActionButtons();
-}
-
-function clearTenantOverride(path) {
-    if (!settingsUIState.tenantDraft) return;
-    deleteNestedValue(settingsUIState.tenantOverridesDraft, path);
-    const baseValue = getValueByPath(getSettingsPayload(settingsUIState.globalSnapshot), path);
-    setNestedValue(settingsUIState.tenantDraft, path, baseValue);
-    const originalOverrides = getOverridesPayload(settingsUIState.tenantSnapshot);
-    settingsUIState.tenantSettingsDirty = !deepEqual(settingsUIState.tenantOverridesDraft, originalOverrides);
-    renderSettingsForm();
-    renderOverrideSummary();
-    updateActionButtons();
-}
-
-function clearAgentOverride(path) {
-    if (!settingsUIState.agentDraft) return;
-    deleteNestedValue(settingsUIState.agentOverridesDraft, path);
-    const baseValue = getValueByPath(getSettingsPayload(settingsUIState.agentBaseSnapshot), path);
-    setNestedValue(settingsUIState.agentDraft, path, baseValue);
-    const originalOverrides = getOverridesPayload(settingsUIState.agentSnapshot);
-    settingsUIState.agentSettingsDirty = !deepEqual(settingsUIState.agentOverridesDraft, originalOverrides);
-    syncSettingsDirtyFlags();
-    renderSettingsForm();
-    renderOverrideSummary();
-    updateActionButtons();
-}
-
-function handleSettingsScopeChange(scope) {
-    if (!scope || scope === settingsUIState.scope) {
-        return;
-    }
-
-    // Prevent tenant-scoped users from accessing global scope
-    if (scope === 'global' && isTenantScopedUser()) {
-        return;
-    }
-
-    settingsUIState.scope = scope;
-    renderSettingsUI();
-
-    if (scope === 'tenant' && settingsUIState.selectedTenantId && !settingsUIState.tenantSnapshot) {
-        loadTenantSnapshot(settingsUIState.selectedTenantId).then(() => {
-            renderSettingsUI();
-        }).catch(err => {
-            reportSettingsError('Failed to load tenant settings', err);
-        });
-    }
-
-    if (scope === 'agent' && settingsUIState.selectedAgentId && !settingsUIState.agentSnapshot) {
-        loadAgentSnapshot(settingsUIState.selectedAgentId).then(() => {
-            renderSettingsUI();
-        }).catch(err => {
-            reportSettingsError('Failed to load agent overrides', err);
-        });
-    }
-}
-
-function handleTenantSelect(event) {
-    const tenantId = event.target.value;
-    settingsUIState.selectedTenantId = tenantId;
-    loadTenantSnapshot(tenantId).then(() => {
-        renderSettingsUI();
-    }).catch(err => {
-        reportSettingsError('Failed to load tenant settings', err);
-    });
-}
-
-function handleAgentSelect(event) {
-    const agentId = event.target.value;
-    settingsUIState.selectedAgentId = agentId;
-    loadAgentSnapshot(agentId).then(() => {
-        renderSettingsUI();
-    }).catch(err => {
-        reportSettingsError('Failed to load agent overrides', err);
-    });
-}
-
-async function handleSettingsSave(event) {
-    event.preventDefault();
-    if (!userCan('settings.fleet.write')) {
-        window.__pm_shared.showToast('You do not have permission to update settings', 'error');
-        return;
-    }
-    settingsUIState.saving = true;
-    updateActionButtons();
-    try {
-        if (settingsUIState.scope === 'global') {
-            await saveGlobalSettings();
-        } else if (settingsUIState.scope === 'tenant') {
-            await saveTenantSettings();
-        } else {
-            await saveAgentSettings();
-        }
-    } catch (err) {
-        reportSettingsError('Failed to save settings', err);
-    } finally {
-        settingsUIState.saving = false;
-        updateActionButtons();
-    }
-}
-
-async function saveGlobalSettings() {
-    if (!settingsUIState.globalDirty) {
-        return;
-    }
-    const pending = [];
-    const settingsChanged = !!settingsUIState.globalSettingsDirty;
-    const managedSectionsChanged = !!settingsUIState.managedSectionsDirty;
-    const policyState = getPolicyState('global');
-    const policyChanged = !!(policyState && policyState.dirty);
-
-    // If settings or managed sections changed, save both together
-    if (settingsChanged || managedSectionsChanged) {
-        const payload = {
-            ...settingsUIState.globalDraft,
-            managed_sections: Array.from(settingsUIState.managedSections)
-        };
-        pending.push(fetchJSON('/api/v1/settings/global', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        }));
-    }
-    if (policyChanged) {
-        pending.push(savePolicyChanges('global'));
-    }
-    if (!pending.length) {
-        return;
-    }
-    await Promise.all(pending);
-    if (settingsChanged || managedSectionsChanged) {
-        await loadGlobalSettingsSnapshot();
-        if (settingsUIState.selectedTenantId) {
-            await loadTenantSnapshot(settingsUIState.selectedTenantId);
-        }
-    }
-    if (policyChanged) {
-        await loadGlobalUpdatePolicy();
-    }
-    renderSettingsUI();
-    window.__pm_shared.showToast('Global settings saved', 'success');
-}
-
-async function saveTenantSettings() {
-    if (!settingsUIState.selectedTenantId) {
-        window.__pm_shared.showToast('Select a tenant to edit overrides', 'error');
-        return;
-    }
-    const tenantId = settingsUIState.selectedTenantId;
-    if (!settingsUIState.tenantDirty) {
-        return;
-    }
-    const pending = [];
-    const settingsChanged = !!settingsUIState.tenantSettingsDirty;
-    const enforcementChanged = !!settingsUIState.tenantEnforcedSectionsDirty;
-    const policyState = getPolicyState('tenant');
-    const policyChanged = !!(policyState && policyState.dirty);
-    if (settingsChanged || enforcementChanged) {
-        const overrides = cloneSettings(settingsUIState.tenantOverridesDraft);
-        const enforced_sections = Array.from(settingsUIState.tenantEnforcedSections || []);
-        const hasOverrides = flattenOverrides(overrides).length > 0;
-        const hasEnforcement = enforced_sections.length > 0;
-        if (!hasOverrides && !hasEnforcement) {
-            pending.push(fetchJSON(`/api/v1/settings/tenants/${encodeURIComponent(tenantId)}`, { method: 'DELETE' }));
-        } else {
-            pending.push(fetchJSON(`/api/v1/settings/tenants/${encodeURIComponent(tenantId)}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ overrides, enforced_sections })
-            }));
-        }
-    }
-    if (policyChanged) {
-        pending.push(savePolicyChanges('tenant', tenantId));
-    }
-    if (!pending.length) {
-        return;
-    }
-    await Promise.all(pending);
-    await loadTenantSnapshot(tenantId);
-    renderSettingsUI();
-    window.__pm_shared.showToast('Tenant configuration saved', 'success');
-}
-
-async function saveAgentSettings() {
-    if (!settingsUIState.selectedAgentId) {
-        window.__pm_shared.showToast('Select an agent to edit overrides', 'error');
-        return;
-    }
-    const agentId = settingsUIState.selectedAgentId;
-    if (!settingsUIState.agentDirty) {
-        return;
-    }
-    const overrides = cloneSettings(settingsUIState.agentOverridesDraft);
-    (settingsUIState.agentEnforcedSections || new Set()).forEach(section => {
-        delete overrides[section];
-    });
-    const hasOverrides = flattenOverrides(overrides).length > 0;
-    if (!hasOverrides) {
-        try {
-            await fetchJSON(`/api/v1/settings/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
-        } catch (err) {
-            if (!err || err.status !== 404) {
-                throw err;
-            }
-        }
-    } else {
-        await fetchJSON(`/api/v1/settings/agents/${encodeURIComponent(agentId)}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(overrides)
-        });
-    }
-    await loadAgentSnapshot(agentId);
-    renderSettingsUI();
-    window.__pm_shared.showToast('Agent overrides saved', 'success');
-}
-
-async function savePolicyChanges(scope, tenantId) {
-    const state = getPolicyState(scope);
-    if (!state || !state.dirty) {
-        return;
-    }
-    let endpoint = '/api/v1/update-policies/global';
-    if (scope === 'tenant') {
-        if (!tenantId) {
-            throw new Error('Tenant ID is required to save tenant policy overrides');
-        }
-        endpoint = `/api/v1/update-policies/${encodeURIComponent(tenantId)}`;
-    }
-    if (!state.enabled) {
-        try {
-            await fetchJSON(endpoint, { method: 'DELETE' });
-        } catch (err) {
-            if (!err || err.status !== 404) {
-                throw err;
-            }
-        }
-        return;
-    }
-    await fetchJSON(endpoint, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ policy: clonePolicySpec(state.policy) })
-    });
-}
-
-function handleDiscardChanges(event) {
-    event.preventDefault();
-    if (settingsUIState.scope === 'global') {
-        settingsUIState.globalDraft = cloneSettings(getSettingsPayload(settingsUIState.globalSnapshot));
-        settingsUIState.globalSettingsDirty = false;
-        resetPolicyDraft('global');
-    } else if (settingsUIState.scope === 'tenant') {
-        const tenantSettings = settingsUIState.tenantSnapshot
-            ? getSettingsPayload(settingsUIState.tenantSnapshot)
-            : getSettingsPayload(settingsUIState.globalSnapshot);
-        settingsUIState.tenantDraft = cloneSettings(tenantSettings);
-        settingsUIState.tenantOverridesDraft = cloneSettings(getOverridesPayload(settingsUIState.tenantSnapshot));
-        settingsUIState.tenantSettingsDirty = false;
-        settingsUIState.tenantEnforcedSections = new Set(settingsUIState.originalTenantEnforcedSections || []);
-        settingsUIState.tenantEnforcedSectionsDirty = false;
-        resetPolicyDraft('tenant');
-    } else {
-        const agentSettings = settingsUIState.agentSnapshot
-            ? getSettingsPayload(settingsUIState.agentSnapshot)
-            : getSettingsPayload(settingsUIState.agentBaseSnapshot);
-        settingsUIState.agentDraft = cloneSettings(agentSettings);
-        settingsUIState.agentOverridesDraft = cloneSettings(getOverridesPayload(settingsUIState.agentSnapshot));
-        settingsUIState.agentSettingsDirty = false;
-    }
-    syncSettingsDirtyFlags();
-    renderSettingsUI();
-}
-
-async function resetAgentOverrides(event) {
-    event.preventDefault();
-    if (!settingsUIState.selectedAgentId) {
-        return;
-    }
-    if (!confirm('Clear all overrides for this agent?')) {
-        return;
-    }
-    try {
-        await fetchJSON(`/api/v1/settings/agents/${encodeURIComponent(settingsUIState.selectedAgentId)}`, { method: 'DELETE' });
-        await loadAgentSnapshot(settingsUIState.selectedAgentId);
-        renderSettingsUI();
-        window.__pm_shared.showToast('Agent now inherits tenant defaults', 'success');
-    } catch (err) {
-        reportSettingsError('Failed to clear agent overrides', err);
-    }
-}
-
-async function resetTenantOverrides(event) {
-    event.preventDefault();
-    if (!settingsUIState.selectedTenantId) {
-        return;
-    }
-    if (!confirm('Clear all overrides for this tenant?')) {
-        return;
-    }
-    try {
-        await fetchJSON(`/api/v1/settings/tenants/${encodeURIComponent(settingsUIState.selectedTenantId)}`, { method: 'DELETE' });
-        await loadTenantSnapshot(settingsUIState.selectedTenantId);
-        renderSettingsUI();
-        window.__pm_shared.showToast('Tenant now inherits global defaults', 'success');
-    } catch (err) {
-        reportSettingsError('Failed to clear tenant overrides', err);
-    }
-}
-
-function renderOverrideSummary() {
-    const container = document.getElementById('settings_override_list');
-    const titleEl = document.getElementById('settings_summary_title');
-    if (!container) return;
-
-    // In global scope, show managed sections summary
-    if (settingsUIState.scope === 'global') {
-        if (titleEl) titleEl.textContent = 'Management Summary';
-        const managedArr = Array.from(settingsUIState.managedSections);
-        const allSections = ['discovery', 'snmp', 'features'];
-        const agentControlled = allSections.filter(s => !settingsUIState.managedSections.has(s));
-
-        if (agentControlled.length === 0) {
-            container.innerHTML = `
-                <div class="override-summary-count">All sections centrally managed</div>
-                <div class="override-summary-empty">
-                    <span style="font-size:12px;">Agents will receive server-defined settings for all categories.</span>
-                </div>
-            `;
-        } else {
-            const cards = agentControlled.map(section => {
-                const label = SETTINGS_SECTION_LABELS[section] || section;
-                return `
-                    <div class="override-card">
-                        <div class="override-card-path">Agent-Controlled</div>
-                        <div class="override-card-value">${escapeHtml(label)}</div>
-                    </div>
-                `;
-            }).join('');
-            container.innerHTML = `
-                <div class="override-summary-count">${agentControlled.length} section${agentControlled.length > 1 ? 's' : ''} controlled locally by agents</div>
-                ${cards}
-            `;
-        }
-        return;
-    }
-
-    // Tenant/Agent scope: show override details
-    titleEl.textContent = 'Override Summary';
-    const scope = settingsUIState.scope;
-    if (scope === 'tenant' && !settingsUIState.selectedTenantId) {
-        container.innerHTML = '<div class="override-summary-empty"><span>Select a tenant to view override details.</span></div>';
-        return;
-    }
-    if (scope === 'agent' && !settingsUIState.selectedAgentId) {
-        container.innerHTML = '<div class="override-summary-empty"><span>Select an agent to view override details.</span></div>';
-        return;
-    }
-    const overrides = flattenOverrides(scope === 'agent' ? settingsUIState.agentOverridesDraft : settingsUIState.tenantOverridesDraft);
-    if (!overrides.length) {
-        container.innerHTML = scope === 'agent'
-            ? '<div class="override-summary-empty"><span>No overrides. This agent inherits tenant defaults.</span></div>'
-            : '<div class="override-summary-empty"><span>No overrides. This tenant inherits all global defaults.</span></div>';
-        return;
-    }
-
-    // Group overrides by section for better organization
-    const grouped = {};
-    overrides.forEach(item => {
-        const section = item.path.split('.')[0] || 'other';
-        if (!grouped[section]) {
-            grouped[section] = [];
-        }
-        grouped[section].push(item);
-    });
-
-    let html = `<div class="override-summary-count">${overrides.length} override${overrides.length > 1 ? 's' : ''} active</div>`;
-
-    Object.entries(grouped).forEach(([section, items]) => {
-        const sectionLabel = SETTINGS_SECTION_LABELS[section] || section;
-        html += `<div style="font-size:11px;text-transform:uppercase;color:var(--muted);margin:12px 0 6px;letter-spacing:0.05em;">${escapeHtml(sectionLabel)}</div>`;
-        items.forEach(item => {
-            let valueClass = '';
-            let displayValue = String(item.value);
-            if (typeof item.value === 'boolean') {
-                valueClass = item.value ? 'bool-true' : 'bool-false';
-                displayValue = item.value ? '‚úì Enabled' : '‚úó Disabled';
-            }
-            html += `
-                <div class="override-card">
-                    <div class="override-card-path">${escapeHtml(item.path)}</div>
-                    <div class="override-card-value ${valueClass}">${escapeHtml(displayValue)}</div>
-                </div>
-            `;
-        });
-    });
-
-    container.innerHTML = html;
-}
-
-function updateActionButtons() {
-    const saveBtn = document.getElementById('settings_save_btn');
-    const discardBtn = document.getElementById('settings_discard_btn');
-    const resetBtn = document.getElementById('settings_reset_overrides_btn');
-    const resetAgentBtn = document.getElementById('settings_reset_agent_overrides_btn');
-    const status = document.getElementById('settings_status');
-    const canEdit = userCan('settings.fleet.write');
-    const dirty = settingsUIState.scope === 'global'
-        ? settingsUIState.globalDirty
-        : (settingsUIState.scope === 'tenant' ? settingsUIState.tenantDirty : settingsUIState.agentDirty);
-    if (saveBtn) {
-        saveBtn.disabled = !canEdit || settingsUIState.saving || !dirty;
-    }
-    if (discardBtn) {
-        discardBtn.disabled = !dirty;
-    }
-    if (resetBtn) {
-        const hasOverrides = flattenOverrides(settingsUIState.tenantOverridesDraft).length > 0;
-        resetBtn.classList.toggle('hidden', settingsUIState.scope !== 'tenant');
-        resetBtn.disabled = !canEdit || !hasOverrides || settingsUIState.saving;
-    }
-    if (resetAgentBtn) {
-        const hasAgentOverrides = flattenOverrides(settingsUIState.agentOverridesDraft).length > 0;
-        resetAgentBtn.disabled = !canEdit || settingsUIState.saving || !hasAgentOverrides;
-    }
-    const tenantControls = document.getElementById('settings_tenant_controls');
-    if (tenantControls) {
-        const showTenantControls = settingsUIState.scope === 'tenant' && settingsUIState.tenantList.length > 0;
-        const tenantScoped = isTenantScopedUser();
-        tenantControls.classList.toggle('hidden', !showTenantControls);
-
-        // For tenant-scoped users with only one tenant, hide the dropdown but show controls
-        const tenantSelect = document.getElementById('settings_tenant_select');
-        const tenantSelectLabel = tenantSelect?.parentElement;
-        if (tenantSelectLabel && tenantScoped && settingsUIState.tenantList.length === 1) {
-            // Replace dropdown with static tenant name display
-            tenantSelectLabel.style.display = 'none';
-        } else if (tenantSelectLabel) {
-            tenantSelectLabel.style.display = '';
-        }
-    }
-    const agentControls = document.getElementById('settings_agent_controls');
-    if (agentControls) {
-        agentControls.classList.toggle('hidden', settingsUIState.scope !== 'agent' || settingsUIState.agentList.length === 0);
-    }
-    if (status) {
-        if (settingsUIState.saving) {
-            status.textContent = 'Saving‚Ä¶';
-        } else if (dirty) {
-            status.textContent = 'Unsaved changes';
-        } else {
-            status.textContent = '';
-        }
-    }
-}
-
-function updateLastUpdatedMeta() {
-    const el = document.getElementById('settings_last_updated');
-    if (!el) return;
-    let text = '';
-    if (settingsUIState.scope === 'global' && settingsUIState.globalSnapshot) {
-        const snap = settingsUIState.globalSnapshot;
-        const updatedAt = getUpdatedAt(snap);
-        if (updatedAt) {
-            text = `Updated ${formatRelativeTime(updatedAt)} by ${escapeHtml(getUpdatedBy(snap) || 'system')}`;
-        }
-    } else if (settingsUIState.scope === 'tenant' && settingsUIState.tenantSnapshot) {
-        const snap = settingsUIState.tenantSnapshot;
-        const overridesUpdatedAt = getOverridesUpdatedAt(snap);
-        if (overridesUpdatedAt) {
-            text = `Overrides updated ${formatRelativeTime(overridesUpdatedAt)} by ${escapeHtml(getOverridesUpdatedBy(snap) || 'system')}`;
-        } else {
-            text = 'Inheriting global defaults';
-        }
-    } else if (settingsUIState.scope === 'agent' && settingsUIState.agentSnapshot) {
-        const snap = settingsUIState.agentSnapshot;
-        const overridesUpdatedAt = getOverridesUpdatedAt(snap);
-        if (overridesUpdatedAt) {
-            text = `Overrides updated ${formatRelativeTime(overridesUpdatedAt)} by ${escapeHtml(getOverridesUpdatedBy(snap) || 'system')}`;
-        } else {
-            text = 'Inheriting tenant defaults';
-        }
-    }
-    el.textContent = text;
-}
-
-function flattenOverrides(overrides, prefix = '', acc = []) {
-    if (!overrides || typeof overrides !== 'object') {
-        return acc;
-    }
-    Object.keys(overrides).forEach(key => {
-        const path = prefix ? `${prefix}.${key}` : key;
-        const value = overrides[key];
-        if (value && typeof value === 'object' && !Array.isArray(value)) {
-            flattenOverrides(value, path, acc);
-        } else {
-            acc.push({ path, value });
-        }
-    });
-    return acc;
-}
-
-function hasOverride(pathParts) {
-    let cursor = settingsUIState.scope === 'agent' ? settingsUIState.agentOverridesDraft : settingsUIState.tenantOverridesDraft;
-    for (let i = 0; i < pathParts.length; i++) {
-        const part = pathParts[i];
-        if (!cursor || typeof cursor !== 'object' || !(part in cursor)) {
-            return false;
-        }
-        cursor = cursor[part];
-    }
-    return true;
-}
-
-// Keys that would let a crafted path reach/mutate Object.prototype (prototype pollution).
-const UNSAFE_PATH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-
-function pathToArray(path) {
-    return (path || '').split('.').filter(key => !UNSAFE_PATH_KEYS.has(key));
-}
-
-function readNested(obj, parts) {
-    let cursor = obj;
-    for (let i = 0; i < parts.length; i++) {
-        if (!cursor) return undefined;
-        cursor = cursor[parts[i]];
-    }
-    return cursor;
-}
-
-function setNestedValue(obj, path, value) {
-    if (!obj) return;
-    const parts = pathToArray(path);
-    if (parts.length === 0) return;
-    let cursor = obj;
-    for (let i = 0; i < parts.length - 1; i++) {
-        const key = parts[i];
-        if (typeof cursor[key] !== 'object' || cursor[key] === null) {
-            cursor[key] = {};
-        }
-        cursor = cursor[key];
-    }
-    cursor[parts[parts.length - 1]] = value;
-}
-
-function deleteNestedValue(obj, path) {
-    if (!obj) return;
-    const parts = pathToArray(path);
-    const stack = [];
-    let cursor = obj;
-    for (let i = 0; i < parts.length - 1; i++) {
-        const key = parts[i];
-        if (typeof cursor[key] !== 'object' || cursor[key] === null) {
-            return;
-        }
-        stack.push([cursor, key]);
-        cursor = cursor[key];
-    }
-    delete cursor[parts[parts.length - 1]];
-    for (let i = stack.length - 1; i >= 0; i--) {
-        const [parent, key] = stack[i];
-        if (parent[key] && Object.keys(parent[key]).length === 0) {
-            delete parent[key];
-        }
-    }
-}
-
-function getValueByPath(obj, path) {
-    return readNested(obj, pathToArray(path));
-}
-
-function valuesEqual(a, b) {
-    if (typeof a === 'number' && typeof b === 'number') {
-        return Number(a) === Number(b);
-    }
-    if (typeof a === 'boolean' || typeof b === 'boolean') {
-        return !!a === !!b;
-    }
-    return a === b;
-}
-
-function cloneSettings(obj) {
-    return obj ? JSON.parse(JSON.stringify(obj)) : {};
-}
-
-function deepEqual(a, b) {
-    if (a === b) {
-        return true;
-    }
-    if (Number.isNaN(a) && Number.isNaN(b)) {
-        return true;
-    }
-    if (Array.isArray(a) || Array.isArray(b)) {
-        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
-            return false;
-        }
-        for (let i = 0; i < a.length; i++) {
-            if (!deepEqual(a[i], b[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-    if (a && b && typeof a === 'object' && typeof b === 'object') {
-        const keysA = Object.keys(a);
-        const keysB = Object.keys(b);
-        if (keysA.length !== keysB.length) {
-            return false;
-        }
-        for (const key of keysA) {
-            if (!deepEqual(a[key], b[key])) {
-                return false;
-            }
-        }
-        return true;
-    }
-    return false;
-}
-
-async function fetchJSON(url, options = {}) {
-    const response = await fetch(url, options);
-    if (!response.ok) {
-        const err = new Error(`HTTP ${response.status}`);
-        err.status = response.status;
-        try {
-            err.body = await response.text();
-        } catch (_) {
-            err.body = '';
-        }
-        throw err;
-    }
-    if (response.status === 204) {
-        return null;
-    }
-    const text = await response.text();
-    return text ? JSON.parse(text) : null;
-}
-
-function reportSettingsError(message, err) {
-    window.__pm_shared.error(message, err);
-    let detail = '';
-    if (err) {
-        const extra = err.body || err.message;
-        if (extra) {
-            detail = ': ' + String(extra).slice(0, 200);
-        }
-    }
-    window.__pm_shared.showToast(message + detail, 'error', 5000);
-}
-
-// ====== Logs Management ======
-function initAuditFilterControls() {
-    if (auditFiltersInitialized) {
-        return;
-    }
-    auditFiltersInitialized = true;
-
-    const searchInput = document.getElementById('audit_search_filter');
-    if (searchInput) {
-        const handler = debounce(() => {
-            auditFilterState.search = (searchInput.value || '').trim().toLowerCase();
-            applyAuditFilters();
-        }, 200);
-        searchInput.addEventListener('input', handler);
-    }
-
-    const actionInput = document.getElementById('audit_action_filter');
-    if (actionInput) {
-        const handler = debounce(() => {
-            auditFilterState.action = (actionInput.value || '').trim().toLowerCase();
-            applyAuditFilters();
-        }, 200);
-        actionInput.addEventListener('input', handler);
-    }
-
-    const tenantInput = document.getElementById('audit_tenant_filter');
-    if (tenantInput) {
-        const handler = debounce(() => {
-            auditFilterState.tenant = (tenantInput.value || '').trim().toLowerCase();
-            applyAuditFilters();
-        }, 200);
-        tenantInput.addEventListener('input', handler);
-    }
-
-    const severityContainer = document.getElementById('audit_severity_filter');
-    if (severityContainer) {
-        const checkboxes = Array.from(severityContainer.querySelectorAll('.audit-severity-option'));
-        const update = () => updateAuditSeverityState(checkboxes);
-        checkboxes.forEach(cb => {
-            toggleSeverityPillState(cb);
-            cb.addEventListener('change', update);
-        });
-    }
-
-    const resetBtn = document.getElementById('audit_clear_filters_btn');
-    if (resetBtn) {
-        resetBtn.addEventListener('click', (ev) => {
-            ev.preventDefault();
-            resetAuditFilters();
-        });
-    }
-
-    const liveToggle = document.getElementById('audit_live_toggle');
-    if (liveToggle) {
-        liveToggle.addEventListener('change', () => {
-            toggleAuditLiveUpdates(Boolean(liveToggle.checked));
-        });
-    }
-}
-
-function updateAuditSeverityState(checkboxes) {
-    const selected = new Set();
-    checkboxes.forEach(cb => {
-        toggleSeverityPillState(cb);
-        if (cb.checked) {
-            selected.add((cb.value || '').toLowerCase());
-        }
-    });
-    if (selected.size === 0) {
-        checkboxes.forEach(cb => {
-            cb.checked = true;
-            toggleSeverityPillState(cb);
-            selected.add((cb.value || '').toLowerCase());
-        });
-        if (window.__pm_shared && typeof window.__pm_shared.showToast === 'function') {
-            window.__pm_shared.showToast('Select at least one severity to filter', 'info');
-        }
-    }
-    auditFilterState.severities = selected;
-    applyAuditFilters();
-}
-
-function toggleSeverityPillState(checkbox) {
-    if (!checkbox) return;
-    const pill = checkbox.closest('.audit-severity-pill');
-    if (pill) {
-        pill.classList.toggle('active', checkbox.checked);
-    }
-}
-
-function resetAuditFilters() {
-    const actionInput = document.getElementById('audit_action_filter');
-    const tenantInput = document.getElementById('audit_tenant_filter');
-    const searchInput = document.getElementById('audit_search_filter');
-    if (actionInput) actionInput.value = '';
-    if (tenantInput) tenantInput.value = '';
-    if (searchInput) searchInput.value = '';
-    auditFilterState.action = '';
-    auditFilterState.tenant = '';
-    auditFilterState.search = '';
-    const severityCheckboxes = document.querySelectorAll('.audit-severity-option');
-    severityCheckboxes.forEach(cb => {
-        cb.checked = true;
-        toggleSeverityPillState(cb);
-    });
-    auditFilterState.severities = new Set(AUDIT_SEVERITY_VALUES);
-    applyAuditFilters();
-}
-
-function setAuditEntries(entries) {
-    auditDataLoaded = true;
-    auditLogEntries = Array.isArray(entries) ? entries : [];
-    updateAuditActionSuggestions(auditLogEntries);
-    applyAuditFilters();
-}
-
-function hasActiveAuditFilters() {
-    const severities = auditFilterState.severities instanceof Set ? auditFilterState.severities : new Set(AUDIT_SEVERITY_VALUES);
-    const allSeveritiesSelected = severities.size === AUDIT_SEVERITY_VALUES.length;
-    return Boolean(auditFilterState.search || auditFilterState.action || auditFilterState.tenant || !allSeveritiesSelected);
-}
-
-function applyAuditFilters() {
-    const entries = Array.isArray(auditLogEntries) ? auditLogEntries : [];
-    const severitySet = auditFilterState.severities instanceof Set && auditFilterState.severities.size > 0
-        ? auditFilterState.severities
-        : new Set(AUDIT_SEVERITY_VALUES);
-    const actionQuery = auditFilterState.action;
-    const tenantQuery = auditFilterState.tenant;
-    const searchTokens = auditFilterState.search ? auditFilterState.search.split(/\s+/).filter(Boolean) : [];
-
-    const filtered = entries.filter(entry => {
-        const severity = String(entry && entry.severity ? entry.severity : 'info').toLowerCase();
-        if (severitySet.size > 0 && !severitySet.has(severity)) {
-            return false;
-        }
-
-        if (actionQuery && !(String(entry.action || '').toLowerCase().includes(actionQuery))) {
-            return false;
-        }
-
-        if (tenantQuery) {
-            const tenantMatches = [
-                entry.tenant_id,
-                entry.metadata && (entry.metadata.tenant_name || entry.metadata.tenant_display || entry.metadata.tenant),
-            ].filter(Boolean).map(v => String(v).toLowerCase());
-            if (!tenantMatches.some(val => val.includes(tenantQuery))) {
-                return false;
-            }
-        }
-
-        if (searchTokens.length > 0) {
-            const haystack = buildAuditSearchHaystack(entry);
-            if (!searchTokens.every(token => haystack.includes(token))) {
-                return false;
-            }
-        }
-
-        return true;
-    });
-
-    // Store filtered entries for progressive rendering and reset display state
-    auditRenderState.filteredEntries = filtered;
-    auditRenderState.displayed = 0;
-    renderAuditLogs(filtered, { filtersActive: hasActiveAuditFilters() });
-    updateAuditSummary(entries.length, filtered.length);
-}
-
-function buildAuditSearchHaystack(entry) {
-    if (!entry) return '';
-    let metadataBlob = '';
-    if (entry.metadata) {
-        try {
-            metadataBlob = JSON.stringify(entry.metadata);
-        } catch (err) {
-            metadataBlob = '';
-        }
-    }
-    return [
-        entry.severity,
-        entry.actor_name,
-        entry.actor_id,
-        entry.actor_type,
-        entry.action,
-        entry.target_type,
-        entry.target_id,
-        entry.tenant_id,
-        entry.details,
-        entry.ip_address,
-        entry.user_agent,
-        entry.request_id,
-        metadataBlob,
-    ].filter(Boolean).join(' ').toLowerCase();
-}
-
-function updateAuditSummary(total, filtered) {
-    const summary = document.getElementById('audit_summary');
-    if (!summary) return;
-    if (!auditDataLoaded) {
-        summary.setAttribute('hidden', 'hidden');
-        return;
-    }
-    const countsEl = document.getElementById('audit_summary_counts');
-    if (countsEl) {
-        if (total === filtered) {
-            countsEl.innerHTML = `<strong>${filtered}</strong> ${filtered === 1 ? 'entry' : 'entries'}`;
-        } else {
-            countsEl.innerHTML = `<strong>${filtered}</strong> of ${total} entries`;
-        }
-    }
-    summary.removeAttribute('hidden');
-}
-
-function setAuditLastUpdated(date = new Date()) {
-    auditLastUpdated = date;
-    const updatedEl = document.getElementById('audit_summary_updated');
-    if (!updatedEl) return;
-    const isoValue = date instanceof Date ? date.toISOString() : date;
-    const relative = formatRelativeTime(isoValue);
-    const exact = date instanceof Date ? date.toLocaleTimeString() : String(date);
-    updatedEl.textContent = `Updated ${relative} (${exact})`;
-}
-
-function updateAuditActionSuggestions(entries) {
-    const dataList = document.getElementById('audit_action_suggestions');
-    if (!dataList) return;
-    dataList.innerHTML = '';
-    const unique = new Set();
-    entries.forEach(entry => {
-        if (entry && entry.action) {
-            unique.add(entry.action);
-        }
-    });
-    Array.from(unique).sort().slice(0, 50).forEach(action => {
-        const option = document.createElement('option');
-        option.value = action;
-        dataList.appendChild(option);
-    });
-}
-
-function toggleAuditLiveUpdates(enabled) {
-    auditLiveRequested = enabled;
-    const toggle = document.getElementById('audit_live_toggle');
-    if (toggle && toggle.checked !== enabled) {
-        toggle.checked = enabled;
-    }
-    syncAuditLiveTimer();
-    if (enabled && activeLogView === 'audit') {
-        loadAuditLogs({ silent: true });
-    }
-}
-
-function syncAuditLiveTimer() {
-    if (auditAutoRefreshHandle) {
-        clearInterval(auditAutoRefreshHandle);
-        auditAutoRefreshHandle = null;
-    }
-    if (auditLiveRequested && activeLogView === 'audit') {
-        auditAutoRefreshHandle = setInterval(() => {
-            loadAuditLogs({ silent: true });
-        }, AUDIT_AUTO_REFRESH_INTERVAL_MS);
-    }
-    updateAuditLiveStatus();
-}
-
-function updateAuditLiveStatus() {
-    const statusEl = document.getElementById('audit_live_status');
-    if (!statusEl) return;
-    if (!auditLiveRequested) {
-        statusEl.textContent = 'Auto-refresh off';
-        return;
-    }
-    if (activeLogView !== 'audit') {
-        statusEl.textContent = 'Auto-refresh paused';
-        return;
-    }
-    statusEl.textContent = auditAutoRefreshHandle ? 'Auto-refresh on' : 'Auto-refresh ready';
-}
-
-// Copy current logs to clipboard
-async function copyLogs() {
-    try {
-        const response = await fetch('/api/logs');
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        const data = await response.json();
-        const lines = data.logs || [];
-        const text = lines.join('\n');
-        await navigator.clipboard.writeText(text);
-        window.__pm_shared.showToast('Logs copied to clipboard', 'success', 1500);
-    } catch (e) {
-        window.__pm_shared.error('Copy logs failed:', e);
-        window.__pm_shared.showToast('Failed to copy logs: ' + e.message, 'error');
-    }
-}
-
-// Download logs as file
-async function downloadLogs() {
-    try {
-        const response = await fetch('/api/logs');
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-        const data = await response.json();
-        const lines = data.logs || [];
-        const text = lines.join('\n');
-        const blob = new Blob([text], { type: 'text/plain' });
-        const filename = `server-logs-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.log`;
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-        window.__pm_shared.showToast('Logs downloaded', 'success');
-    } catch (e) {
-        window.__pm_shared.error('Download logs failed:', e);
-        window.__pm_shared.showToast('Failed to download logs: ' + e.message, 'error');
-    }
-}
-
-// Clear server logs (rotate)
-async function clearLogs() {
-    try {
-        const confirmed = await window.__pm_shared.showConfirm(
-            'Clear server logs? This will rotate the current log file.',
-            'Clear Logs'
-        );
-        if (!confirmed) return;
-
-        const resp = await fetch('/api/logs/clear', { method: 'POST' });
-        if (!resp.ok) {
-            const text = await resp.text();
-            window.__pm_shared.showToast('Clear logs failed: ' + text, 'error');
-            return;
-        }
-
-        // Clear the display and reset state
-        currentLogLines = [];
-        logsState.entries = [];
-        logsState.total = 0;
-        logsState.offset = 0;
-        logsState.hasMore = false;
-        logsState.hasPrevious = false;
-        cleanupLogsInfiniteScroll();
-
-        const logEl = document.getElementById('log');
-        if (logEl) {
-            logEl.innerHTML = '<span style="color:#586e75">(logs cleared - waiting for new entries)</span>';
-        }
-        const tbody = document.getElementById('log_table_body');
-        if (tbody) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#586e75">(logs cleared - waiting for new entries)</td></tr>';
-        }
-        updateLogsShowingCount(0);
-
-        window.__pm_shared.showToast('Logs cleared and rotated', 'success');
-    } catch (e) {
-        window.__pm_shared.error('Clear logs failed:', e);
-        window.__pm_shared.showToast('Failed to clear logs: ' + e.message, 'error');
-    }
-}
-
-async function loadLogs(options = {}) {
-    const { append = false, prepend = false } = options;
-
-    if (logsState.loading) return;
-    logsState.loading = true;
-
-    try {
-        // Build query params
-        const params = new URLSearchParams();
-        params.set('limit', String(logsState.limit));
-
-        // Calculate offset based on append/prepend mode
-        let requestOffset = logsState.offset;
-        if (append && logsState.entries.length > 0) {
-            // Loading older logs - offset is after current entries
-            requestOffset = logsState.entries.length;
-        } else if (prepend) {
-            // Loading newer logs - offset is 0 (newest first)
-            requestOffset = 0;
-        }
-        params.set('offset', String(requestOffset));
-
-        // Add level filter
-        const levelFilter = document.getElementById('log_level_filter');
-        const level = levelFilter ? levelFilter.value : '';
-        if (level) {
-            params.set('level', level);
-        }
-
-        // Add search filter
-        const searchFilter = document.getElementById('log_search_filter');
-        const search = searchFilter ? searchFilter.value.trim() : '';
-        if (search) {
-            params.set('search', search);
-        }
-
-        const response = await fetch(`/api/logs?${params.toString()}`);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const data = await response.json();
-        const newEntries = (data.logs || []).map(parseLogLine);
-
-        // Update state
-        logsState.total = data.total || 0;
-        logsState.hasMore = data.has_more || false;
-        logsState.hasPrevious = data.has_previous || false;
-
-        if (append && logsState.entries.length > 0) {
-            // Append older logs to the end
-            logsState.entries = [...logsState.entries, ...newEntries];
-            // Cull from the beginning (newest) if too many
-            if (logsState.entries.length > logsState.maxLoaded) {
-                const excess = logsState.entries.length - logsState.maxLoaded;
-                logsState.entries = logsState.entries.slice(excess);
-                logsState.hasPrevious = true; // We culled newer logs
-            }
-        } else if (prepend && logsState.entries.length > 0) {
-            // Prepend newer logs to the beginning
-            logsState.entries = [...newEntries, ...logsState.entries];
-            // Cull from the end (oldest) if too many
-            if (logsState.entries.length > logsState.maxLoaded) {
-                logsState.entries = logsState.entries.slice(0, logsState.maxLoaded);
-                logsState.hasMore = true; // We culled older logs
-            }
-        } else {
-            // Fresh load
-            logsState.entries = newEntries;
-            logsState.offset = 0;
-        }
-
-        // Update currentLogLines for compatibility
-        currentLogLines = logsState.entries;
-
-        // Render (pass append flag to skip auto-scroll)
-        renderLogs({ logs: logsState.entries.map(e => e.raw), append });
-
-        // Setup infinite scroll observer (only if more to load)
-        if (logsState.hasMore) {
-            setupLogsInfiniteScroll();
-        }
-
-    } catch (error) {
-        window.__pm_shared.error('Failed to load logs:', error);
-        const logEl = document.getElementById('log');
-        if (logEl) {
-            logEl.textContent = 'Failed to load logs: ' + error.message;
-        }
-    } finally {
-        logsState.loading = false;
-    }
-}
-
-async function loadAuditLogs(options) {
-    if (!userCan('audit.logs.read')) {
-        return;
-    }
-
-    const opts = options || {};
-    const silent = Boolean(opts.silent);
-
-    const container = document.getElementById('audit_logs_table');
-    if (!container) {
-        window.__pm_shared.warn('loadAuditLogs: container not found');
-        return;
-    }
-
-    const params = new URLSearchParams();
-    const timeFilter = document.getElementById('audit_time_filter');
-    const hours = timeFilter ? parseInt(timeFilter.value, 10) : 24;
-    if (hours && hours > 0) {
-        params.set('hours', String(hours));
-    }
-
-    const actorFilter = document.getElementById('audit_actor_filter');
-    const actorValue = actorFilter ? actorFilter.value.trim() : '';
-    if (actorValue) {
-        params.set('actor_id', actorValue);
-    }
-
-    if (!silent) {
-        container.innerHTML = '<div class="muted-text">Loading audit log...</div>';
-    }
-
-    const queryString = params.toString();
-    const endpoint = queryString ? `/api/audit/logs?${queryString}` : '/api/audit/logs';
-
-    try {
-        const response = await fetch(endpoint);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const payload = await response.json();
-        let entries = [];
-        if (payload && Array.isArray(payload.entries)) {
-            entries = payload.entries;
-        } else if (Array.isArray(payload)) {
-            entries = payload;
-        }
-        setAuditEntries(entries);
-        setAuditLastUpdated(new Date());
-    } catch (error) {
-        window.__pm_shared.error('Failed to load audit logs:', error);
-        if (!silent) {
-            const message = escapeHtml(error && error.message ? error.message : String(error));
-            container.innerHTML = `<div class="error-text">Failed to load audit logs: ${message}</div>`;
-        }
-    }
-}
-
-// ====== Metrics ======
-const serverMetricsVM = {
-    timeseries: null,
-    loading: false,
-    error: null,
-};
-
-async function loadMetrics(force) {
-    const tab = document.querySelector('[data-tab="metrics"]');
-    if (!tab) return;
-    if (metricsVM.loading && !force) return;
-
-    const since = new Date(Date.now() - getMetricsRangeWindow(metricsVM.range));
-    const params = new URLSearchParams({ since: since.toISOString() });
-
-    // Add filter params if set
-    if (metricsVM.filters.tenantId) {
-        params.set('tenant_id', metricsVM.filters.tenantId);
-    }
-    if (metricsVM.filters.agentId) {
-        params.set('agent_id', metricsVM.filters.agentId);
-    }
-    if (metricsVM.filters.deviceSerial) {
-        params.set('device_serial', metricsVM.filters.deviceSerial);
-    }
-
-    // Server time-series params - request all series for comprehensive dashboards
-    const tsParams = new URLSearchParams({
-        start: since.toISOString(),
-        end: new Date().toISOString(),
-        resolution: 'auto',
-        series: 'goroutines,heap_alloc,db_size,total_pages,color_pages,mono_pages,scan_count,toner_high,toner_medium,toner_low,toner_critical,ws_connections,agents,devices,devices_online,devices_error,agents_ws,agents_http,agents_offline',
-    });
-
-    metricsVM.loading = true;
-    serverMetricsVM.loading = true;
-    renderMetricsLoading();
-
-    // Determine if we should load server metrics (only for global admins)
-    const loadServerMetrics = isGlobalAdmin();
-
-    try {
-        const fetchPromises = [
-            fetch('/api/metrics'),
-            fetch(`/api/metrics/aggregated?${params.toString()}`),
-        ];
-        // Only fetch server time-series for global admins
-        if (loadServerMetrics) {
-            fetchPromises.push(fetch(`/api/metrics/timeseries?${tsParams.toString()}`));
-        }
-
-        const responses = await Promise.all(fetchPromises);
-        const [summaryResp, aggregatedResp] = responses;
-        const timeseriesResp = loadServerMetrics ? responses[2] : null;
-
-        if (!summaryResp.ok) {
-            throw new Error('Summary request failed: HTTP ' + summaryResp.status);
-        }
-        if (!aggregatedResp.ok) {
-            throw new Error('Aggregated request failed: HTTP ' + aggregatedResp.status);
-        }
-
-        metricsVM.summary = await summaryResp.json();
-        metricsVM.aggregated = await aggregatedResp.json();
-        metricsVM.lastFetched = new Date();
-        metricsVM.error = null;
-
-        // Load server time-series data (non-blocking on error, only for admins)
-        if (timeseriesResp && timeseriesResp.ok) {
-            serverMetricsVM.timeseries = await timeseriesResp.json();
-            serverMetricsVM.error = null;
-        } else {
-            serverMetricsVM.timeseries = null;
-        }
-
-        renderMetricsDashboard();
-    } catch (err) {
-        metricsVM.error = err;
-        renderMetricsError(err);
-    } finally {
-        metricsVM.loading = false;
-        serverMetricsVM.loading = false;
-    }
-}
-
-// Helper to generate chart skeleton loading HTML
-function chartSkeletonHTML(text, count = 1) {
-    const skeleton = `<div class="metric-chart-card loading"><div class="chart-skeleton"><div class="chart-spinner"></div><span class="chart-loading-text">${text}</span></div></div>`;
-    return count > 1 ? Array(count).fill(skeleton).join('') : skeleton;
-}
-
-function renderMetricsLoading() {
-    const statsEl = document.getElementById('metrics_stats');
-    const chartsEl = document.getElementById('metrics_chart_grid');
-    const consumablesChartsEl = document.getElementById('metrics_consumables_charts');
-    const agentFleetChartsEl = document.getElementById('metrics_agent_fleet_charts');
-    const serverChartsEl = document.getElementById('metrics_server_charts');
-    const serverEl = document.getElementById('metrics_server_panel');
-    const consumablesEl = document.getElementById('metrics_consumables');
-    if (statsEl && !metricsVM.summary) {
-        statsEl.innerHTML = '<div class="metric-card loading">Loading metrics‚Ä¶</div>';
-    }
-    if (chartsEl && !metricsVM.aggregated) {
-        chartsEl.innerHTML = chartSkeletonHTML('Loading throughput data‚Ä¶', 3);
-    }
-    if (consumablesChartsEl && !serverMetricsVM.timeseries) {
-        consumablesChartsEl.innerHTML = chartSkeletonHTML('Loading consumables history‚Ä¶', 2);
-    }
-    if (agentFleetChartsEl && !serverMetricsVM.timeseries) {
-        agentFleetChartsEl.innerHTML = chartSkeletonHTML('Loading agent fleet data‚Ä¶', 2);
-    }
-    if (serverChartsEl && !serverMetricsVM.timeseries) {
-        serverChartsEl.innerHTML = chartSkeletonHTML('Loading server time-series‚Ä¶', 3);
-    }
-    if (serverEl && !metricsVM.aggregated) {
-        serverEl.innerHTML = '<div class="metric-card loading">Collecting server stats‚Ä¶</div>';
-    }
-    if (consumablesEl && !metricsVM.aggregated) {
-        consumablesEl.innerHTML = '<div class="card-title">Consumables</div><div class="muted-text">Loading‚Ä¶</div>';
-    }
-}
-
-function renderMetricsDashboard() {
-    // Hide/show server-only sections based on role
-    updateMetricsServerVisibility();
-
-    renderMetricsOverview(metricsVM.summary, metricsVM.aggregated);
-    renderFleetCharts(metricsVM.aggregated);
-    renderConsumablesTimeSeriesCharts(serverMetricsVM.timeseries);
-    renderAgentFleetCharts(serverMetricsVM.timeseries);
-
-    // Only render server metrics for global admins
-    if (isGlobalAdmin()) {
-        renderServerTimeSeriesCharts(serverMetricsVM.timeseries);
-        renderServerPanel(metricsVM.aggregated?.server);
-    }
-
-    renderConsumables(metricsVM.aggregated?.fleet);
-    renderMetricsActivity(metricsVM.aggregated);
-    updateMetricsRangeButtons();
-}
-
-/**
- * Show/hide server metrics sections based on user role.
- * Server runtime stats are only visible to global admins.
- */
-function updateMetricsServerVisibility() {
-    const serverSection = document.getElementById('metrics_server_section');
-    const serverPanel = document.getElementById('metrics_server_panel');
-    const showServer = isGlobalAdmin();
-
-    if (serverSection) {
-        serverSection.style.display = showServer ? '' : 'none';
-    }
-    if (serverPanel) {
-        serverPanel.style.display = showServer ? '' : 'none';
-    }
-}
-
-function renderMetricsOverview(summary, aggregated) {
-    const container = document.getElementById('metrics_stats');
-    if (!container) return;
-    if (!summary || !aggregated) {
-        container.innerHTML = '<div class="metric-card loading">Waiting for fleet data‚Ä¶</div>';
-        return;
-    }
-
-    const totals = aggregated?.fleet?.totals || {};
-    const statuses = aggregated?.fleet?.statuses || {};
-    const history = aggregated?.fleet?.history?.total_impressions || aggregated?.fleet?.history?.TotalImpressions || [];
-    const throughput = calculateThroughput(history);
-    const rangeLabel = metricsRangeLabel(metricsVM.range);
-
-    container.innerHTML = `
-        <div class="metric-card">
-            <div class="card-title">Agents</div>
-            <div class="metric-kpi-value">${formatNumber(totals.agents || summary.agents_count || 0)}</div>
-            <div class="metric-kpi-label">Connected</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Devices</div>
-            <div class="metric-kpi-value">${formatNumber(totals.devices || summary.devices_count || 0)}</div>
-            <div class="metric-kpi-label">Managed across fleet</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Throughput (${rangeLabel})</div>
-            <div class="metric-kpi-value">${formatNumber(Math.round(throughput))}</div>
-            <div class="metric-kpi-label">Estimated pages per hour</div>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Alerts</div>
-            ${renderMetricsStatusChips(statuses)}
-            <div class="metric-footnote">${metricsVM.lastFetched ? 'Updated ' + formatRelativeTime(metricsVM.lastFetched) : ''}</div>
-        </div>
-    `;
-}
-
-function renderMetricsStatusChips(statuses) {
-    const error = statuses?.error || 0;
-    const warn = statuses?.warning || 0;
-    const jam = statuses?.jam || 0;
-    return `
-        <div class="metric-status-chips">
-            <span class="metric-chip error">Errors <strong>${formatNumber(error)}</strong></span>
-            <span class="metric-chip warn">Warnings <strong>${formatNumber(warn)}</strong></span>
-            <span class="metric-chip jam">Jams <strong>${formatNumber(jam)}</strong></span>
-        </div>
-    `;
-}
-
-function renderFleetCharts(aggregated) {
-    const grid = document.getElementById('metrics_chart_grid');
-    if (!grid) return;
-    const history = aggregated?.fleet?.history;
-    const totals = aggregated?.fleet?.totals || {};
-    if (!history) {
-        grid.innerHTML = `
-            <div class="metric-chart-card">
-                <div class="card-title">Total Impressions</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>No fleet history yet</span>
-                </div>
-            </div>
-            <div class="metric-chart-card">
-                <div class="card-title">Color vs Mono</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>No fleet history yet</span>
-                </div>
-            </div>
-            <div class="metric-chart-card">
-                <div class="card-title">Scan Volume</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>No fleet history yet</span>
-                </div>
-            </div>`;
-        return;
-    }
-
-    // Helper to compute cumulative series from rate data
-    // Takes rate points and lifetime total, works backwards to compute cumulative at each point
-    const toCumulativeSeries = (ratePoints, lifetimeTotal) => {
-        if (!Array.isArray(ratePoints) || ratePoints.length === 0) return [];
-        // Sum all deltas to get total printed during this window
-        const windowTotal = ratePoints.reduce((sum, pt) => sum + (pt.value || 0), 0);
-        // Starting cumulative is (lifetime - window total)
-        let cumulative = lifetimeTotal - windowTotal;
-        return ratePoints.map(pt => {
-            cumulative += pt.value || 0;
-            return { time: pt.time, value: cumulative };
-        });
-    };
-
-    const totalRatePoints = toSeriesPoints(history.total_impressions || history.TotalImpressions);
-    const colorRatePoints = toSeriesPoints(history.color_impressions || history.ColorImpressions);
-    const monoRatePoints = toSeriesPoints(history.mono_impressions || history.MonoImpressions);
-    const scanRatePoints = toSeriesPoints(history.scan_volume || history.ScanVolume);
-
-    const cards = [
-        {
-            id: 'fleet_total_chart',
-            title: 'Total Impressions',
-            rateSeries: [{ label: 'Hourly Rate', color: FLEET_SERIES_COLORS[0], points: totalRatePoints }],
-            cumulativeSeries: [{ label: 'Cumulative', color: '#9f7aea', points: toCumulativeSeries(totalRatePoints, totals.page_count || 0) }],
-        },
-        {
-            id: 'fleet_color_mono_chart',
-            title: 'Color vs Mono',
-            rateSeries: [
-                { label: 'Color/hr', color: FLEET_SERIES_COLORS[1], points: colorRatePoints },
-                { label: 'Mono/hr', color: FLEET_SERIES_COLORS[2], points: monoRatePoints },
-            ],
-            cumulativeSeries: [
-                { label: 'Color Total', color: '#00bcd4', points: toCumulativeSeries(colorRatePoints, totals.color_pages || 0) },
-                { label: 'Mono Total', color: '#78909c', points: toCumulativeSeries(monoRatePoints, totals.mono_pages || 0) },
-            ],
-        },
-        {
-            id: 'fleet_scan_chart',
-            title: 'Scan Volume',
-            rateSeries: [{ label: 'Scans/hr', color: FLEET_SERIES_COLORS[3], points: scanRatePoints }],
-            cumulativeSeries: [{ label: 'Total Scans', color: '#26a69a', points: toCumulativeSeries(scanRatePoints, totals.scan_count || 0) }],
-        },
-    ];
-
-    grid.innerHTML = cards.map(card => `
-        <div class="metric-chart-card data-loading">
-            <div class="card-title">${card.title}</div>
-            <canvas id="${card.id}" class="metric-chart-canvas" height="220"></canvas>
-        </div>
-    `).join('');
-
-    // Small delay for DOM to settle, then draw and reveal
-    requestAnimationFrame(() => {
-        cards.forEach(card => {
-            const canvas = document.getElementById(card.id);
-            if (canvas) {
-                drawFleetChartDualAxis(canvas, card.rateSeries, card.cumulativeSeries, { label: card.title });
-                // Remove loading class to trigger fade-in
-                canvas.closest('.metric-chart-card')?.classList.remove('data-loading');
-            }
-        });
-    });
-}
-
-// Server Runtime Time-Series Charts - Netdata-style full-width
-
-// Helper to normalize chart series points from {t, v} to {time, value} format
-// Backend sends compact {t, v} but our chart functions expect {time, value}
-// Returns null if input is falsy/empty so fallback can work with || operator
-function normalizeChartSeriesPoints(points) {
-    if (!Array.isArray(points) || points.length === 0) return null;
-    // Check if already in correct format
-    if (points[0].time !== undefined) return points;
-    // Transform from {t, v} to {time, value}
-    return points.map(p => ({ time: p.t, value: p.v }));
-}
-
-const SERVER_SERIES_COLORS = {
-    goroutines: '#4299e1',
-    heap_alloc: '#48bb78',
-    db_size: '#ed8936',
-    ws_connections: '#9f7aea',
-    total_pages: '#4a5568',
-    color_pages: '#00bcd4',
-    mono_pages: '#718096',
-    scan_volume: '#38b2ac',
-    toner_low: '#ecc94b',
-    toner_critical: '#f56565',
-    toner_high: '#4299e1',
-    toner_medium: '#48bb78',
-    agents: '#9f7aea',
-    devices: '#ed8936',
-    devices_online: '#48bb78',
-    devices_error: '#f56565',
-    agents_ws: '#48bb78',      // Green for WebSocket connected
-    agents_http: '#ecc94b',    // Yellow for HTTP fallback
-    agents_offline: '#f56565', // Red for offline
-};
-
-/**
- * Helper to render chart cards without flashing.
- * Reuses existing canvas elements when possible to avoid DOM thrashing during live updates.
- * @param {HTMLElement} grid - Container element
- * @param {Array} cards - Array of {id, title, series, formatY?} objects
- * @param {Function} drawFn - Chart drawing function (drawFleetChart or custom)
- * @param {string} noDataHtml - HTML to show when no data
- */
-function renderChartCardsSmooth(grid, cards, drawFn, noDataHtml) {
-    if (!grid) return;
-
-    // Filter to cards with actual data
-    const validCards = cards.filter(card =>
-        card.series && card.series.some(s => s.points && s.points.length > 0)
-    );
-
-    if (validCards.length === 0) {
-        grid.innerHTML = noDataHtml;
-        return;
-    }
-
-    // Check if we can reuse existing canvases (same card IDs in same order)
-    const existingIds = Array.from(grid.querySelectorAll('canvas.metric-chart-canvas')).map(c => c.id);
-    const newIds = validCards.map(c => c.id);
-    const canReuse = existingIds.length === newIds.length && existingIds.every((id, i) => id === newIds[i]);
-
-    if (!canReuse) {
-        // Need to rebuild DOM structure
-        grid.innerHTML = validCards.map(card => `
-            <div class="metric-chart-card">
-                <div class="card-title">${card.title}</div>
-                <canvas id="${card.id}" class="metric-chart-canvas" height="220"></canvas>
-            </div>
-        `).join('');
-    }
-
-    // Draw charts (reuses existing canvas elements if structure matches)
-    requestAnimationFrame(() => {
-        validCards.forEach(card => {
-            const canvas = document.getElementById(card.id);
-            if (canvas) {
-                drawFn(canvas, card.series, {
-                    label: card.title,
-                    formatY: card.formatY,
-                });
-            }
-        });
-    });
-}
-
-// Consumables Time-Series Charts - Historical view of toner levels across fleet
-function renderConsumablesTimeSeriesCharts(timeseries) {
-    const grid = document.getElementById('metrics_consumables_charts');
-    if (!grid) return;
-
-    if (!timeseries || !timeseries.snapshots || timeseries.snapshots.length === 0) {
-        grid.innerHTML = `
-            <div class="metric-chart-card">
-                <div class="card-title">Consumables Distribution Over Time</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>
-            <div class="metric-chart-card">
-                <div class="card-title">Low & Critical Consumables Trend</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>`;
-        return;
-    }
-
-    const chartSeries = timeseries.chart_series || {};
-    const snapshots = timeseries.snapshots || [];
-
-    const buildSeriesFromSnapshots = (key, accessor) => {
-        return snapshots.map(s => ({
-            time: new Date(s.timestamp).getTime(),
-            value: accessor(s),
-        })).filter(p => p.value !== undefined && p.value !== null);
-    };
-
-    const cards = [
-        {
-            id: 'consumables_history_chart',
-            title: 'Consumables Distribution Over Time',
-            series: [
-                {
-                    label: 'High (>50%)',
-                    color: SERVER_SERIES_COLORS.toner_high,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_high) || buildSeriesFromSnapshots('toner_high', s => s.fleet?.toner_high),
-                },
-                {
-                    label: 'Medium (25-50%)',
-                    color: SERVER_SERIES_COLORS.toner_medium,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_medium) || buildSeriesFromSnapshots('toner_medium', s => s.fleet?.toner_medium),
-                },
-                {
-                    label: 'Low (10-25%)',
-                    color: SERVER_SERIES_COLORS.toner_low,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_low) || buildSeriesFromSnapshots('toner_low', s => s.fleet?.toner_low),
-                },
-                {
-                    label: 'Critical (<10%)',
-                    color: SERVER_SERIES_COLORS.toner_critical,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_critical) || buildSeriesFromSnapshots('toner_critical', s => s.fleet?.toner_critical),
-                },
-            ],
-        },
-        {
-            id: 'consumables_alerts_chart',
-            title: 'Low & Critical Consumables Trend',
-            series: [
-                {
-                    label: 'Low',
-                    color: SERVER_SERIES_COLORS.toner_low,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_low) || buildSeriesFromSnapshots('toner_low', s => s.fleet?.toner_low),
-                },
-                {
-                    label: 'Critical',
-                    color: SERVER_SERIES_COLORS.toner_critical,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_critical) || buildSeriesFromSnapshots('toner_critical', s => s.fleet?.toner_critical),
-                },
-            ],
-        },
-    ];
-
-    const noDataHtml = `
-        <div class="metric-chart-card">
-            <div class="card-title">Consumables Distribution Over Time</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>
-        <div class="metric-chart-card">
-            <div class="card-title">Low & Critical Consumables Trend</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>`;
-
-    renderChartCardsSmooth(grid, cards, drawFleetChart, noDataHtml);
-}
-
-// Agent Fleet Time-Series Charts - Historical view of agent fleet health
-function renderAgentFleetCharts(timeseries) {
-    const grid = document.getElementById('metrics_agent_fleet_charts');
-    if (!grid) return;
-
-    if (!timeseries || !timeseries.snapshots || timeseries.snapshots.length === 0) {
-        grid.innerHTML = `
-            <div class="metric-chart-card">
-                <div class="card-title">Agent & Device Count</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>
-            <div class="metric-chart-card">
-                <div class="card-title">Device Status</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>`;
-        return;
-    }
-
-    const chartSeries = timeseries.chart_series || {};
-    const snapshots = timeseries.snapshots || [];
-
-    const buildSeriesFromSnapshots = (key, accessor) => {
-        return snapshots.map(s => ({
-            time: new Date(s.timestamp).getTime(),
-            value: accessor(s),
-        })).filter(p => p.value !== undefined && p.value !== null);
-    };
-
-    const cards = [
-        {
-            id: 'agent_count_chart',
-            title: 'Agent & Device Count',
-            series: [
-                {
-                    label: 'Agents',
-                    color: SERVER_SERIES_COLORS.agents,
-                    points: normalizeChartSeriesPoints(chartSeries.agents) || buildSeriesFromSnapshots('agents', s => s.fleet?.total_agents),
-                },
-                {
-                    label: 'Devices',
-                    color: SERVER_SERIES_COLORS.devices,
-                    points: normalizeChartSeriesPoints(chartSeries.devices) || buildSeriesFromSnapshots('devices', s => s.fleet?.total_devices),
-                },
-            ],
-        },
-        {
-            id: 'device_health_chart',
-            title: 'Device Health',
-            series: [
-                {
-                    label: 'Online',
-                    color: SERVER_SERIES_COLORS.devices_online,
-                    points: normalizeChartSeriesPoints(chartSeries.devices_online) || buildSeriesFromSnapshots('devices_online', s => s.fleet?.devices_online),
-                },
-                {
-                    label: 'Errors',
-                    color: SERVER_SERIES_COLORS.devices_error,
-                    points: normalizeChartSeriesPoints(chartSeries.devices_error) || buildSeriesFromSnapshots('devices_error', s => s.fleet?.devices_error),
-                },
-            ],
-        },
-    ];
-
-    const noDataHtml = `
-        <div class="metric-chart-card">
-            <div class="card-title">Agent & Device Count</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>
-        <div class="metric-chart-card">
-            <div class="card-title">Device Health</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>`;
-
-    renderChartCardsSmooth(grid, cards, drawFleetChart, noDataHtml);
-}
-
-function renderServerTimeSeriesCharts(timeseries) {
-    const grid = document.getElementById('metrics_server_charts');
-    if (!grid) return;
-
-    if (!timeseries || !timeseries.snapshots || timeseries.snapshots.length === 0) {
-        grid.innerHTML = `
-            <div class="metric-chart-card">
-                <div class="card-title">Goroutines</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>
-            <div class="metric-chart-card">
-                <div class="card-title">Memory (Heap)</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>
-            <div class="metric-chart-card">
-                <div class="card-title">Database Size</div>
-                <div class="no-data-placeholder">
-                    <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                    <span>Collecting data‚Ä¶</span>
-                </div>
-            </div>`;
-        return;
-    }
-
-    const chartSeries = timeseries.chart_series || {};
-    const snapshots = timeseries.snapshots || [];
-
-    // Build chart data from snapshots if chart_series not provided
-    const buildSeriesFromSnapshots = (key, accessor) => {
-        return snapshots.map(s => ({
-            time: new Date(s.timestamp).getTime(),
-            value: accessor(s),
-        })).filter(p => p.value !== undefined && p.value !== null);
-    };
-
-    const cards = [
-        {
-            id: 'server_goroutines_chart',
-            title: 'Goroutines',
-            series: [{
-                label: 'Goroutines',
-                color: SERVER_SERIES_COLORS.goroutines,
-                points: normalizeChartSeriesPoints(chartSeries.goroutines) || buildSeriesFromSnapshots('goroutines', s => s.server?.goroutines)
-            }],
-        },
-        {
-            id: 'server_memory_chart',
-            title: 'Memory (Heap)',
-            series: [{
-                label: 'Heap Alloc',
-                color: SERVER_SERIES_COLORS.heap_alloc,
-                points: normalizeChartSeriesPoints(chartSeries.heap_alloc) || buildSeriesFromSnapshots('heap_alloc', s => s.server?.heap_alloc_mb),
-            }],
-            formatY: v => formatBytes(v * 1024 * 1024), // heap_alloc_mb is in MB
-        },
-        {
-            id: 'server_db_chart',
-            title: 'Database Size',
-            series: [{
-                label: 'DB Size',
-                color: SERVER_SERIES_COLORS.db_size,
-                points: normalizeChartSeriesPoints(chartSeries.db_size) || buildSeriesFromSnapshots('db_size', s => s.server?.db_size_bytes),
-            }],
-            formatY: formatBytes,
-        },
-        {
-            id: 'server_ws_chart',
-            title: 'Agent Connections',
-            series: [
-                {
-                    label: 'WebSocket',
-                    color: SERVER_SERIES_COLORS.agents_ws,
-                    points: normalizeChartSeriesPoints(chartSeries.agents_ws) || buildSeriesFromSnapshots('agents_ws', s => s.fleet?.agents_ws),
-                },
-                {
-                    label: 'HTTP',
-                    color: SERVER_SERIES_COLORS.agents_http,
-                    points: normalizeChartSeriesPoints(chartSeries.agents_http) || buildSeriesFromSnapshots('agents_http', s => s.fleet?.agents_http),
-                },
-                {
-                    label: 'Offline',
-                    color: SERVER_SERIES_COLORS.agents_offline,
-                    points: normalizeChartSeriesPoints(chartSeries.agents_offline) || buildSeriesFromSnapshots('agents_offline', s => s.fleet?.agents_offline),
-                },
-            ],
-        },
-        {
-            id: 'server_pages_chart',
-            title: 'Fleet Page Counts',
-            series: [
-                {
-                    label: 'Total',
-                    color: SERVER_SERIES_COLORS.total_pages,
-                    points: normalizeChartSeriesPoints(chartSeries.total_pages) || buildSeriesFromSnapshots('total_pages', s => s.fleet?.total_pages),
-                },
-                {
-                    label: 'Color',
-                    color: SERVER_SERIES_COLORS.color_pages,
-                    points: normalizeChartSeriesPoints(chartSeries.color_pages) || buildSeriesFromSnapshots('color_pages', s => s.fleet?.color_pages),
-                },
-                {
-                    label: 'Mono',
-                    color: SERVER_SERIES_COLORS.mono_pages,
-                    points: normalizeChartSeriesPoints(chartSeries.mono_pages) || buildSeriesFromSnapshots('mono_pages', s => s.fleet?.mono_pages),
-                },
-            ],
-        },
-        {
-            id: 'server_toner_chart',
-            title: 'Toner Levels',
-            series: [
-                {
-                    label: 'Low',
-                    color: SERVER_SERIES_COLORS.toner_low,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_low) || buildSeriesFromSnapshots('toner_low', s => s.fleet?.toner_low),
-                },
-                {
-                    label: 'Critical',
-                    color: SERVER_SERIES_COLORS.toner_critical,
-                    points: normalizeChartSeriesPoints(chartSeries.toner_critical) || buildSeriesFromSnapshots('toner_critical', s => s.fleet?.toner_critical),
-                },
-            ],
-        },
-    ];
-
-    const noDataHtml = `
-        <div class="metric-chart-card">
-            <div class="card-title">Goroutines</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>
-        <div class="metric-chart-card">
-            <div class="card-title">Memory (Heap)</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>
-        <div class="metric-chart-card">
-            <div class="card-title">Database Size</div>
-            <div class="no-data-placeholder">
-                <svg class="no-data-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
-                <span>Collecting data‚Ä¶</span>
-            </div>
-        </div>`;
-
-    renderChartCardsSmooth(grid, cards, drawFleetChart, noDataHtml);
-}
-
-function renderServerPanel(server) {
-    const panel = document.getElementById('metrics_server_panel');
-    if (!panel) return;
-    if (!server) {
-        panel.innerHTML = '<div class="metric-card loading">Server metrics unavailable.</div>';
-        return;
-    }
-
-    const runtime = server.runtime || {};
-    const memory = runtime.memory || {};
-    const db = server.database || {};
-    const uptime = formatDuration(server.uptime_seconds);
-    const artifactsBytes = db.release_artifacts_bytes || db.release_bytes || 0;
-    const cacheBytes = artifactsBytes;
-
-    panel.innerHTML = `
-        <div class="metric-card">
-            <div class="card-title">Server Runtime</div>
-            <div class="metric-kpi-value" style="font-size:18px;">${escapeHtml(server.hostname || 'PrintMaster')}</div>
-            <div class="metric-kpi-label">Up ${uptime}, ${escapeHtml(runtime.go_version || 'Go')}</div>
-            <ul style="list-style:none;padding:0;margin:12px 0 0;font-size:13px;line-height:1.6;">
-                <li>Goroutines: <strong>${formatNumber(runtime.num_goroutine || 0)}</strong></li>
-                <li>Heap: <strong>${formatBytes(memory.heap_alloc_bytes || memory.heap_alloc || 0)}</strong></li>
-                <li>Total Alloc: <strong>${formatBytes(memory.total_alloc_bytes || memory.total_alloc || 0)}</strong></li>
-            </ul>
-        </div>
-        <div class="metric-card">
-            <div class="card-title">Database</div>
-            ${db ? `
-                <ul style="list-style:none;padding:0;margin:0;font-size:13px;line-height:1.6;">
-                    <li>Agents: <strong>${formatNumber(db.agents || 0)}</strong></li>
-                    <li>Devices: <strong>${formatNumber(db.devices || 0)}</strong></li>
-                    <li>Metrics rows: <strong>${formatNumber(db.metrics_snapshots || 0)}</strong></li>
-                    <li>Sessions: <strong>${formatNumber(db.sessions || 0)}</strong></li>
-                    <li>Users: <strong>${formatNumber(db.users || 0)}</strong></li>
-                    <li>Audit entries: <strong>${formatNumber(db.audit_entries || 0)}</strong></li>
-                    <li>Artifacts: <strong>${formatNumber(db.release_artifacts || 0)}</strong> (${formatBytes(artifactsBytes)})</li>
-                    <li>Total cache size: <strong>${formatBytes(cacheBytes)}</strong></li>
-                </ul>
-            ` : '<div class="muted-text">No DB stats available.</div>'}
-        </div>
-    `;
-}
-
-// Consumables donut chart colors matching the tier semantics
-const CONSUMABLE_TIER_COLORS = {
-    critical: '#f56565', // Red for critical
-    low: '#ecc94b',      // Yellow/amber for low
-    medium: '#48bb78',   // Green for medium
-    high: '#4299e1',     // Blue for high
-    unknown: '#718096',  // Gray for unknown
-};
-
-function renderConsumables(fleet) {
-    const card = document.getElementById('metrics_consumables');
-    if (!card) return;
-    card.innerHTML = '<div class="card-title">Consumables</div>';
-    if (!fleet || !fleet.consumables) {
-        card.innerHTML += '<div class="muted-text">No consumable data yet.</div>';
-        return;
-    }
-    const totals = fleet.totals || {};
-    const consumables = fleet.consumables;
-    const totalDevices = (consumables.critical || 0) + (consumables.low || 0) + (consumables.medium || 0) + (consumables.high || 0) + (consumables.unknown || 0);
-
-    if (totalDevices === 0) {
-        card.innerHTML += '<div class="muted-text">No devices with consumable data.</div>';
-        return;
-    }
-
-    const tiers = [
-        { key: 'critical', label: 'Critical (<10%)', value: consumables.critical || 0, color: CONSUMABLE_TIER_COLORS.critical },
-        { key: 'low', label: 'Low (10-25%)', value: consumables.low || 0, color: CONSUMABLE_TIER_COLORS.low },
-        { key: 'medium', label: 'Medium (25-50%)', value: consumables.medium || 0, color: CONSUMABLE_TIER_COLORS.medium },
-        { key: 'high', label: 'High (>50%)', value: consumables.high || 0, color: CONSUMABLE_TIER_COLORS.high },
-        { key: 'unknown', label: 'Unknown', value: consumables.unknown || 0, color: CONSUMABLE_TIER_COLORS.unknown },
-    ];
-
-    // Build donut chart container with legend
-    card.innerHTML += `
-        <div class="consumables-chart-container">
-            <canvas id="consumables_donut_chart" width="160" height="160"></canvas>
-            <div class="consumables-legend">
-                ${tiers.map(tier => `
-                    <div class="consumables-legend-item">
-                        <span class="consumables-legend-swatch" style="background:${tier.color};"></span>
-                        <span class="consumables-legend-label">${tier.label}:</span>
-                        <strong>${formatNumber(tier.value)}</strong>
-                        <span class="consumables-legend-pct">(${Math.round((tier.value / totalDevices) * 100)}%)</span>
-                    </div>
-                `).join('')}
-            </div>
-        </div>
-    `;
-
-    // Draw the donut chart
-    const canvas = document.getElementById('consumables_donut_chart');
-    if (canvas) {
-        drawConsumablesDonut(canvas, tiers, totalDevices);
-    }
-}
-
-function drawConsumablesDonut(canvas, tiers, total) {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const size = 160;
-    canvas.width = size * dpr;
-    canvas.height = size * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, size, size);
-
-    const centerX = size / 2;
-    const centerY = size / 2;
-    const outerRadius = 70;
-    const innerRadius = 45;
-
-    let startAngle = -Math.PI / 2; // Start from top
-
-    // Draw segments
-    tiers.forEach(tier => {
-        if (tier.value === 0) return;
-        const sliceAngle = (tier.value / total) * Math.PI * 2;
-        const endAngle = startAngle + sliceAngle;
-
-        ctx.beginPath();
-        ctx.arc(centerX, centerY, outerRadius, startAngle, endAngle);
-        ctx.arc(centerX, centerY, innerRadius, endAngle, startAngle, true);
-        ctx.closePath();
-        ctx.fillStyle = tier.color;
-        ctx.fill();
-
-        startAngle = endAngle;
-    });
-
-    // Draw center text showing total
-    ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.font = 'bold 20px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(formatNumber(total), centerX, centerY - 6);
-    ctx.font = '10px sans-serif';
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText('devices', centerX, centerY + 10);
-}
-
-function renderMetricsActivity(aggregated) {
-    const card = document.getElementById('metrics_activity');
-    if (!card) return;
-    card.innerHTML = '<div class="card-title">Activity</div>';
-    if (!aggregated || !aggregated.fleet) {
-        card.innerHTML += '<div class="muted-text">No activity yet.</div>';
-        return;
-    }
-
-    const totals = aggregated.fleet.totals || {};
-    const history = aggregated.fleet.history?.total_impressions || [];
-    const lastPoint = history[history.length - 1];
-    const periodTotal = history.reduce((sum, pt) => sum + Number(pt?.value || 0), 0);
-    const lastTimestamp = lastPoint ? formatDateTime(lastPoint.timestamp) : 'n/a';
-
-    card.innerHTML += `
-        <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
-            <div>Total lifetime pages: <strong>${formatNumber(totals.page_count || 0)}</strong></div>
-            <div>Period pages (${metricsRangeLabel(metricsVM.range)}): <strong>${formatNumber(periodTotal)}</strong></div>
-            <div>Last metric: <strong>${escapeHtml(lastTimestamp)}</strong></div>
-        </div>
-    `;
-}
-
-function renderMetricsError(err) {
-    const statsEl = document.getElementById('metrics_stats');
-    if (statsEl) {
-        statsEl.innerHTML = `<div class="metric-card" style="color:var(--danger);">Failed to load metrics: ${escapeHtml(err?.message || err)}</div>`;
-    }
-    const chartsEl = document.getElementById('metrics_chart_grid');
-    if (chartsEl) {
-        chartsEl.innerHTML = '<div class="metric-chart-card" style="color:var(--danger);">Unable to render charts.</div>';
-    }
-}
-
-function getMetricsRangeWindow(range) {
-    return METRICS_RANGE_WINDOWS[range] || METRICS_RANGE_WINDOWS[METRICS_DEFAULT_RANGE];
-}
-
-function metricsRangeLabel(range) {
-    switch (range) {
-        case '5m': return '5 minutes';
-        case '15m': return '15 minutes';
-        case '30m': return '30 minutes';
-        case '1h': return '1 hour';
-        case '6h': return '6 hours';
-        case '12h': return '12 hours';
-        case '24h': return '24 hours';
-        case '7d': return '7 days';
-        case '30d': return '30 days';
-        case '90d': return '90 days';
-        case '365d': return '1 year';
-        default: return range;
-    }
-}
-
-function initMetricsRangeControls() {
-    const controls = document.getElementById('metrics_range_controls');
-    if (!controls || controls._metricsBound) return;
-    controls._metricsBound = true;
-    controls.addEventListener('click', (evt) => {
-        const btn = evt.target.closest('[data-range]');
-        if (!btn) return;
-        setMetricsRange(btn.getAttribute('data-range'));
-    });
-    updateMetricsRangeButtons();
-}
-
-/**
- * Initialize metrics filter controls (tenant, agent, device dropdowns).
- * Cascading filter pattern:
- * - Global admins: Show tenant filter first ‚Üí agent filter appears when tenant selected ‚Üí device filter appears when agent selected
- * - Non-admin users: Show agent filter first (scoped to their tenant) ‚Üí device filter appears when agent selected
- */
-function initMetricsFilterControls() {
-    const filtersContainer = document.getElementById('metrics_filters');
-    const tenantSelect = document.getElementById('metrics_tenant_filter');
-    const agentSelect = document.getElementById('metrics_agent_filter');
-    const deviceSelect = document.getElementById('metrics_device_filter');
-
-    if (!filtersContainer) return;
-    if (filtersContainer._filtersBound) return;
-    filtersContainer._filtersBound = true;
-
-    // Cascading filter setup: hide downstream filters initially
-    if (isGlobalAdmin()) {
-        // Global admins start with tenant filter only
-        if (tenantSelect) {
-            tenantSelect.addEventListener('change', onMetricsTenantChange);
-        }
-        if (agentSelect) {
-            agentSelect.style.display = 'none'; // Hidden until tenant selected
-            agentSelect.addEventListener('change', onMetricsAgentChange);
-        }
-    } else {
-        // Non-global users: hide tenant filter, show agent filter
-        if (tenantSelect) {
-            tenantSelect.style.display = 'none';
-        }
-        if (agentSelect) {
-            agentSelect.addEventListener('change', onMetricsAgentChange);
-        }
-    }
-
-    // Device filter always hidden until agent selected
-    if (deviceSelect) {
-        deviceSelect.style.display = 'none';
-        deviceSelect.addEventListener('change', onMetricsDeviceChange);
-    }
-
-    // Initial population of filters
-    populateMetricsFilters();
-}
-
-/**
- * Populate metrics filter dropdowns with available options.
- * Cascading pattern:
- * - Global admins: Populate tenant only; agent filter populated when tenant selected
- * - Non-admin users: Populate agent filter immediately (scoped to their tenant)
- */
-async function populateMetricsFilters() {
-    const tenantSelect = document.getElementById('metrics_tenant_filter');
-    const agentSelect = document.getElementById('metrics_agent_filter');
-    const deviceSelect = document.getElementById('metrics_device_filter');
-
-    // Populate tenant filter (global admins only)
-    if (tenantSelect && isGlobalAdmin()) {
-        try {
-            const tenantsResp = await fetch('/api/v1/tenants');
-            if (tenantsResp.ok) {
-                const tenants = await tenantsResp.json();
-                tenantSelect.innerHTML = '<option value="">All Tenants</option>';
-                (tenants || []).forEach(t => {
-                    const opt = document.createElement('option');
-                    opt.value = t.id;
-                    opt.textContent = t.name || t.id;
-                    tenantSelect.appendChild(opt);
-                });
-            }
-        } catch (err) {
-            window.__pm_shared.warn('Failed to load tenants for metrics filter', err);
-        }
-        // Agent filter stays hidden until tenant is selected (for global admins)
-        return;
-    }
-
-    // For non-global users: populate agent filter immediately (scoped to their tenant)
-    if (agentSelect) {
-        try {
-            const agentsResp = await fetch('/api/v1/agents/list');
-            if (agentsResp.ok) {
-                const agents = await agentsResp.json();
-                agentSelect.innerHTML = '<option value="">All Agents</option>';
-                (agents || []).forEach(a => {
-                    const opt = document.createElement('option');
-                    opt.value = a.agent_id;
-                    opt.textContent = a.name || a.hostname || a.agent_id;
-                    agentSelect.appendChild(opt);
-                });
-            }
-        } catch (err) {
-            window.__pm_shared.warn('Failed to load agents for metrics filter', err);
-        }
-    }
-
-    // Device filter starts empty - populated when agent is selected
-    if (deviceSelect) {
-        deviceSelect.innerHTML = '<option value="">All Devices</option>';
-        deviceSelect.disabled = true;
-    }
-}
-
-function onMetricsTenantChange(evt) {
-    const tenantId = evt.target.value;
-    metricsVM.filters.tenantId = tenantId;
-    metricsVM.filters.agentId = '';
-    metricsVM.filters.deviceSerial = '';
-
-    // Update visual state
-    evt.target.classList.toggle('has-value', !!tenantId);
-
-    // Reset agent/device filters
-    const agentSelect = document.getElementById('metrics_agent_filter');
-    const deviceSelect = document.getElementById('metrics_device_filter');
-    if (agentSelect) {
-        agentSelect.value = '';
-        agentSelect.classList.remove('has-value');
-        // Show agent filter when tenant selected, hide when "All Tenants"
-        agentSelect.style.display = tenantId ? '' : 'none';
-    }
-    if (deviceSelect) {
-        deviceSelect.value = '';
-        deviceSelect.innerHTML = '<option value="">All Devices</option>';
-        deviceSelect.disabled = true;
-        deviceSelect.classList.remove('has-value');
-        // Hide device filter when tenant changes
-        deviceSelect.style.display = 'none';
-    }
-
-    // Reload metrics with new filter
-    loadMetrics(true);
-
-    // Re-populate agent filter for selected tenant
-    if (tenantId) {
-        populateAgentFilterForTenant(tenantId);
-    }
-}
-
-async function populateAgentFilterForTenant(tenantId) {
-    const agentSelect = document.getElementById('metrics_agent_filter');
-    if (!agentSelect) return;
-
-    try {
-        let url = '/api/v1/agents/list';
-        if (tenantId) {
-            url += `?tenant_id=${encodeURIComponent(tenantId)}`;
-        }
-        const resp = await fetch(url);
-        if (resp.ok) {
-            const agents = await resp.json();
-            agentSelect.innerHTML = '<option value="">All Agents</option>';
-            (agents || []).forEach(a => {
-                const opt = document.createElement('option');
-                opt.value = a.agent_id;
-                opt.textContent = a.name || a.hostname || a.agent_id;
-                agentSelect.appendChild(opt);
-            });
-        }
-    } catch (err) {
-        window.__pm_shared.warn('Failed to reload agents for tenant', err);
-    }
-}
-
-function onMetricsAgentChange(evt) {
-    const agentId = evt.target.value;
-    metricsVM.filters.agentId = agentId;
-    metricsVM.filters.deviceSerial = '';
-
-    // Update visual state
-    evt.target.classList.toggle('has-value', !!agentId);
-
-    const deviceSelect = document.getElementById('metrics_device_filter');
-    if (deviceSelect) {
-        deviceSelect.value = '';
-        deviceSelect.classList.remove('has-value');
-
-        if (agentId) {
-            // Show and populate device filter for selected agent
-            deviceSelect.style.display = '';
-            populateDeviceFilterForAgent(agentId);
-        } else {
-            // Hide device filter when "All Agents" is selected
-            deviceSelect.style.display = 'none';
-            deviceSelect.innerHTML = '<option value="">All Devices</option>';
-            deviceSelect.disabled = true;
-        }
-    }
-
-    // Reload metrics with new filter
-    loadMetrics(true);
-}
-
-async function populateDeviceFilterForAgent(agentId) {
-    const deviceSelect = document.getElementById('metrics_device_filter');
-    if (!deviceSelect) return;
-
-    deviceSelect.disabled = false;
-    deviceSelect.innerHTML = '<option value="">All Devices</option>';
-
-    try {
-        // Fetch all devices and filter by agent_id client-side
-        const resp = await fetch('/api/v1/devices/list');
-        if (resp.ok) {
-            const data = await resp.json();
-            const devices = Array.isArray(data) ? data : (data.devices || []);
-            // Filter to only devices belonging to the selected agent
-            const agentDevices = devices.filter(d => d.agent_id === agentId);
-            agentDevices.forEach(d => {
-                const opt = document.createElement('option');
-                opt.value = d.serial;
-                opt.textContent = d.model || d.serial;
-                if (d.ip) {
-                    opt.textContent += ` (${d.ip})`;
-                }
-                deviceSelect.appendChild(opt);
-            });
-
-            if (agentDevices.length === 0) {
-                deviceSelect.innerHTML = '<option value="">No devices</option>';
-                deviceSelect.disabled = true;
-            }
-        }
-    } catch (err) {
-        window.__pm_shared.warn('Failed to load devices for agent', err);
-        deviceSelect.disabled = true;
-    }
-}
-
-function onMetricsDeviceChange(evt) {
-    const serial = evt.target.value;
-    metricsVM.filters.deviceSerial = serial;
-
-    // Update visual state
-    evt.target.classList.toggle('has-value', !!serial);
-
-    // Reload metrics with new filter
-    loadMetrics(true);
-}
-
-function setMetricsRange(range) {
-    if (!range || range === metricsVM.range) return;
-    metricsVM.range = range;
-    updateMetricsRangeButtons();
-    loadMetrics(true);
-}
-
-function updateMetricsRangeButtons() {
-    const controls = document.getElementById('metrics_range_controls');
-    if (!controls) return;
-    controls.querySelectorAll('[data-range]').forEach(btn => {
-        if (btn.getAttribute('data-range') === metricsVM.range) {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
-    });
-}
-
-function isMetricsTabActive() {
-    const tab = document.querySelector('[data-tab="metrics"]');
-    return tab && !tab.classList.contains('hidden');
-}
-
-/**
- * Handle live metrics snapshot from SSE for real-time chart updates.
- * Appends the new snapshot to the timeseries data and re-renders charts.
- */
-function handleLiveMetricsSnapshot(snapshot) {
-    // Only update if on metrics tab and we have existing data to append to
-    if (!isMetricsTabActive() || !serverMetricsVM.timeseries) {
-        return;
-    }
-
-    const ts = serverMetricsVM.timeseries;
-    const snapshots = ts.snapshots || [];
-    const chartSeries = ts.chart_series || {};
-
-    // Convert snapshot timestamp to milliseconds for chart compatibility
-    const timestampMs = new Date(snapshot.timestamp).getTime();
-    const fleet = snapshot.fleet || {};
-    const server = snapshot.server || {};
-
-    // Append to snapshots array
-    snapshots.push({
-        timestamp: snapshot.timestamp,
-        tier: snapshot.tier || 'raw',
-        fleet: fleet,
-        server: server,
-    });
-
-    // Append to chart_series arrays for each metric
-    // Backend uses compact {t, v} format, so we append in the same format
-    const appendPoint = (key, value) => {
-        if (chartSeries[key] && Array.isArray(chartSeries[key])) {
-            // Use the same format as existing points (compact {t, v})
-            chartSeries[key].push({ t: timestampMs, v: value ?? 0 });
-        }
-    };
-
-    // Fleet metrics
-    appendPoint('agents', fleet.total_agents);
-    appendPoint('devices', fleet.total_devices);
-    appendPoint('devices_online', fleet.devices_online);
-    appendPoint('devices_offline', fleet.devices_offline);
-    appendPoint('devices_error', fleet.devices_error);
-    appendPoint('agents_ws', fleet.agents_ws);
-    appendPoint('agents_http', fleet.agents_http);
-    appendPoint('agents_offline', fleet.agents_offline);
-    appendPoint('toner_high', fleet.toner_high);
-    appendPoint('toner_medium', fleet.toner_medium);
-    appendPoint('toner_low', fleet.toner_low);
-    appendPoint('toner_critical', fleet.toner_critical);
-    appendPoint('toner_unknown', fleet.toner_unknown);
-    appendPoint('total_pages', fleet.total_pages);
-    appendPoint('color_pages', fleet.color_pages);
-    appendPoint('mono_pages', fleet.mono_pages);
-    appendPoint('scan_count', fleet.scan_count);
-    appendPoint('ws_connections', fleet.ws_connections);
-
-    // Server metrics
-    appendPoint('goroutines', server.goroutines);
-    appendPoint('heap_alloc', server.heap_alloc_mb);
-    appendPoint('db_size', server.db_size_bytes);
-
-    // Prune old data points outside current time window
-    const rangeWindow = getMetricsRangeWindow(metricsVM.range);
-    const cutoff = Date.now() - rangeWindow;
-
-    // Prune snapshots
-    while (snapshots.length > 0 && new Date(snapshots[0].timestamp).getTime() < cutoff) {
-        snapshots.shift();
-    }
-
-    // Prune chart_series (points use {t, v} format where t is timestamp in ms)
-    for (const key in chartSeries) {
-        const arr = chartSeries[key];
-        if (Array.isArray(arr)) {
-            while (arr.length > 0 && arr[0].t < cutoff) {
-                arr.shift();
-            }
-        }
-    }
-
-    // Re-render the time-series charts (throttled to avoid excessive redraws)
-    throttledRenderLiveMetrics();
-}
-
-// Throttle live chart updates to max once per second for smooth performance
-let _liveMetricsRenderTimer = null;
-function throttledRenderLiveMetrics() {
-    if (_liveMetricsRenderTimer) return;
-    _liveMetricsRenderTimer = setTimeout(() => {
-        _liveMetricsRenderTimer = null;
-        renderConsumablesTimeSeriesCharts(serverMetricsVM.timeseries);
-        renderAgentFleetCharts(serverMetricsVM.timeseries);
-        renderServerTimeSeriesCharts(serverMetricsVM.timeseries);
-    }, 1000);
-}
-
-function isDevicesTabActive() {
-    const tab = document.querySelector('[data-tab="devices"]');
-    return tab && !tab.classList.contains('hidden');
-}
-
-function toSeriesPoints(arr) {
-    if (!Array.isArray(arr)) return [];
-    return arr.map(pt => {
-        const timestamp = pt?.timestamp || pt?.Timestamp;
-        const value = Number(pt?.value ?? pt?.Value ?? 0);
-        const timeMs = timestamp ? new Date(timestamp).getTime() : NaN;
-        return (Number.isFinite(timeMs)) ? { time: timeMs, value } : null;
-    }).filter(Boolean);
-}
-
-function calculateThroughput(series) {
-    if (!Array.isArray(series) || series.length === 0) return 0;
-    const total = series.reduce((sum, pt) => sum + Number(pt?.value || pt?.Value || 0), 0);
-    const hours = getMetricsRangeWindow(metricsVM.range) / (60 * 60 * 1000);
-    return hours > 0 ? total / hours : 0;
-}
-
-// Chart functions (drawFleetChart, drawFleetChartDualAxis) are now in utils/charts.js
-// formatDurationSec, formatDateShort, formatTimeShort are now in utils/formatters.js
-
-function renderLogs(logs) {
-    // Parse and normalize log lines
-    let lines = [];
-    let isAppend = false;
-    if (logs && logs.logs && Array.isArray(logs.logs)) {
-        lines = logs.logs;
-        isAppend = Boolean(logs.append);
-    } else if (Array.isArray(logs)) {
-        lines = logs;
-    } else if (typeof logs === 'string') {
-        lines = logs.split('\n').filter(l => l.trim());
-    }
-
-    // Parse log lines into structured entries (if not already parsed)
-    // Check if first item is already a parsed entry (has 'raw' property)
-    if (lines.length > 0 && typeof lines[0] === 'object' && lines[0].raw !== undefined) {
-        currentLogLines = lines; // Already parsed
-    } else {
-        currentLogLines = lines.map(parseLogLine);
-    }
-
-    // Sync with logsState if entries came from loadLogs
-    if (logsState.entries.length > 0) {
-        currentLogLines = logsState.entries;
-    }
-
-    // Render based on current view mode (pass isAppend to skip auto-scroll)
-    if (activeLogViewMode === 'table') {
-        renderLogsTable(currentLogLines, isAppend);
-    } else {
-        renderLogsRaw(currentLogLines, isAppend);
-    }
-}
-
-/**
- * Parse a single log line into structured components
- * Format: 2006-01-02T15:04:05-07:00 [LEVEL] message key=value key=value
- */
-function parseLogLine(line) {
-    if (!line || typeof line !== 'string') {
-        return { raw: String(line || ''), timestamp: null, level: '', message: line || '', context: {} };
-    }
-
-    const entry = { raw: line, timestamp: null, level: '', message: '', context: {} };
-
-    // Match timestamp at start: ISO 8601 format
-    const timestampMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z)?)\s*/);
-    if (timestampMatch) {
-        try {
-            entry.timestamp = new Date(timestampMatch[1]);
-        } catch (e) {
-            entry.timestamp = null;
-        }
-        line = line.slice(timestampMatch[0].length);
-    }
-
-    // Match level in brackets: [ERROR], [WARN], [INFO], [DEBUG], [TRACE]
-    const levelMatch = line.match(/^\[(\w+)\]\s*/);
-    if (levelMatch) {
-        entry.level = levelMatch[1].toUpperCase();
-        line = line.slice(levelMatch[0].length);
-    }
-
-    // Extract key=value context pairs from the end
-    // Work backwards to find context pairs
-    const contextPairs = [];
-    const kvPattern = /\s+(\w+)=("[^"]*"|\S+)$/;
-    let remaining = line;
-    let match;
-    while ((match = remaining.match(kvPattern)) !== null) {
-        let value = match[2];
-        // Remove quotes if present
-        if (value.startsWith('"') && value.endsWith('"')) {
-            value = value.slice(1, -1);
-        }
-        contextPairs.unshift({ key: match[1], value: value });
-        remaining = remaining.slice(0, match.index);
-    }
-
-    entry.message = remaining.trim();
-    contextPairs.forEach(pair => {
-        entry.context[pair.key] = pair.value;
-    });
-
-    return entry;
-}
-
-function renderLogsTable(entries, isAppend = false) {
-    const tbody = document.getElementById('log_table_body');
-    if (!tbody) {
-        window.__pm_shared.warn('renderLogsTable: tbody not found');
-        return;
-    }
-
-    // Update total count from server state
-    const entryCountEl = document.getElementById('logs_entry_count');
-    if (entryCountEl) {
-        entryCountEl.textContent = logsState.total || (entries ? entries.length : 0);
-    }
-
-    if (!entries || entries.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" class="log-table-empty">No logs available</td></tr>';
-        updateLogsShowingCount(0);
-        return;
-    }
-
-    // Server-side filtering is already applied, just render all entries
-    updateLogsShowingCount(entries.length);
-
-    // Build rows with load-more sentinel at the end (for loading older logs)
-    const rows = entries.map(entry => {
-        const timeHtml = entry.timestamp
-            ? `<span class="log-time-date">${formatDateShort(entry.timestamp)}</span>${formatTimeShort(entry.timestamp)}`
-            : '<span class="log-time">‚Äî</span>';
-
-        const levelClass = entry.level ? `log-level-${entry.level.toLowerCase()}` : '';
-        const levelHtml = entry.level
-            ? `<span class="log-level ${levelClass}">${escapeHtml(entry.level)}</span>`
-            : '';
-
-        const contextHtml = Object.keys(entry.context).length > 0
-            ? Object.entries(entry.context).map(([k, v]) =>
-                `<span class="log-context-tag"><span class="tag-key">${escapeHtml(k)}</span>=<span class="tag-value">${escapeHtml(String(v))}</span></span>`
-            ).join('')
-            : '';
-
-        return `<tr>
-            <td class="log-time">${timeHtml}</td>
-            <td>${levelHtml}</td>
-            <td class="log-message">${escapeHtml(entry.message)}</td>
-            <td class="log-context">${contextHtml}</td>
-        </tr>`;
-    });
-
-    // Add load-more sentinel at the end if more logs are available, or end indicator
-    if (logsState.hasMore) {
-        rows.push(`<tr id="logs_load_more_sentinel" class="logs-load-sentinel">
-            <td colspan="4" style="text-align:center;padding:16px;">
-                <div class="loading-spinner" style="display:inline-block;margin-right:8px;"></div>
-                <span class="muted-text">Loading older logs...</span>
-            </td>
-        </tr>`);
-    } else if (entries.length > 0) {
-        rows.push(`<tr class="logs-end-marker">
-            <td colspan="4" style="text-align:center;padding:12px;color:var(--muted);font-style:italic;">
-                ‚Äî End of logs ‚Äî
-            </td>
-        </tr>`);
-    }
-
-    tbody.innerHTML = rows.join('');
-
-    // Auto-scroll to bottom if not paused and NOT appending older logs
-    if (!isAppend) {
-        const pauseCheckbox = document.getElementById('pause_autoscroll');
-        if (!pauseCheckbox || !pauseCheckbox.checked) {
-            const container = document.getElementById('log_table_container');
-            if (container) {
-                container.scrollTop = container.scrollHeight;
-            }
-        }
-    }
-}
-
-function renderLogsRaw(entries, isAppend = false) {
-    const container = document.getElementById('log');
-    if (!container) {
-        window.__pm_shared.warn('renderLogsRaw: log element not found');
-        return;
-    }
-
-    // Update total count from server state
-    const entryCountEl = document.getElementById('logs_entry_count');
-    if (entryCountEl) {
-        entryCountEl.textContent = logsState.total || (entries ? entries.length : 0);
-    }
-
-    if (!entries || entries.length === 0) {
-        container.textContent = 'No logs available';
-        updateLogsShowingCount(0);
-        return;
-    }
-
-    // Server-side filtering is already applied
-    updateLogsShowingCount(entries.length);
-
-    // Build content with load-more indicator or end marker
-    let content = entries.map(e => e.raw).join('\n');
-    if (logsState.hasMore) {
-        content += '\n\n--- Scroll down to load older logs ---';
-    } else if (entries.length > 0) {
-        content += '\n\n‚Äî End of logs ‚Äî';
-    }
-    container.textContent = content;
-
-    // Auto-scroll to bottom if not paused and NOT appending older logs
-    if (!isAppend) {
-        const pauseCheckbox = document.getElementById('pause_autoscroll');
-        if (!pauseCheckbox || !pauseCheckbox.checked) {
-            container.scrollTop = container.scrollHeight;
-        }
-    }
-}
-
-function updateLogsShowingCount(count) {
-    const showingCountEl = document.getElementById('logs_showing_count');
-    if (showingCountEl) {
-        showingCountEl.textContent = count;
-    }
-}
-
-// Setup IntersectionObserver for logs infinite scroll (load older logs when sentinel becomes visible)
-function setupLogsInfiniteScroll() {
-    cleanupLogsInfiniteScroll();
-
-    const sentinel = document.getElementById('logs_load_more_sentinel');
-    if (!sentinel || !logsState.hasMore) return;
-
-    logsState.scrollObserver = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting && !logsState.loading && logsState.hasMore) {
-                // Enforce cooldown to prevent runaway requests
-                const now = Date.now();
-                if (now - logsState.lastLoadTime < logsState.cooldownMs) {
-                    return;
-                }
-                logsState.lastLoadTime = now;
-                // Load older logs
-                loadLogs({ append: true });
-            }
-        });
-    }, {
-        root: document.getElementById('log_table_container'),
-        rootMargin: '100px',
-        threshold: 0.1
-    });
-
-    logsState.scrollObserver.observe(sentinel);
-}
-
-function cleanupLogsInfiniteScroll() {
-    if (logsState.scrollObserver) {
-        logsState.scrollObserver.disconnect();
-        logsState.scrollObserver = null;
-    }
-}
-
-// formatDateShort and formatTimeShort are now in utils/formatters.js
-
-function renderAuditLogs(entries, options = {}) {
-    const container = document.getElementById('audit_logs_table');
-    if (!container) {
-        window.__pm_shared.warn('renderAuditLogs: container not found');
-        return;
-    }
-
-    const append = Boolean(options.append);
-
-    if (!Array.isArray(entries) || entries.length === 0) {
-        const message = options.filtersActive
-            ? 'No audit entries match the current filters.'
-            : 'No audit entries in this window.';
-        container.innerHTML = `<div class="muted-text" style="padding:12px;">${message}</div>`;
-        cleanupAuditInfiniteScroll();
-        return;
-    }
-
-    // Progressive rendering - only render a page at a time
-    if (!append) {
-        auditRenderState.displayed = 0;
-        // Initialize the table structure
-        container.innerHTML = `
-            <table class="simple-table">
-                <thead>
-                    <tr>
-                        <th>Timestamp</th>
-                        <th>Actor</th>
-                        <th>Action</th>
-                        <th>Target</th>
-                        <th>Details</th>
-                    </tr>
-                </thead>
-                <tbody></tbody>
-            </table>
-        `;
-    }
-
-    const tbody = container.querySelector('tbody');
-    if (!tbody) return;
-
-    const startIdx = auditRenderState.displayed;
-    const endIdx = Math.min(startIdx + auditRenderState.pageSize, entries.length);
-    const pageEntries = entries.slice(startIdx, endIdx);
-
-    // Remove existing sentinel
-    const existingSentinel = document.getElementById('audit_load_more_sentinel');
-    if (existingSentinel) existingSentinel.remove();
-
-    const rows = pageEntries.map(entry => {
-        const ts = escapeHtml(formatDateTime(entry.timestamp));
-        const rel = escapeHtml(formatRelativeTime(entry.timestamp));
-        const actorName = entry.actor_name || entry.actor_id || '‚Äî';
-        const actorMetaParts = [];
-        if (entry.actor_type) {
-            actorMetaParts.push((entry.actor_type || '').toUpperCase());
-        }
-        if (entry.actor_id) {
-            actorMetaParts.push(entry.actor_id);
-        }
-        const actorMeta = actorMetaParts.length ? `<div class="audit-actor-meta">${escapeHtml(actorMetaParts.join(' ‚Ä¢ '))}</div>` : '';
-
-        const severity = String(entry.severity || 'info').toLowerCase();
-        const severityBadge = `<span class="badge ${getSeverityBadgeClass(severity)}">${escapeHtml(severity.toUpperCase())}</span>`;
-
-        const actionLabel = escapeHtml(entry.action || '‚Äî');
-
-        const targetPrimaryParts = [];
-        if (entry.target_type) targetPrimaryParts.push(entry.target_type);
-        if (entry.target_id) targetPrimaryParts.push(entry.target_id);
-        const targetPrimary = targetPrimaryParts.length ? escapeHtml(targetPrimaryParts.join(' ‚Ä¢ ')) : '‚Äî';
-        const tenantTag = entry.tenant_id ? `<div class="audit-target-meta">Tenant: ${escapeHtml(entry.tenant_id)}</div>` : '';
-
-        const detailLines = [];
-        if (entry.details) {
-            detailLines.push(entry.details);
-        }
-        if (entry.ip_address) {
-            detailLines.push(`IP: ${entry.ip_address}`);
-        }
-        if (entry.user_agent) {
-            detailLines.push(`User-Agent: ${entry.user_agent}`);
-        }
-        if (entry.request_id) {
-            detailLines.push(`Request: ${entry.request_id}`);
-        }
-        const metadataText = formatAuditMetadata(entry.metadata);
-        const detailText = detailLines.length ? escapeHtml(detailLines.join('\n')) : '‚Äî';
-        const metadataBlock = metadataText ? `<pre class="audit-metadata">${escapeHtml(metadataText)}</pre>` : '';
-
-        return `
-            <tr>
-                <td>
-                    <div class="table-primary">${ts}</div>
-                    <div class="muted-text">${rel}</div>
-                </td>
-                <td>
-                    <div class="table-primary">${escapeHtml(actorName)}</div>
-                    ${actorMeta}
-                </td>
-                <td>
-                    <div class="table-primary">${actionLabel}</div>
-                    <div class="audit-detail-meta">${severityBadge}</div>
-                </td>
-                <td>
-                    <div class="table-primary">${targetPrimary}</div>
-                    ${tenantTag}
-                </td>
-                <td>
-                    <div class="audit-details">${detailText}</div>
-                    ${metadataBlock}
-                </td>
-            </tr>
-        `;
-    }).join('');
-
-    tbody.insertAdjacentHTML('beforeend', rows);
-    auditRenderState.displayed = endIdx;
-
-    // Add sentinel row if more items available
-    if (endIdx < entries.length) {
-        const sentinelRow = document.createElement('tr');
-        sentinelRow.id = 'audit_load_more_sentinel';
-        sentinelRow.className = 'audit-load-sentinel';
-        sentinelRow.innerHTML = '<td colspan="5" style="text-align:center;padding:16px;"><div class="loading-spinner" style="display:inline-block;margin-right:8px;"></div><span class="muted-text">Loading more audit entries...</span></td>';
-        tbody.appendChild(sentinelRow);
-        setupAuditInfiniteScroll();
-    } else {
-        cleanupAuditInfiniteScroll();
-    }
-}
-
-// Setup IntersectionObserver for audit logs infinite scroll
-function setupAuditInfiniteScroll() {
-    cleanupAuditInfiniteScroll();
-
-    const sentinel = document.getElementById('audit_load_more_sentinel');
-    if (!sentinel) return;
-
-    auditRenderState.observer = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting && auditRenderState.displayed < auditRenderState.filteredEntries.length) {
-                loadMoreAuditLogs();
-            }
-        });
-    }, {
-        root: null,
-        rootMargin: '200px',
-        threshold: 0
-    });
-
-    auditRenderState.observer.observe(sentinel);
-}
-
-// Cleanup the audit logs infinite scroll observer
-function cleanupAuditInfiniteScroll() {
-    if (auditRenderState.observer) {
-        auditRenderState.observer.disconnect();
-        auditRenderState.observer = null;
-    }
-}
-
-// Load more audit logs for infinite scroll
-function loadMoreAuditLogs() {
-    renderAuditLogs(auditRenderState.filteredEntries, { append: true, filtersActive: hasActiveAuditFilters() });
-}
-
-function getSeverityBadgeClass(severity) {
-    switch (severity) {
-        case 'error':
-            return 'badge-error';
-        case 'warn':
-        case 'warning':
-            return 'badge-warn';
-        default:
-            return 'badge-info';
-    }
-}
-
-function formatAuditMetadata(metadata) {
-    if (!metadata || typeof metadata !== 'object') {
-        return '';
-    }
-    try {
-        return JSON.stringify(metadata, null, 2);
-    } catch (err) {
-        window.__pm_shared.warn('formatAuditMetadata failed', err);
-        return '';
-    }
-}
-
-// ====== Modal Handlers ======
-// Agent Details Modal (overlay)
-document.getElementById('agent_details_close_x')?.addEventListener('click', () => {
-    document.getElementById('agent_details_overlay').style.display = 'none';
-});
-document.getElementById('agent_details_close')?.addEventListener('click', () => {
-    document.getElementById('agent_details_overlay').style.display = 'none';
-});
-
-// Click outside modal to close
-window.addEventListener('click', (event) => {
-    const agentOverlay = document.getElementById('agent_details_overlay');
-    const confirmModal = document.getElementById('confirm_modal');
-
-    if (event.target === agentOverlay) {
-        agentOverlay.style.display = 'none';
-    }
-    if (event.target === confirmModal) {
-        confirmModal.style.display = 'none';
-    }
-});
-
-// NOTE: Delegated click handler for data-action buttons is in common/web/cards.js
-// That handler calls window.__pm_shared.* functions which are exported below.
-// Do NOT add a duplicate handler here - it causes actions to fire twice.
-
-// Toggle visibility of advanced settings controls
-function toggleAdvancedSettings() {
-    try {
-        const enabled = document.getElementById('settings_advanced_toggle')?.checked || false;
-        // Elements marked as advanced-setting should be shown/hidden
-        document.querySelectorAll('.advanced-setting').forEach(el => {
-            if (enabled) {
-                el.style.display = '';
-            } else {
-                el.style.display = 'none';
-            }
-        });
-
-        // Textareas or other advanced inputs may use a dedicated class
-        document.querySelectorAll('.advanced-setting-textarea').forEach(el => {
-            if (enabled) el.style.display = '';
-            else el.style.display = 'none';
-        });
-
-        // Persist preference
-        try { localStorage.setItem('settings_advanced', enabled ? 'true' : 'false'); } catch (e) { }
-    } catch (e) {
-        window.__pm_shared.error('toggleAdvancedSettings failed', e);
-        throw e;
-    }
-}
-
-// ====== Add Agent Modal UI ======
-function initAddAgentUI() {
-    if (addAgentUIInitialized) return;
-    addAgentUIInitialized = true;
-    // Wire header Join button if present
-    const joinBtn = document.getElementById('join_token_btn');
-    if (joinBtn) joinBtn.addEventListener('click', () => openAddAgentModal({}));
-
-    // Wire modal chrome
-    const closeX = document.getElementById('add_agent_close_x');
-    const cancelBtn = document.getElementById('add_agent_cancel');
-    const primaryBtn = document.getElementById('add_agent_primary');
-
-    if (closeX) closeX.addEventListener('click', closeAddAgentModal);
-    if (cancelBtn) cancelBtn.addEventListener('click', closeAddAgentModal);
-    if (primaryBtn) primaryBtn.addEventListener('click', handleAddAgentPrimary);
-}
-
-function openAddAgentModal(opts) {
-    // opts: { tenantID?: string }
-    window._addAgentState = {
-        step: 1,
-        tenantID: opts && opts.tenantID ? opts.tenantID : null,
-        ttl: 60,
-        one_time: true,
-        token: null,
-        mode: 'token',
-        platform: 'windows',
-        format: 'zip',
-        arch: 'amd64'
-    };
-    renderAddAgentStep(1);
-    const modal = document.getElementById('add_agent_modal');
-    if (modal) { modal.style.display = 'flex'; document.body.style.overflow = 'hidden'; }
-}
-
-function closeAddAgentModal() {
-    const modal = document.getElementById('add_agent_modal');
-    if (modal) { modal.style.display = 'none'; document.body.style.overflow = ''; }
-    // Clean up floating dropdown if it exists
-    const dropdown = document.getElementById('add_agent_options_dropdown');
-    if (dropdown) dropdown.remove();
-    try { delete window._addAgentState; } catch (e) { }
-}
-
-async function handleAddAgentPrimary() {
-    const st = window._addAgentState || { step: 1 };
-    if (st.step === 1) {
-        // Read form values
-        const tenantSel = document.getElementById('add_agent_tenant');
-        const ttlEl = document.getElementById('add_agent_ttl');
-        const oneTimeEl = document.getElementById('add_agent_one_time');
-        const tenantID = tenantSel ? tenantSel.value : (st.tenantID || null);
-        const ttl = ttlEl ? parseInt(ttlEl.value, 10) || 60 : 60;
-        const one_time = oneTimeEl ? oneTimeEl.checked : true;
-        const platformSel = document.getElementById('add_agent_platform');
-        const formatSel = document.getElementById('add_agent_format');
-        const archSel = document.getElementById('add_agent_arch');
-        const platform = platformSel ? platformSel.value : (st.platform || 'windows');
-        const format = formatSel ? formatSel.value : (st.format || 'zip');
-        const arch = archSel ? archSel.value : (st.arch || 'amd64');
-
-        st.tenantID = tenantID;
-        st.ttl = ttl;
-        st.one_time = one_time;
-        st.platform = platform;
-        st.format = format;
-        st.arch = arch;
-
-        // Basic validation
-        if (!tenantID) { window.__pm_shared.showAlert('Please select a tenant (customer) to assign this token to.', 'Missing tenant', true, false); return; }
-
-        // Decide whether user wants a raw token or a generated bootstrap script
-        const selectedActionEl = document.querySelector('input[name="add_agent_action"]:checked');
-        const action = selectedActionEl ? selectedActionEl.value : 'token';
-        if (action === 'token') {
-            // Create join token
-            try {
-                const payload = { tenant_id: tenantID, ttl_minutes: ttl, one_time: one_time };
-                const r = await fetch('/api/v1/join-token', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-                if (!r.ok) throw new Error(await r.text());
-                const data = await r.json();
-                st.token = data.token;
-                st.script = null;
-                st.mode = 'token';
-                st.step = 2;
-                window._addAgentState = st;
-                renderAddAgentStep(2);
-            } catch (err) {
-                window.__pm_shared.showAlert('Failed to create join token: ' + (err && err.message ? err.message : err), 'Error', true, false);
-            }
-        } else if (action === 'script') {
-            // Generate bootstrap script via server packages API
-            try {
-                const payload = { tenant_id: tenantID, platform: platform, installer_type: 'script', ttl_minutes: ttl };
-                const r = await fetch('/api/v1/packages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-                if (!r.ok) {
-                    throw new Error(await r.text());
-                }
-                // Handle JSON or plain text responses
-                const ct = (r.headers.get('content-type') || '').toLowerCase();
-                let scriptText = '';
-                let filename = 'bootstrap.sh';
-                let downloadURL = null;
-                let oneLiner = null;
-                if (ct.includes('application/json')) {
-                    const data = await r.json();
-                    scriptText = data.script || '';
-                    filename = data.filename || filename;
-                    downloadURL = data.download_url || null;
-                    oneLiner = data.one_liner || null;
-                } else {
-                    scriptText = await r.text();
-                    const cd = r.headers.get('content-disposition');
-                    if (cd) {
-                        const m = cd.match(/filename="?([^";]+)"?/);
-                        if (m && m[1]) filename = m[1];
-                    } else if (platform === 'windows') filename = 'bootstrap.ps1';
-                    else if (platform === 'darwin') filename = 'bootstrap.sh';
-                }
-
-                st.script = scriptText;
-                st.scriptFilename = filename;
-                st.scriptDownloadURL = downloadURL;
-                st.oneLiner = oneLiner;
-                st.token = null;
-                st.mode = 'script';
-                st.step = 2;
-                window._addAgentState = st;
-                renderAddAgentStep(2);
-            } catch (err) {
-                window.__pm_shared.showAlert('Failed to generate bootstrap script: ' + (err && err.message ? err.message : err), 'Error', true, false);
-            }
-        } else if (action === 'email') {
-            // Send bootstrap script via email
-            const emailEl = document.getElementById('add_agent_email');
-            const emailAddr = emailEl ? emailEl.value.trim() : '';
-            if (!emailAddr) {
-                window.__pm_shared.showAlert('Please enter a recipient email address.', 'Missing email', true, false);
-                return;
-            }
-            // Basic email validation
-            if (!emailAddr.includes('@') || !emailAddr.includes('.')) {
-                window.__pm_shared.showAlert('Please enter a valid email address.', 'Invalid email', true, false);
-                return;
-            }
-            try {
-                const payload = { tenant_id: tenantID, platform: platform, email: emailAddr, ttl_minutes: ttl };
-                const r = await fetch('/api/v1/packages/send-email', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-                if (!r.ok) {
-                    const errText = await r.text();
-                    throw new Error(errText);
-                }
-                const data = await r.json();
-                st.emailSent = true;
-                st.emailTo = emailAddr;
-                st.mode = 'email';
-                st.step = 2;
-                window._addAgentState = st;
-                renderAddAgentStep(2);
-            } catch (err) {
-                window.__pm_shared.showAlert('Failed to send deployment email: ' + (err && err.message ? err.message : err), 'Error', true, false);
-            }
-        } else {
-            window.__pm_shared.showAlert('Unsupported onboarding option selected.', 'Error', true, false);
-        }
-    } else if (st.step === 2) {
-        // Done
-        closeAddAgentModal();
-        // Optionally refresh tokens/tenants list
-        try { loadTenants(); } catch (e) { }
-    }
-}
-
-function renderAddAgentStep(step) {
-    const indicator = document.getElementById('add_agent_step_indicator');
-    const content = document.getElementById('add_agent_content');
-    const primaryBtn = document.getElementById('add_agent_primary');
-    if (!content) return;
-    if (indicator) {
-        if (step === 1) {
-            indicator.textContent = 'Step 1/2 ‚Äî Create onboarding asset';
-        } else {
-            const mode = (window._addAgentState && window._addAgentState.mode) ? window._addAgentState.mode : 'token';
-            let label = 'Token (shown once)';
-            if (mode === 'script') label = 'Bootstrap script';
-            else if (mode === 'email') label = 'Email sent';
-            indicator.textContent = 'Step 2/2 ‚Äî ' + label;
-        }
-    }
-
-    if (step === 1) {
-        // Tenant select - handled by populateTenantDropdown after content is set
-        const state = window._addAgentState || {};
-        const ttlValue = state.ttl && state.ttl > 0 ? state.ttl : 60;
-        const oneTimeChecked = state.one_time === undefined ? true : !!state.one_time;
-        const defaultPlatform = state.platform || 'windows';
-        const platformOptions = [
-            { value: 'linux', label: 'Linux' },
-            { value: 'windows', label: 'Windows' },
-            { value: 'darwin', label: 'macOS' }
-        ].map(opt => `<option value="${escapeHtml(opt.value)}" ${opt.value === defaultPlatform ? 'selected' : ''}>${escapeHtml(opt.label)}</option>`).join('\n');
-        const formatOptions = [
-            { value: 'zip', label: 'ZIP archive' },
-            { value: 'tar.gz', label: 'TAR.GZ archive' }
-        ].map(opt => `<option value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</option>`).join('\n');
-        const archOptions = [
-            { value: 'amd64', label: 'x86_64 / amd64' },
-            { value: 'arm64', label: 'ARM64 / Apple Silicon' }
-        ].map(opt => `<option value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</option>`).join('\n');
-
-        content.innerHTML = `
-            <div style="display:flex;flex-direction:column;gap:8px;">
-                <label style="font-weight:600">Customer (tenant)</label>
-                <select id="add_agent_tenant" style="padding:8px;border-radius:4px;border:1px solid var(--border);">
-                </select>
-
-                <label style="font-weight:600">Join token TTL (minutes)</label>
-                <input id="add_agent_ttl" type="number" value="${escapeHtml(String(ttlValue))}" min="1" style="padding:8px;border-radius:4px;border:1px solid var(--border);width:120px;" autocomplete="off" data-1p-ignore data-lpignore="true" />
-
-                <label style="display:flex;align-items:center;gap:8px;">
-                    <input id="add_agent_one_time" type="checkbox" ${oneTimeChecked ? 'checked' : ''} />
-                    <span style="color:var(--muted)">One-time (single-use) token</span>
-                </label>
-
-                <div style="margin-top:8px;">
-                    <div style="font-weight:600;margin-bottom:6px;">Onboarding method</div>
-                    <label style="display:flex;align-items:center;gap:8px;"><input type="radio" name="add_agent_action" value="token" ${state.mode === 'token' || !state.mode ? 'checked' : ''} /> Show raw token</label>
-                    <label style="display:flex;align-items:center;gap:8px;"><input type="radio" name="add_agent_action" value="script" ${state.mode === 'script' ? 'checked' : ''} /> Generate bootstrap script</label>
-                    <label style="display:flex;align-items:center;gap:8px;"><input type="radio" name="add_agent_action" value="email" ${state.mode === 'email' ? 'checked' : ''} /> Send via email</label>
-                    <div id="add_agent_platform_row" style="margin-top:8px;display:none;">
-                        <label style="font-weight:600">Target platform</label>
-                        <select id="add_agent_platform" style="padding:8px;border-radius:4px;border:1px solid var(--border);width:180px;">
-                            ${platformOptions}
-                        </select>
-                    </div>
-                    <div id="add_agent_email_row" style="margin-top:8px;display:none;">
-                        <label style="font-weight:600">Recipient email</label>
-                        <input id="add_agent_email" type="email" placeholder="user@example.com" style="padding:8px;border-radius:4px;border:1px solid var(--border);width:280px;" autocomplete="off" data-1p-ignore data-lpignore="true" />
-                        <div style="color:var(--muted);font-size:12px;margin-top:4px;">The recipient will receive an HTML email with the installation one-liner and full script.</div>
-                    </div>
-                </div>
-
-                <div style="color:var(--muted);font-size:13px">Tokens and scripts inherit this TTL.</div>
-            </div>
-        `;
-
-        // Populate tenant dropdown with "Add Tenant" option
-        const tenantSelect = content.querySelector('#add_agent_tenant');
-        if (tenantSelect) {
-            populateTenantDropdown(tenantSelect, {
-                placeholder: '-- select customer --',
-                selectedId: state.tenantID || '',
-                showAddOption: true
-            });
-            // Also track state change when tenant is selected (but not for "Add Tenant")
-            tenantSelect.addEventListener('change', () => {
-                if (tenantSelect.value !== '__add_new_tenant__') {
-                    state.tenantID = tenantSelect.value;
-                }
-            });
-        }
-
-        const ttlInput = content.querySelector('#add_agent_ttl');
-        if (ttlInput) {
-            ttlInput.addEventListener('change', () => {
-                const parsed = parseInt(ttlInput.value, 10);
-                state.ttl = (isNaN(parsed) || parsed <= 0) ? 60 : parsed;
-                ttlInput.value = state.ttl;
-            });
-        }
-
-        const oneTimeInput = content.querySelector('#add_agent_one_time');
-        if (oneTimeInput) {
-            oneTimeInput.checked = oneTimeChecked;
-            oneTimeInput.addEventListener('change', () => { state.one_time = oneTimeInput.checked; });
-        }
-
-        const platformSelect = content.querySelector('#add_agent_platform');
-        if (platformSelect) {
-            platformSelect.value = defaultPlatform;
-            state.platform = platformSelect.value;
-            platformSelect.addEventListener('change', () => {
-                state.platform = platformSelect.value;
-            });
-        }
-
-        const actionRadios = content.querySelectorAll('input[name="add_agent_action"]');
-        const platRow = content.querySelector('#add_agent_platform_row');
-        const emailRow = content.querySelector('#add_agent_email_row');
-        const updatePrimaryLabel = () => {
-            const sel = content.querySelector('input[name="add_agent_action"]:checked');
-            if (!sel || !primaryBtn) return;
-            if (sel.value === 'script') primaryBtn.textContent = 'Generate Script';
-            else if (sel.value === 'email') primaryBtn.textContent = 'Send Email';
-            else primaryBtn.textContent = 'Create Token';
-        };
-        const updateFieldVisibility = () => {
-            const sel = content.querySelector('input[name="add_agent_action"]:checked');
-            const mode = sel ? sel.value : 'token';
-            if (platRow) platRow.style.display = (mode === 'script' || mode === 'email') ? '' : 'none';
-            if (emailRow) emailRow.style.display = mode === 'email' ? '' : 'none';
-        };
-        actionRadios.forEach(r => r.addEventListener('change', () => {
-            state.mode = r.value;
-            updatePrimaryLabel();
-            updateFieldVisibility();
-        }));
-        updatePrimaryLabel();
-        updateFieldVisibility();
-    } else {
-        // Step 2: show token, script, or email confirmation
-        const token = (window._addAgentState && window._addAgentState.token) ? window._addAgentState.token : '';
-        const mode = (window._addAgentState && window._addAgentState.mode) ? window._addAgentState.mode : 'token';
-        const script = (window._addAgentState && window._addAgentState.script) ? window._addAgentState.script : null;
-        const filename = (window._addAgentState && window._addAgentState.scriptFilename) ? window._addAgentState.scriptFilename : 'bootstrap';
-        const emailSent = (window._addAgentState && window._addAgentState.emailSent) ? window._addAgentState.emailSent : false;
-        const emailTo = (window._addAgentState && window._addAgentState.emailTo) ? window._addAgentState.emailTo : '';
-
-        if (emailSent && mode === 'email') {
-            content.innerHTML = `
-                <div style="display:flex;flex-direction:column;gap:12px;align-items:center;text-align:center;padding:20px;">
-                    <div style="font-size:48px;">‚úâÔ∏è</div>
-                    <h3 style="margin:0;color:var(--text);">Email Sent Successfully</h3>
-                    <p style="color:var(--muted);margin:0;">Agent deployment instructions have been sent to:</p>
-                    <div style="font-family:monospace;padding:12px 24px;background:var(--panel);border-radius:6px;border:1px solid var(--border);font-weight:600;">${escapeHtml(emailTo)}</div>
-                    <p style="color:var(--muted);font-size:13px;margin:0;">The email contains the one-liner command and full bootstrap script for the selected platform. The recipient can follow the instructions to install and register the agent.</p>
-                </div>
-            `;
-        } else if (script && mode === 'script') {
-            const oneLiner = (window._addAgentState && window._addAgentState.oneLiner) ? window._addAgentState.oneLiner : null;
-            content.innerHTML = `
-                <div style="display:flex;flex-direction:column;gap:12px;">
-                    ${oneLiner ? `<div style="font-family:monospace;padding:12px;background:var(--panel);border-radius:6px;border:1px dashed var(--border);word-break:break-all;">${escapeHtml(oneLiner)}</div>` : `<div style="font-family:monospace;white-space:pre-wrap;padding:12px;background:var(--panel);border-radius:6px;border:1px dashed var(--border);">${escapeHtml(script)}</div>`}
-                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                        <button id="add_agent_copy" class="modal-button" style="flex:1;min-width:200px;font-weight:600;">${oneLiner ? 'Copy one-liner' : 'Copy script'}</button>
-                        ${oneLiner ? `<button id="add_agent_more_options" class="modal-button modal-button-secondary" style="padding:8px 12px;">More options ‚ñæ</button>` : `<button id="add_agent_download" class="modal-button modal-button-secondary">Download script</button>`}
-                    </div>
-                    <div style="color:var(--muted);font-size:13px">This script was generated for the selected platform. Download or copy it and execute it on the target machine to install and register the agent.</div>
-                    ${oneLiner ? `<div id="add_agent_full_script" style="display:none;margin-top:8px;font-family:monospace;white-space:pre-wrap;padding:12px;background:var(--panel);border-radius:6px;border:1px dashed var(--border);">${escapeHtml(script)}</div>` : ''}
-                </div>
-            `;
-            // Create floating dropdown for more options (appended to body to escape modal overflow)
-            let existingDropdown = document.getElementById('add_agent_options_dropdown');
-            if (existingDropdown) existingDropdown.remove();
-            if (oneLiner) {
-                const dropdown = document.createElement('div');
-                dropdown.id = 'add_agent_options_dropdown';
-                dropdown.style.cssText = 'display:none;position:fixed;background:var(--bg);border:1px solid var(--border);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.5);z-index:100000;min-width:180px;';
-                dropdown.innerHTML = `
-                    <button id="add_agent_download" style="display:block;width:100%;text-align:left;padding:10px 14px;background:none;border:none;color:var(--text);cursor:pointer;font-size:14px;">Download script</button>
-                    ${(window._addAgentState && window._addAgentState.scriptDownloadURL) ? `<a id="add_agent_download_url" href="${escapeHtml(window._addAgentState.scriptDownloadURL)}" target="_blank" style="display:block;width:100%;text-align:left;padding:10px 14px;background:none;border:none;color:var(--text);cursor:pointer;font-size:14px;text-decoration:none;border-top:1px solid var(--border);">Open hosted URL</a>` : ''}
-                    <button id="add_agent_show_full" style="display:block;width:100%;text-align:left;padding:10px 14px;background:none;border:none;color:var(--text);cursor:pointer;font-size:14px;border-top:1px solid var(--border);">Show full script</button>
-                `;
-                document.body.appendChild(dropdown);
-            }
-            const copyBtn = document.getElementById('add_agent_copy');
-            if (copyBtn) copyBtn.addEventListener('click', () => {
-                const textToCopy = oneLiner ? oneLiner : script;
-                navigator.clipboard?.writeText(textToCopy).then(() => { window.__pm_shared.showToast((oneLiner ? 'One-liner' : 'Script') + ' copied to clipboard', 'success'); }).catch(err => { window.__pm_shared.showAlert('Failed to copy: ' + (err && err.message ? err.message : err), 'Error', true, false); });
-            });
-            // Wire up dropdown toggle for more options
-            const moreOptionsBtn = document.getElementById('add_agent_more_options');
-            const dropdown = document.getElementById('add_agent_options_dropdown');
-            if (moreOptionsBtn && dropdown) {
-                const positionDropdown = () => {
-                    const rect = moreOptionsBtn.getBoundingClientRect();
-                    dropdown.style.top = (rect.bottom + 4) + 'px';
-                    dropdown.style.left = rect.left + 'px';
-                };
-                moreOptionsBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    if (dropdown.style.display === 'none') {
-                        positionDropdown();
-                        dropdown.style.display = 'block';
-                    } else {
-                        dropdown.style.display = 'none';
-                    }
-                });
-                // Close dropdown when clicking outside
-                document.addEventListener('click', (e) => {
-                    if (!moreOptionsBtn.contains(e.target) && !dropdown.contains(e.target)) {
-                        dropdown.style.display = 'none';
-                    }
-                });
-                // Add hover effect to dropdown items
-                dropdown.querySelectorAll('button, a').forEach(item => {
-                    item.addEventListener('mouseenter', () => { item.style.background = 'var(--panel)'; });
-                    item.addEventListener('mouseleave', () => { item.style.background = 'none'; });
-                });
-            }
-            const dlBtn = document.getElementById('add_agent_download');
-            if (dlBtn) dlBtn.addEventListener('click', () => {
-                const blob = new Blob([script], { type: 'application/octet-stream' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-                if (dropdown) dropdown.style.display = 'none';
-            });
-            const showFull = document.getElementById('add_agent_show_full');
-            if (showFull) {
-                showFull.addEventListener('click', () => {
-                    const full = document.getElementById('add_agent_full_script');
-                    if (!full) return;
-                    if (full.style.display === 'none') {
-                        full.style.display = 'block'; showFull.textContent = 'Hide full script';
-                    } else { full.style.display = 'none'; showFull.textContent = 'Show full script'; }
-                    if (dropdown) dropdown.style.display = 'none';
-                });
-            }
-        } else {
-            content.innerHTML = `
-                <div style="display:flex;flex-direction:column;gap:12px;">
-                    <div style="font-family:monospace;white-space:pre-wrap;padding:12px;background:var(--panel);border-radius:6px;border:1px dashed var(--border);">${escapeHtml(token)}</div>
-                    <div style="display:flex;gap:8px;">
-                        <button id="add_agent_copy" class="modal-button modal-button-secondary">Copy token</button>
-                        <button id="add_agent_download" class="modal-button">Download token</button>
-                    </div>
-                    <div style="color:var(--muted);font-size:13px">This token is shown only once. After you close this modal the raw token cannot be retrieved again from the server.</div>
-                </div>
-            `;
-            // Wire copy/download for token
-            const copyBtn = document.getElementById('add_agent_copy');
-            if (copyBtn) copyBtn.addEventListener('click', copyTokenToClipboard);
-            const dlBtn = document.getElementById('add_agent_download');
-            if (dlBtn) dlBtn.addEventListener('click', () => {
-                const blob = new Blob([token], { type: 'text/plain' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url; a.download = 'join-token.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-            });
-        }
-        if (primaryBtn) primaryBtn.textContent = 'Done';
-    }
-}
-
-function copyTokenToClipboard() {
-    const token = (window._addAgentState && window._addAgentState.token) ? window._addAgentState.token : '';
-    if (!token) return;
-    navigator.clipboard?.writeText(token).then(() => {
-        window.__pm_shared.showToast('Token copied to clipboard', 'success');
-    }).catch(err => {
-        window.__pm_shared.showAlert('Failed to copy token: ' + (err && err.message ? err.message : err), 'Error', true, false);
-    });
-}
-
-// Update the compact time filter display label from slider index
-function updateTimeFilter(index) {
-    const labels = ['1m', '2m', '5m', '10m', '15m', '30m', '1h', '2h', '3h', '6h', '12h', '1d', '3d', 'All Time'];
-    let idx = parseInt(index, 10);
-    if (isNaN(idx) || idx < 0) idx = labels.length - 1;
-    if (idx >= labels.length) idx = labels.length - 1;
-    const el = document.getElementById('time_filter_value');
-    if (el) el.textContent = labels[idx];
-}
-
-// Wire up printer details modal close buttons and backdrop
-(function wirePrinterModal() {
-    const detailsOverlay = document.getElementById('printer_details_overlay');
-    const modalCloseBtn = document.querySelector('#printer_details_actions button');
-    const printerDetailsCloseX = document.getElementById('printer_details_close_x');
-
-    function closePrinterDetailsModal() {
-        if (detailsOverlay) {
-            detailsOverlay.style.display = 'none';
-            document.body.style.overflow = '';
-            try { delete detailsOverlay.dataset.currentPrinterIp; } catch (e) { }
-        }
-    }
-
-    if (modalCloseBtn) modalCloseBtn.addEventListener('click', closePrinterDetailsModal);
-    if (printerDetailsCloseX) printerDetailsCloseX.addEventListener('click', closePrinterDetailsModal);
-    if (detailsOverlay) {
-        detailsOverlay.addEventListener('click', function (e) {
-            if (e.target === detailsOverlay) closePrinterDetailsModal();
-        });
-    }
-})();
-
-// Wire up alerting and reports modals
-(function wireAlertingModals() {
-    // Helper to close modal
-    function closeModal(modal) {
-        if (modal) modal.style.display = 'none';
-    }
-
-    // Helper to wire a modal's close buttons
-    function wireModalClose(modalId, closeXId, cancelId) {
-        const modal = document.getElementById(modalId);
-        const closeX = document.getElementById(closeXId);
-        const cancel = document.getElementById(cancelId);
-
-        if (closeX) closeX.addEventListener('click', () => closeModal(modal));
-        if (cancel) cancel.addEventListener('click', () => closeModal(modal));
-        if (modal) {
-            modal.addEventListener('click', (e) => {
-                if (e.target === modal) closeModal(modal);
-            });
-        }
-    }
-
-    // Alert Rule Modal
-    wireModalClose('alert_rule_modal', 'alert_rule_modal_close_x', 'alert_rule_cancel');
-    const alertRuleSaveBtn = document.getElementById('alert_rule_save');
-    if (alertRuleSaveBtn) alertRuleSaveBtn.addEventListener('click', saveAlertRule);
-
-    // Notification Channel Modal
-    wireModalClose('notification_channel_modal', 'notification_channel_modal_close_x', 'channel_cancel');
-    const channelSaveBtn = document.getElementById('channel_save');
-    if (channelSaveBtn) channelSaveBtn.addEventListener('click', saveNotificationChannel);
-    const channelTypeSelect = document.getElementById('channel_type');
-    if (channelTypeSelect) channelTypeSelect.addEventListener('change', updateChannelConfigSection);
-
-    // Wire up channel type cards click handlers
-    document.querySelectorAll('.channel-type-card').forEach(card => {
-        card.addEventListener('click', () => {
-            const type = card.dataset.type;
-            if (type && channelTypeSelect) {
-                channelTypeSelect.value = type;
-                updateChannelConfigSection();
-            }
-        });
-    });
-
-    // Escalation Policy Modal
-    wireModalClose('escalation_policy_modal', 'escalation_policy_modal_close_x', 'escalation_cancel');
-    const escalationSaveBtn = document.getElementById('escalation_save');
-    if (escalationSaveBtn) escalationSaveBtn.addEventListener('click', saveEscalationPolicy);
-
-    // Maintenance Window Modal
-    wireModalClose('maintenance_window_modal', 'maintenance_window_modal_close_x', 'maintenance_cancel');
-    const maintenanceSaveBtn = document.getElementById('maintenance_save');
-    if (maintenanceSaveBtn) maintenanceSaveBtn.addEventListener('click', saveMaintenanceWindow);
-
-    // Scheduled Report Modal
-    wireModalClose('scheduled_report_modal', 'scheduled_report_modal_close_x', 'schedule_cancel');
-    const scheduleSaveBtn = document.getElementById('schedule_save');
-    if (scheduleSaveBtn) scheduleSaveBtn.addEventListener('click', saveScheduledReport);
-
-    // Schedule frequency change handler - show/hide day fields
-    const frequencySelect = document.getElementById('schedule_frequency');
-    if (frequencySelect) {
-        frequencySelect.addEventListener('change', () => {
-            const freq = frequencySelect.value;
-            const dayField = document.getElementById('schedule_day_field');
-            const dayOfMonthField = document.getElementById('schedule_day_of_month_field');
-
-            if (dayField) dayField.style.display = freq === 'weekly' ? 'block' : 'none';
-            if (dayOfMonthField) dayOfMonthField.style.display = freq === 'monthly' ? 'block' : 'none';
-        });
-    }
-
-    // Report Download Modal
-    wireModalClose('report_download_modal', 'report_download_close_x', 'report_download_close');
-})();
-
+        const selectedSet = new Set(selectedAgentI◊ﬂ7—º≠z &ä€^t⁄’\]\”€ìÿYHÿ]ôYôYàOOH	›ùYIŒ¬àBà⁄X⁄’\]\’ŸŸ€Kò⁄X⁄ŸYHYŸ[ù’ìKò⁄X⁄’\]\”€ìÿY¬à⁄X⁄’\]\’ŸŸ€KòY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+]ô[ù
+HOà¬àYŸ[ù’ìKò⁄X⁄’\]\”€ìÿYH]ô[ùù\ôŸ]ò⁄X⁄ŸY¬àÿÿ[›‹òYŸKúŸ]][J	ÿYŸ[ù◊ÿ⁄X⁄◊›\]\◊€€ó€ÿY	À]ô[ùù\ôŸ]ò⁄X⁄ŸY»	›ùYI»à	Ÿò[ŸI N¬àJN¬àBÇàÀ»⁄X⁄»[õ‹à\]\»ù]€Çà€€ú›⁄X⁄’\]\–ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿ⁄X⁄◊›\]\◊ÿùâ N¬àYà
+⁄X⁄’\]\–ùäH¬à⁄X⁄’\]\–ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à⁄X⁄–YŸ[ù—õ‹ï\]\ 
+N¬àJN¬àBÇà€€ú›⁄\»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿX›]ôWŸö[\ú… N¬àYà
+⁄\»	âàX⁄\Àô]\Ÿ]òõ›[ô
+H¬à⁄\Àô]\Ÿ]òõ›[ôH	›ùYIŒ¬à⁄\ÀòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬à€€ú›ùàH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€ñŸ]KYö[\óI N¬àYà
+XùäHô]\õé¬à[ôPYŸ[ùö[\ê⁄\ô[[›ôJùãôŸ]]öXù]J	Ÿ]KYö[\â JN¬àJN¬àBÇà€€ú›XõHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõI N¬àYà
+XõJH¬à€€ú›XYHXõKú]Y\ûTŸ[X›‹ä	›XY	 N¬àYà
+XY	âàZXYô]\Ÿ]òõ›[ô
+H¬àXYô]\Ÿ]òõ›[ôH	›ùYIŒ¬àXYòY]ô[ù\›[ô\ä	ÿ€X⁄…À[ôPYŸ[ùXõT€‹ù€X⁄ N¬àBàÀ»Y€X⁄»[ô\àõ‹à€X⁄ÿXõHõ›‹»
+ö[KY^‹ô\à›[HŸ[X›[€äBà€€ú›õŸHHXõKú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+õŸH	âà]õŸKô]\Ÿ]úõ›–€X⁄–õ›[ô
+H¬àõŸKô]\Ÿ]úõ›–€X⁄–õ›[ôH	›ùYIŒ¬àõŸKòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬àÀ»€â›öYŸŸ\àõ›»€X⁄»Yà€X⁄⁄[ô»€àHù]€à‹àX›[€ú»€€[[ÇàYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀùXõKXX›[€ú… H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀòX›[€úÀX€€	 JH¬àô]\õé¬àBà€€ú›õ›»H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	›ãòYŸ[ù\õ›ÀX€X⁄ÿXõI N¬àYà
+\õ› Hô]\õé¬à€€ú›YŸ[ùYHõ›ÀôŸ]]öXù]J	Ÿ]KXYŸ[ùZY	 N¬àYà
+YŸ[ùY
+H¬àÀ»ö[KY^‹ô\à›[Nà€X⁄»Ÿ[X›À›XõKX€X⁄»‹[ú»]Z[¬à[ôPYŸ[ùŸ[X›[€äYŸ[ùY]ô[ù
+N¬àBàJN¬àÀ»›XõKX€X⁄»‹[ú»YŸ[ù]Z[¬àõŸKòY]ô[ù\›[ô\ä	Ÿõ€X⁄…À
+]ô[ù
+HOà¬àYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀùXõKXX›[€ú… H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀòX›[€úÀX€€	 JH¬àô]\õé¬àBà€€ú›õ›»H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	›ãòYŸ[ù\õ›ÀX€X⁄ÿXõI N¬àYà
+\õ› Hô]\õé¬à€€ú›YŸ[ùYHõ›ÀôŸ]]öXù]J	Ÿ]KXYŸ[ùZY	 N¬àYà
+YŸ[ùY
+H¬àöY]–YŸ[ù]Z[ YŸ[ùY
+N¬àBàJN¬àBàBÇàÀ»Y€X⁄»[ô\àõ‹à€X⁄ÿXõHYŸ[ùÿ\ô»
+ö[KY^‹ô\à›[HŸ[X›[€äBà€€ú›ÿ\ô–€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬àYà
+ÿ\ô–€€ùZ[ô\à	âàXÿ\ô–€€ùZ[ô\ãô]\Ÿ]òÿ\ô€X⁄–õ›[ô
+H¬àÿ\ô–€€ùZ[ô\ãô]\Ÿ]òÿ\ô€X⁄–õ›[ôH	›ùYIŒ¬àÿ\ô–€€ùZ[ô\ãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬àÀ»€â›öYŸŸ\àÿ\ô€X⁄»Yà€X⁄⁄[ô»€àHù]€à‹àX›[€ú»\ôXBàYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	Àô]öXŸKXÿ\ôXX›[€ú… JH¬àô]\õé¬àBà€€ú›ÿ\ôH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀòYŸ[ùXÿ\ôX€X⁄ÿXõI N¬àYà
+Xÿ\ô
+Hô]\õé¬à€€ú›YŸ[ùYHÿ\ôôŸ]]öXù]J	Ÿ]KXYŸ[ùZY	 N¬àYà
+YŸ[ùY
+H¬àÀ»ö[KY^‹ô\à›[Nà€X⁄»Ÿ[X›À›XõKX€X⁄»‹[ú»]Z[¬à[ôPYŸ[ùŸ[X›[€äYŸ[ùY]ô[ù
+N¬àBàJN¬àÀ»›XõKX€X⁄»‹[ú»YŸ[ù]Z[¬àÿ\ô–€€ùZ[ô\ãòY]ô[ù\›[ô\ä	Ÿõ€X⁄…À
+]ô[ù
+HOà¬àYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	Àô]öXŸKXÿ\ôXX›[€ú… JH¬àô]\õé¬àBà€€ú›ÿ\ôH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀòYŸ[ùXÿ\ôX€X⁄ÿXõI N¬àYà
+Xÿ\ô
+Hô]\õé¬à€€ú›YŸ[ùYHÿ\ôôŸ]]öXù]J	Ÿ]KXYŸ[ùZY	 N¬àYà
+YŸ[ùY
+H¬àöY]–YŸ[ù]Z[ YŸ[ùY
+N¬àBàJN¬àBÇàﬁ[ò–YŸ[ù’öY]’ŸŸ€J
+N¬àﬁ[ò–YŸ[ù€‹ù€€ùõ€ 
+N¬àﬁ[ò–YŸ[ù]ZX⁄—ö[\ú 
+N¬àﬁ[ò’[ò[ùö[\ì‹[€ú 	ÿYŸ[ù… N¬à[ö]YŸ[ù’XõP›\›€Z^ô\ä
+N¬ÇàÀ»[ö]X[^ôH€€ù^Y[ùHõ‹àYŸ[ù»XõH[ôÿ\ô¬àYà
+⁄[ô›ÀîP€€ù^Y[ùJH¬à€€ú›YŸ[ù’XõHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõI N¬àYà
+YŸ[ù’XõJH¬à⁄[ô›ÀîP€€ù^Y[ùKö[ö]YŸ[ù€€ù^Y[ùJYŸ[ù’XõJN¬àBà€€ú›YŸ[ù–ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬àYà
+YŸ[ù–ÿ\ô H¬à⁄[ô›ÀîP€€ù^Y[ùKö[ö]YŸ[ù€€ù^Y[ùJYŸ[ù–ÿ\ô N¬àBàBüBÇôù[ò›[€à[ö]YŸ[ù’XõP›\›€Z^ô\ä
+H¬àYà
+YŸ[ù’ìKùXõP›\›€Z^ô\äHô]\õé¬ÇàÀ»€õH[ö]X[^ôHYàXõP›\›€Z^ô\à\»]òZ[XõBàYà
+\[Ÿà⁄[ô›ÀïXõP›\›€Z^ô\àOOH	›[ôYö[ôY	 H¬à€€ú€€Kùÿ\õä	’XõP›\›€Z^ô\àõ›]òZ[XõI N¬àô]\õé¬àBÇàÀ»‹ôX]H›\›€Z^ô\à[ú›[òŸBàYŸ[ù’ìKùXõP›\›€Z^ô\àHô]»⁄[ô›ÀïXõP›\›€Z^ô\ä	ÿYŸ[ù…À¬à€€[[ëYúŒà⁄[ô›ÀêQ—Sï◊–””SSó—QíSíUS”î»◊Kà\ú⁄\›€€ôöYŒàùYKà[òXõTô\⁄^ôNàùYKà[òXõTô[‹ô\éàùYKà[òXõP€€[[ìY[ùNàùYKà[òXõQ^‹ùàùYKà€î€‹ùà
+€‹ù›]JHOà¬àÀ»ﬁ[ò»⁄]YŸ[ù’ìHö[\ú¬àYà
+€‹ù›]KöŸ^JH¬àYŸ[ù’ìKôö[\úÀú€‹ùŸ^HH€‹ù›]KöŸ^N¬àYŸ[ù’ìKôö[\úÀú€‹ù\àH€‹ù›]Kô\é¬àﬁ[ò–YŸ[ù€‹ù€€ùõ€ 
+N¬à\PYŸ[ùö[\ú 
+N¬àBàKà€ê€€[[ê⁄[ôŸNà
+
+HOà¬àÀ»ôK\ô[ô\àXõH⁄[à€€[[ú»⁄[ôŸBàô[ô\êYŸ[ù’XõRXY\ä
+N¬àYà
+YŸ[ù’ìKùöY]»OOH	›XõI H¬àô[ô\êYŸ[ùXõJYŸ[ù’ìKôö[\ôY
+N¬àBàKà€ë^‹ùà
+
+HOà¬àÀ»^‹ù›\úô[ùö[\ôY]BàYà
+YŸ[ù’ìKùXõP›\›€Z^ô\äH¬à€€ú›[Y\›[\Hô]»]J
+Kù“T”‘›ö[ô 
+Kú‹]
+	’	 VÃN¬àYŸ[ù’ìKùXõP›\›€Z^ô\ãô^‹ù–‘’äYŸ[ù’ìKôö[\ôYö[ùX\›\ãXYŸ[ùÀI›[Y\›[\Kò‹›ò
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYÀú⁄›’ÿ\›Àä	–YŸ[ù»^‹ùY»‘’âÀ	‹›XÿŸ\‹… N¬àBàBàJN¬ÇàÀ»ô[ô\à€€ò\Çà€€ú›€€ò\ê€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõWÿ›\›€Z^ô\ó›€€ò\â N¬àYà
+€€ò\ê€€ùZ[ô\äH¬à€€ò\ê€€ùZ[ô\ãö[õô\íSHYŸ[ù’ìKùXõP›\›€Z^ô\ãúô[ô\ï€€ò\ä
+N¬àYŸ[ù’ìKùXõP›\›€Z^ô\ãòö[ô€€ò\ë]ô[ù €€ò\ê€€ùZ[ô\äN¬àBÇàÀ»ô[ô\à[ö]X[XY\Çàô[ô\êYŸ[ù’XõRXY\ä
+N¬ÇàÀ»^‹ŸH[\àù[ò›[€ú»€à⁄[ô›»õ‹à\ŸHûH€€[[àô[ô\ô\ú¬à⁄[ô›Àúô[ô\êYŸ[ù›]\–òYŸHHô[ô\êYŸ[ù›]\–òYŸN¬à⁄[ô›Àúô[ô\êYŸ[ùô\ú⁄[€êŸ[Hô[ô\êYŸ[ùô\ú⁄[€êŸ[¬à⁄[ô›ÀôŸ]YŸ[ù\‹^Sò[YHHŸ]YŸ[ù\‹^Sò[YN¬üBÇôù[ò›[€àô[ô\êYŸ[ù”ÿY[ô 
+H¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬àYà
+ÿ\ô H¬àÿ\ôÀò€\‹”\›úô[[›ôJ	⁄Y[â N¬àÿ\ôÀö[õô\íSH	œ]à€\‹œHõ]]Y]^èìÿY[ô»YŸ[ù¯†)èŸ]èâŒ¬àBà€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõW›‹ò\\â N¬àYà
+‹ò\\äH¬à€€ú›õŸHH‹ò\\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+õŸJH¬à€€ú›ö\⁄XõP€€[[ú»HYŸ[ù’ìKùXõP›\›€Z^ô\Çà»YŸ[ù’ìKùXõP›\›€Z^ô\ãôŸ]ö\⁄XõP€€[[ú 
+Kõ[ô›àà¬àõŸKö[õô\íSHèè€€‹[èHâ›ö\⁄XõP€€[[úﬂHà€\‹œHõ]]Y]^èìÿY[ô»YŸ[ù¯†)è›è›èò¬àBàBà€€ú›Y]öX‹»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊€›ô\ùöY]◊€Y]öX‹… N¬àYà
+Y]öX‹»	âàXYŸ[ù’ìKõY]öX‹Àú›[[X\ûJH¬àY]öX‹Àö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èìÿY[ô»YŸ[ùY]öX‹¯†)èŸ]èâŒ¬àBüBÇôù[ò›[€àô[ô\êYŸ[ù—\úõ‹ä\úõ‹äH¬à€€ú›Y\‹ÿYŸHH\úõ‹à	âà\úõ‹ãõY\‹ÿYŸH»\úõ‹ãõY\‹ÿYŸHà	’[ö€õ›€à\úõ‹âŒ¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬àYà
+ÿ\ô H¬àÿ\ôÀò€\‹”\›úô[[›ôJ	⁄Y[â N¬àÿ\ôÀö[õô\íSH]à€\‹œHô\úõ‹ã]^èëòZ[Y»ÿYYŸ[ùŒà	Ÿ\ÿÿ\R[
+Y\‹ÿYŸJ_OŸ]èò¬àBà€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõW›‹ò\\â N¬àYà
+‹ò\\äH¬à€€ú›õŸHH‹ò\\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+õŸJH¬à€€ú›ö\⁄XõP€€[[ú»HYŸ[ù’ìKùXõP›\›€Z^ô\Çà»YŸ[ù’ìKùXõP›\›€Z^ô\ãôŸ]ö\⁄XõP€€[[ú 
+Kõ[ô›àà¬àõŸKö[õô\íSHèè€€‹[èHâ›ö\⁄XõP€€[[úﬂHà€\‹œHô\úõ‹ã]^èëòZ[Y»ÿYYŸ[ùŒà	Ÿ\ÿÿ\R[
+Y\‹ÿYŸJ_O›è›èò¬àBàBà€€ú››]»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹›]… N¬àYà
+›] H¬à›]Àö[õô\íSH]à€\‹œHô\úõ‹ã]^èëòZ[Y»ÿYYŸ[ùŒà	Ÿ\ÿÿ\R[
+Y\‹ÿYŸJ_OŸ]èò¬àBüBÇôù[ò›[€àôYúô\⁄YŸ[ùY]öX‹ 
+H¬àYà
+P\úò^Kö\–\úò^JYŸ[ù’ìKö][\ HYŸ[ù’ìKö][\Àõ[ô›OOH
+H¬àYŸ[ù’ìKõY]öX‹Àú›[[X\ûHHù[¬àô[ô\êYŸ[ù”›ô\ùöY] 
+N¬àô]\õé¬àBà€€ú›õ›»H]Kõõ› 
+N¬àYà
+YŸ[ù’ìKõY]öX‹Àú›[[X\ûH	âàYŸ[ù’ìKõY]öX‹Àõ\›ô]⁄Y	âà
+õ›»HYŸ[ù’ìKõY]öX‹Àõ\›ô]⁄YôŸ][YJ
+JHQ—Sï◊”QUíP‘◊”PV–Q—W”T H¬àô[ô\êYŸ[ù”›ô\ùöY] 
+N¬àô]\õé¬àBàYŸ[ù’ìKõY]öX‹Àú›[[X\ûHH€€\]PYŸ[ùY]öX‹ YŸ[ù’ìKö][\ N¬àYŸ[ù’ìKõY]öX‹Àõ\›ô]⁄YHô]»]J
+N¬àô[ô\êYŸ[ù”›ô\ùöY] 
+N¬üBÇôù[ò›[€à€€\]PYŸ[ùY]öX‹ \›
+H¬à€€ú››[[X\ûHH¬à›[à\›õ[ô›àX›]ôNààY‹òYYààŸôõ[ôNààô\ú⁄[€úŒàﬂKà]õ‹õ\ŒàﬂKàN¬à\›ôõ‹ëXX⁄
+YŸ[ùOà¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬à€€ú››]\“Ÿ^HHY]Kú›]\“Ÿ^H	€Ÿôõ[ôIŒ¬à›[[X\ûV‹›]\“Ÿ^WHH
+›[[X\ûV‹›]\“Ÿ^WH
+H
+»N¬à€€ú›ô\ú⁄[€àHY]Kùô\ú⁄[€ìXô[YŸ[ùùô\ú⁄[€à	’[ö€õ›€âŒ¬à›[[X\ûKùô\ú⁄[€ú÷›ô\ú⁄[€óHH
+›[[X\ûKùô\ú⁄[€ú÷›ô\ú⁄[€óH
+H
+»N¬à€€ú›]õ‹õHHY]Kú]õ‹õSXô[YŸ[ùú]õ‹õH	’[ö€õ›€âŒ¬à›[[X\ûKú]õ‹õ\÷‹]õ‹õWHH
+›[[X\ûKú]õ‹õ\÷‹]õ‹õWH
+H
+»N¬àJN¬à€€ú›ô\ú⁄[€ë[ùöY\»HÿöôX›ô[ùöY\ ›[[X\ûKùô\ú⁄[€ú Kú€‹ù
+
+KäHOàñÃWHHVÃWJN¬à›[[X\ûKúö[X\ûUô\ú⁄[€àHô\ú⁄[€ë[ùöY\Àõ[ô›»ô\ú⁄[€ë[ùöY\÷ÃVÃHà	’[ö€õ›€âŒ¬à›[[X\ûKúö[X\ûUô\ú⁄[€î⁄\ôHHô\ú⁄[€ë[ùöY\Àõ[ô›»
+ô\ú⁄[€ë[ùöY\÷ÃVÃWH»X]õX^
+K›[[X\ûKù›[
+JHà¬à›[[X\ûKõ›]]YH›[[X\ûKù›[H
+ô\ú⁄[€ë[ùöY\Àõ[ô›»ô\ú⁄[€ë[ùöY\÷ÃVÃWHà
+N¬àô]\õà›[[X\ûN¬üBÇôù[ò›[€àô[ô\êYŸ[ù”›ô\ùöY] 
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊€›ô\ùöY]◊€Y]öX‹… N¬àYà
+X€€ùZ[ô\äHô]\õé¬àYà
+XYŸ[ù’ìKõY]öX‹Àú›[[X\ûJH¬à€€ùZ[ô\ãö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èìõ»YŸ[ùY]öX‹»Y]èŸ]èâŒ¬àô]\õé¬àBà€€ú››[[X\ûHHYŸ[ù’ìKõY]öX‹Àú›[[X\ûN¬à€€ú›]õ‹õ\»HÿöôX›ô[ùöY\ ›[[X\ûKú]õ‹õ\»ﬂJKú€‹ù
+
+KäHOàñÃWHHVÃWJKú€XŸJ N¬à€€ùZ[ô\ãö[õô\íSHà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèêYŸ[ù»€õ[ôOŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\ä›[[X\ûKòX›]ôH
+_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èêX›]ôHŸà	Ÿõ‹õX]ù[Xô\ä›[[X\ûKù›[
+_OŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèê€€õôX›[€àZ^Ÿ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\ä›[[X\ûKôY‹òYY
+_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èëY‹òYY
+ò[òX⁄ OŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèïô\ú⁄[€à[Y€õY[ùŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸ\ÿÿ\R[
+›[[X\ûKúö[X\ûUô\ú⁄[€à	’[ö€õ›€â _OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èâ”X]úõ›[ô
+
+›[[X\ûKúö[X\ûUô\ú⁄[€î⁄\ôH
+H
+àL
+_IH€à\»ùZ[Ÿ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèï‹]õ‹õ\œŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâ‹]õ‹õ\Àõ[ô›»\ÿÿ\R[
+]õ‹õ\÷ÃVÃJHà	¯†%	ﬂOŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èì[‹›€€[[€à‘œŸ]èÇàŸ]èÇà¬üBÇôù[ò›[€àôYúô\⁄YŸ[ùö[\ú 
+H¬à€€ú›ô\ú⁄[€ú»Hô]»Ÿ]
+
+N¬à€€ú›]õ‹õ\»Hô]»Ÿ]
+
+N¬àYŸ[ù’ìKö][\Àôõ‹ëXX⁄
+YŸ[ùOà¬àYà
+YŸ[ùùô\ú⁄[€äH¬àô\ú⁄[€úÀòY
+YŸ[ùùô\ú⁄[€äN¬àBàYà
+YŸ[ùú]õ‹õJH¬à]õ‹õ\ÀòY
+YŸ[ùú]õ‹õJN¬àBàJN¬à€€ú›ô\ú⁄[€îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›ô\ú⁄[€óŸö[\â N¬àYà
+ô\ú⁄[€îŸ[X›
+H¬à€€ú››\úô[ùHYŸ[ù’ìKôö[\úÀùô\ú⁄[€é¬à€€ú›‹[€ú»H…œ‹[€àò[YOHàèê[ô\ú⁄[€úœ€‹[€èâÀããê\úò^Kôúõ€Jô\ú⁄[€ú Kú€‹ù
+
+KäHOàKõÿÿ[P€€\\ôJã[ôYö[ôY»Ÿ[ú⁄]]ö]Nà	ÿò\ŸI»JJKõX\
+àOà‹[€àò[YOHâŸ\ÿÿ\R[
+ä_HèâŸ\ÿÿ\R[
+ä_O€‹[€èò
+WKöõ⁄[ä	… N¬àô\ú⁄[€îŸ[X›ö[õô\íSH‹[€úŒ¬àYà
+›\úô[ù	âàô\ú⁄[€úÀö\ ›\úô[ù
+JH¬àô\ú⁄[€îŸ[X›ùò[YHH›\úô[ù¬àH[ŸH¬àô\ú⁄[€îŸ[X›ùò[YHH	…Œ¬àYŸ[ù’ìKôö[\úÀùô\ú⁄[€àH	…Œ¬àBàBà€€ú›]õ‹õTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹]õ‹õWŸö[\â N¬àYà
+]õ‹õTŸ[X›
+H¬à€€ú››\úô[ùHYŸ[ù’ìKôö[\úÀú]õ‹õN¬à€€ú›‹[€ú»H…œ‹[€àò[YOHàèê[]õ‹õ\œ€‹[€èâÀããê\úò^Kôúõ€J]õ‹õ\ Kú€‹ù
+
+KäHOàKõÿÿ[P€€\\ôJã[ôYö[ôY»Ÿ[ú⁄]]ö]Nà	ÿò\ŸI»JJKõX\
+Oà‹[€àò[YOHâŸ\ÿÿ\R[
+
+_HèâŸ\ÿÿ\R[
+
+_O€‹[€èò
+WKöõ⁄[ä	… N¬à]õ‹õTŸ[X›ö[õô\íSH‹[€úŒ¬àYà
+›\úô[ù	âà]õ‹õ\Àö\ ›\úô[ù
+JH¬à]õ‹õTŸ[X›ùò[YHH›\úô[ù¬àH[ŸH¬à]õ‹õTŸ[X›ùò[YHH	…Œ¬àYŸ[ù’ìKôö[\úÀú]õ‹õHH	…Œ¬àBàBüBÇôù[ò›[€à\PYŸ[ùö[\ú 
+H¬àYà
+P\úò^Kö\–\úò^JYŸ[ù’ìKö][\ JH¬àô]\õé¬àBà€€ú››[›]\Ÿ\»HùZ[YŸ[ù›]\–€›[ù 
+N¬à€€ú›ö[\ôY›]\Ÿ\»HùZ[YŸ[ù›]\–€›[ù 
+N¬à€€ú›ö[\ôYH◊N¬àYŸ[ù’ìKö][\Àôõ‹ëXX⁄
+YŸ[ùOà¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬à€€ú››]\“Ÿ^HHY]Kú›]\“Ÿ^H	€Ÿôõ[ôIŒ¬àYà
+›[›]\Ÿ\÷‹›]\“Ÿ^WHOOH[ôYö[ôY
+H¬à›[›]\Ÿ\÷‹›]\“Ÿ^WH
+œHN¬àBàYà
+X]⁄\–YŸ[ùö[\ú YŸ[ùYŸ[ù’ìKôö[\ú JH¬àö[\ôYú\⁄
+YŸ[ù
+N¬àYà
+ö[\ôY›]\Ÿ\÷‹›]\“Ÿ^WHOOH[ôYö[ôY
+H¬àö[\ôY›]\Ÿ\÷‹›]\“Ÿ^WH
+œHN¬àBàBàJN¬àYŸ[ù’ìKôö[\ôYH€‹ùYŸ[ù ö[\ôY
+N¬àYŸ[ù’ìKú›]Àù›[HYŸ[ù’ìKö][\Àõ[ô›¬àYŸ[ù’ìKú›]Àôö[\ôYHYŸ[ù’ìKôö[\ôYõ[ô›¬àYŸ[ù’ìKú›]Àù›[›]\Ÿ\»H›[›]\Ÿ\Œ¬àYŸ[ù’ìKú›]Àôö[\ôY›]\Ÿ\»Hö[\ôY›]\Ÿ\Œ¬àô[ô\êYŸ[ù“[õ[ôT›] 
+N¬àô[ô\êYŸ[ù–X›]ôQö[\ú 
+N¬àﬁ[ò–YŸ[ù]ZX⁄—ö[\ú 
+N¬àYà
+YŸ[ù’ìKùöY]»OOH	›XõI H¬àô[ô\êYŸ[ùXõJYŸ[ù’ìKôö[\ôY
+N¬àH[ŸH¬àô[ô\êYŸ[ùÿ\ô YŸ[ù’ìKôö[\ôY
+N¬àBàﬁ[ò–YŸ[ùXõT€‹ù[ôXÿ]‹ú 
+N¬üBÇôù[ò›[€àX]⁄\–YŸ[ùö[\ú YŸ[ùö[\ú H¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬à€€ú›]Y\ûHH
+ö[\úÀú]Y\ûH	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+]Y\ûH	âà
+[Y]KúŸX\ò⁄Y]KúŸX\ò⁄ö[ô^Ÿä]Y\ûJHOOHLJJH¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀùô\ú⁄[€à	âà
+YŸ[ùùô\ú⁄[€à	… HOOHö[\úÀùô\ú⁄[€äH¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀú]õ‹õH	âà
+YŸ[ùú]õ‹õH	… HOOHö[\úÀú]õ‹õJH¬àô]\õàò[ŸN¬àBà€€ú›[ò[ùYHYŸ[ùù[ò[ù⁄YY]Kù[ò[ùY	…Œ¬àYà
+ö[\úÀù[ò[ùY	âà[ò[ùYOOHö[\úÀù[ò[ùY
+H¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀú›]\Ÿ\»	âàö[\úÀú›]\Ÿ\Àú⁄^ôHà	âàYö[\úÀú›]\Ÿ\Àö\ Y]Kú›]\“Ÿ^H	€Ÿôõ[ôI JH¬àô]\õàò[ŸN¬àBàô]\õàùYN¬üBÇôù[ò›[€à€‹ùYŸ[ù \›
+H¬à€€ú›Ÿ^HHYŸ[ù’ìKôö[\úÀú€‹ùŸ^H	€\›‹ŸY[âŒ¬à€€ú›\àHYŸ[ù’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»HàLN¬àô]\õà\›ú€XŸJ
+Kú€‹ù
+
+KäHOà¬à€€ú›Uò[HŸ]YŸ[ù€‹ùò[YJKŸ^JN¬à€€ú›ïò[HŸ]YŸ[ù€‹ùò[YJãŸ^JN¬àYà
+Uò[ïò[
+Hô]\õàLH
+à\é¬àYà
+Uò[àïò[
+Hô]\õàH
+à\é¬à€€ú›Sò[YHH
+Kõò[YHKö‹›ò[YHKòYŸ[ù⁄Y	… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›ìò[YHH
+ãõò[YHãö‹›ò[YHãòYŸ[ù⁄Y	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+Sò[YHìò[YJHô]\õàLN¬àYà
+Sò[YHàìò[YJHô]\õàN¬àô]\õà¬àJN¬üBÇôù[ò›[€àŸ]YŸ[ù€‹ùò[YJYŸ[ùŸ^JH¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬à›⁄]⁄
+Ÿ^JH¬àÿ\ŸH	€ò[YIŒÇàô]\õàŸ]YŸ[ù\‹^Sò[YJYŸ[ù
+Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	‹›]\…ŒÇàô]\õàQ—Sï‘’UT◊”‘ëTñ€Y]Kú›]\“Ÿ^H	€Ÿôõ[ôI◊H¬àÿ\ŸH	›ô\ú⁄[€âŒÇàô]\õà
+YŸ[ùùô\ú⁄[€à	… Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	‹]õ‹õIŒÇàô]\õà
+YŸ[ùú]õ‹õH	… Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	›[ò[ù	ŒÇàô]\õàõ‹õX][ò[ù\‹^JYŸ[ùù[ò[ù⁄YY]Kù[ò[ùY	… Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	€\›‹ŸY[âŒÇàYò][Çàô]\õàY]Kõ\›ŸY[ì\»¬àBüBÇôù[ò›[€àô[ô\êYŸ[ù“[õ[ôT›] 
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹›]… N¬àYà
+X€€ùZ[ô\äHô]\õé¬à€€ú››]\Ÿ\»HYŸ[ù’ìKú›]Àôö[\ôY›]\Ÿ\»ﬂN¬à€€ùZ[ô\ãö[õô\íSHà]èè›õ€ôœï›[è‹›õ€ôœà	Ÿõ‹õX]ù[Xô\äYŸ[ù’ìKú›]Àù›[
+_OŸ]èÇà]èè›õ€ôœî⁄›⁄[ôŒè‹›õ€ôœà	Ÿõ‹õX]ù[Xô\äYŸ[ù’ìKú›]Àôö[\ôY
+_OŸ]èÇà]èÇà‹[à€\‹œHú›]\À\[X[HèêX›]ôH	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\ÀòX›]ôH
+_O‹‹[èÇà‹[à€\‹œHú›]\À\[ÿ\õö[ô»èëY‹òYY	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\ÀôY‹òYY
+_O‹‹[èÇà‹[à€\‹œHú›]\À\[\úõ‹àèìŸôõ[ôH	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\ÀõŸôõ[ôH
+_O‹‹[èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\êYŸ[ù–X›]ôQö[\ú 
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿX›]ôWŸö[\ú… N¬àYà
+X€€ùZ[ô\äHô]\õé¬à€€ú›⁄\»H◊N¬à€€ú›ö[\ú»HYŸ[ù’ìKôö[\úŒ¬àYà
+ö[\úÀú]Y\ûJH¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	‘ŸX\ò⁄	Àö[\úÀú]Y\ûK	‹ŸX\ò⁄	 JN¬àBàYà
+ö[\úÀùô\ú⁄[€äH¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	’ô\ú⁄[€âÀö[\úÀùô\ú⁄[€ã	›ô\ú⁄[€â JN¬àBàYà
+ö[\úÀú]õ‹õJH¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	‘]õ‹õIÀö[\úÀú]õ‹õK	‹]õ‹õI JN¬àBàYà
+ö[\úÀù[ò[ùY
+H¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	’[ò[ù	Àõ‹õX][ò[ù\‹^Jö[\úÀù[ò[ùY
+K	›[ò[ù	 JN¬àBàYà
+ö[\úÀú›]\Ÿ\»	âàö[\úÀú›]\Ÿ\Àú⁄^ôHà	âàö[\úÀú›]\Ÿ\Àú⁄^ôHQ—Sï‘’UT◊“—VTÀõ[ô›
+H¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	‘›]\…À\úò^Kôúõ€Jö[\úÀú›]\Ÿ\ KõX\
+»OàQ—Sï‘’UT◊”PëS÷‹◊H Köõ⁄[ä	À	 K	‹›]\Ÿ\… JN¬àBàYà
+⁄\Àõ[ô›OOH
+H¬à€€ùZ[ô\ãö[õô\íSH	…Œ¬à€€ùZ[ô\ãò€\‹”\›òY
+	⁄Y[â N¬àô]\õé¬àBà€€ùZ[ô\ãò€\‹”\›úô[[›ôJ	⁄Y[â N¬à€€ùZ[ô\ãö[õô\íSH⁄\Àöõ⁄[ä	… N¬üBÇôù[ò›[€à[ôPYŸ[ùö[\ê⁄\ô[[›ôJö[\íŸ^JH¬à›⁄]⁄
+ö[\íŸ^JH¬àÿ\ŸH	‹ŸX\ò⁄	ŒÇàYŸ[ù’ìKôö[\úÀú]Y\ûHH	…Œ¬à€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹ŸX\ò⁄	 N¬àYà
+ŸX\ò⁄[ú]
+HŸX\ò⁄[ú]ùò[YHH	…Œ¬àúôXZŒ¬àÿ\ŸH	›ô\ú⁄[€âŒÇàYŸ[ù’ìKôö[\úÀùô\ú⁄[€àH	…Œ¬à€€ú›ô\ú⁄[€îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›ô\ú⁄[€óŸö[\â N¬àYà
+ô\ú⁄[€îŸ[X›
+Hô\ú⁄[€îŸ[X›ùò[YHH	…Œ¬àúôXZŒ¬àÿ\ŸH	‹]õ‹õIŒÇàYŸ[ù’ìKôö[\úÀú]õ‹õHH	…Œ¬à€€ú›]õ‹õTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹]õ‹õWŸö[\â N¬àYà
+]õ‹õTŸ[X›
+H]õ‹õTŸ[X›ùò[YHH	…Œ¬àúôXZŒ¬àÿ\ŸH	›[ò[ù	ŒÇàYŸ[ù’ìKôö[\úÀù[ò[ùYH	…Œ¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›[ò[ùŸö[\â N¬àYà
+[ò[ùŸ[X›
+H[ò[ùŸ[X›ùò[YHH	…Œ¬àúôXZŒ¬àÿ\ŸH	‹›]\Ÿ\…ŒÇàYŸ[ù’ìKôö[\úÀú›]\Ÿ\»Hô]»Ÿ]
+Q—Sï‘’UT◊“—VT N¬àúôXZŒ¬àYò][Çàô]\õé¬àBà\PYŸ[ùö[\ú 
+N¬üBÇôù[ò›[€àﬁ[ò–YŸ[ù]ZX⁄—ö[\ú 
+H¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	»ÿYŸ[ù◊‹›]\◊Ÿö[\àŸ]K\›]\◊I Kôõ‹ëXX⁄
+ùàOà¬à€€ú›Ÿ^HHùãôŸ]]öXù]J	Ÿ]K\›]\… N¬à€€ú›X›]ôHHYŸ[ù’ìKôö[\úÀú›]\Ÿ\Àö\ Ÿ^JN¬àùãò€\‹”\›ùŸŸ€J	ÿX›]ôIÀX›]ôJN¬à€€ú›ò\ŸSXô[HùãôŸ]]öXù]J	Ÿ]K[Xô[	 Hùãù^€€ù[ùùö[J
+N¬à€€ú›€›[ùHYŸ[ù’ìKú›]Àù›[›]\Ÿ\œÀñ⁄Ÿ^WH¬àùãö[õô\íSH	Ÿ\ÿÿ\R[
+ò\ŸSXô[
+_H‹[à€\‹œHú[X€›[ùèâŸõ‹õX]ù[Xô\ä€›[ù
+_O‹‹[èò¬àJN¬üBÇôù[ò›[€àŸŸ€PYŸ[ù›]\—ö[\ä›]\“Ÿ^JH¬àYà
+PQ—Sï‘’UT◊“—VTÀö[ò€Y\ ›]\“Ÿ^JJHô]\õé¬à€€ú›ô^Hô]»Ÿ]
+YŸ[ù’ìKôö[\úÀú›]\Ÿ\»Q—Sï‘’UT◊“—VT N¬àYà
+ô^ö\ ›]\“Ÿ^JJH¬àô^ô[]J›]\“Ÿ^JN¬àH[ŸH¬àô^òY
+›]\“Ÿ^JN¬àBàYà
+ô^ú⁄^ôHOOH
+H¬àQ—Sï‘’UT◊“—VTÀôõ‹ëXX⁄
+Ÿ^HOàô^òY
+Ÿ^JJN¬àBàYŸ[ù’ìKôö[\úÀú›]\Ÿ\»Hô^¬à\PYŸ[ùö[\ú 
+N¬üBÇôù[ò›[€àô\Ÿ]YŸ[ùö[\ú 
+H¬àYŸ[ù’ìKôö[\úÀú]Y\ûHH	…Œ¬àYŸ[ù’ìKôö[\úÀùô\ú⁄[€àH	…Œ¬àYŸ[ù’ìKôö[\úÀú]õ‹õHH	…Œ¬àYŸ[ù’ìKôö[\úÀù[ò[ùYH	…Œ¬àYŸ[ù’ìKôö[\úÀú›]\Ÿ\»Hô]»Ÿ]
+Q—Sï‘’UT◊“—VT N¬à€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹ŸX\ò⁄	 N¬àYà
+ŸX\ò⁄[ú]
+HŸX\ò⁄[ú]ùò[YHH	…Œ¬à€€ú›ô\ú⁄[€îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›ô\ú⁄[€óŸö[\â N¬àYà
+ô\ú⁄[€îŸ[X›
+Hô\ú⁄[€îŸ[X›ùò[YHH	…Œ¬à€€ú›]õ‹õTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹]õ‹õWŸö[\â N¬àYà
+]õ‹õTŸ[X›
+H]õ‹õTŸ[X›ùò[YHH	…Œ¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›[ò[ùŸö[\â N¬àYà
+[ò[ùŸ[X›
+H[ò[ùŸ[X›ùò[YHH	…Œ¬à\PYŸ[ùö[\ú 
+N¬üBÇôù[ò›[€àŸ]YŸ[ù’öY] öY] H¬à€€ú›ô^öY]»HQ—Sï◊’íQU◊”‘S”îÀö[ò€Y\ öY] H»öY]»à	ÿÿ\ô…Œ¬àYà
+YŸ[ù’ìKùöY]»OOHô^öY] H¬àô]\õé¬àBàYŸ[ù’ìKùöY]»Hô^öY]Œ¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀêQ—Sï◊’íQUÀô^öY] N¬àﬁ[ò–YŸ[ù’öY]’ŸŸ€J
+N¬àYà
+YŸ[ù’ìKùöY]»OOH	›XõI H¬àô[ô\êYŸ[ùXõJYŸ[ù’ìKôö[\ôY
+N¬àH[ŸH¬àô[ô\êYŸ[ùÿ\ô YŸ[ù’ìKôö[\ôY
+N¬àBüBÇôù[ò›[€àﬁ[ò–YŸ[ù’öY]’ŸŸ€J
+H¬à€€ú›ŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›öY]◊›ŸŸ€I N¬àYà
+]ŸŸ€JHô]\õé¬àŸŸ€Kú]Y\ûTŸ[X›‹ê[
+	÷Ÿ]K]öY]◊I Kôõ‹ëXX⁄
+ùàOà¬à€€ú›öY]»HùãôŸ]]öXù]J	Ÿ]K]öY]… N¬à€€ú›X›]ôHHöY]»OOHYŸ[ù’ìKùöY]Œ¬àùãò€\‹”\›ùŸŸ€J	ÿX›]ôIÀX›]ôJN¬àùãúŸ]]öXù]J	ÿ\öXK\ô\‹ŸY	ÀX›]ôH»	›ùYI»à	Ÿò[ŸI N¬àJN¬üBÇôù[ò›[€àŸ]YŸ[ù€‹ù
+Ÿ^K\äH¬à€€ú›ô^Ÿ^HHQ—Sï◊‘”‘ï“—VTÀö[ò€Y\ Ÿ^JH»Ÿ^Hà	€\›‹ŸY[âŒ¬à€€ú›ô^\àH\àOOH	ÿ\ÿ…»»	ÿ\ÿ…»à	Ÿ\ÿ…Œ¬àYà
+YŸ[ù’ìKôö[\úÀú€‹ùŸ^HOOHô^Ÿ^H	âàYŸ[ù’ìKôö[\úÀú€‹ù\àOOHô^\äH¬àô]\õé¬àBàYŸ[ù’ìKôö[\úÀú€‹ùŸ^HHô^Ÿ^N¬àYŸ[ù’ìKôö[\úÀú€‹ù\àHô^\é¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀêQ—Sï◊‘”‘ï“—VKô^Ÿ^JN¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀêQ—Sï◊‘”‘ï—Tãô^\äN¬àﬁ[ò–YŸ[ù€‹ù€€ùõ€ 
+N¬à\PYŸ[ùö[\ú 
+N¬üBÇôù[ò›[€àﬁ[ò–YŸ[ù€‹ù€€ùõ€ 
+H¬à€€ú›€‹ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹€‹ù‹Ÿ[X›	 N¬àYà
+€‹ùŸ[X›	âà€‹ùŸ[X›ùò[YHOOHYŸ[ù’ìKôö[\úÀú€‹ùŸ^JH¬à€‹ùŸ[X›ùò[YHHYŸ[ù’ìKôö[\úÀú€‹ùŸ^N¬àBà€€ú›€‹ù\êùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹€‹ùŸ\óÿùâ N¬à€€ú›€‹ù\íX€€àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊‹€‹ùŸ\ó⁄X€€â N¬àYà
+€‹ù\êùäH¬à€‹ù\êùãô]\Ÿ]ô\àHYŸ[ù’ìKôö[\úÀú€‹ù\é¬à€‹ù\êùãúŸ]]öXù]J	ÿ\öXK[Xô[	ÀYŸ[ù’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	‘€‹ù\ÿŸ[ô[ô…»à	‘€‹ù\ÿŸ[ô[ô… N¬àBàYà
+€‹ù\íX€€äH¬à€‹ù\íX€€ãù^€€ù[ùHYŸ[ù’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	¯°§I»à	¯°§…Œ¬àBüBÇôù[ò›[€àﬁ[ò–YŸ[ùXõT€‹ù[ôXÿ]‹ú 
+H¬à€€ú›XYHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	»ÿYŸ[ù◊›XõHXY	 N¬àYà
+ZXY
+Hô]\õé¬àXYú]Y\ûTŸ[X›‹ê[
+	›Ÿ]K\€‹ùZŸ^WI Kôõ‹ëXX⁄
+Oà¬à€€ú›Ÿ^HHôŸ]]öXù]J	Ÿ]K\€‹ùZŸ^I N¬àYà
+Ÿ^HOOHYŸ[ù’ìKôö[\úÀú€‹ùŸ^JH¬àò€\‹”\›òY
+	‹€‹ùY	 N¬àúŸ]]öXù]J	ÿ\öXK\€‹ù	ÀYŸ[ù’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	ÿ\ÿŸ[ô[ô…»à	Ÿ\ÿŸ[ô[ô… N¬àH[ŸH¬àò€\‹”\›úô[[›ôJ	‹€‹ùY	 N¬àúô[[›ôP]öXù]J	ÿ\öXK\€‹ù	 N¬àBàJN¬üBÇôù[ò›[€à[ôPYŸ[ùXõT€‹ù€X⁄ ]ô[ù
+H¬à€€ú›\ôŸ]H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	›Ÿ]K\€‹ùZŸ^WI N¬àYà
+]\ôŸ]
+H¬àô]\õé¬àBà€€ú›Ÿ^HH\ôŸ]ôŸ]]öXù]J	Ÿ]K\€‹ùZŸ^I N¬àYà
+ZŸ^JH¬àô]\õé¬àBà€€ú›ô^\àH
+YŸ[ù’ìKôö[\úÀú€‹ùŸ^HOOHŸ^H	âàYŸ[ù’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ… H»	Ÿ\ÿ…»à	ÿ\ÿ…Œ¬àŸ]YŸ[ù€‹ù
+Ÿ^Kô^\äN¬üBÇôù[ò›[€àô[ô\êYŸ[ùÿ\ô YŸ[ù H¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬à€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõW›‹ò\\â N¬àYà
+Xÿ\ô Hô]\õé¬àYà
+‹ò\\äH¬à‹ò\\ãò€\‹”\›òY
+	⁄Y[â N¬àBàÿ\ôÀò€\‹”\›úô[[›ôJ	⁄Y[â N¬àYà
+XYŸ[ù»YŸ[ùÀõ[ô›OOH
+H¬àÿ\ôÀö[õô\íSH	œ]à€\‹œHõ]]Y]^èìõ»YŸ[ù»X]⁄H›\úô[ùö[\úÀèŸ]èâŒ¬àô]\õé¬àBàÿ\ôÀö[õô\íSHYŸ[ùÀõX\
+YŸ[ùOàô[ô\êYŸ[ùÿ\ô
+YŸ[ù
+JKöõ⁄[ä	… N¬üBÇôù[ò›[€àô[ô\êYŸ[ùô\ú⁄[€êŸ[
+YŸ[ùõ‹ïXõHHò[ŸJH¬à€€ú››\úô[ùô\ú⁄[€àHYŸ[ùùô\ú⁄[€à	…Œ¬à€€ú›]\›ô\ú⁄[€àHYŸ[ù’ìKõ]\›ô\ú⁄[€é¬à€€ú›\‹^Uô\ú⁄[€àH\ÿÿ\R[
+›\úô[ùô\ú⁄[€à	”ã–I N¬à€€ú›YŸ[ùYHYŸ[ùòYŸ[ù⁄Y	…Œ¬ÇàÀ»⁄X⁄»Yà\ôI‹»[àX›]ôH\]Hõ‹à\»YŸ[ùà€€ú›\]T›]HHYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àYà
+\]T›]JH¬à€€ú›ò]‘›]\»H\]T›]Kú›]\»	…Œ¬à€€ú››]\»H
+
+
+HOà¬à›⁄]⁄
+ò]‘›]\ H¬àÿ\ŸH	‹[ô[ô…ŒÇàô]\õà	ÿ⁄X⁄⁄[ô…Œ¬àÿ\ŸH	‹›Y⁄[ô…ŒÇàÿ\ŸH	ÿ\Z[ô…ŒÇàô]\õà	‹ôXYIŒ¬àÿ\ŸH	‹›XÿŸYYY	ŒÇàô]\õà	ÿ€€\]IŒ¬àÿ\ŸH	‹õ€YÿòX⁄…ŒÇàô]\õà	ŸòZ[Y	Œ¬àYò][Çàô]\õàò]‘›]\Œ¬àBàJJ
+N¬ÇàÀ»ÿ[›[]H€[€›õŸ‹ô\‹»\òŸ[ùYŸHò\ŸY€à\ŸBà€€ú›€[€›õŸ‹ô\‹»HŸ]€[€›Y\]TõŸ‹ô\‹ YŸ[ùY›]\À\]T›]JN¬ÇàÀ»⁄›»õŸ‹ô\‹»ù]€àõ‹àX›]ôH›]\¬àYà
+›]\»OOH	ÿ⁄X⁄⁄[ô…»›]\»OOH	Ÿ›€õÿY[ô…»›]\»OOH	‹ôXYI»›]\»OOH	‹ô\›\ù[ô…»›]\»OOH	›ô\öYûZ[ô… H¬à€€ú›ÿ[êÿ[òŸ[H›]\»OOH	‹ôXYI»	âà›]\»OOH	‹ô\›\ù[ô…»	âà›]\»OOH	›ô\öYûZ[ô…Œ¬à€€ú›ÿ[òŸ[ùàHÿ[êÿ[òŸ[à»ù]€à€\‹œHù\]KXùàÿ[òŸ[à]KXX›[€èHòÿ[òŸ[]\]Hà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+YŸ[ùY
+_Hà]OHêÿ[òŸ[\]Hè∏ß%Oÿù]€èòàà	…Œ¬àÀ»õŸ‹ô\‹»ù]€à⁄]ö[YôôX›à€€ú›õŸ‹ô\‹–ùàHù]€à€\‹œHù\]KXùàõŸ‹ô\‹ÀXùàà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+YŸ[ùY
+_Hà\ÿXõY›[OHãK\õŸ‹ô\‹Œà	‹€[€›õŸ‹ô\‹ﬂIHèâ”X]úõ›[ô
+€[€›õŸ‹ô\‹ _IOÿù]€èò¬à€€ú›€€ù[ùH	‹õŸ‹ô\‹–ùüIÿÿ[òŸ[ùüX¬àYà
+õ‹ïXõJH¬àô]\õà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\çú»èâŸ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùOŸ]èò¬àBàô]\õà	Ÿ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùX¬àBÇàÀ»⁄›»òZ[Y›]HúöYYõBàYà
+›]\»OOH	ŸòZ[Y	 H¬à€€ú›\úõ‹ì\Ÿ»H\]T›]Kô\úõ‹à	—òZ[Y	Œ¬à€€ú›€€ù[ùH‹[à€\‹œHù\]KY\úõ‹àà]OHâŸ\ÿÿ\R[
+\úõ‹ì\Ÿ _Hè∏ß%HòZ[Y‹‹[èò¬àYà
+õ‹ïXõJH¬àô]\õà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\çú»èâŸ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùOŸ]èò¬àBàô]\õà	Ÿ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùX¬àBÇàÀ»⁄⁄\Y\]H
+€XﬁH‹à[ôXYH›\úô[ù
+BàYà
+›]\»OOH	‹⁄⁄\Y	 H¬à€€ú›€€ù[ùH‹[à€\‹œHù\]K\õŸ‹ô\‹»èî⁄⁄\Y‹‹[èò¬àYà
+õ‹ïXõJH¬àô]\õà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\çú»èâŸ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùOŸ]èò¬àBàô]\õà	Ÿ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùX¬àBÇàÀ»⁄›»€€\]H›]HúöYYõBàYà
+›]\»OOH	ÿ€€\]I H¬à€€ú›€€ù[ùH‹[à€\‹œHù\]KX€€\]Hè∏ß$»\]Y‹‹[èò¬àYà
+õ‹ïXõJH¬àô]\õà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\çú»èâŸ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùOŸ]èò¬àBàô]\õà	Ÿ\‹^Uô\ú⁄[€üH	ÿ€€ù[ùX¬àBàBÇàÀ»⁄X⁄»Yà\]H\»]òZ[XõH
+õ‹õX[›]JHH€õH⁄›»Yà]\›\»X›X[Hô]Ÿ\ÇàYà
+]\›ô\ú⁄[€à	âà›\úô[ùô\ú⁄[€à	âà›\úô[ùô\ú⁄[€àOOH	”ã–I»	âà€€\\ôUô\ú⁄[€ú ]\›ô\ú⁄[€ã›\úô[ùô\ú⁄[€äHà
+H¬àÀ»⁄X⁄»õ‹àŸXî€ÿ⁄Ÿ]€€õôX›[€à\⁄[ô»€€õôX›[€ó›\HöY[à€€ú›€€õôX›[€ï\HH
+YŸ[ùò€€õôX›[€ó›\H	… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›ÿ[ï\]HH€€õôX›[€ï\HOOH	›‹…Œ¬à€€ú›€€\Hÿ[ï\]H»\]H]òZ[XõNà	€]\›ô\ú⁄[€üXà	–YŸ[ùõ›€€õôX›YöXHŸXî€ÿ⁄Ÿ]	Œ¬à€€ú›ù]€ê€\‹»Hÿ[ï\]H»	›\]KXùâ»à	›\]KXùà\ÿXõY	Œ¬à€€ú›\]PùàHù]€à€\‹œHâÿù]€ê€\‹ﬂHà]KXX›[€èHù\]KXYŸ[ùà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+YŸ[ùY
+_Hà]OHâŸ\ÿÿ\R[
+€€\
+_Hà	ÿÿ[ï\]H»	…»à	Ÿ\ÿXõY	ﬂO∏°§H	Ÿ\ÿÿ\R[
+]\›ô\ú⁄[€ä_Oÿù]€èò¬àYà
+õ‹ïXõJH¬àô]\õà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\çú»èâŸ\‹^Uô\ú⁄[€üH	›\]PùüOŸ]èò¬àBàô]\õà	Ÿ\‹^Uô\ú⁄[€üH	›\]PùüX¬àBàô]\õà\‹^Uô\ú⁄[€é¬üBÇãÀ»ÿ[›[]H€[€›YõŸ‹ô\‹»õ‹à\]H[ö[X][€ú¬ãÀ»\Ÿ\Œà⁄X⁄⁄[ô»
+MIJK›€õÿY[ô»
+KMMIJKôXYK⁄[ú›[[ô»
+MKNIJKô\›\ù[ô»
+KNMIJKô\öYûZ[ô»
+MKNNIJBôù[ò›[€àŸ]€[€›Y\]TõŸ‹ô\‹ YŸ[ùY›]\À\]T›]JH¬à€€ú›õ›»H]Kõõ› 
+N¬à€€ú››\ù[YHH\]T›]Kù[Y\›[\õ›Œ¬à€€ú›[\ŸYHõ›»H›\ù[YN¬ÇàÀ»[ö]X[^ôH‹àŸ][ö[X][€à›]BàYà
+XYŸ[ù’ìKù\]P[ö[X][€ú H¬àYŸ[ù’ìKù\]P[ö[X][€ú»HﬂN¬àBà][ö[HHYŸ[ù’ìKù\]P[ö[X][€ú÷ÿYŸ[ùYN¬àYà
+X[ö[H[ö[Kú›]\»OOH›]\ H¬àÀ»›]\»⁄[ôŸY›\ùô]»[ö[X][€àúõ€H›\úô[ù\‹^HõŸ‹ô\‹»‹à\ŸH›\ùà€€ú›\ŸT›\ùHŸ]\ŸT›\ù\òŸ[ù
+›]\ N¬à€€ú›ô]ö[›\‘õŸ‹ô\‹»H[ö[H»[ö[Kô\‹^TõŸ‹ô\‹»à\ŸT›\ù¬à[ö[HH¬à›]\Àà›\ù[YNàõ›Àà›\ùõŸ‹ô\‹ŒàX]õX^
+ô]ö[›\‘õŸ‹ô\‹À\ŸT›\ù
+Kà\‹^TõŸ‹ô\‹ŒàX]õX^
+ô]ö[›\‘õŸ‹ô\‹À\ŸT›\ù
+BàN¬àYŸ[ù’ìKù\]P[ö[X][€ú÷ÿYŸ[ùYHH[ö[N¬àBÇà€€ú›\ŸQ[ôHŸ]\ŸQ[ô\òŸ[ù
+›]\ N¬à€€ú›\ŸQ\ò][€àHŸ]\ŸQ\ò][€ä›]\ N¬ÇàÀ»õ‹à›€õÿY[ôÀ\ŸHX›X[õŸ‹ô\‹»úõ€HYŸ[ù
+ÿÿ[Y»KMMIHò[ôŸJBàYà
+›]\»OOH	Ÿ›€õÿY[ô… H¬à€€ú›ò]‘õŸ‹ô\‹»H\]T›]KúõŸ‹ô\‹»¬à€€ú›\ôŸ]õŸ‹ô\‹»HH
+»
+ò]‘õŸ‹ô\‹»
+àçJN»À»ÿÿ[HLL	H»KMMIBàÀ»€[€››ÿ\ô»\ôŸ]à€€ú›õŸ‹ô\‹—YôàH\ôŸ]õŸ‹ô\‹»H[ö[Kô\‹^TõŸ‹ô\‹Œ¬à[ö[Kô\‹^TõŸ‹ô\‹»
+œHõŸ‹ô\‹—Yôà
+àåŒ»À»X\ŸH›ÿ\ô»\ôŸ]àô]\õàX]õZ[ä[ö[Kô\‹^TõŸ‹ô\‹À\ŸQ[ô
+N¬àBÇàÀ»õ‹à›\à\Ÿ\À[ö[X]H[YKXò\ŸY›ÿ\ô»\ŸH[ôà€€ú›\ŸQ[\ŸYHõ›»H[ö[Kú›\ù[YN¬à€€ú›\ŸTõŸ‹ô\‹»HX]õZ[ä\ŸQ[\ŸY»\ŸQ\ò][€ãJN¬àÀ»X\ŸH›]›XöX»õ‹à€[€›XŸ[\ò][€à]\ŸH[ôà€€ú›X\ŸYõŸ‹ô\‹»HHHX]ú› HH\ŸTõŸ‹ô\‹À N¬à€€ú›\ôŸ]õŸ‹ô\‹»H[ö[Kú›\ùõŸ‹ô\‹»
+»
+\ŸQ[ôH[ö[Kú›\ùõŸ‹ô\‹ H
+àX\ŸYõŸ‹ô\‹»
+àéMN»À»€â›]Z]HôXX⁄[ôÇàÀ»€[€›\]Bà€€ú›YôàH\ôŸ]õŸ‹ô\‹»H[ö[Kô\‹^TõŸ‹ô\‹Œ¬à[ö[Kô\‹^TõŸ‹ô\‹»
+œHYôà
+àåé¬Çàô]\õàX]õZ[äX]õX^
+[ö[Kô\‹^TõŸ‹ô\‹À
+KNJN¬üBÇôù[ò›[€àŸ]\ŸT›\ù\òŸ[ù
+›]\ H¬à›⁄]⁄
+›]\ H¬àÿ\ŸH	ÿ⁄X⁄⁄[ô…Œàô]\õà¬àÿ\ŸH	Ÿ›€õÿY[ô…Œàô]\õàN¬àÿ\ŸH	‹ôXYIŒàô]\õàMN¬àÿ\ŸH	‹ô\›\ù[ô…Œàô]\õàN¬àÿ\ŸH	›ô\öYûZ[ô…Œàô]\õàMN¬àYò][àô]\õà¬àBüBÇôù[ò›[€àŸ]\ŸQ[ô\òŸ[ù
+›]\ H¬à›⁄]⁄
+›]\ H¬àÿ\ŸH	ÿ⁄X⁄⁄[ô…Œàô]\õàN¬àÿ\ŸH	Ÿ›€õÿY[ô…Œàô]\õàMN¬àÿ\ŸH	‹ôXYIŒàô]\õàN¬àÿ\ŸH	‹ô\›\ù[ô…Œàô]\õàMN¬àÿ\ŸH	›ô\öYûZ[ô…Œàô]\õàNN¬àYò][àô]\õàL¬àBüBÇôù[ò›[€àŸ]\ŸQ\ò][€ä›]\ H¬à›⁄]⁄
+›]\ H¬àÿ\ŸH	ÿ⁄X⁄⁄[ô…Œàô]\õàÃ»À»‹»õ‹à⁄X⁄⁄[ô¬àÿ\ŸH	Ÿ›€õÿY[ô…Œàô]\õàÃ»À»Ã»\Xÿ[›€õÿYàÿ\ŸH	‹ôXYIŒàô]\õàL»À»L»õ‹à[ú›[‹›Y⁄[ô¬àÿ\ŸH	‹ô\›\ù[ô…Œàô]\õàML»À»M\»õ‹àô\›\ùàÿ\ŸH	›ô\öYûZ[ô…Œàô]\õàL»À»\»õ‹àô\öYöXÿ][€ÇàYò][àô]\õàL¬àBüBÇôù[ò›[€àô[ô\êYŸ[ù’XõRXY\ä
+H¬à€€ú›XYHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõW⁄XY\â N¬àYà
+]XY
+Hô]\õé¬ÇàYà
+XYŸ[ù’ìKùXõP›\›€Z^ô\äH¬àÀ»ò[òX⁄»»›]X»XY\ú»Yà›\›€Z^ô\àõ›]òZ[XõBàÀ»X›[€ú»€€[[àô[[›ôYH\⁄[ô»€€ù^Y[ùH[ú›XY
+öY⁄X€X⁄ BàXYö[õô\íSHà]K\€‹ùZŸ^OHõò[YHèêYŸ[ù›Çà]K\€‹ùZŸ^OHù[ò[ùèï[ò[ù›Çà]K\€‹ùZŸ^OHú›]\»èî›]\œ›Çà]K\€‹ùZŸ^OHò€€õôX›[€àèê€€õôX›[€è›Çà]K\€‹ùZŸ^OHú]õ‹õHèî]õ‹õO›Çà]K\€‹ùZŸ^OHùô\ú⁄[€àèïô\ú⁄[€è›Çà]K\€‹ùZŸ^OHõ\›‹ŸY[àèì\›ŸY[è›Çà¬àô]\õé¬àBÇàÀ»\ŸHXõH›\›€Z^ô\à»ô[ô\à[ò[ZX»XY\ú¬àXYö[õô\íSHYŸ[ù’ìKùXõP›\›€Z^ô\ãúô[ô\íXY\ä
+N¬ÇàÀ»ö[ôXY\à]ô[ù»
+€‹ù[ôÀô\⁄^ôH[ô\ Bà€€ú›XõHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõI N¬àYà
+XõJH¬à€€ú›XY[[Y[ùHXõKú]Y\ûTŸ[X›‹ä	›XY	 N¬àYà
+XY[[Y[ù
+H¬àYŸ[ù’ìKùXõP›\›€Z^ô\ãòö[ôXY\ë]ô[ù XY[[Y[ù
+N¬àBàBüBÇôù[ò›[€àô[ô\êYŸ[ùXõJYŸ[ù H¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬à€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊›XõW›‹ò\\â N¬àYà
+]‹ò\\äHô]\õé¬àYà
+ÿ\ô H¬àÿ\ôÀò€\‹”\›òY
+	⁄Y[â N¬àBà‹ò\\ãò€\‹”\›úô[[›ôJ	⁄Y[â N¬à€€ú›õŸHH‹ò\\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+]õŸJHô]\õé¬ÇàÀ»ÿ[›[]Hö\⁄XõH€€[[à€›[ùõ‹à€€‹[Çà€€ú›ö\⁄XõP€€[[ú»HYŸ[ù’ìKùXõP›\›€Z^ô\Çà»YŸ[ù’ìKùXõP›\›€Z^ô\ãôŸ]ö\⁄XõP€€[[ú 
+Kõ[ô›àà¬ÇàYà
+XYŸ[ù»YŸ[ùÀõ[ô›OOH
+H¬àõŸKö[õô\íSHèè€€‹[èHâ›ö\⁄XõP€€[[úﬂHà€\‹œHõ]]Y]^èìõ»YŸ[ù»X]⁄H›\úô[ùö[\úÀè›è›èò¬àô]\õé¬àBÇàÀ»\ŸHXõH›\›€Z^ô\àYà]òZ[XõBàYà
+YŸ[ù’ìKùXõP›\›€Z^ô\äH¬à€€ú›õ›‹»HYŸ[ùÀõX\
+YŸ[ùOà¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬àô]\õààà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y	… _Hà€\‹œHòYŸ[ù\õ›ÀX€X⁄ÿXõHà]OHê€X⁄»»öY]»]Z[ÀöY⁄X€X⁄»õ‹àX›[€ú»èÇà	ÿYŸ[ù’ìKùXõP›\›€Z^ô\ãúô[ô\îõ› YŸ[ùY]J_Bà›èÇà¬àJKöõ⁄[ä	… N¬àõŸKö[õô\íSHõ›‹Œ¬àô]\õé¬àBÇàÀ»ò[òX⁄»»‹öY⁄[ò[ô[ô\ö[ô»Yàõ»›\›€Z^ô\ÇàÀ»X›[€ú»€€[[àô[[›ôYH\⁄[ô»€€ù^Y[ùH[ú›XY
+öY⁄X€X⁄ Bà€€ú›õ›‹»HYŸ[ùÀõX\
+YŸ[ùOà¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬à€€ú›[ò[ùXô[Hõ‹õX][ò[ù\‹^JYŸ[ùù[ò[ù⁄YY]Kù[ò[ùY	… N¬àô]\õààà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y	… _Hà€\‹œHòYŸ[ù\õ›ÀX€X⁄ÿXõHà]OHê€X⁄»»öY]»]Z[ÀöY⁄X€X⁄»õ‹àX›[€ú»èÇàÇà]à€\‹œHùXõK\ö[X\ûHèâŸ\ÿÿ\R[
+Ÿ]YŸ[ù\‹^Sò[YJYŸ[ù
+J_OŸ]èÇà]à€\‹œHõ]]Y]^èâŸ\ÿÿ\R[
+YŸ[ùö‹›ò[YH	… _OŸ]èÇà›ÇàâŸ\ÿÿ\R[
+[ò[ùXô[
+_O›Çàâ‹ô[ô\êYŸ[ù›]\–òYŸJY]J_O›ÇàâŸ\ÿÿ\R[
+YŸ[ùú]õ‹õH	’[ö€õ›€â _O›Çàâ‹ô[ô\êYŸ[ùô\ú⁄[€êŸ[
+YŸ[ùùYJ_O›Çà]OHâŸ\ÿÿ\R[
+Y]Kõ\›ŸY[ï€€\	”ô]ô\â _HèâŸ\ÿÿ\R[
+Y]Kõ\›ŸY[îô[]]ôH	”ô]ô\â _O›Çà›èÇà¬àJKöõ⁄[ä	… N¬àõŸKö[õô\íSHõ›‹Œ¬üBÇôù[ò›[€àô[ô\êYŸ[ùÿ\ô
+YŸ[ù
+H¬à€€ú›Y]HHYŸ[ùó◊€Y]HﬂN¬à€€ú›ôY⁄\›\ôY]HHYŸ[ùúôY⁄\›\ôYÿ]»ô]»]JYŸ[ùúôY⁄\›\ôYÿ]
+Hàù[¬à€€ú››]\–€€‹àHQ—Sï‘’UT◊–””‘î÷€Y]Kú›]\“Ÿ^H	€Ÿôõ[ôI◊H	›ò\äK[]]Y
+IŒ¬à€€ú›[ò[ùXô[Hõ‹õX][ò[ù\‹^JYŸ[ùù[ò[ù⁄YY]Kù[ò[ùY	… N¬àô]\õàà]à€\‹œHô]öXŸKXÿ\ôYŸ[ùXÿ\ôX€X⁄ÿXõHà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y	… _Hà]KXYŸ[ù[ò[YOHâŸ\ÿÿ\R[
+Ÿ]YŸ[ù\‹^Sò[YJYŸ[ù
+J_Hà]OHê€X⁄»»öY]»]Z[ÀöY⁄X€X⁄»õ‹àX›[€ú»èÇà]à€\‹œHô]öXŸKXÿ\ôZXY\àèÇà]èÇà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\éèÇà]à€\‹œHô]öXŸKXÿ\ô]]HèâŸ\ÿÿ\R[
+Ÿ]YŸ[ù\‹^Sò[YJYŸ[ù
+J_OŸ]èÇà‹[à€\‹œHòYŸ[ùZõ⁄[ôYXùXòõHà›[OHõX\ô⁄[ã[YùéŸ\‹^Nâ‹ôY⁄\›\ôY]H»	⁄[õ[ôKYõ^	»à	€õ€ôIﬂNÿ[Y€ãZ][\ŒòŸ[ù\é‹Y[ôŒåúúÿõ‹ô\ã\òY]\ŒåLúÿòX⁄Ÿ‹õ›[ôùò\äK\[ô[
+NŸõ€ù\⁄^ôNåLúÿ€€‹éùò\äK[]]Y
+Nÿõ‹ô\éå\€€Yò\äKXõ‹ô\äN»èâ‹ôY⁄\›\ôY]H»	“õ⁄[ôY	»à	…ﬂO‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\›Xù]HèÇà‹[à€\‹œHò€‹XXõHà]KX€‹OHâŸ\ÿÿ\R[
+YŸ[ùö‹›ò[YH	… _Hà]OHê€X⁄»»€‹H‹›ò[YHèâŸ\ÿÿ\R[
+YŸ[ùö‹›ò[YH	”ã–I _O‹‹[èÇà‹[à›[OHõX\ô⁄[ã[Yùéÿ€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåLú»à€\‹œHò€‹XXõHà]KX€‹OHâŸ\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y	… _Hà]OHê€X⁄»»€‹HYŸ[ùQèâŸ\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y	… _O‹‹[èÇàŸ]èÇàŸ]èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ôZ[ôõ»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èî›]\œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHYŸ[ù\›]\À]ò[YHèâ‹ô[ô\êYŸ[ù›]\–òYŸJY]J_O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èíTYô\‹œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YH€‹XXõHà]KX€‹OHâŸ\ÿÿ\R[
+YŸ[ùö\	… _Hà]OHê€X⁄»»€‹HèâŸ\ÿÿ\R[
+YŸ[ùö\	”ã–I _O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èî]õ‹õO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâŸ\ÿÿ\R[
+YŸ[ùú]õ‹õH	’[ö€õ›€â _O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èï[ò[ù‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâŸ\ÿÿ\R[
+[ò[ùXô[
+_O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èïô\ú⁄[€è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHYŸ[ù]ô\ú⁄[€ãXŸ[èâ‹ô[ô\êYŸ[ùô\ú⁄[€êŸ[
+YŸ[ùò[ŸJ_O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›ŸY[è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHYŸ[ù[\›\ŸY[àà]OHâŸ\ÿÿ\R[
+Y]Kõ\›ŸY[ï€€\	”ô]ô\â _HèâŸ\ÿÿ\R[
+Y]Kõ\›ŸY[îô[]]ôH	”ô]ô\â _O‹‹[èÇàŸ]èÇà	‹ôY⁄\›\ôY]H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èîôY⁄\›\ôY‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ‹ôY⁄\›\ôY]Kù”ÿÿ[T›ö[ô 
+_Hèâ‹ôY⁄\›\ôY]Kù”ÿÿ[Q]T›ö[ô 
+_O‹‹[èÇàŸ]èòà	…ﬂBàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ôZ[ù]]Y]^à›[OHôõ€ù\⁄^ôNåL\‹Y[ôŒéLú›^X[Y€éòŸ[ù\éÿõ‹ô\ã]‹å\€€Yò\äKXõ‹ô\äN»èÇàöY⁄X€X⁄»õ‹àX›[€ú¬àŸ]èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\êYŸ[ù›]\–òYŸJY]JH¬à€€ú›€ŸHHY]Kú›]\“Ÿ^H	€Ÿôõ[ôIŒ¬à€€ú›Xô[HQ—Sï‘’UT◊”PëS÷ÿ€ŸWHY]Kú›]\”Xô[	’[ö€õ›€âŒ¬à€€ú›€ôHH€ŸHOOH	ÿX›]ôI»»	⁄X[I»à€ŸHOOH	€Ÿôõ[ôI»»	Ÿ\úõ‹â»à	›ÿ\õö[ô…Œ¬àô]\õà‹[à€\‹œHú›]\À\[	›€ô_HèâŸ\ÿÿ\R[
+Xô[
+_O‹‹[èò¬üBÇôù[ò›[€àö[ôYŸ[ùÿ\ô[[Y[ù
+YŸ[ùY
+H¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù◊ÿÿ\ô… N¬àYà
+Xÿ\ô Hô]\õàù[¬à€€ú›ÿYôRYH
+\[Ÿà‘‘»OOH	›[ôYö[ôY	»	âà‘‘Àô\ÿÿ\JH»‘‘Àô\ÿÿ\JYŸ[ùY	… Hà›ö[ô YŸ[ùY	… Kúô\XŸJ◊ŸÀ	◊	 Kúô\XŸJ»ãŸÀ	◊â N¬àô]\õàÿ\ôÀú]Y\ûTŸ[X›‹äŸ]KXYŸ[ùZYHâ‹ÿYôRYHóX
+N¬üBÇôù[ò›[€àŸ]YŸ[ùõ⁄[ôY
+YŸ[ùYõ⁄[ôY
+H¬à€€ú›ÿ\ôHö[ôYŸ[ùÿ\ô[[Y[ù
+YŸ[ùY
+N¬àYà
+Xÿ\ô
+Hô]\õé¬à€€ú›ùXòõHHÿ\ôú]Y\ûTŸ[X›‹ä	ÀòYŸ[ùZõ⁄[ôYXùXòõI N¬àYà
+XùXòõJHô]\õé¬àYà
+õ⁄[ôY
+H¬àùXòõKú›[Kô\‹^HH	⁄[õ[ôKYõ^	Œ¬àùXòõKù^€€ù[ùH	“õ⁄[ôY	Œ¬àH[ŸH¬àùXòõKú›[Kô\‹^HH	€õ€ôIŒ¬àùXòõKù^€€ù[ùH	…Œ¬àBüBÇôù[ò›[€à\Ÿ\ùYŸ[ùôX€‹ô
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õé¬àYà
+P\úò^Kö\–\úò^JYŸ[ù’ìKö][\ JH¬àYŸ[ù’ìKö][\»H◊N¬àBà]\]YHò[ŸN¬àYŸ[ù’ìKö][\»HYŸ[ù’ìKö][\ÀõX\
+YŸ[ùOà¬àYà
+YŸ[ùòYŸ[ù⁄Y	âàôX€‹ôòYŸ[ù⁄Y	âàYŸ[ùòYŸ[ù⁄YOOHôX€‹ôòYŸ[ù⁄Y
+H¬à\]YHùYN¬àô]\õà[úöX⁄⁄[ô€PYŸ[ù
+»ããòYŸ[ùããúôX€‹ôJN¬àBàô]\õàYŸ[ù¬àJN¬àYà
+]\]Y
+H¬àYŸ[ù’ìKö][\Àú\⁄
+[úöX⁄⁄[ô€PYŸ[ù
+ôX€‹ô
+JN¬àBàYŸ[ù’ìKú›]Àù›[HYŸ[ù’ìKö][\Àõ[ô›¬à]⁄YŸ[ù\ôX›‹ûJôX€‹ô
+N¬àôYúô\⁄YŸ[ùö[\ú 
+N¬àôYúô\⁄YŸ[ùY]öX‹ 
+N¬à\PYŸ[ùö[\ú 
+N¬üBÇôù[ò›[€à\]PYŸ[ù€€õôX›[€äYŸ[ùY€€õï\JH¬à€€ú›[ô^HYŸ[ù’ìKö][\Àôö[ô[ô^
+YŸ[ùOàYŸ[ùòYŸ[ù⁄YOOHYŸ[ùY
+N¬àYà
+[ô^OOHLJH¬àÿYYŸ[ù ùYJN¬àô]\õé¬àBà€€ú›ô^H[úöX⁄⁄[ô€PYŸ[ù
+»ããòYŸ[ù’ìKö][\÷⁄[ô^K€€õôX›[€ó›\Nà€€õï\HJN¬àYŸ[ù’ìKö][\Àú‹XŸJ[ô^Kô^
+N¬à]⁄YŸ[ù\ôX›‹ûJô^
+N¬àôYúô\⁄YŸ[ùY]öX‹ 
+N¬à\PYŸ[ùö[\ú 
+N¬üBÇôù[ò›[€à\]PYŸ[ùX\ùôX]
+YŸ[ùY›]\À\›ŸY[äH¬à€€ú›[ô^HYŸ[ù’ìKö][\Àôö[ô[ô^
+YŸ[ùOàYŸ[ùòYŸ[ù⁄YOOHYŸ[ùY
+N¬àYà
+[ô^OOHLJH¬àÿYYŸ[ù ùYJN¬àô]\õé¬àBà€€ú›\]\»H»ããòYŸ[ù’ìKö][\÷⁄[ô^K›]\Œà›]\»YŸ[ù’ìKö][\÷⁄[ô^Kú›]\»N¬àYà
+\›ŸY[äH¬à\]\Àõ\›‹ŸY[àH\›ŸY[é¬àBà€€ú›ô^H[úöX⁄⁄[ô€PYŸ[ù
+\]\ N¬àYŸ[ù’ìKö][\Àú‹XŸJ[ô^Kô^
+N¬à]⁄YŸ[ù\ôX›‹ûJô^
+N¬àôYúô\⁄YŸ[ùY]öX‹ 
+N¬à\PYŸ[ùö[\ú 
+N¬üBÇãÀ»ô]⁄H⁄[ô€HYŸ[ù	‹»]H[ô\]HH\›ò\ﬁ[ò»ù[ò›[€àô]⁄⁄[ô€PYŸ[ù
+YŸ[ùY
+H¬àûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀ…ÿYŸ[ùYX
+N¬àYà
+\ô\‹€úŸKõ⁄ H¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»ô]⁄⁄[ô€HYŸ[ùâÀô\‹€úŸKú›]\ N¬àô]\õàù[¬àBà€€ú›YŸ[ù]HH]ÿZ]ô\‹€úŸKöú€€ä
+N¬àYà
+YŸ[ù]JH¬à€€ú›[ô^HYŸ[ù’ìKö][\Àôö[ô[ô^
+HOàKòYŸ[ù⁄YOOHYŸ[ùY
+N¬à€€ú›[úöX⁄YH[úöX⁄⁄[ô€PYŸ[ù
+YŸ[ù]JN¬àYà
+[ô^OOHLJH¬àYŸ[ù’ìKö][\Àú‹XŸJ[ô^K[úöX⁄Y
+N¬àH[ŸH¬àYŸ[ù’ìKö][\Àú\⁄
+[úöX⁄Y
+N¬àBà]⁄YŸ[ù\ôX›‹ûJ[úöX⁄Y
+N¬àôYúô\⁄YŸ[ùY]öX‹ 
+N¬à\PYŸ[ùö[\ú 
+N¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àô]\õà[úöX⁄Y¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—\úõ‹àô]⁄[ô»⁄[ô€HYŸ[ùâÀ\úäN¬àBàô]\õàù[¬üBÇãÀ»[ôHYŸ[ùôX€€õôX›[ô»Yù\à[à\]Hô\›\ùò\ﬁ[ò»ù[ò›[€à[ôPYŸ[ùôX€€õôX›Yù\ï\]JYŸ[ùY\]T›]JH¬à€€ú›YŸ[ùò[YHHYŸ[ù’ìKö][\Àôö[ô
+HOàKòYŸ[ù⁄YOOHYŸ[ùY
+OÀõò[YHYŸ[ùY¬ÇàÀ»ò[ú⁄][€à»ùô\öYûZ[ô»à›]BàYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬àããù\]T›]Kà›]\Œà	›ô\öYûZ[ô…ÀàY\‹ÿYŸNà	–YŸ[ùôX€€õôX›Yô\öYûZ[ô»\]KããâÀà[Y\›[\à]Kõõ› 
+BàN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬ÇàÀ»€X[[^H»]YŸ[ùŸ]HYù\àô\›\ùà]ÿZ]ô]»õ€Z\ŸJàOàŸ][Y[›]
+ãML
+JN¬ÇàÀ»ô]⁄úô\⁄YŸ[ù]Bà€€ú›\]YYŸ[ùH]ÿZ]ô]⁄⁄[ô€PYŸ[ù
+YŸ[ùY
+N¬àYà
+]\]YYŸ[ù
+H¬àÀ»€›[â›ô]⁄H€X\à›]H⁄]ÿ\õö[ô¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_NàôX€€õôX›Yù]€›[â›ô\öYûH\]X	›ÿ\õö[ô… N¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àô]\õé¬àBÇà€€ú›ô]’ô\ú⁄[€àH\]YYŸ[ùùô\ú⁄[€é¬à€€ú›ô]ö[›\’ô\ú⁄[€àH\]T›]Kúô]ö[›\’ô\ú⁄[€é¬à€€ú›\ôŸ]ô\ú⁄[€àH\]T›]Kù\ôŸ]ô\ú⁄[€é¬ÇàÀ»⁄X⁄»Yàô\ú⁄[€à⁄[ôŸYàYà
+ô]ö[›\’ô\ú⁄[€à	âàô]’ô\ú⁄[€à	âàô]’ô\ú⁄[€àOOHô]ö[›\’ô\ú⁄[€äH¬àÀ»ô\ú⁄[€à⁄[ôŸYH\]H›XÿŸYYYBà€€ú›ô\ú⁄[€ìX]⁄H\ôŸ]ô\ú⁄[€à	âàô]’ô\ú⁄[€àOOH\ôŸ]ô\ú⁄[€é¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+à	ÿYŸ[ùò[Y_Nà\]H€€\]HH	‹ô]ö[›\’ô\ú⁄[€üH8°§à	€ô]’ô\ú⁄[€üXà	‹›XÿŸ\‹…¬à
+N¬àYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬àããù\]T›]Kà›]\Œà	ÿ€€\]IÀàY\‹ÿYŸNàô\ú⁄[€ìX]⁄»	’\]Hô\öYöYY	»à\]Y»	€ô]’ô\ú⁄[€üXà[Y\›[\à]Kõõ› 
+BàN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àÀ»€X\à›]HYù\à⁄›⁄[ô»›XÿŸ\‹¬àŸ][Y[›]
+
+
+HOà¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àKÃ
+N¬àH[ŸHYà
+ô]ö[›\’ô\ú⁄[€à	âàô]’ô\ú⁄[€àOOHô]ö[›\’ô\ú⁄[€äH¬àÀ»ÿ[YHô\ú⁄[€àH\]HX^H]ôHòZ[Y‹àÿ\»HõÀ[‹à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+à	ÿYŸ[ùò[Y_NàôX€€õôX›Y⁄]ÿ[YHô\ú⁄[€à
+	€ô]’ô\ú⁄[€üJXà	›ÿ\õö[ô…¬à
+N¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àH[ŸH¬àÀ»€›[â›]\õZ[ôHH€X\à›]Bà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_NàôX€€õôX›Y
+ô\ú⁄[€éà	€ô]’ô\ú⁄[€à	›[ö€õ›€âﬂJX	⁄[ôõ… N¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àBüBÇôù[ò›[€à[úöX⁄YŸ[ù \›
+H¬àYà
+P\úò^Kö\–\úò^J\›
+JHô]\õà◊N¬àô]\õà\›õX\
+][HOà[úöX⁄⁄[ô€PYŸ[ù
+][JJN¬üBÇôù[ò›[€à[úöX⁄⁄[ô€PYŸ[ù
+YŸ[ù
+H¬àYà
+XYŸ[ù\[ŸàYŸ[ùOOH	€ÿöôX›	 H¬àô]\õàYŸ[ù¬àBàÀ»\ö]ôH›]\»úõ€H€€õôX›[€ó›\Nà‹œXX›]ôKYY‹òYYõ€ôK€Z\‹⁄[ôœ[Ÿôõ[ôBà€€ú››]\“Ÿ^HHõ‹õX[^ôPYŸ[ù›]\—úõ€P€€õôX›[€äYŸ[ùò€€õôX›[€ó›\JN¬à€€ú››]\”Xô[HQ—Sï‘’UT◊”PëS÷‹›]\“Ÿ^WH›]\“Ÿ^N¬à€€ú›\›ŸY[í\€»HYŸ[ùõ\›‹ŸY[àYŸ[ùõ\›⁄X\ùôX]YŸ[ùù\]Yÿ]¬à€€ú›\›ŸY[ë]HH\›ŸY[í\€»»ô]»]J\›ŸY[í\€ Hàù[¬à€€ú›[ò[ùYHYŸ[ùù[ò[ù⁄Y	…Œ¬à€€ú›[ò[ùXô[H[ò[ùY»[ò[ù\‹^Sò[YPûRY
+[ò[ùY
+Hà	…Œ¬àô]\õà¬àããòYŸ[ùà◊€Y]Nà¬à›]\“Ÿ^Kà›]\”Xô[àô\ú⁄[€ìXô[àYŸ[ùùô\ú⁄[€à	’[ö€õ›€âÀà]õ‹õSXô[àYŸ[ùú]õ‹õH	’[ö€õ›€âÀà\›ŸY[îô[]]ôNà\›ŸY[ë]H»õ‹õX]ô[]]ôU[YJ\›ŸY[ë]JHà	”ô]ô\âÀà\›ŸY[ï€€\à\›ŸY[ë]H»\›ŸY[ë]Kù”ÿÿ[T›ö[ô 
+Hà	”ô]ô\âÀà\›ŸY[ì\Œà\›ŸY[ë]H»\›ŸY[ë]KôŸ][YJ
+Hàà[ò[ùYàŸX\ò⁄àùZ[YŸ[ùŸX\ò⁄õÿäYŸ[ù[ò[ùXô[[ò[ùY
+KàBàN¬üBÇôù[ò›[€àùZ[YŸ[ùŸX\ò⁄õÿäYŸ[ù[ò[ùXô[
+H¬à€€ú›\ù»H¬àYŸ[ùòYŸ[ù⁄YàYŸ[ùõò[YKàYŸ[ùö‹›ò[YKàYŸ[ùö\àYŸ[ùú]õ‹õKàYŸ[ùùô\ú⁄[€ãàYŸ[ùò€€õôX›[€ó›\Kà[ò[ùXô[àYŸ[ùù[ò[ù⁄YàKôö[\äõ€€X[äN¬àô]\õà\ùÀöõ⁄[ä	»	 Kù”›Ÿ\êÿ\ŸJ
+N¬üBÇôù[ò›[€àõ‹õX[^ôPYŸ[ù›]\—úõ€P€€õôX›[€ä€€õôX›[€ï\JH¬à€€ú›€€õàH
+€€õôX›[€ï\H	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+€€õàOOH	›‹…»€€õãö[ò€Y\ 	›ŸXú€ÿ⁄Ÿ]	 JH¬àô]\õà	ÿX›]ôIŒ¬àBàYà
+€€õàOOH	⁄	»€€õãö[ò€Y\ 	⁄	 JH¬àô]\õà	ŸY‹òYY	Œ¬àBàô]\õà	€Ÿôõ[ôIŒ¬üBÇôù[ò›[€àùZ[YŸ[ù›]\–€›[ù 
+H¬à€€ú›X\HﬂN¬àQ—Sï‘’UT◊“—VTÀôõ‹ëXX⁄
+Ÿ^HOà»X\⁄Ÿ^WHH»JN¬àô]\õàX\¬üBÇãÀ»]öXŸH[\ú»õ‹àŸ\ùô\àRBôù[ò›[€àY‹ï\]Q]öXŸPÿ\ô
+]öXŸJH¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬àYà
+X€€ùZ[ô\äHô]\õé¬à€€ú›Ÿ\öX[H]öXŸKúŸ\öX[	…Œ¬àYà
+\Ÿ\öX[
+H¬àÀ»ò[òX⁄Œàô[ÿYù[]öXŸ\¬àÿY]öXŸ\ 
+N¬àô]\õé¬àBà€€ú›^\›[ô»H€€ùZ[ô\ãú]Y\ûTŸ[X›‹äŸ]K\Ÿ\öX[Hâ‹Ÿ\öX[HóX
+N¬à€€ú›ÿ\ô[Hô[ô\îŸ\ùô\ë]öXŸPÿ\ô
+]öXŸJN¬àYà
+^\›[ô H¬à^\›[ôÀõ›]\íSHÿ\ô[¬àH[ŸH¬àÀ»[úŸ\ù]‹à€€ùZ[ô\ãö[úŸ\ùYòXŸ[ùS
+	ÿYù\òôY⁄[âÀÿ\ô[
+N¬àBüBÇãÀ»OOOOOHŸ[X›[€à[\ú»
+ö[KY^‹ô\à›[JHOOOOOBÇã äÇà
+à\]\»ö\›X[Ÿ[X›[€à›]Hõ‹àYŸ[ùõ›‹Àÿÿ\ô¬à
+ã¬ôù[ò›[€à\]PYŸ[ùŸ[X›[€ïRJ
+H¬àÀ»\]HXõHõ›‹¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	›ãòYŸ[ù\õ›ÀX€X⁄ÿXõI Kôõ‹ëXX⁄
+õ›»Oà¬à€€ú›YŸ[ùYHõ›ÀôŸ]]öXù]J	Ÿ]KXYŸ[ùZY	 N¬àYà
+YŸ[ù’ìKúŸ[X›[€ãúŸ[X›YYÀö\ YŸ[ùY
+JH¬àõ›Àò€\‹”\›òY
+	ÿYŸ[ù\õ›À\Ÿ[X›Y	 N¬àH[ŸH¬àõ›Àò€\‹”\›úô[[›ôJ	ÿYŸ[ù\õ›À\Ÿ[X›Y	 N¬àBàJN¬àÀ»\]Hÿ\ô¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	ÀòYŸ[ùXÿ\ôX€X⁄ÿXõI Kôõ‹ëXX⁄
+ÿ\ôOà¬à€€ú›YŸ[ùYHÿ\ôôŸ]]öXù]J	Ÿ]KXYŸ[ùZY	 N¬àYà
+YŸ[ù’ìKúŸ[X›[€ãúŸ[X›YYÀö\ YŸ[ùY
+JH¬àÿ\ôò€\‹”\›òY
+	ÿYŸ[ùXÿ\ô\Ÿ[X›Y	 N¬àH[ŸH¬àÿ\ôò€\‹”\›úô[[›ôJ	ÿYŸ[ùXÿ\ô\Ÿ[X›Y	 N¬àBàJN¬üBÇã äÇà
+à\]\»ö\›X[Ÿ[X›[€à›]Hõ‹à]öXŸHõ›‹Àÿÿ\ô¬à
+ã¬ôù[ò›[€à\]Q]öXŸTŸ[X›[€ïRJ
+H¬àÀ»\]HXõHõ›‹¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	›ãô]öXŸK\õ›ÀX€X⁄ÿXõI Kôõ‹ëXX⁄
+õ›»Oà¬à€€ú›Ÿ\öX[Hõ›ÀôŸ]]öXù]J	Ÿ]K\Ÿ\öX[	 N¬à€€ú›\Hõ›ÀôŸ]]öXù]J	Ÿ]KZ\	 N¬à€€ú›YHŸ\öX[\¬àYà
+]öXŸ\’ìKúŸ[X›[€ãúŸ[X›YYÀö\ Y
+JH¬àõ›Àò€\‹”\›òY
+	Ÿ]öXŸK\õ›À\Ÿ[X›Y	 N¬àH[ŸH¬àõ›Àò€\‹”\›úô[[›ôJ	Ÿ]öXŸK\õ›À\Ÿ[X›Y	 N¬àBàJN¬àÀ»\]Hÿ\ô¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	Àô]öXŸKXÿ\ôX€X⁄ÿXõI Kôõ‹ëXX⁄
+ÿ\ôOà¬à€€ú›Ÿ\öX[Hÿ\ôôŸ]]öXù]J	Ÿ]K\Ÿ\öX[	 N¬à€€ú›\Hÿ\ôôŸ]]öXù]J	Ÿ]KZ\	 N¬à€€ú›YHŸ\öX[\¬àYà
+]öXŸ\’ìKúŸ[X›[€ãúŸ[X›YYÀö\ Y
+JH¬àÿ\ôò€\‹”\›òY
+	Ÿ]öXŸKXÿ\ô\Ÿ[X›Y	 N¬àH[ŸH¬àÿ\ôò€\‹”\›úô[[›ôJ	Ÿ]öXŸKXÿ\ô\Ÿ[X›Y	 N¬àBàJN¬üBÇã äÇà
+à[ô\»YŸ[ùŸ[X›[€à⁄]ö[KY^‹ô\à›[H[ŸYöY\ú¬à
+à\ò[H‹›ö[ôﬂHYŸ[ùYHHYŸ[ùQôZ[ô»€X⁄ŸYà
+à\ò[H”[›\ŸQ]ô[ùH]ô[ùHH€X⁄»]ô[ùõ‹à[ŸYöY\àŸ^H]X›[€Çà
+ã¬ôù[ò›[€à[ôPYŸ[ùŸ[X›[€äYŸ[ùY]ô[ù
+H¬à€€ú›Ÿ[X›[€àHYŸ[ù’ìKúŸ[X›[€é¬ÇàYà
+]ô[ùú⁄YùŸ^H	âàŸ[X›[€ãõ\›Ÿ[X›Y
+H¬àÀ»⁄Yù
+ÿ€X⁄ŒàŸ[X›ò[ôŸBà€€ú›ö[\ôYHYŸ[ù’ìKôö[\ôY¬à€€ú›Y»Hö[\ôYõX\
+HOàKöY
+N¬à€€ú›\›YHYÀö[ô^ŸäŸ[X›[€ãõ\›Ÿ[X›Y
+N¬à€€ú››\úíYHYÀö[ô^ŸäYŸ[ùY
+N¬ÇàYà
+\›YOOHLH	âà›\úíYOOHLJH¬à€€ú››\ùHX]õZ[ä\›Y›\úíY
+N¬à€€ú›[ôHX]õX^
+\›Y›\úíY
+N¬àÀ»€X\àŸ[X›[€àYàõ››õô\‹ŸY[àŸ[X›ò[ôŸBàYà
+Y]ô[ùò›õŸ^H	âàY]ô[ùõY]RŸ^JH¬àŸ[X›[€ãúŸ[X›YYÀò€X\ä
+N¬àBàõ‹à
+]HH›\ù»HH[ô»J  H¬àŸ[X›[€ãúŸ[X›YYÀòY
+Y÷⁄WJN¬àBàBàH[ŸHYà
+]ô[ùò›õŸ^H]ô[ùõY]RŸ^JH¬àÀ»›õ
+ÿ€X⁄ŒàŸŸ€H[ô]öYX[Ÿ[X›[€ÇàYà
+Ÿ[X›[€ãúŸ[X›YYÀö\ YŸ[ùY
+JH¬àŸ[X›[€ãúŸ[X›YYÀô[]JYŸ[ùY
+N¬àH[ŸH¬àŸ[X›[€ãúŸ[X›YYÀòY
+YŸ[ùY
+N¬àBàŸ[X›[€ãõ\›Ÿ[X›YHYŸ[ùY¬àH[ŸH¬àÀ»õ‹õX[€X⁄Œà€X\àŸ[X›[€ãŸ[X›€õH\»€ôBàŸ[X›[€ãúŸ[X›YYÀò€X\ä
+N¬àŸ[X›[€ãúŸ[X›YYÀòY
+YŸ[ùY
+N¬àŸ[X›[€ãõ\›Ÿ[X›YHYŸ[ùY¬àBÇà\]PYŸ[ùŸ[X›[€ïRJ
+N¬üBÇã äÇà
+à[ô\»]öXŸHŸ[X›[€à⁄]ö[KY^‹ô\à›[H[ŸYöY\ú¬à
+à\ò[H‹›ö[ôﬂH]öXŸRYHH]öXŸHQ
+Ÿ\öX[‹àT
+HôZ[ô»€X⁄ŸYà
+à\ò[H”[›\ŸQ]ô[ùH]ô[ùHH€X⁄»]ô[ùõ‹à[ŸYöY\àŸ^H]X›[€Çà
+ã¬ôù[ò›[€à[ôQ]öXŸTŸ[X›[€ä]öXŸRY]ô[ù
+H¬à€€ú›Ÿ[X›[€àH]öXŸ\’ìKúŸ[X›[€é¬ÇàYà
+]ô[ùú⁄YùŸ^H	âàŸ[X›[€ãõ\›Ÿ[X›Y
+H¬àÀ»⁄Yù
+ÿ€X⁄ŒàŸ[X›ò[ôŸBà€€ú›ö[\ôYH]öXŸ\’ìKôö[\ôY¬à€€ú›Y»Hö[\ôYõX\
+OàúŸ\öX[ö\
+N¬à€€ú›\›YHYÀö[ô^ŸäŸ[X›[€ãõ\›Ÿ[X›Y
+N¬à€€ú››\úíYHYÀö[ô^Ÿä]öXŸRY
+N¬ÇàYà
+\›YOOHLH	âà›\úíYOOHLJH¬à€€ú››\ùHX]õZ[ä\›Y›\úíY
+N¬à€€ú›[ôHX]õX^
+\›Y›\úíY
+N¬àÀ»€X\àŸ[X›[€àYàõ››õô\‹ŸY[àŸ[X›ò[ôŸBàYà
+Y]ô[ùò›õŸ^H	âàY]ô[ùõY]RŸ^JH¬àŸ[X›[€ãúŸ[X›YYÀò€X\ä
+N¬àBàõ‹à
+]HH›\ù»HH[ô»J  H¬àŸ[X›[€ãúŸ[X›YYÀòY
+Y÷⁄WJN¬àBàBàH[ŸHYà
+]ô[ùò›õŸ^H]ô[ùõY]RŸ^JH¬àÀ»›õ
+ÿ€X⁄ŒàŸŸ€H[ô]öYX[Ÿ[X›[€ÇàYà
+Ÿ[X›[€ãúŸ[X›YYÀö\ ]öXŸRY
+JH¬àŸ[X›[€ãúŸ[X›YYÀô[]J]öXŸRY
+N¬àH[ŸH¬àŸ[X›[€ãúŸ[X›YYÀòY
+]öXŸRY
+N¬àBàŸ[X›[€ãõ\›Ÿ[X›YH]öXŸRY¬àH[ŸH¬àÀ»õ‹õX[€X⁄Œà€X\àŸ[X›[€ãŸ[X›€õH\»€ôBàŸ[X›[€ãúŸ[X›YYÀò€X\ä
+N¬àŸ[X›[€ãúŸ[X›YYÀòY
+]öXŸRY
+N¬àŸ[X›[€ãõ\›Ÿ[X›YH]öXŸRY¬àBÇà\]Q]öXŸTŸ[X›[€ïRJ
+N¬üBÇã äÇà
+à€X\ú»[YŸ[ùŸ[X›[€ú¬à
+ã¬ôù[ò›[€à€X\êYŸ[ùŸ[X›[€ä
+H¬àYŸ[ù’ìKúŸ[X›[€ãúŸ[X›YYÀò€X\ä
+N¬àYŸ[ù’ìKúŸ[X›[€ãõ\›Ÿ[X›YHù[¬à\]PYŸ[ùŸ[X›[€ïRJ
+N¬üBÇã äÇà
+à€X\ú»[]öXŸHŸ[X›[€ú¬à
+ã¬ôù[ò›[€à€X\ë]öXŸTŸ[X›[€ä
+H¬à]öXŸ\’ìKúŸ[X›[€ãúŸ[X›YYÀò€X\ä
+N¬à]öXŸ\’ìKúŸ[X›[€ãõ\›Ÿ[X›YHù[¬à\]Q]öXŸTŸ[X›[€ïRJ
+N¬üBÇãÀ»OOOOOHYŸ[ù]Z[»OOOOOBò\ﬁ[ò»ù[ò›[€àöY]–YŸ[ù]Z[ YŸ[ùY
+H¬àûH¬àÀ»⁄›»[Ÿ[›ô\õ^H[[YYX][H⁄]ÿY[ô»›]Bà€€ú››ô\õ^HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€›ô\õ^I N¬à€€ú›õŸHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ÿõŸI N¬à€€ú›]HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊›]I N¬Çà›ô\õ^Kú›[Kô\‹^HH	Ÿõ^	Œ¬àõŸKö[õô\íSH	œ]à›[OHò€€‹éùò\äK[]]Y
+N›^X[Y€éòŸ[ù\é‹Y[ôŒç»èìÿY[ô»YŸ[ù]Z[ÀããèŸ]èâŒ¬à]Kù^€€ù[ùH	–YŸ[ù]Z[…Œ¬Çà€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀ…ÿYŸ[ùYX
+N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬àBÇà€€ú›YŸ[ùH]ÿZ]ô\‹€úŸKöú€€ä
+N¬àô[ô\êYŸ[ù]Z[”[Ÿ[
+YŸ[ù
+N¬àHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»ÿYYŸ[ù]Z[ŒâÀ\úõ‹äN¬à€€ú›õŸHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ÿõŸI N¬àõŸKù^€€ù[ùH	…Œ¬à€€ú›\úõ‹ï^Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à\úõ‹ï^ú›[Kò‹‹’^H	ÿ€€‹éùò\äKY\úõ‹äN›^X[Y€éòŸ[ù\é‹Y[ôŒç…Œ¬à\úõ‹ï^ù^€€ù[ùHòZ[Y»ÿYYŸ[ù]Z[Œà	Ÿ\úõ‹à	âà\úõ‹ãõY\‹ÿYŸH»\úõ‹ãõY\‹ÿYŸHà	›[ö€õ›€à\úõ‹âﬂX¬àõŸKò\[ô⁄[
+\úõ‹ï^
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»ÿYYŸ[ù]Z[…À	Ÿ\úõ‹â N¬àBüBÇôù[ò›[€àô[ô\êYŸ[ù]Z[”[Ÿ[
+YŸ[ù
+H¬à€€ú›]HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊›]I N¬à€€ú›õŸHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ÿõŸI N¬Çà]Kù^€€ù[ùHYŸ[ùà	ŸŸ]YŸ[ù\‹^Sò[YJYŸ[ù
+_X¬Çà€€ú›YŸ[ùQH\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y	… N¬à€€ú›YŸ[ùò[YHH\ÿÿ\R[
+YŸ[ùõò[YH	… N¬à€€ú›‹›ò[YHH\ÿÿ\R[
+YŸ[ùö‹›ò[YH	”ã–I N¬à€€ú›\Yô\‹»H\ÿÿ\R[
+YŸ[ùö\	”ã–I N¬à€€ú››]\’^H\ÿÿ\R[
+YŸ[ùú›]\»	›[ö€õ›€â N¬à€€ú›]õ‹õHH\ÿÿ\R[
+YŸ[ùú]õ‹õH	’[ö€õ›€â N¬à€€ú›‹’ô\ú⁄[€àH\ÿÿ\R[
+YŸ[ùõ‹◊›ô\ú⁄[€à	… N¬à€€ú›\ò⁄]X›\ôHH\ÿÿ\R[
+YŸ[ùò\ò⁄]X›\ôH	… N¬à€€ú›YŸ[ùô\ú⁄[€àH\ÿÿ\R[
+YŸ[ùùô\ú⁄[€à	”ã–I N¬à€€ú›õ›ÿ€€ô\ú⁄[€àH\ÿÿ\R[
+YŸ[ùúõ›ÿ€€›ô\ú⁄[€à	”ã–I N¬à€€ú›€’ô\ú⁄[€àH\ÿÿ\R[
+YŸ[ùô€◊›ô\ú⁄[€à	… N¬à€€ú›ùZ[\HH\ÿÿ\R[
+YŸ[ùòùZ[›\H	… N¬à€€ú›⁄]€€[Z]H\ÿÿ\R[
+›ö[ô YŸ[ùô⁄]ÿ€€[Z]	… JN¬à€€ú›ÿYôSù[Xô\àH
+ò[YKò[òX⁄»H
+HOà¬à€€ú›ù[Xô\àHù[Xô\äò[YJN¬àô]\õàù[Xô\ãö\—ö[ö]Jù[Xô\äH»›ö[ô ù[Xô\äHà›ö[ô ò[òX⁄ N¬àN¬Çà€€ú›\›ŸY[ë]HHYŸ[ùõ\›‹ŸY[à»ô]»]JYŸ[ùõ\›‹ŸY[äHàù[¬à€€ú›ôY⁄\›\ôY]HHYŸ[ùúôY⁄\›\ôYÿ]»ô]»]JYŸ[ùúôY⁄\›\ôYÿ]
+Hàù[¬à€€ú›\›X\ùôX]]HHYŸ[ùõ\›⁄X\ùôX]»ô]»]JYŸ[ùõ\›⁄X\ùôX]
+Hàù[¬à€€ú›\›]öXŸTﬁ[ò—]HHYŸ[ùõ\›Ÿ]öXŸW‹ﬁ[ò»»ô]»]JYŸ[ùõ\›Ÿ]öXŸW‹ﬁ[ò Hàù[¬à€€ú›\›Y]öX‹‘ﬁ[ò—]HHYŸ[ùõ\›€Y]öX‹◊‹ﬁ[ò»»ô]»]JYŸ[ùõ\›€Y]öX‹◊‹ﬁ[ò Hàù[¬à€€ú›€€õôX›[€ï\HH
+YŸ[ùò€€õôX›[€ó›\H	… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›€€[X[ô[òXõYH€€õôX›[€ï\HOOH	›‹…Œ¬à€€ú›€€[X[ô\ÿXõY]àH€€[X[ô[òXõY»	…»à	Ÿ\ÿXõY]OHîô\]Z\ô\»X›]ôHŸXî€ÿ⁄Ÿ]€€õôX›[€àâŒ¬à€€ú›€€[X[ô[ùH€€[X[ô[òXõYà»	–€€[X[ô»\ôH[]ô\ôY[ú›[ùH›ô\àHX›]ôHŸXî€ÿ⁄Ÿ][õô[â¬àà	–YŸ[ù]\›ôH€€õôX›YöXHŸXî€ÿ⁄Ÿ]»ôXŸZ]ôHô[[›H€€[X[ôÀâŒ¬ÇàÀ»ÿ[›[]H\[YBà]\[YU^H	”ã–IŒ¬àYà
+ôY⁄\›\ôY]H	âà\›ŸY[ë]JH¬à€€ú›\[YS\»H\›ŸY[ë]HHôY⁄\›\ôY]N¬à€€ú›^\»HX]ôõ€‹ä\[YS\»»
+L
+àå
+àå
+àç
+JN¬à€€ú››\ú»HX]ôõ€‹ä
+\[YS\»	H
+L
+àå
+àå
+àç
+JH»
+L
+àå
+àå
+JN¬à\[YU^H	Ÿ^\ﬂY	⁄›\úﬂZ¬àBÇà€€ú››]\–€€‹ú»H¬à	ÿX›]ôIŒà	›ò\äK\›XÿŸ\‹ IÀà	ŸY‹òYY	Œà	›ò\äK]ÿ\õö[ô IÀà	€Ÿôõ[ôIŒà	›ò\äKY\úõ‹äI¬àN¬à€€ú››]\–€€‹àH›]\–€€‹ú÷ÿYŸ[ùú›]\◊H	›ò\äK[]]Y
+IŒ¬ÇàõŸKö[õô\íSHà]à€\‹œHòYŸ[ùY]Z[ÀY‹öYèÇàKKHò\⁄X»[ôõ»KOÇà]à€\‹œHú[ô[èÇà›[OHõX\ô⁄[ã]‹åÿ€€‹éùò\äKZY⁄Y⁄
+NŸõ€ù\⁄^ôNåM»èêò\⁄X»[ôõ‹õX][€è⁄Çà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èêYŸ[ùQ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YH€‹XXõHà]KX€‹OHâÿYŸ[ùQHà]OHê€X⁄»»€‹HèÇà	ÿYŸ[ùQBà‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èìò[YO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHàYHòYŸ[ùŸ]Z[◊€ò[YWŸ\‹^HèâÿYŸ[ùò[Y_O‹‹[èÇà‹[à›[OHõX\ô⁄[ã[Yùé»èèù]€àYHòYŸ[ùŸ]Z[◊ŸY]€ò[YWÿùàèëY]ÿù]€èè‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èí‹›ò[YO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YH€‹XXõHà]KX€‹OHâ⁄‹›ò[Y_Hà]OHê€X⁄»»€‹HèÇà	⁄‹›ò[Y_Bà‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èíTYô\‹œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YH€‹XXõHà]KX€‹OHâ⁄\Yô\‹ﬂHà]OHê€X⁄»»€‹HèÇà	⁄\Yô\‹ﬂBà‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èî›]\œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà›[OHò€€‹éâ‹›]\–€€‹üHèÇà8•„»	‹›]\’^Bà‹‹[èÇàŸ]èÇàŸ]èÇàŸ]èÇààKKHﬁ\›[H[ôõ»KOÇà]à€\‹œHú[ô[èÇà›[OHõX\ô⁄[ã]‹åÿ€€‹éùò\äKZY⁄Y⁄
+NŸõ€ù\⁄^ôNåM»èîﬁ\›[H[ôõ‹õX][€è⁄Çà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èî]õ‹õO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹]õ‹õ_O‹‹[èÇàŸ]èÇà	ÿYŸ[ùõ‹◊›ô\ú⁄[€à»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì‘»ô\ú⁄[€è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ€‹’ô\ú⁄[€üO‹‹[èÇàŸ]èÇàà	…ﬂBà	ÿYŸ[ùò\ò⁄]X›\ôH»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èê\ò⁄]X›\ôO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâÿ\ò⁄]X›\ô_O‹‹[èÇàŸ]èÇàà	…ﬂBà	ÿYŸ[ùõù[Wÿ‹H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èê‘\œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹ÿYôSù[Xô\äYŸ[ùõù[Wÿ‹J_O‹‹[èÇàŸ]èÇàà	…ﬂBà	ÿYŸ[ùù›[€Y[[‹ûW€Xà»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èìY[[‹ûO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹ÿYôSù[Xô\äù[Xô\äYŸ[ùù›[€Y[[‹ûW€XäH»Lç
+_H–è‹‹[èÇàŸ]èÇàà	…ﬂBàŸ]èÇàŸ]èÇààKKHô\ú⁄[€à[ôõ»KOÇà]à€\‹œHú[ô[èÇà›[OHõX\ô⁄[ã]‹åÿ€€‹éùò\äKZY⁄Y⁄
+NŸõ€ù\⁄^ôNåM»èïô\ú⁄[€à[ôõ‹õX][€è⁄Çà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èêYŸ[ùô\ú⁄[€è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâÿYŸ[ùô\ú⁄[€üO‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èîõ›ÿ€€ô\ú⁄[€è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹õ›ÿ€€ô\ú⁄[€üO‹‹[èÇàŸ]èÇà	ÿYŸ[ùô€◊›ô\ú⁄[€à»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èë€»ô\ú⁄[€è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâŸ€’ô\ú⁄[€üO‹‹[èÇàŸ]èÇàà	…ﬂBà	ÿYŸ[ùòùZ[›\H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èêùZ[\O‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâÿùZ[\_O‹‹[èÇàŸ]èÇàà	…ﬂBà	ÿYŸ[ùô⁄]ÿ€€[Z]	âàYŸ[ùô⁄]ÿ€€[Z]OOH	›[ö€õ›€â»»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èë⁄]€€[Z]‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YH€‹XXõHà]KX€‹OHâŸ⁄]€€[Z]Hà]OHê€X⁄»»€‹HèÇà	Ÿ\ÿÿ\R[
+›ö[ô YŸ[ùô⁄]ÿ€€[Z]
+Kú›Xú›ö[ô 
+J_KããÇà‹‹[èÇàŸ]èÇàà	…ﬂBàŸ]èÇàŸ]èÇààKKHX›]ö]HKOÇà]à€\‹œHú[ô[èÇà›[OHõX\ô⁄[ã]‹åÿ€€‹éùò\äKZY⁄Y⁄
+NŸõ€ù\⁄^ôNåM»èêX›]ö]O⁄Çà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà	‹ôY⁄\›\ôY]H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èîôY⁄\›\ôY‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ‹ôY⁄\›\ôY]Kù”ÿÿ[T›ö[ô 
+_HèÇà	‹ôY⁄\›\ôY]Kù”ÿÿ[Q]T›ö[ô 
+_Bà‹‹[èÇàŸ]èÇàà	…ﬂBà	€\›ŸY[ë]H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›ŸY[è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ€\›ŸY[ë]Kù”ÿÿ[T›ö[ô 
+_HèÇà	€\›ŸY[ë]Kù”ÿÿ[T›ö[ô 
+_Bà‹‹[èÇàŸ]èÇàà	…ﬂBà	€\›X\ùôX]]H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›X\ùôX]‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ€\›X\ùôX]]Kù”ÿÿ[T›ö[ô 
+_HèÇà	€\›X\ùôX]]Kù”ÿÿ[T›ö[ô 
+_Bà‹‹[èÇàŸ]èÇàà	…ﬂBà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èï\[YO‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ›\[YU^O‹‹[èÇàŸ]èÇàŸ]èÇàŸ]èÇààKKH]Hﬁ[ò»KOÇà]à€\‹œHú[ô[èÇà›[OHõX\ô⁄[ã]‹åÿ€€‹éùò\äKZY⁄Y⁄
+NŸõ€ù\⁄^ôNåM»èë]Hﬁ[ò⁄õ€ö^ò][€è⁄Çà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èë]öXŸ\œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹ÿYôSù[Xô\äYŸ[ùô]öXŸWÿ€›[ù
+_O‹‹[èÇàŸ]èÇà	€\›]öXŸTﬁ[ò—]H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›]öXŸHﬁ[òœ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ€\›]öXŸTﬁ[ò—]Kù”ÿÿ[T›ö[ô 
+_HèÇà	€\›]öXŸTﬁ[ò—]Kù”ÿÿ[T›ö[ô 
+_Bà‹‹[èÇàŸ]èÇààà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›]öXŸHﬁ[òœ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà›[OHò€€‹éùò\äK[]]Y
+N»èìô]ô\è‹‹[èÇàŸ]èÇàBà	€\›Y]öX‹‘ﬁ[ò—]H»à]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›Y]öX‹»ﬁ[òœ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ€\›Y]öX‹‘ﬁ[ò—]Kù”ÿÿ[T›ö[ô 
+_HèÇà	€\›Y]öX‹‘ﬁ[ò—]Kù”ÿÿ[T›ö[ô 
+_Bà‹‹[èÇàŸ]èÇààà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›Y]öX‹»ﬁ[òœ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà›[OHò€€‹éùò\äK[]]Y
+N»èìô]ô\è‹‹[èÇàŸ]èÇàBàŸ]èÇàŸ]èÇàŸ]èÇààKKH‘»XY€õ‹›X‹»KOÇà]à›[OHõX\ô⁄[ã]‹åMú»èÇà]à€\‹œHú[ô[èÇà›[OHõX\ô⁄[ã]‹åÿ€€‹éùò\äKZY⁄Y⁄
+NŸõ€ù\⁄^ôNåM»èïŸXî€ÿ⁄Ÿ]XY€õ‹›X‹œ⁄Çà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èî[ô»òZ[\ô\œ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹ÿYôSù[Xô\äYŸ[ùù‹◊‹[ô◊ŸòZ[\ô\ _O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èë\ÿ€€õôX›]ô[ùœ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ‹ÿYôSù[Xô\äYŸ[ùù‹◊Ÿ\ÿ€€õôX›Ÿ]ô[ù _O‹‹[èÇàŸ]èÇà]à›[OHò€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåLú»èï\ŸH€›[ù»\ôHXY€õ‹›X‹»úõ€HHŸ\ùô\â‹»ŸXî€ÿ⁄Ÿ]›Xúﬁ\›[Kà^H[[ôXÿ]HõZﬁH€€õôX›[€ú»‹àô]€‹ö»\‹›Y\ÀèŸ]èÇàŸ]èÇàŸ]èÇàŸ]èÇàKKHX›[€àù]€ú»KOÇà]à›[OHõX\ô⁄[ã]‹àå»\‹^Nàõ^»ÿ\àL»ù\›YûKX€€ù[ùàõ^Y[ô»õ^]‹ò\à‹ò\»èÇàù]€àYHòYŸ[ùÿ⁄X⁄◊›\]Wÿùàà]KXYŸ[ùZYHâÿYŸ[ùQHà	ÿ€€[X[ô\ÿXõY]üOÇà⁄X⁄»õ‹à\]Bàÿù]€èÇàù]€àYHòYŸ[ùŸõ‹òŸW›\]Wÿùàà]KXYŸ[ùZYHâÿYŸ[ùQHà	ÿ€€[X[ô\ÿXõY]üOÇàõ‹òŸHôZ[ú›[àÿù]€èÇàù]€à]KXX›[€èHõ‹[ãXYŸ[ùà]KXYŸ[ùZYHâÿYŸ[ùQHà	ÿ€€[X[ô\ÿXõY]üOÇà‹[àYŸ[ùRBàÿù]€èÇàŸ]èÇà]à€\‹œHòYŸ[ù]\]KYôYYòX⁄»èÇà]àYHòYŸ[ù›\]W⁄[ùà€\‹œHòYŸ[ù]\]KZ[ù	ÿ€€[X[ô[òXõY»	…»à	»\úõ‹âﬂHèâŸ\ÿÿ\R[
+€€[X[ô[ù
+_OŸ]èÇà]àYHòYŸ[ù›\]W‹›]\»à€\‹œHòYŸ[ù]\]K\›]\»àõ€OHú›]\»à\öXK[]ôOHú€]HèèŸ]èÇàŸ]èÇà¬àÀ»]X⁄[õ[ôHY]‹à[ô\ú»õ›»]”HõŸ\»\ôHô\Ÿ[ùàûH»ÿ]X⁄YŸ[ù]Z[”ò[YQY]‹äYŸ[ù
+N»Hÿ]⁄
+JH»⁄[ô›Àó◊‹W‹⁄\ôY	âà⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õà	âà⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	ÿ]X⁄Y]‹àòZ[Y	ÀJN»BàÀ»]X⁄⁄X⁄»õ‹à\]H[ô\ÇàûH»ÿ]X⁄YŸ[ù\]R[ô\äYŸ[ù
+N»Hÿ]⁄
+JH»⁄[ô›Àó◊‹W‹⁄\ôY	âà⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õà	âà⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	ÿ]X⁄\]H[ô\àòZ[Y	ÀJN»BüBÇãÀ»Yù\àô[ô\ö[ô»HYŸ[ù]Z[»[Ÿ[ŸH]X⁄H€X[[õ[ôH[ô\ÇãÀ»»[›»Y][ô»HYŸ[ù	‹»\Ÿ\ãYúöY[ôHò[YKà\»ŸŸ€\»[à[ú]ãÀ»[àH[Ÿ[[ôŸ[ô»H‘’»\]HHò[YH€àHŸ\ùô\ã[ÇãÀ»\]\»HRHÿ\ô[ã\XŸKÇôù[ò›[€àÿ]X⁄YŸ[ù]Z[”ò[YQY]‹äYŸ[ù
+H¬àûH¬à€€ú›Y]ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ŸY]€ò[YWÿùâ N¬àYà
+YY]ùäHô]\õé¬àY]ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›\‹^Q[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€ò[YWŸ\‹^I N¬àYà
+Y\‹^Q[
+Hô]\õé¬à€€ú››\úô[ùH\‹^Q[ù^€€ù[ù	…Œ¬àÀ»‹ôX]HY]RH⁄]õ‹\à[ÿö[KYúöY[ôH[ú]›[[ô¬àÀ»\ŸHõ^\›\ù»ô]ô[ù[ÿö[H›\ú€‹à‹⁄][€àùY‹»⁄]õ^Y[ôà\‹^Q[ö[õô\íSH‹[à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\çú⁄ù\›YûKX€€ù[ùôõ^\›\ù›⁄YåL	N»èÇà[ú]YHòYŸ[ùŸ]Z[◊€ò[YW⁄[ú]àò[YOHâŸ\ÿÿ\R[
+YŸ[ùõò[YH	… _HÇà›[OHôõ^åN€Z[ã]⁄YåLå€X^]⁄Yåå›^X[Y€éõYùŸ\ôX›[€éõéŸõ€ù\⁄^ôNåM‹Y[ôŒç»àà]]ÿ€€\]OHõŸôàà]KL\ZY€õ‹ôH]K[Y€õ‹ôOHùùYHàœÇàù]€àYHòYŸ[ùŸ]Z[◊‹ÿ]ôW€ò[YHèîÿ]ôOÿù]€èÇàù]€àYHòYŸ[ùŸ]Z[◊ÿÿ[òŸ[€ò[YHèêÿ[òŸ[ÿù]€èÇà‹‹[èò¬ÇàÀ»õÿ›\»H[ú][ôŸ[X›[^€»\Ÿ\àÿ[à[[YYX][H\H»ô\XŸBà€€ú›[ú][Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€ò[YW⁄[ú]	 N¬àYà
+[ú][
+H¬à[ú][ôõÿ›\ 
+N¬à[ú][úŸ[X›
+
+N¬àBÇà€€ú›ÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊‹ÿ]ôW€ò[YI N¬à€€ú›ÿ[òŸ[ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ÿÿ[òŸ[€ò[YI N¬àYà
+ÿ[òŸ[ùäHÿ[òŸ[ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà»\‹^Q[ù^€€ù[ùH›\úô[ù»JN¬ÇàYà
+ÿ]ôPùäHÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À\ﬁ[ò»
+
+HOà¬à€€ú›[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€ò[YW⁄[ú]	 N¬àYà
+Z[ú]
+Hô]\õé¬à€€ú›ô]”ò[YHH[ú]ùò[YKùö[J
+N¬àûH¬à€€ú›ô\»H]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùòYŸ[ù⁄Y
+_X¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»ò[YNàô]”ò[YHJBàJN¬àYà
+\ô\Àõ⁄ Hõ›»ô]»\úõ‹ä	“	»
+»ô\Àú›]\ N¬à€€ú›\]YH]ÿZ]ô\Àöú€€ä
+N¬àÀ»\]H[Ÿ[\‹^Bà€€ú›]HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊›]I N¬à€€ú›ò[YQ\‹^HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€ò[YWŸ\‹^I N¬àYà
+ò[YQ\‹^JHò[YQ\‹^Kù^€€ù[ùH\]Yõò[YH	…Œ¬àYà
+]JH]Kù^€€ù[ùHYŸ[ùà	›\]Yõò[YH\]Yö‹›ò[YH\]YòYŸ[ù⁄YX¬àÀ»\]HYŸ[ùÿ\ô[à\›àûH»\Ÿ\ùYŸ[ùôX€‹ô
+\]Y
+N»Hÿ]⁄
+JH»Bà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–YŸ[ùò[YH\]Y	À	‹›XÿŸ\‹… N¬àHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»\]HYŸ[ùò[YIÀ	Ÿ\úõ‹â N¬àÀ»ô\›‹ôH\‹^Bà\‹^Q[ù^€€ù[ùH›\úô[ù¬àBàJN¬àJN¬àHÿ]⁄
+JH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»]X⁄YŸ[ù]Z[»ò[YHY]‹âÀJN¬àBüBÇôù[ò›[€àÿ]X⁄YŸ[ù\]R[ô\äYŸ[ù
+H¬àûH¬à€€ú›ÿ[îŸ[ô€€[X[ô»H
+YŸ[ùò€€õôX›[€ó›\H	… Kù”›Ÿ\êÿ\ŸJ
+HOOH	›‹…Œ¬à€€ú››]\—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù›\]W‹›]\… N¬à€€ú›ô\]Z\ôU‹”Y\‹ÿYŸHH	‘ô\]Z\ô\»X›]ôHŸXî€ÿ⁄Ÿ]€€õôX›[€âŒ¬Çà€€ú›Ÿ]›]\»H
+Y\‹ÿYŸK€ôHH	⁄[ôõ… HOà¬àYà
+\›]\—[
+Hô]\õé¬à›]\—[ù^€€ù[ùHY\‹ÿYŸH	…Œ¬à›]\—[ò€\‹”\›úô[[›ôJ	‹›]\ÀZ[ôõ…À	‹›]\À\›XÿŸ\‹…À	‹›]\ÀY\úõ‹â N¬àYà
+[Y\‹ÿYŸJH¬àô]\õé¬àBà€€ú›€»H€ôHOOH	‹›XÿŸ\‹…»»	‹›]\À\›XÿŸ\‹…»à€ôHOOH	Ÿ\úõ‹â»»	‹›]\ÀY\úõ‹â»à	‹›]\ÀZ[ôõ…Œ¬à›]\—[ò€\‹”\›òY
+€ N¬àN¬Çà€€ú›⁄X⁄–ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùÿ⁄X⁄◊›\]Wÿùâ N¬àYà
+⁄X⁄–ùäH¬à€€ú›ô\Ÿ]⁄X⁄–ù]€àH
+
+HOà¬à⁄X⁄–ùãô\ÿXõYHXÿ[îŸ[ô€€[X[ôŒ¬à⁄X⁄–ùãù^€€ù[ùH	–⁄X⁄»õ‹à\]IŒ¬àYà
+Xÿ[îŸ[ô€€[X[ô H¬à⁄X⁄–ùãù]HHô\]Z\ôU‹”Y\‹ÿYŸN¬àH[ŸH¬à⁄X⁄–ùãúô[[›ôP]öXù]J	›]I N¬àBàN¬àô\Ÿ]⁄X⁄–ù]€ä
+N¬à⁄X⁄–ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À\ﬁ[ò»
+
+HOà¬àYà
+Xÿ[îŸ[ô€€[X[ô H¬àŸ]›]\ 	–€€õôX›öXHŸXî€ÿ⁄Ÿ]»Ÿ[ô\]H€€[X[ôÀâÀ	Ÿ\úõ‹â N¬àô]\õé¬àBà⁄X⁄–ùãô\ÿXõYHùYN¬à⁄X⁄–ùãù^€€ù[ùH	–⁄X⁄⁄[ôÀããâŒ¬àŸ]›]\ 	–€€ùX›[ô»YŸ[ù8†)âÀ	⁄[ôõ… N¬àûH¬à€€ú›ô\»H]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀÿ€€[X[ô…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùòYŸ[ù⁄Y
+_X¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»€€[X[ôà	ÿ⁄X⁄◊›\]I»JBàJN¬àYà
+\ô\Àõ⁄ H¬à€€ú›H]ÿZ]ô\Àù^
+
+N¬àõ›»ô]»\úõ‹ä	‘ô\]Y\›òZ[Y	 N¬àBà€€ú›]HH]ÿZ]ô\Àöú€€ä
+N¬àYà
+]Kú›XÿŸ\‹ H¬à€€ú››[[X\ûHH]KõY\‹ÿYŸH	’\]H⁄X⁄»öYŸŸ\ôY	Œ¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+›[[X\ûK	‹›XÿŸ\‹… N¬àŸ]›]\ 	‹›[[X\û_H]	€ô]»]J
+Kù”ÿÿ[U[YT›ö[ô 
+_X	‹›XÿŸ\‹… N¬àH[ŸH¬à€€ú›\Ÿ»H]Kô\úõ‹à	—òZ[Y»öYŸŸ\à\]H⁄X⁄…Œ¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+\ŸÀ	Ÿ\úõ‹â N¬àŸ]›]\ \ŸÀ	Ÿ\úõ‹â N¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»Ÿ[ô€€[X[ôà	»
+»
+\úãõY\‹ÿYŸH\úäK	Ÿ\úõ‹â N¬àŸ]›]\ 	—òZ[Y»Ÿ[ô€€[X[ôà	»
+»
+\úãõY\‹ÿYŸH\úäK	Ÿ\úõ‹â N¬àHö[ò[H¬àô\Ÿ]⁄X⁄–ù]€ä
+N¬àBàJN¬àBÇà€€ú›õ‹òŸPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸõ‹òŸW›\]Wÿùâ N¬àYà
+õ‹òŸPùäH¬à€€ú›ô\Ÿ]õ‹òŸPù]€àH
+Xô[
+HOà¬àõ‹òŸPùãô\ÿXõYHXÿ[îŸ[ô€€[X[ôŒ¬àõ‹òŸPùãù^€€ù[ùHXô[	—õ‹òŸHôZ[ú›[	Œ¬àYà
+Xÿ[îŸ[ô€€[X[ô H¬àõ‹òŸPùãù]HHô\]Z\ôU‹”Y\‹ÿYŸN¬àH[ŸH¬àõ‹òŸPùãúô[[›ôP]öXù]J	›]I N¬àBàN¬àô\Ÿ]õ‹òŸPù]€ä
+N¬àõ‹òŸPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À\ﬁ[ò»
+
+HOà¬àYà
+]⁄[ô›Àò€€ôö\õJ	—õ‹òŸHôZ[ú›[\»YŸ[ù»HŸ\ùöXŸH⁄[ô\›\ù[ôX^H[\‹ò\ö[H\ÿ€€õôX›â JH¬àô]\õé¬àBàYà
+Xÿ[îŸ[ô€€[X[ô H¬àŸ]›]\ 	–€€õôX›öXHŸXî€ÿ⁄Ÿ]»Ÿ[ô\]H€€[X[ôÀâÀ	Ÿ\úõ‹â N¬àô]\õé¬àBàõ‹òŸPùãô\ÿXõYHùYN¬à€€ú›ô]ö[›\”Xô[Hõ‹òŸPùãù^€€ù[ù¬àõ‹òŸPùãù^€€ù[ùH	—õ‹ò⁄[ôÀããâŒ¬àŸ]›]\ 	–€€ùX›[ô»YŸ[ù8†)âÀ	⁄[ôõ… N¬àûH¬à€€ú›ô\»H]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀÿ€€[X[ô…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùòYŸ[ù⁄Y
+_X¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ¬à€€[X[ôà	Ÿõ‹òŸW›\]IÀà]Nà»ôX\€€éà	‹Ÿ\ùô\ó›ZWŸõ‹òŸW‹ôZ[ú›[	»BàJBàJN¬àYà
+\ô\Àõ⁄ H¬à€€ú›H]ÿZ]ô\Àù^
+
+N¬àõ›»ô]»\úõ‹ä	‘ô\]Y\›òZ[Y	 N¬àBà€€ú›]HH]ÿZ]ô\Àöú€€ä
+N¬àYà
+]Kú›XÿŸ\‹ H¬à€€ú››[[X\ûHH]KõY\‹ÿYŸH	—õ‹òŸYôZ[ú›[öYŸŸ\ôY	Œ¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+›[[X\ûK	‹›XÿŸ\‹… N¬àŸ]›]\ 	‹›[[X\û_H]	€ô]»]J
+Kù”ÿÿ[U[YT›ö[ô 
+_X	‹›XÿŸ\‹… N¬àH[ŸH¬à€€ú›\Ÿ»H]Kô\úõ‹à	—òZ[Y»õ‹òŸHôZ[ú›[	Œ¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+\ŸÀ	Ÿ\úõ‹â N¬àŸ]›]\ \ŸÀ	Ÿ\úõ‹â N¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»Ÿ[ôõ‹òŸHôZ[ú›[à	»
+»
+\úãõY\‹ÿYŸH\úäK	Ÿ\úõ‹â N¬àŸ]›]\ 	—òZ[Y»Ÿ[ôõ‹òŸHôZ[ú›[à	»
+»
+\úãõY\‹ÿYŸH\úäK	Ÿ\úõ‹â N¬àHö[ò[H¬àô\Ÿ]õ‹òŸPù]€äô]ö[›\”Xô[
+N¬àBàJN¬àBàHÿ]⁄
+JH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»]X⁄YŸ[ù\]H[ô\âÀJN¬àBüBÇãÀ»OOOOOH\]HYŸ[ù
+úõ€HYŸ[ù\›ÿÿ\ô HOOOOOBÇãÀ»[ôH\]HõŸ‹ô\‹»]ô[ù»úõ€H‘—Bôù[ò›[€à[ôPYŸ[ù\]TõŸ‹ô\‹ ]JH¬à€€ú›YŸ[ùYH]KòYŸ[ù⁄Y¬àYà
+XYŸ[ùY
+Hô]\õé¬ÇàÀ»õ‹õX[^ôH›]\»ò[Y\»[Z]YûHYŸ[ù]]À]\]H\[[ôBà€€ú›ò]‘›]\»H
+]Kú›]\»	›[ö€õ›€â Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú››]\»H
+
+
+HOà¬à›⁄]⁄
+ò]‘›]\ H¬àÿ\ŸH	‹[ô[ô…ŒÇàô]\õà	ÿ⁄X⁄⁄[ô…Œ¬àÿ\ŸH	‹›Y⁄[ô…ŒÇàÿ\ŸH	ÿ\Z[ô…ŒÇàô]\õà	‹ôXYIŒ»À»[ú›[[ô»\ŸBàÿ\ŸH	‹›XÿŸYYY	ŒÇàô]\õà	ÿ€€\]IŒ¬àÿ\ŸH	‹õ€YÿòX⁄…ŒÇàô]\õà	ŸòZ[Y	Œ¬àÿ\ŸH	‹⁄⁄\Y	ŒÇàô]\õà	‹⁄⁄\Y	Œ¬àYò][Çàô]\õàò]‘›]\Œ¬àBàJJ
+N¬Çà€€ú›õŸ‹ô\‹»H]KúõŸ‹ô\‹»¬à€€ú›Y\‹ÿYŸHH]KõY\‹ÿYŸH	…Œ¬à€€ú›\ôŸ]ô\ú⁄[€àH]Kù\ôŸ]›ô\ú⁄[€à	…Œ¬à€€ú›\úõ‹ì\Ÿ»H]Kô\úõ‹à	…Œ¬ÇàÀ»\]H›]HòX⁄⁄[ô»Hô\Ÿ\ùôHô]ö[›\’ô\ú⁄[€à[ô‹⁄›€ïÿ\›»Yà[ôXYHŸ]à€€ú›^\›[ô‘›]HHYŸ[ù’ìKù\]T›]VÿYŸ[ùYHﬂN¬à€€ú›YŸ[ùHYŸ[ù’ìKö][\Àôö[ô
+HOàKòYŸ[ù⁄YOOHYŸ[ùY
+N¬à€€ú›ô]ö[›\’ô\ú⁄[€àH^\›[ô‘›]Kúô]ö[›\’ô\ú⁄[€àYŸ[ùÀùô\ú⁄[€à	…Œ¬à€€ú›⁄›€ïÿ\›»H^\›[ô‘›]Kó‹⁄›€ïÿ\›»ﬂN¬ÇàYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬à›]\ÀàõŸ‹ô\‹ÀàY\‹ÿYŸKà\ôŸ]ô\ú⁄[€ãàô]ö[›\’ô\ú⁄[€ãà\úõ‹éà\úõ‹ì\ŸÀà[Y\›[\à]Kõõ› 
+Kà‹⁄›€ïÿ\›Œà⁄›€ïÿ\›»À»ô\Ÿ\ùôHÿ\›òX⁄⁄[ô»X‹õ‹‹»\]\¬àN¬ÇàÀ»›\ù[ö[X][€à€‹Yà[à\]H\»X›]ôBàYà
+›]\»OOH	ÿ⁄X⁄⁄[ô…»›]\»OOH	Ÿ›€õÿY[ô…»›]\»OOH	‹ôXYI»à›]\»OOH	‹ô\›\ù[ô…»›]\»OOH	›ô\öYûZ[ô… H¬à›\ù\]TõŸ‹ô\‹–[ö[X][€ä
+N¬àBÇàÀ»⁄›»ÿ\›õ›YöXÿ][€ú»õ‹àŸ^H]ô[ù¬à€€ú›YŸ[ùò[YHHYŸ[ùÀõò[YHYŸ[ùÀö‹›ò[YHYŸ[ùY¬Çà›⁄]⁄
+›]\ H¬àÿ\ŸH	ÿ⁄X⁄⁄[ô…ŒÇàÀ»õ»ÿ\›õ‹à⁄X⁄⁄[ôÀù\›RH\]BàúôXZŒ¬àÿ\ŸH	Ÿ›€õÿY[ô…ŒÇàÀ»€õH⁄›»ë›€õÿY[ôÀããààÿ\›€òŸH\à\]HﬁX€BàYà
+\⁄›€ïÿ\›Àô›€õÿY[ô H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_Nà›€õÿY[ô»\]Kããò	⁄[ôõ… N¬à⁄›€ïÿ\›Àô›€õÿY[ô»HùYN¬àBàúôXZŒ¬àÿ\ŸH	‹ôXYIŒÇàYà
+\⁄›€ïÿ\›ÀúôXYJH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_Nà\]H›€õÿYYô\\ö[ô»»[ú›[ããò	⁄[ôõ… N¬à⁄›€ïÿ\›ÀúôXYHHùYN¬àBàúôXZŒ¬àÿ\ŸH	‹ô\›\ù[ô…ŒÇàYà
+\⁄›€ïÿ\›Àúô\›\ù[ô H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_Nàô\›\ù[ô»»\H\]Kããò	⁄[ôõ… N¬à⁄›€ïÿ\›Àúô\›\ù[ô»HùYN¬àBàÀ»›‹ôHô]ö[›\»ô\ú⁄[€àõ‹à€€\\ö\€€à⁄[àYŸ[ùôX€€õôX›¬àYà
+YŸ[ùÀùô\ú⁄[€à	âàXYŸ[ù’ìKù\]T›]VÿYŸ[ùYKúô]ö[›\’ô\ú⁄[€äH¬àYŸ[ù’ìKù\]T›]VÿYŸ[ùYKúô]ö[›\’ô\ú⁄[€àHYŸ[ùùô\ú⁄[€é¬àBàÀ»ò[òX⁄ŒàYàŸHô]ô\àX\àòX⁄»Yù\àô\›\ù€X\àH›]H[ôôYúô\⁄àYà
+\⁄›€ïÿ\›Àúô\›\ù[Y[›]
+H¬à⁄›€ïÿ\›Àúô\›\ù[Y[›]HùYN¬àŸ][Y[›]
+
+
+HOà¬à€€ú››HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àYà
+›	âà›ú›]\»OOH	‹ô\›\ù[ô… H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_Nà\]H[YY›]ÿZ][ô»õ‹àôX€€õôX›	›ÿ\õö[ô… N¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àÀ»ô]⁄ù\›\»YŸ[ù	‹»]H[ú›XYŸà[YŸ[ù¬àô]⁄⁄[ô€PYŸ[ù
+YŸ[ùY
+N¬àBàKÃ
+N»À»[ò‹ôX\ŸY»Ã»»[›»õ‹à€›Ÿ\àô\›\ù¬àBàúôXZŒ¬àÿ\ŸH	ÿ€€\]IŒÇà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_Nà\]H€€\]HX	‹›XÿŸ\‹… N¬àÀ»€X\à›]HYù\àH[^H»]RH\]BàŸ][Y[›]
+
+
+HOà¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àYà
+YŸ[ù’ìKù\]P[ö[X][€ú H[]HYŸ[ù’ìKù\]P[ö[X][€ú÷ÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àKÃ
+N¬àÀ»ô[ÿYYŸ[ù»»Ÿ]ô]»ô\ú⁄[€ÇàŸ][Y[›]
+
+
+HOàÿYYŸ[ù 
+Kå
+N¬àúôXZŒ¬àÿ\ŸH	ŸòZ[Y	ŒÇà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	ÿYŸ[ùò[Y_Nà\]HòZ[YH	Ÿ\úõ‹ì\Ÿ»Y\‹ÿYŸ_X	Ÿ\úõ‹â N¬àÀ»€X\à›]HYù\à⁄›⁄[ô»\úõ‹ÇàŸ][Y[›]
+
+
+HOà¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àYà
+YŸ[ù’ìKù\]P[ö[X][€ú H[]HYŸ[ù’ìKù\]P[ö[X][€ú÷ÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àKL
+N¬àúôXZŒ¬àÿ\ŸH	⁄YIŒÇàÀ»YŸ[ùô]\õôY»YK€X\à[ûH[ô[ô»›]Bà[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àYà
+YŸ[ù’ìKù\]P[ö[X][€ú H[]HYŸ[ù’ìKù\]P[ö[X][€ú÷ÿYŸ[ùYN¬àúôXZŒ¬àBÇàÀ»ôYúô\⁄Hô\ú⁄[€àŸ[õ‹à\»YŸ[ùàôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬üBÇãÀ»ôYúô\⁄Hô\ú⁄[€àŸ[\‹^Hõ‹àH‹X⁄YöX»YŸ[ùôù[ò›[€àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+H¬à€€ú›YŸ[ùHYŸ[ù’ìKö][\Àôö[ô
+HOàKòYŸ[ù⁄YOOHYŸ[ùY
+N¬àYà
+XYŸ[ù
+Hô]\õé¬ÇàÀ»\]H[àXõHöY]¬à€€ú›XõTõ›»Hÿ›[Y[ùú]Y\ûTŸ[X›‹äñŸ]KXYŸ[ùZYHâÿYŸ[ùYHóX
+N¬àYà
+XõTõ› H¬àÀ»ö\ú›ûH»ö[ôûH]KX€€[[ãZY
+XõH›\›€Z^ô\äBà]ô\ú⁄[€êŸ[HXõTõ›Àú]Y\ûTŸ[X›‹ä	›Ÿ]KX€€[[ãZYHùô\ú⁄[€àóI N¬àYà
+]ô\ú⁄[€êŸ[
+H¬àÀ»ò[òX⁄ŒàûH»ö[ôûH‹⁄][€à
+YÿXﬁHõ€ãX›\›€Z^ô\àô[ô\äBàÀ»[àHò[òX⁄»ô[ô\ô\ãô\ú⁄[€à\»Hù€€[[à
+[ô^JBà€€ú›Ÿ[»HXõTõ›Àú]Y\ûTŸ[X›‹ê[
+	›	 N¬àYà
+Ÿ[Àõ[ô›èHäH¬àô\ú⁄[€êŸ[HŸ[÷ÕWN¬àBàBàYà
+ô\ú⁄[€êŸ[
+H¬àô\ú⁄[€êŸ[ö[õô\íSHô[ô\êYŸ[ùô\ú⁄[€êŸ[
+YŸ[ùùYJN¬àBàBàÀ»\]H[àÿ\ôöY]¬à€€ú›ÿ\ôHÿ›[Y[ùú]Y\ûTŸ[X›‹äô]öXŸKXÿ\ôŸ]KXYŸ[ùZYHâÿYŸ[ùYHóX
+N¬àYà
+ÿ\ô
+H¬à€€ú›ô\ú⁄[€î‹[àHÿ\ôú]Y\ûTŸ[X›‹ä	ÀòYŸ[ù]ô\ú⁄[€ãXŸ[	 N¬àYà
+ô\ú⁄[€î‹[äH¬àô\ú⁄[€î‹[ãö[õô\íSHô[ô\êYŸ[ùô\ú⁄[€êŸ[
+YŸ[ùò[ŸJN¬àBàBüBÇãÀ»[ö[X][€à€‹õ‹à€[€›õŸ‹ô\‹»\]\¬õ]\]TõŸ‹ô\‹–[ö[X][€ëúò[YHHù[¬ôù[ò›[€à›\ù\]TõŸ‹ô\‹–[ö[X][€ä
+H¬àYà
+\]TõŸ‹ô\‹–[ö[X][€ëúò[YJHô]\õé»À»[ôXYHù[õö[ô¬Çàù[ò›[€à[ö[X]J
+H¬àÀ»⁄X⁄»Yà[ûH\]\»\ôH[àõŸ‹ô\‹¬à€€ú›X›]ôU\]\»HÿöôX›öŸ^\ YŸ[ù’ìKù\]T›]HﬂJKôö[\äYOà¬à€€ú››]HHYŸ[ù’ìKù\]T›]V⁄YN¬à€€ú››]\»H›]OÀú›]\Œ¬àô]\õà›]\»OOH	ÿ⁄X⁄⁄[ô…»›]\»OOH	Ÿ›€õÿY[ô…»›]\»OOH	‹ôXYI»à›]\»OOH	‹ô\›\ù[ô…»›]\»OOH	›ô\öYûZ[ô…»à›]\»OOH	‹[ô[ô…»›]\»OOH	‹›Y⁄[ô…»›]\»OOH	ÿ\Z[ô…Œ¬àJN¬ÇàYà
+X›]ôU\]\Àõ[ô›OOH
+H¬àÀ»õ»X›]ôH\]\À›‹[ö[X][€Çà\]TõŸ‹ô\‹–[ö[X][€ëúò[YHHù[¬àÀ»€X[à\[ö[X][€à›]BàYà
+YŸ[ù’ìKù\]P[ö[X][€ú H¬àYŸ[ù’ìKù\]P[ö[X][€ú»HﬂN¬àBàô]\õé¬àBÇàÀ»\]HõŸ‹ô\‹»õ‹àXX⁄X›]ôH\]BàX›]ôU\]\Àôõ‹ëXX⁄
+YŸ[ùYOà¬àÀ»\]HHõŸ‹ô\‹»ù]€à\ôX›H⁄]›]ù[ôK\ô[ô\Çà€€ú›õŸ‹ô\‹–ùàHÿ›[Y[ùú]Y\ûTŸ[X›‹äù\]KXùãúõŸ‹ô\‹ÀXùñŸ]KXYŸ[ùZYHâÿYŸ[ùYHóX
+N¬àYà
+õŸ‹ô\‹–ùäH¬à€€ú›\]T›]HHYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬à€€ú›ò]‘›]\»H\]T›]OÀú›]\»	…Œ¬à€€ú››]\»H
+
+
+HOà¬à›⁄]⁄
+ò]‘›]\ H¬àÿ\ŸH	‹[ô[ô…Œàô]\õà	ÿ⁄X⁄⁄[ô…Œ¬àÿ\ŸH	‹›Y⁄[ô…ŒÇàÿ\ŸH	ÿ\Z[ô…Œàô]\õà	‹ôXYIŒ¬àYò][àô]\õàò]‘›]\Œ¬àBàJJ
+N¬à€€ú›€[€›õŸ‹ô\‹»HŸ]€[€›Y\]TõŸ‹ô\‹ YŸ[ùY›]\À\]T›]JN¬àõŸ‹ô\‹–ùãú›[KúŸ]õ‹\ùJ	ÀK\õŸ‹ô\‹…À	‹€[€›õŸ‹ô\‹ﬂIX
+N¬àõŸ‹ô\‹–ùãù^€€ù[ùH	”X]úõ›[ô
+€[€›õŸ‹ô\‹ _IX¬àBàJN¬ÇàÀ»€€ù[ùYH[ö[X][€Çà\]TõŸ‹ô\‹–[ö[X][€ëúò[YHHô\]Y\›[ö[X][€ëúò[YJ[ö[X]JN¬àBÇà\]TõŸ‹ô\‹–[ö[X][€ëúò[YHHô\]Y\›[ö[X][€ëúò[YJ[ö[X]JN¬üBÇãÀ»›‹[ö[X][€à⁄[àõ»\]\»\ôHX›]ôBôù[ò›[€à›‹\]TõŸ‹ô\‹–[ö[X][€ä
+H¬àYà
+\]TõŸ‹ô\‹–[ö[X][€ëúò[YJH¬àÿ[òŸ[[ö[X][€ëúò[YJ\]TõŸ‹ô\‹–[ö[X][€ëúò[YJN¬à\]TõŸ‹ô\‹–[ö[X][€ëúò[YHHù[¬àBüBÇãÀ»ÿ[òŸ[[à[ã\õŸ‹ô\‹»\]Bò\ﬁ[ò»ù[ò›[€àÿ[òŸ[YŸ[ù\]JYŸ[ùY
+H¬àYà
+XYŸ[ùY
+Hô]\õé¬Çà€€ú››]HHYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àYà
+\›]H›]Kú›]\»OOH	‹ô\›\ù[ô… H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–ÿ[õõ›ÿ[òŸ[\]H]\»›YŸIÀ	›ÿ\õö[ô… N¬àô]\õé¬àBÇàûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀÿ€€[X[ô…ÿYŸ[ùYX¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»€€[X[ôà	ÿÿ[òŸ[›\]I»JBàJN¬ÇàYà
+\ô\‹€úŸKõ⁄ H¬à€€ú›\úõ‹ï^H]ÿZ]ô\‹€úŸKù^
+
+N¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂNà	Ÿ\úõ‹ï^X
+N¬àBÇà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–ÿ[òŸ[ô\]Y\›Ÿ[ù	À	⁄[ôõ… N¬àHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»ÿ[òŸ[\]NâÀ\úõ‹äN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»ÿ[òŸ[\]Nà	»
+»
+\úõ‹ãõY\‹ÿYŸH\úõ‹äK	Ÿ\úõ‹â N¬àBüBÇò\ﬁ[ò»ù[ò›[€à\]PYŸ[ù
+YŸ[ùY
+H¬àYà
+XYŸ[ùY
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	”õ»YŸ[ùQõ›öYY	À	Ÿ\úõ‹â N¬àô]\õé¬àBÇàÀ»Ÿ][ö]X[\][ô»›]BàYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬à›]\Œà	ÿ⁄X⁄⁄[ô…ÀàõŸ‹ô\‹ŒààY\‹ÿYŸNà	‘Ÿ[ô[ô»\]H€€[X[ôããâÀà\ôŸ]ô\ú⁄[€éàYŸ[ù’ìKõ]\›ô\ú⁄[€à	…Àà\úõ‹éà	…Àà[Y\›[\à]Kõõ› 
+BàN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àÀ»›\ù€[€›[ö[X][€à€‹à›\ù\]TõŸ‹ô\‹–[ö[X][€ä
+N¬ÇàûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀÿ€€[X[ô…ÿYŸ[ùYX¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»€€[X[ôà	ÿ⁄X⁄◊›\]I»JBàJN¬ÇàYà
+\ô\‹€úŸKõ⁄ H¬à€€ú›\úõ‹ï^H]ÿZ]ô\‹€úŸKù^
+
+N¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂNà	Ÿ\úõ‹ï^X
+N¬àBÇà€€ú›ô\›[H]ÿZ]ô\‹€úŸKöú€€ä
+N¬àYà
+ô\›[ú›XÿŸ\‹ H¬àÀ»\]H›]H»⁄›»ŸI‹ôHÿZ][ô»õ‹àYŸ[ùô\‹€úŸBàYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬àããòYŸ[ù’ìKù\]T›]VÿYŸ[ùYKàY\‹ÿYŸNà	’ÿZ][ô»õ‹àYŸ[ùããâÀàN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àH[ŸH¬àÀ»€€[X[ôòZ[YàYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬àããòYŸ[ù’ìKù\]T›]VÿYŸ[ùYKà›]\Œà	ŸòZ[Y	Àà\úõ‹éàô\›[õY\‹ÿYŸH	’[ö€õ›€à\úõ‹âÀàN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	’\]H€€[X[ôòZ[Yà	»
+»
+ô\›[õY\‹ÿYŸH	›[ö€õ›€â K	›ÿ\õö[ô… N¬àŸ][Y[›]
+
+
+HOà¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àKL
+N¬àBàHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»Ÿ[ô\]H€€[X[ôâÀ\úõ‹äN¬àYŸ[ù’ìKù\]T›]VÿYŸ[ùYHH¬àããòYŸ[ù’ìKù\]T›]VÿYŸ[ùYKà›]\Œà	ŸòZ[Y	Àà\úõ‹éà\úõ‹ãõY\‹ÿYŸH›ö[ô \úõ‹äKàN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»Ÿ[ô\]H€€[X[ôà	»
+»
+\úõ‹ãõY\‹ÿYŸH\úõ‹äK	Ÿ\úõ‹â N¬àŸ][Y[›]
+
+
+HOà¬à[]HYŸ[ù’ìKù\]T›]VÿYŸ[ùYN¬àôYúô\⁄YŸ[ùô\ú⁄[€êŸ[
+YŸ[ùY
+N¬àKL
+N¬àBüBÇãÀ»^‹ŸHŸ\ùô\ã\‹X⁄YöX»YŸ[ùRH[\ú»»H⁄\ôYò[Y\‹XŸH€»BãÀ»[Yÿ]Yÿ\ô[ô\ú»
+ÿYYX\õY\äHÿ[HöX⁄ô[ô\ô\à[ú›XYãÀ»ŸàHŸ[ô\öX»ò[òX⁄»[à€€[[€ã›ŸXã‹⁄\ôYöúÿ⁄X⁄⁄›‹»ò]»î””ãÇùûH¬à⁄[ô›Àó◊‹W‹⁄\ôYH⁄[ô›Àó◊‹W‹⁄\ôYﬂN¬à⁄[ô›Àó◊‹W‹⁄\ôYùöY]–YŸ[ù]Z[»HöY]–YŸ[ù]Z[Œ¬à⁄[ô›Àó◊‹W‹⁄\ôYúô[ô\êYŸ[ù]Z[”[Ÿ[Hô[ô\êYŸ[ù]Z[”[Ÿ[¬àÀ»[€»^‹ŸH[]K€‹[à[\ú»Yàô\Ÿ[ù€»⁄\ôYÿ[\ú»\ŸHŸ\ùô\à[\[Y[ù][€ú¬à⁄[ô›Àó◊‹W‹⁄\ôYô[]PYŸ[ùH⁄[ô›Àó◊‹W‹⁄\ôYô[]PYŸ[ù[]PYŸ[ù¬à⁄[ô›Àó◊‹W‹⁄\ôYõ‹[êYŸ[ùRHH⁄[ô›Àó◊‹W‹⁄\ôYõ‹[êYŸ[ùRH‹[êYŸ[ùRN¬à⁄[ô›Àó◊‹W‹⁄\ôYù\]PYŸ[ùH⁄[ô›Àó◊‹W‹⁄\ôYù\]PYŸ[ù\]PYŸ[ù¬à⁄[ô›Àó◊‹W‹⁄\ôYòÿ[òŸ[YŸ[ù\]HH⁄[ô›Àó◊‹W‹⁄\ôYòÿ[òŸ[YŸ[ù\]Hÿ[òŸ[YŸ[ù\]N¬àÀ»[ÿ^\»›ô\úöYH]öXŸH[\ú»€»ÿ\ô»[ô⁄\ôYRH\ŸHHŸ\ùô\àõﬁH[ô⁄[ùà⁄[ô›Àó◊‹W‹⁄\ôYõ‹[ë]öXŸURHH‹[ë]öXŸURN¬à⁄[ô›Àó◊‹W‹⁄\ôYõ‹[ë]öXŸSY]öX‹»H⁄[ô›Àó◊‹W‹⁄\ôYõ‹[ë]öXŸSY]öX‹»‹[ë]öXŸSY]öX‹Œ¬à⁄[ô›Àó◊‹W‹⁄\ôYõ‹[ëõY]Ÿ][ô‹—õ‹ï[ò[ùH‹[ëõY]Ÿ][ô‹—õ‹ï[ò[ù¬à⁄[ô›Àó◊‹W‹⁄\ôYõ‹[ëõY]Ÿ][ô‹—õ‹êYŸ[ùH‹[ëõY]Ÿ][ô‹—õ‹êYŸ[ù¬üHÿ]⁄
+JH»€€ú€€Kùÿ\õä	—òZ[Y»^‹ŸHŸ\ùô\àRH[\ú»»⁄\ôYò[Y\‹XŸIÀJN»BÇãÀ»OOOOOH[]HYŸ[ùOOOOOBò\ﬁ[ò»ù[ò›[€à[]PYŸ[ù
+YŸ[ùY\‹^Sò[YJH¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	Ÿ[]PYŸ[ùÿ[YâÀYŸ[ùY\‹^Sò[YJN¬Çà€€ú›€€ôö\õYYH]ÿZ]⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–€€ôö\õJà\ôH[›H›\ôH[›Hÿ[ù»[]HYŸ[ùâŸ\‹^Sò[Y_Hè◊óï\»⁄[\õX[ô[ùHô[[›ôHHYŸ[ù[ô[]»\‹€ÿ⁄X]Y]öXŸ\»[ôY]öX‹Àà\»X›[€àÿ[õõ›ôH[ô€ôKòà	—[]HYŸ[ù	ÀàùYBà
+N¬Çà⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	’\Ÿ\à€€ôö\õYYâÀ€€ôö\õYY
+N¬ÇàYà
+X€€ôö\õYY
+H¬àô]\õé¬àBÇàûH¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	‘Ÿ[ô[ô»SUHô\]Y\›ŒâÀÿ\K›åKÿYŸ[ùÀ…ÿYŸ[ùYX
+N¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀ…ÿYŸ[ùYX¬àY]Ÿà	—SUI¬àJN¬Çà⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	‘ô\‹€úŸH›]\ŒâÀô\‹€úŸKú›]\Àô\‹€úŸKú›]\’^
+N¬ÇàYà
+\ô\‹€úŸKõ⁄ H¬à€€ú›\úõ‹ï^H]ÿZ]ô\‹€úŸKù^
+
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—[]HòZ[YâÀ\úõ‹ï^
+N¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂNà	Ÿ\úõ‹ï^X
+N¬àBÇà€€ú›ô\›[H]ÿZ]ô\‹€úŸKöú€€ä
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	—[]H›XÿŸ\‹Ÿù[âÀô\›[
+N¬Çà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+YŸ[ùâŸ\‹^Sò[Y_Hà[]Y›XÿŸ\‹Ÿù[X	‹›XÿŸ\‹… N¬ÇàÀ»ô[[›ôHYŸ[ùÿ\ô⁄][ö[X][€Çà€€ú›ÿ\ôHÿ›[Y[ùú]Y\ûTŸ[X›‹äŸ]KXYŸ[ùZYHâÿYŸ[ùYHóX
+N¬àYà
+ÿ\ô
+H¬àÿ\ôò€\‹”\›òY
+	‹ô[[›ö[ô… N¬àŸ][Y[›]
+
+
+HOà¬àÀ»ô[ÿYYŸ[ù»\›àÿYYŸ[ù 
+N¬àK
+N»À»X]⁄[ö[X][€à\ò][€ÇàH[ŸH¬àÀ»ÿ\ôõ›õ›[ôù\›ô[ÿYàÿYYŸ[ù 
+N¬àBàHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»[]HYŸ[ùâÀ\úõ‹äN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+òZ[Y»[]HYŸ[ùà	Ÿ\úõ‹ãõY\‹ÿYŸ_X	Ÿ\úõ‹â N¬àBüBÇãÀ»OOOOOHô\›\ùYŸ[ùOOOOOBò\ﬁ[ò»ù[ò›[€àô\›\ùYŸ[ù
+YŸ[ùY\‹^Sò[YJH¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	‹ô\›\ùYŸ[ùÿ[YâÀYŸ[ùY\‹^Sò[YJN¬Çà€€ú›€€ôö\õYYH]ÿZ]⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–€€ôö\õJà\ôH[›H›\ôH[›Hÿ[ù»ô\›\ùYŸ[ùâŸ\‹^Sò[YHYŸ[ùYHè◊óïHYŸ[ù⁄[[\‹ò\ö[H\ÿ€€õôX›[ô⁄›[ôX€€õôX›⁄][àHô]»ŸX€€ôÀòà	‘ô\›\ùYŸ[ù	Àà»€€ôö\õU^à	‘ô\›\ù	À€€ôö\õP€\‹Œà	ÿùã]ÿ\õö[ô…»Bà
+N¬ÇàYà
+X€€ôö\õYY
+H¬àô]\õé¬àBÇàûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K›åKÿYŸ[ùÀÿ€€[X[ô…ÿYŸ[ùYX¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»€€[X[ôà	‹ô\›\ù	»JBàJN¬ÇàYà
+\ô\‹€úŸKõ⁄ H¬à€€ú›\úõ‹ï^H]ÿZ]ô\‹€úŸKù^
+
+N¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂNà	Ÿ\úõ‹ï^X
+N¬àBÇà€€ú›ô\›[H]ÿZ]ô\‹€úŸKöú€€ä
+N¬àYà
+ô\›[ú›XÿŸ\‹ H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	‘ô\›\ù€€[X[ôŸ[ùàYŸ[ù⁄[ôX€€õôX›⁄‹ùKâÀ	‹›XÿŸ\‹… N¬àH[ŸH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»Ÿ[ôô\›\ù€€[X[ôà	»
+»
+ô\›[õY\‹ÿYŸH	›[ö€õ›€â K	›ÿ\õö[ô… N¬àBàHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»ô\›\ùYŸ[ùâÀ\úõ‹äN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+òZ[Y»ô\›\ùYŸ[ùà	Ÿ\úõ‹ãõY\‹ÿYŸ_X	Ÿ\úõ‹â N¬àBüBÇãÀ»^‹ŸHô\›\ùYŸ[ù»⁄\ôYò[Y\‹XŸBùûH¬à⁄[ô›Àó◊‹W‹⁄\ôYúô\›\ùYŸ[ùHô\›\ùYŸ[ù¬üHÿ]⁄
+JH»€€ú€€Kùÿ\õä	—òZ[Y»^‹ŸHô\›\ùYŸ[ù»⁄\ôYò[Y\‹XŸIÀJN»BÇãÀ»OOOOOH[]H]öXŸHOOOOOBã äÇà
+à[]HH]öXŸHúõ€HHŸ\ùô\à
+[ô‹[€ò[Húõ€HHYŸ[ù
+KÇà
+à⁄›‹»H€€ôö\õX][€à[Ÿ[⁄]‹[€ú»»[]HY]öX‹»\›‹ûBà
+à[ô»[€»[]Húõ€HHYŸ[ù	‹»]Xò\ŸKÇà
+ã¬ò\ﬁ[ò»ù[ò›[€à[]Q]öXŸJŸ\öX[YŸ[ùY
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	Ÿ[]Q]öXŸHÿ[YâÀŸ\öX[YŸ[ùY
+N¬ÇàÀ»‹ôX]H›\›€H€€ôö\õX][€à[Ÿ[⁄]⁄X⁄ÿõﬁ\¬à€€ú›ô\›[H]ÿZ]⁄›—[]Q]öXŸP€€ôö\õJŸ\öX[YŸ[ùY
+N¬ÇàYà
+\ô\›[ò€€ôö\õYY
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	—[]H]öXŸHÿ[òŸ[Y	 N¬àô]\õé¬àBÇàûH¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	‘Ÿ[ô[ô»[]Hô\]Y\›âÀ¬àŸ\öX[àYŸ[ù⁄YàYŸ[ùYà[]W€Y]öX‹Œàô\›[ô[]SY]öX‹Àà[]WŸúõ€WÿYŸ[ùàô\›[ô[]Qúõ€PYŸ[ùàJN¬Çà€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+	Àÿ\K›åKŸ]öXŸ\ÀŸ[]IÀ¬àY]Ÿà	‘‘’	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ¬àŸ\öX[àŸ\öX[àYŸ[ù⁄YàYŸ[ùYà[]W€Y]öX‹Œàô\›[ô[]SY]öX‹Àà[]WŸúõ€WÿYŸ[ùàô\›[ô[]Qúõ€PYŸ[ùàJBàJN¬ÇàYà
+\ô\‹€úŸKõ⁄ H¬à€€ú›\úõ‹ï^H]ÿZ]ô\‹€úŸKù^
+
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—[]HòZ[YâÀ\úõ‹ï^
+N¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂNà	Ÿ\úõ‹ï^X
+N¬àBÇà€€ú›ô\‹€úŸQ]HH]ÿZ]ô\‹€úŸKöú€€ä
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYõŸ 	—[]H›XÿŸ\‹Ÿù[âÀô\‹€úŸQ]JN¬Çà]Y\‹ÿYŸHH]öXŸHâ‹Ÿ\öX[Hà[]Y›XÿŸ\‹Ÿù[X¬àYà
+ô\‹€úŸQ]Kô[]YŸúõ€WÿYŸ[ù
+H¬àY\‹ÿYŸH
+œH	»
+[€»ô[[›ôYúõ€HYŸ[ù
+IŒ¬àBàYà
+ô\‹€úŸQ]Kô[]Y€Y]öX‹ H¬àY\‹ÿYŸH
+œH	»⁄]Y]öX‹»\›‹ûIŒ¬àBà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+Y\‹ÿYŸK	‹›XÿŸ\‹… N¬ÇàÀ»ô[[›ôH]öXŸHúõ€HRH⁄][ö[X][€Çà€€ú›ÿ\ôHÿ›[Y[ùú]Y\ûTŸ[X›‹äŸ]K\Ÿ\öX[Hâ‹Ÿ\öX[HóX
+N¬à€€ú›õ›»Hÿ›[Y[ùú]Y\ûTŸ[X›‹äñŸ]K\Ÿ\öX[Hâ‹Ÿ\öX[HóX
+N¬à€€ú›\ôŸ]Hÿ\ôõ›Œ¬ÇàYà
+\ôŸ]
+H¬à\ôŸ]ò€\‹”\›òY
+	‹ô[[›ö[ô… N¬àŸ][Y[›]
+
+
+HOà¬àÀ»ô[ÿY]öXŸ\»\›àÿY]öXŸ\ 
+N¬àK
+N¬àH[ŸH¬àÀ»[[Y[ùõ›õ›[ôù\›ô[ÿYàÿY]öXŸ\ 
+N¬àBÇàÀ»€‹ŸH[ûH‹[à]öXŸH[Ÿ[à€€ú›[Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ö[ù\óŸ]Z[◊€[Ÿ[	 N¬àYà
+[Ÿ[	âà[Ÿ[ú›[Kô\‹^HOOH	€õ€ôI H¬à[Ÿ[ú›[Kô\‹^HH	€õ€ôIŒ¬àBÇàHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»[]H]öXŸNâÀ\úõ‹äN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+òZ[Y»[]H]öXŸNà	Ÿ\úõ‹ãõY\‹ÿYŸ_X	Ÿ\úõ‹â N¬àBüBÇã äÇà
+à⁄›»›\›€H[]H]öXŸH€€ôö\õX][€à[Ÿ[⁄]⁄X⁄ÿõﬁ\¬à
+à\ò[H‹›ö[ôﬂHŸ\öX[H]öXŸHŸ\öX[ù[Xô\Çà
+à\ò[H‹›ö[ôﬂHYŸ[ùYHQŸàHYŸ[ù]›€ú»H]öXŸBà
+àô]\õú»‘õ€Z\ŸOÿ€€ôö\õYYàõ€€X[ã[]SY]öX‹Œàõ€€X[ã[]Qúõ€PYŸ[ùàõ€€X[üOüBà
+ã¬ôù[ò›[€à⁄›—[]Q]öXŸP€€ôö\õJŸ\öX[YŸ[ùY
+H¬àô]\õàô]»õ€Z\ŸJ
+ô\€€ôJHOà¬àÀ»[\à»\ÿÿ\HSà€€ú›ÿYôQ\ÿÿ\HH
+ HOà
+\[Ÿà\ÿÿ\R[OOH	Ÿù[ò›[€â»»\ÿÿ\R[
+ Hà›ö[ô  Kúô\XŸJ…ãŸÀâò[\»äKúô\XŸJœŸÀâõ»äKúô\XŸJœãŸÀâô›»äKúô\XŸJ»ãŸÀâú][›»äKúô\XŸJ…ÀŸÀâàÃŒN»äJN¬Çà€€ú›‹ò\\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à‹ò\\ãò€\‹”ò[YHH	€[Ÿ[[›ô\õ^IŒ¬à‹ò\\ãú›[Kô\‹^HH	Ÿõ^	Œ¬à€€ú›ZYH	Ÿ[]WŸ]öXŸWÿ€€ôö\õW…»
+»]Kõõ› 
+N¬à‹ò\\ãöYHZY¬Çà€€ú›\–YŸ[ùHYŸ[ùY	âàYŸ[ùYOOH	…Œ¬à€€ú›[]SY]öX‹“YH	›ZYWŸ[]W€Y]öX‹ÿ¬à€€ú›[]Qúõ€PYŸ[ùYH	›ZYWŸ[]WŸúõ€WÿYŸ[ù¬Çà‹ò\\ãö[õô\íSHà]à€\‹œHõ[Ÿ[X€€ù[ùà›[OHõX^]⁄YçLå»èÇà]à€\‹œHõ[Ÿ[ZXY\àèÇà»€\‹œHõ[Ÿ[]]Hèë[]H]öXŸO⁄œÇàù]€à€\‹œHõ[Ÿ[X€‹ŸK^à]OHê€‹ŸHèâù[Y\Œœÿù]€èÇàŸ]èÇà]à€\‹œHõ[Ÿ[XõŸHèÇà›[OHõX\ô⁄[ãXõ›€NåMú»èê\ôH[›H›\ôH[›Hÿ[ù»[]H]öXŸH›õ€ôœâ‹ÿYôQ\ÿÿ\JŸ\öX[
+_O‹›õ€ôœèœ‹Çà›[OHõX\ô⁄[ãXõ›€NåMúÿ€€‹éùò\äK]^[]]Y
+NŸõ€ù\⁄^ôNåL‹»èï\»⁄[\õX[ô[ùHô[[›ôHH]öXŸHúõ€HHŸ\ùô\à]Xò\ŸKè‹Çàà]à›[OHòòX⁄Ÿ‹õ›[ôùò\äKXôÀ]\ùX\ûJNÿõ‹ô\ã\òY]\Œé‹Y[ôŒåLú€X\ô⁄[ãXõ›€NåLú»èÇà]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\Œôõ^\›\ùŸÿ\åLÿ›\ú€‹éú⁄[ù\é€X\ô⁄[ãXõ›€NåL›⁄YåL	N»èÇà[ú]\OHò⁄X⁄ÿõﬁàYHâŸ[]SY]öX‹“YHà›[OHõX\ô⁄[ã]‹å‹ÿ›\ú€‹éú⁄[ù\éŸõ^\⁄ö[öŒå»èÇàXô[õ‹èHâŸ[]SY]öX‹“YHà›[OHò›\ú€‹éú⁄[ù\é»èÇà‹[à›[OHôõ€ù]ŸZY⁄çL»èê[€»[]HY]öX‹»\›‹ûO‹‹[èÇà]à›[OHôõ€ù\⁄^ôNåLúÿ€€‹éùò\äK]^[]]Y
+N€X\ô⁄[ã]‹åú»èÇàô[[›ôH[\›‹öXÿ[YŸH€›[ùÀ€ô\à]ô[À[ô›\àY]öX‹»]Hõ‹à\»]öXŸBàŸ]èÇà€Xô[ÇàŸ]èÇàà	⁄\–YŸ[ù»à]à›[OHô\‹^Nôõ^ÿ[Y€ãZ][\Œôõ^\›\ùŸÿ\åLÿ›\ú€‹éú⁄[ù\é›⁄YåL	N»èÇà[ú]\OHò⁄X⁄ÿõﬁàYHâŸ[]Qúõ€PYŸ[ùYHà›[OHõX\ô⁄[ã]‹å‹ÿ›\ú€‹éú⁄[ù\éŸõ^\⁄ö[öŒå»èÇàXô[õ‹èHâŸ[]Qúõ€PYŸ[ùYHà›[OHò›\ú€‹éú⁄[ù\é»èÇà‹[à›[OHôõ€ù]ŸZY⁄çL»èê[€»[]Húõ€HYŸ[ù‹‹[èÇà]à›[OHôõ€ù\⁄^ôNåLúÿ€€‹éùò\äK]^[]]Y
+N€X\ô⁄[ã]‹åú»èÇàô[[›ôHH]öXŸHúõ€HHYŸ[ù	‹»ÿÿ[]Xò\ŸH\»Ÿ[àH]öXŸHX^HôHôKY\ÿ€›ô\ôY€àHô^ÿÿ[ãÇàŸ]èÇà€Xô[ÇàŸ]èÇààà]à›[OHôõ€ù\⁄^ôNåLúÿ€€‹éùò\äK]^[]]Y
+NŸõ€ù\›[Nö][XŒ»èÇà\»]öXŸH\»õ»\‹€ÿ⁄X]YYŸ[ù€»]⁄[€õHôH[]Yúõ€HHŸ\ùô\ãÇàŸ]èÇàBàŸ]èÇàŸ]èÇà]à€\‹œHõ[Ÿ[Yõ€›\àèÇàù]€à€\‹œHõ[Ÿ[Xù]€à[Ÿ[Xù]€ã\ŸX€€ô\ûHà]KXX›[€èHòÿ[òŸ[èêÿ[òŸ[ÿù]€èÇàù]€à€\‹œHõ[Ÿ[Xù]€à[Ÿ[Xù]€ãY[ôŸ\àà]KXX›[€èHò€€ôö\õHèë[]H]öXŸOÿù]€èÇàŸ]èÇàŸ]èÇà¬àÿ›[Y[ùòõŸKò\[ô⁄[
+‹ò\\äN¬Çà€€ú›ùê€€ôö\õHH‹ò\\ãú]Y\ûTŸ[X›‹ä	÷Ÿ]KXX›[€èHò€€ôö\õHóI N¬à€€ú›ùêÿ[òŸ[H‹ò\\ãú]Y\ûTŸ[X›‹ä	÷Ÿ]KXX›[€èHòÿ[òŸ[óI N¬à€€ú›€‹ŸVH‹ò\\ãú]Y\ûTŸ[X›‹ä	Àõ[Ÿ[X€‹ŸK^	 N¬à€€ú›⁄”Y]öX‹»H‹ò\\ãú]Y\ûTŸ[X›‹ä…Ÿ[]SY]öX‹“YX
+N¬à€€ú›⁄–YŸ[ùH‹ò\\ãú]Y\ûTŸ[X›‹ä…Ÿ[]Qúõ€PYŸ[ùYX
+N¬Çàù[ò›[€à€X[ù\
+
+H¬àûH»ùê€€ôö\õH	âàùê€€ôö\õKúô[[›ôQ]ô[ù\›[ô\ä	ÿ€X⁄…À€ê€€ôö\õJN»Hÿ]⁄
+JH»BàûH»ùêÿ[òŸ[	âàùêÿ[òŸ[úô[[›ôQ]ô[ù\›[ô\ä	ÿ€X⁄…À€êÿ[òŸ[
+N»Hÿ]⁄
+JH»BàûH»€‹ŸV	âà€‹ŸVúô[[›ôQ]ô[ù\›[ô\ä	ÿ€X⁄…À€êÿ[òŸ[
+N»Hÿ]⁄
+JH»BàûH»‹ò\\ãúô[[›ôQ]ô[ù\›[ô\ä	ÿ€X⁄…À€êòX⁄Ÿõ‹
+N»Hÿ]⁄
+JH»BàÀ»YH[[YYX][H€»^]‹öY⁄ŸY\»]\»€€ôK[àô[[›ôH€àô^úò[YBàÀ»»]ŸXí⁄]	‹»òX⁄Ÿõ‹Yö[\à€€\‹⁄]‹à^Y\àŸ]HôYõ‹ôHHô^àÀ»X›[€à
+ﬁ[ò⁄õ€õ›\»ô[[›ò[ÿ]\Ÿ\»úöYYà^[›][ú›Xö[]H[àŸXí⁄]
+KÇà‹ò\\ãú›[Kùö\⁄Xö[]HH	⁄Y[âŒ¬à‹ò\\ãú›[Kú⁄[ù\ë]ô[ù»H	€õ€ôIŒ¬àô\]Y\›[ö[X][€ëúò[YJ
+
+HOà¬àûH»‹ò\\ãú\ô[ùõŸH	âà‹ò\\ãú\ô[ùõŸKúô[[›ôP⁄[
+‹ò\\äN»Hÿ]⁄
+JH»BàJN¬àBÇàù[ò›[€à€ê€€ôö\õJ
+H¬à€€ú›[]SY]öX‹»H⁄”Y]öX‹»»⁄”Y]öX‹Àò⁄X⁄ŸYàò[ŸN¬à€€ú›[]Qúõ€PYŸ[ùH⁄–YŸ[ù»⁄–YŸ[ùò⁄X⁄ŸYàò[ŸN¬à€X[ù\
+
+N¬àô\€€ôJ»€€ôö\õYYàùYK[]SY]öX‹À[]Qúõ€PYŸ[ùJN¬àBÇàù[ò›[€à€êÿ[òŸ[
+
+H¬à€X[ù\
+
+N¬àô\€€ôJ»€€ôö\õYYàò[ŸK[]SY]öX‹Œàò[ŸK[]Qúõ€PYŸ[ùàò[ŸHJN¬àBÇàù[ò›[€à€êòX⁄Ÿõ‹
+JH¬àYà
+Kù\ôŸ]OOH‹ò\\äH€êÿ[òŸ[
+
+N¬àBÇàùê€€ôö\õH	âàùê€€ôö\õKòY]ô[ù\›[ô\ä	ÿ€X⁄…À€ê€€ôö\õJN¬àùêÿ[òŸ[	âàùêÿ[òŸ[òY]ô[ù\›[ô\ä	ÿ€X⁄…À€êÿ[òŸ[
+N¬à€‹ŸV	âà€‹ŸVòY]ô[ù\›[ô\ä	ÿ€X⁄…À€êÿ[òŸ[
+N¬à‹ò\\ãòY]ô[ù\›[ô\ä	ÿ€X⁄…À€êòX⁄Ÿõ‹
+N¬àJN¬üBÇãÀ»^‹ŸH[]Q]öXŸH»⁄\ôYò[Y\‹XŸBùûH¬à⁄[ô›Àó◊‹W‹⁄\ôYô[]Q]öXŸHH[]Q]öXŸN¬üHÿ]⁄
+JH»€€ú€€Kùÿ\õä	—òZ[Y»^‹ŸH[]Q]öXŸH»⁄\ôYò[Y\‹XŸIÀJN»BÇãÀ»OOOOOH]öXŸ\»X[òYŸ[Y[ùOOOOOBôù[ò›[€à[ö]]öXŸ\’RJ
+H¬àYà
+]öXŸ\’ìKùZR[ö]X[^ôY
+H¬àô]\õé¬àBà]öXŸ\’ìKùZR[ö]X[^ôYHùYN¬ÇàÀ»[ö]X[^ôHXõH›\›€Z^ô\Çà[ö]]öXŸ\’XõP›\›€Z^ô\ä
+N¬ÇàÀ»⁄YXò\àŸŸ€Bà€€ú›⁄YXò\ïŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹⁄YXò\ó›ŸŸ€I N¬à€€ú›⁄YXò\àHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	Àô]öXŸ\À\⁄YXò\â N¬àYà
+⁄YXò\ïŸŸ€H	âà⁄YXò\äH¬à⁄YXò\ïŸŸ€KòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à⁄YXò\ãò€\‹”\›ùŸŸ€J	ÿ€€\ŸY	 N¬àJN¬ÇàÀ»›\ù€€\ŸY€à[ÿö[Hõ‹à€X[ô\àVàYà
+⁄[ô›Àö[õô\ï⁄YHL
+H¬à⁄YXò\ãò€\‹”\›òY
+	ÿ€€\ŸY	 N¬àBàBÇà€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹ŸX\ò⁄	 N¬àYà
+ŸX\ò⁄[ú]
+H¬àŸX\ò⁄[ú]ùò[YHH]öXŸ\’ìKôö[\úÀú]Y\ûN¬à€€ú›[ôTŸX\ò⁄HXõ›[òŸJ
+]ô[ù
+HOà¬à]öXŸ\’ìKôö[\úÀú]Y\ûHH
+]ô[ùù\ôŸ]ùò[YH	… Kùö[J
+N¬à\Q]öXŸQö[\ú 
+N¬àKå
+N¬àŸX\ò⁄[ú]òY]ô[ù\›[ô\ä	⁄[ú]	À[ôTŸX\ò⁄
+N¬àBÇà€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿYŸ[ùŸö[\â N¬àYà
+YŸ[ùŸ[X›
+H¬àYŸ[ùŸ[X›ùò[YHH]öXŸ\’ìKôö[\úÀòYŸ[ùY¬àYŸ[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+]ô[ù
+HOà¬à]öXŸ\’ìKôö[\úÀòYŸ[ùYH]ô[ùù\ôŸ]ùò[YH	…Œ¬à\Q]öXŸQö[\ú 
+N¬àJN¬àBÇà€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›[ò[ùŸö[\â N¬àYà
+[ò[ùŸ[X›
+H¬à[ò[ùŸ[X›ùò[YHH]öXŸ\’ìKôö[\úÀù[ò[ùY¬à[ò[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+]ô[ù
+HOà¬à]öXŸ\’ìKôö[\úÀù[ò[ùYH]ô[ùù\ôŸ]ùò[YH	…Œ¬à\Q]öXŸQö[\ú 
+N¬àJN¬àBÇà€€ú›X[ùYòX›\ô\îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€X[ùYòX›\ô\óŸö[\â N¬àYà
+X[ùYòX›\ô\îŸ[X›
+H¬àX[ùYòX›\ô\îŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+]ô[ù
+HOà¬à]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\àH]ô[ùù\ôŸ]ùò[YH	…Œ¬à\Q]öXŸQö[\ú 
+N¬àJN¬àBÇà€€ú›€‹ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹€‹ù‹Ÿ[X›	 N¬àYà
+€‹ùŸ[X›
+H¬à€‹ùŸ[X›ùò[YHH]öXŸ\’ìKôö[\úÀú€‹ùŸ^N¬à€‹ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+]ô[ù
+HOà¬àŸ]]öXŸT€‹ù
+]ô[ùù\ôŸ]ùò[YK]öXŸ\’ìKôö[\úÀú€‹ù\äN¬àJN¬àBÇà€€ú›€‹ù\êùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹€‹ùŸ\óÿùâ N¬àYà
+€‹ù\êùäH¬à€‹ù\êùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›ô^\àH]öXŸ\’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	Ÿ\ÿ…»à	ÿ\ÿ…Œ¬àŸ]]öXŸT€‹ù
+]öXŸ\’ìKôö[\úÀú€‹ùŸ^Kô^\äN¬àJN¬àBÇà€€ú›öY]’ŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›öY]◊›ŸŸ€I N¬àYà
+öY]’ŸŸ€JH¬àöY]’ŸŸ€KòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬à€€ú›ùàH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	÷Ÿ]K]öY]◊I N¬àYà
+XùäHô]\õé¬àŸ]]öXŸ\’öY] ùãôŸ]]öXù]J	Ÿ]K]öY]… JN¬àJN¬àBÇà€€ú››]\—ö[\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹›]\◊Ÿö[\â N¬àYà
+›]\—ö[\äH¬à›]\—ö[\ãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬à€€ú›ùàH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	÷Ÿ]K\›]\◊I N¬àYà
+XùäHô]\õé¬àŸŸ€T›]\—ö[\äùãôŸ]]öXù]J	Ÿ]K\›]\… JN¬àJN¬àBÇà€€ú›€€ú›[XXõQö[\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿ€€ú›[XXõWŸö[\â N¬àYà
+€€ú›[XXõQö[\äH¬à€€ú›[XXõQö[\ãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬à€€ú›ùàH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	÷Ÿ]KXò[ôI N¬àYà
+XùäHô]\õé¬àŸŸ€P€€ú›[XXõQö[\äùãôŸ]]öXù]J	Ÿ]KXò[ô	 JN¬àJN¬àBÇà€€ú›ô\Ÿ]ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹ô\Ÿ]Ÿö[\ú… N¬àYà
+ô\Ÿ]ùäH¬àô\Ÿ]ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àô\Ÿ]]öXŸQö[\ú N¬àBÇà€€ú›⁄\»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿX›]ôWŸö[\ú… N¬àYà
+⁄\»	âàX⁄\Àô]\Ÿ]òõ›[ô
+H¬à⁄\Àô]\Ÿ]òõ›[ôH	›ùYIŒ¬à⁄\ÀòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬à€€ú›ùàH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€ñŸ]KYö[\óI N¬àYà
+XùäHô]\õé¬à[ôQö[\ê⁄\ô[[›ôJùãôŸ]]öXù]J	Ÿ]KYö[\â JN¬àJN¬àBÇà€€ú›XõHHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõI N¬àYà
+XõJH¬à€€ú›XYHXõKú]Y\ûTŸ[X›‹ä	›XY	 N¬àYà
+XY	âàZXYô]\Ÿ]òõ›[ô
+H¬àXYô]\Ÿ]òõ›[ôH	›ùYIŒ¬àÀ»ö[ô›\›€Z^ô\àXY\à]ô[ù»
+[ò€Y\»€‹ù[ô»[ôô\⁄^ö[ô BàYà
+]öXŸ\’ìKùXõP›\›€Z^ô\äH¬à]öXŸ\’ìKùXõP›\›€Z^ô\ãòö[ôXY\ë]ô[ù XY
+N¬àBàBàÀ»Y€X⁄»[ô\àõ‹à€X⁄ÿXõHõ›‹»
+ö[KY^‹ô\à›[HŸ[X›[€äBà€€ú›õŸHHXõKú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+õŸH	âà]õŸKô]\Ÿ]úõ›–€X⁄–õ›[ô
+H¬àõŸKô]\Ÿ]úõ›–€X⁄–õ›[ôH	›ùYIŒ¬àõŸKòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬àÀ»€â›öYŸŸ\àõ›»€X⁄»Yà€X⁄⁄[ô»€àHù]€à‹àX›[€ú»€€[[ÇàYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀùXõKXX›[€ú… H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀòX›[€úÀX€€	 JH¬àô]\õé¬àBà€€ú›õ›»H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	›ãô]öXŸK\õ›ÀX€X⁄ÿXõI N¬àYà
+\õ› Hô]\õé¬à€€ú›Ÿ\öX[Hõ›ÀôŸ]]öXù]J	Ÿ]K\Ÿ\öX[	 N¬à€€ú›\Hõ›ÀôŸ]]öXù]J	Ÿ]KZ\	 N¬à€€ú›]öXŸRYHŸ\öX[\¬àYà
+]öXŸRY
+H¬àÀ»ö[KY^‹ô\à›[Nà€X⁄»Ÿ[X›À›XõKX€X⁄»‹[ú»]Z[¬à[ôQ]öXŸTŸ[X›[€ä]öXŸRY]ô[ù
+N¬àBàJN¬àÀ»›XõKX€X⁄»‹[ú»]öXŸH]Z[¬àõŸKòY]ô[ù\›[ô\ä	Ÿõ€X⁄…À
+]ô[ù
+HOà¬àYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀùXõKXX›[€ú… H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÀòX›[€úÀX€€	 JH¬àô]\õé¬àBà€€ú›õ›»H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	›ãô]öXŸK\õ›ÀX€X⁄ÿXõI N¬àYà
+\õ› Hô]\õé¬à€€ú›Ÿ\öX[Hõ›ÀôŸ]]öXù]J	Ÿ]K\Ÿ\öX[	 N¬à€€ú›\Hõ›ÀôŸ]]öXù]J	Ÿ]KZ\	 N¬à€€ú›€⁄›\HŸ\öX[\¬àYà
+€⁄›\
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›‘ö[ù\ë]Z[ €⁄›\	‹ÿ]ôY	 N¬àBàJN¬àBàBÇàÀ»Y€X⁄»[ô\àõ‹à€X⁄ÿXõH]öXŸHÿ\ô»
+ö[KY^‹ô\à›[HŸ[X›[€äBà€€ú›ÿ\ô–€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬àYà
+ÿ\ô–€€ùZ[ô\à	âàXÿ\ô–€€ùZ[ô\ãô]\Ÿ]òÿ\ô€X⁄–õ›[ô
+H¬àÿ\ô–€€ùZ[ô\ãô]\Ÿ]òÿ\ô€X⁄–õ›[ôH	›ùYIŒ¬àÿ\ô–€€ùZ[ô\ãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬àÀ»€â›öYŸŸ\àÿ\ô€X⁄»Yà€X⁄⁄[ô»€àHù]€à‹àX›[€ú»\ôXBàYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	Àô]öXŸKXÿ\ôXX›[€ú… JH¬àô]\õé¬àBà€€ú›ÿ\ôH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	Àô]öXŸKXÿ\ôX€X⁄ÿXõI N¬àYà
+Xÿ\ô
+Hô]\õé¬à€€ú›Ÿ\öX[Hÿ\ôôŸ]]öXù]J	Ÿ]K\Ÿ\öX[	 N¬à€€ú›\Hÿ\ôôŸ]]öXù]J	Ÿ]KZ\	 N¬à€€ú›]öXŸRYHŸ\öX[\¬àYà
+]öXŸRY
+H¬àÀ»ö[KY^‹ô\à›[Nà€X⁄»Ÿ[X›À›XõKX€X⁄»‹[ú»]Z[¬à[ôQ]öXŸTŸ[X›[€ä]öXŸRY]ô[ù
+N¬àBàJN¬àÀ»›XõKX€X⁄»‹[ú»]öXŸH]Z[¬àÿ\ô–€€ùZ[ô\ãòY]ô[ù\›[ô\ä	Ÿõ€X⁄…À
+]ô[ù
+HOà¬àYà
+]ô[ùù\ôŸ]ò€‹Ÿ\›
+	ÿù]€â H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	Àô]öXŸKXÿ\ôXX›[€ú… JH¬àô]\õé¬àBà€€ú›ÿ\ôH]ô[ùù\ôŸ]ò€‹Ÿ\›
+	Àô]öXŸKXÿ\ôX€X⁄ÿXõI N¬àYà
+Xÿ\ô
+Hô]\õé¬à€€ú›Ÿ\öX[Hÿ\ôôŸ]]öXù]J	Ÿ]K\Ÿ\öX[	 N¬à€€ú›\Hÿ\ôôŸ]]öXù]J	Ÿ]KZ\	 N¬à€€ú›€⁄›\HŸ\öX[\¬àYà
+€⁄›\
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›‘ö[ù\ë]Z[ €⁄›\	‹ÿ]ôY	 N¬àBàJN¬àBÇàﬁ[ò—]öXŸ\’öY]’ŸŸ€J
+N¬àﬁ[ò—]öXŸT€‹ù€€ùõ€ 
+N¬àﬁ[ò—]öXŸ\–YŸ[ùö[\ì‹[€ú 
+N¬àôYúô\⁄]öXŸQö[\ú 
+N¬àﬁ[ò—]öXŸT]ZX⁄—ö[\ú 
+N¬àô[ô\ë]öXŸ\”›ô\ùöY] 
+N¬àﬁ[ò’[ò[ùö[\ì‹[€ú 	Ÿ]öXŸ\… N¬ÇàÀ»[ö]X[^ôH€€ù^Y[ùHõ‹à]öXŸ\»XõH[ôÿ\ô¬àYà
+⁄[ô›ÀîP€€ù^Y[ùJH¬à€€ú›]öXŸ\’XõHHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõI N¬àYà
+]öXŸ\’XõJH¬à⁄[ô›ÀîP€€ù^Y[ùKö[ö]]öXŸP€€ù^Y[ùJ]öXŸ\’XõJN¬àBà€€ú›]öXŸ\–ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬àYà
+]öXŸ\–ÿ\ô H¬à⁄[ô›ÀîP€€ù^Y[ùKö[ö]]öXŸP€€ù^Y[ùJ]öXŸ\–ÿ\ô N¬àBàBüBÇã äÇà
+à[ö]X[^ôHH]öXŸ\»XõH›\›€Z^ô\Çà
+ã¬ôù[ò›[€à[ö]]öXŸ\’XõP›\›€Z^ô\ä
+H¬àYà
+]öXŸ\’ìKùXõP›\›€Z^ô\äHô]\õé¬ÇàÀ»€õH[ö]X[^ôHYàXõP›\›€Z^ô\à\»]òZ[XõBàYà
+\[Ÿà⁄[ô›ÀïXõP›\›€Z^ô\àOOH	›[ôYö[ôY	 H¬à€€ú€€Kùÿ\õä	’XõP›\›€Z^ô\àõ›]òZ[XõI N¬àô]\õé¬àBÇàÀ»‹ôX]H›\›€Z^ô\à[ú›[òŸBà]öXŸ\’ìKùXõP›\›€Z^ô\àHô]»⁄[ô›ÀïXõP›\›€Z^ô\ä	Ÿ]öXŸ\…À¬à€€[[ëYúŒà⁄[ô›ÀëUíP—T◊–””SSó—QíSíUS”î»◊Kà\ú⁄\›€€ôöYŒàùYKà[òXõTô\⁄^ôNàùYKà[òXõTô[‹ô\éàùYKà[òXõP€€[[ìY[ùNàùYKà[òXõQ^‹ùàùYKà€î€‹ùà
+€‹ù›]JHOà¬àÀ»ﬁ[ò»⁄]]öXŸ\’ìHö[\ú¬àYà
+€‹ù›]KöŸ^JH¬à]öXŸ\’ìKôö[\úÀú€‹ùŸ^HH€‹ù›]KöŸ^N¬à]öXŸ\’ìKôö[\úÀú€‹ù\àH€‹ù›]Kô\é¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀëUíP—T◊‘”‘ï“—VK€‹ù›]KöŸ^JN¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀëUíP—T◊‘”‘ï—Tã€‹ù›]Kô\äN¬àﬁ[ò—]öXŸT€‹ù€€ùõ€ 
+N¬à\Q]öXŸQö[\ú 
+N¬àBàKà€ê€€[[ê⁄[ôŸNà
+
+HOà¬àÀ»ôK\ô[ô\àXõH⁄[à€€[[ú»⁄[ôŸBàô[ô\ë]öXŸ\’XõRXY\ä
+N¬àYà
+]öXŸ\’ìKùöY]»OOH	›XõI H¬àô[ô\ë]öXŸUXõJ]öXŸ\’ìKôö[\ôY
+N¬àBàKà€ë^‹ùà
+
+HOà¬àÀ»^‹ù›\úô[ùö[\ôY]BàYà
+]öXŸ\’ìKùXõP›\›€Z^ô\äH¬à€€ú›[Y\›[\Hô]»]J
+Kù“T”‘›ö[ô 
+Kú‹]
+	’	 VÃN¬à]öXŸ\’ìKùXõP›\›€Z^ô\ãô^‹ù–‘’ä]öXŸ\’ìKôö[\ôYö[ùX\›\ãY]öXŸ\ÀI›[Y\›[\Kò‹›ò
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYÀú⁄›’ÿ\›Àä	—]öXŸ\»^‹ùY»‘’âÀ	‹›XÿŸ\‹… N¬àBàBàJN¬ÇàÀ»ô[ô\à€€ò\Çà€€ú›€€ò\ê€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõWÿ›\›€Z^ô\ó›€€ò\â N¬àYà
+€€ò\ê€€ùZ[ô\äH¬à€€ò\ê€€ùZ[ô\ãö[õô\íSH]öXŸ\’ìKùXõP›\›€Z^ô\ãúô[ô\ï€€ò\ä
+N¬à]öXŸ\’ìKùXõP›\›€Z^ô\ãòö[ô€€ò\ë]ô[ù €€ò\ê€€ùZ[ô\äN¬àBÇàÀ»ô[ô\à[ö]X[XY\Çàô[ô\ë]öXŸ\’XõRXY\ä
+N¬ÇàÀ»^‹ŸH[\àù[ò›[€ú»€à⁄\ôYõ‹à\ŸHûH€€[[àô[ô\ô\ú¬à⁄[ô›Àó◊‹W‹⁄\ôYúô[ô\ë]öXŸT›]\–òYŸHHô[ô\ë]öXŸT›]\–òYŸN¬à⁄[ô›Àó◊‹W‹⁄\ôYúô[ô\ï€ô\êò\ú»Hô[ô\ï€ô\êò\úŒ¬üBÇò\ﬁ[ò»ù[ò›[€àÿY]öXŸ\ õ‹òŸHHò[ŸJH¬à[ö]]öXŸ\’RJ
+N¬àYà
+]öXŸ\’ìKõÿY[ô»	âàYõ‹òŸJH¬àô]\õé¬àBà]öXŸ\’ìKõÿY[ô»HùYN¬àô[ô\ë]öXŸ\”ÿY[ô 
+N¬à€€ú›Y]öX‹‘õ€Z\ŸHHô]⁄õY]Y]öX‹‘€ò\⁄›
+
+Kòÿ]⁄
+\úàOà¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»ô]⁄õY]Y]öX‹»õ‹à]öXŸ\»XâÀ\úäN¬àô]\õàù[¬àJN¬à€€ú›YŸ[ù‘õ€Z\ŸHH[ú›\ôPYŸ[ù\ôX›‹ûJ
+N¬à€€ú›[ò[ùõ€Z\ŸHH[ú›\ôU[ò[ù\ôX›‹ûJ
+N¬àûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+	Àÿ\K›åKŸ]öXŸ\À€\›	 N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬àBà]ÿZ]YŸ[ù‘õ€Z\ŸN¬à]ÿZ][ò[ùõ€Z\ŸN¬à€€ú›]öXŸ\»H]ÿZ]ô\‹€úŸKöú€€ä
+N¬à]öXŸ\’ìKö][\»H[úöX⁄]öXŸ\ \úò^Kö\–\úò^J]öXŸ\ H»]öXŸ\»à◊JN¬à]öXŸ\’ìKú›]Àù›[H]öXŸ\’ìKö][\Àõ[ô›¬à]öXŸ\’ìKô\úõ‹àHù[¬à]öXŸ\’ìKõÿYYHùYN¬àôYúô\⁄]öXŸQö[\ú 
+N¬à\Q]öXŸQö[\ú 
+N¬àHÿ]⁄
+\úõ‹äH¬à]öXŸ\’ìKô\úõ‹àH\úõ‹é¬àô[ô\ë]öXŸ\—\úõ‹ä\úõ‹äN¬àHö[ò[H¬à]öXŸ\’ìKõÿY[ô»Hò[ŸN¬àBÇàY]öX‹‘õ€Z\ŸKù[ä€ò\⁄›Oà¬àYà
+€ò\⁄›
+H¬à]öXŸ\’ìKõY]öX‹Àú›[[X\ûHH€ò\⁄›ú›[[X\ûN¬à]öXŸ\’ìKõY]öX‹ÀòYŸ‹ôYÿ]YH€ò\⁄›òYŸ‹ôYÿ]Y¬à]öXŸ\’ìKõY]öX‹Àõ\›ô]⁄YH€ò\⁄›ôô]⁄Y]ô]»]J
+N¬àBàô[ô\ë]öXŸ\”›ô\ùöY] 
+N¬àJN¬üBÇôù[ò›[€àô[ô\ë]öXŸ\”ÿY[ô 
+H¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬àYà
+ÿ\ô H¬àÿ\ôÀò€\‹”\›úô[[›ôJ	⁄Y[â N¬àÿ\ôÀö[õô\íSH	œ]à€\‹œHõ]]Y]^èìÿY[ô»]öXŸ\¯†)èŸ]èâŒ¬àBà€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõW›‹ò\\â N¬àYà
+‹ò\\äH¬à€€ú›õŸHH‹ò\\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+õŸJH¬à€€ú›ö\⁄XõP€€€›[ùH]öXŸ\’ìKùXõP›\›€Z^ô\èÀôŸ]ö\⁄XõP€€[[ú 
+OÀõ[ô›Lé¬àõŸKö[õô\íSHèè€€‹[èHâ›ö\⁄XõP€€€›[ùHà€\‹œHõ]]Y]^èìÿY[ô»]öXŸ\¯†)è›è›èò¬àBàBüBÇôù[ò›[€àô[ô\ë]öXŸ\—\úõ‹ä\úõ‹äH¬à€€ú›Y\‹ÿYŸHH\úõ‹à	âà\úõ‹ãõY\‹ÿYŸH»\úõ‹ãõY\‹ÿYŸHà	’[ö€õ›€à\úõ‹âŒ¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬àYà
+ÿ\ô H¬àÿ\ôÀò€\‹”\›úô[[›ôJ	⁄Y[â N¬àÿ\ôÀö[õô\íSH]à€\‹œHô\úõ‹ã]^èëòZ[Y»ÿY]öXŸ\Œà	Ÿ\ÿÿ\R[
+Y\‹ÿYŸJ_OŸ]èò¬àBà€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõW›‹ò\\â N¬àYà
+‹ò\\äH¬à€€ú›õŸHH‹ò\\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+õŸJH¬à€€ú›ö\⁄XõP€€€›[ùH]öXŸ\’ìKùXõP›\›€Z^ô\èÀôŸ]ö\⁄XõP€€[[ú 
+OÀõ[ô›Lé¬àõŸKö[õô\íSHèè€€‹[èHâ›ö\⁄XõP€€€›[ùHà€\‹œHô\úõ‹ã]^èëòZ[Y»ÿY]öXŸ\Œà	Ÿ\ÿÿ\R[
+Y\‹ÿYŸJ_O›è›èò¬àBàBüBÇò\ﬁ[ò»ù[ò›[€àô]⁄õY]Y]öX‹‘€ò\⁄›
+
+H¬à€€ú›õ›»H]Kõõ› 
+N¬àYà
+Y]öX‹’ìKú›[[X\ûH	âàY]öX‹’ìKòYŸ‹ôYÿ]Y	âàY]öX‹’ìKõ\›ô]⁄Y
+H¬à€€ú›YŸHHõ›»HY]öX‹’ìKõ\›ô]⁄YôŸ][YJ
+N¬àYà
+YŸHUíP—T◊”QUíP‘◊”PV–Q—W”T H¬àô]\õà¬à›[[X\ûNàY]öX‹’ìKú›[[X\ûKàYŸ‹ôYÿ]YàY]öX‹’ìKòYŸ‹ôYÿ]Yàô]⁄Y]àY]öX‹’ìKõ\›ô]⁄YàN¬àBàBà€€ú›ò[ôŸHHY]öX‹’ìKúò[ôŸHQUíP‘◊—QêUS‘êSë—N¬à€€ú›⁄[òŸHHô]»]Jõ›»HŸ]Y]öX‹‘ò[ôŸU⁄[ô› ò[ôŸJJN¬à€€ú›\ò[\»Hô]»TìŸX\ò⁄\ò[\ »⁄[òŸNà⁄[òŸKù“T”‘›ö[ô 
+HJN¬à€€ú›‹›[[X\ûTô\‹YŸ‹ôYÿ]Yô\‹HH]ÿZ]õ€Z\ŸKò[
+¬àô]⁄
+	Àÿ\K€Y]öX‹… Kàô]⁄
+ÿ\K€Y]öX‹ÀÿYŸ‹ôYÿ]Y…‹\ò[\Àù‘›ö[ô 
+_X
+BàJN¬àYà
+\›[[X\ûTô\‹õ⁄ H¬àõ›»ô]»\úõ‹ä	‘›[[X\ûHô\]Y\›òZ[Yà	»
+»›[[X\ûTô\‹ú›]\ N¬àBàYà
+XYŸ‹ôYÿ]Yô\‹õ⁄ H¬àõ›»ô]»\úõ‹ä	–YŸ‹ôYÿ]Yô\]Y\›òZ[Yà	»
+»YŸ‹ôYÿ]Yô\‹ú›]\ N¬àBà€€ú››[[X\ûHH]ÿZ]›[[X\ûTô\‹öú€€ä
+N¬à€€ú›YŸ‹ôYÿ]YH]ÿZ]YŸ‹ôYÿ]Yô\‹öú€€ä
+N¬àô]\õà»›[[X\ûKYŸ‹ôYÿ]Yô]⁄Y]àô]»]J
+HN¬üBÇôù[ò›[€àô[ô\ë]öXŸ\”›ô\ùöY] 
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€›ô\ùöY]◊€Y]öX‹… N¬àYà
+X€€ùZ[ô\äHô]\õé¬àYà
+Y]öXŸ\’ìKõY]öX‹Àú›[[X\ûHY]öXŸ\’ìKõY]öX‹ÀòYŸ‹ôYÿ]Y
+H¬à€€ùZ[ô\ãö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èëõY]Y]öX‹»[ò]òZ[XõKèŸ]èâŒ¬àô]\õé¬àBà€€ú››[»H]öXŸ\’ìKõY]öX‹ÀòYŸ‹ôYÿ]YÀôõY]Àù›[»ﬂN¬à€€ú››]\Ÿ\»H]öXŸ\’ìKõY]öX‹ÀòYŸ‹ôYÿ]YÀôõY]Àú›]\Ÿ\»ﬂN¬à€€ú›\›‹ûHH]öXŸ\’ìKõY]öX‹ÀòYŸ‹ôYÿ]YÀôõY]Àö\›‹ûOÀù›[⁄[\ô\‹⁄[€ú»◊N¬à€€ú›õ›Y⁄]Hÿ[›[]Uõ›Y⁄]
+\›‹ûJN¬à€€ú›ò[ôŸSXô[HY]öX‹‘ò[ôŸSXô[
+Y]öX‹’ìKúò[ôŸHQUíP‘◊—QêUS‘êSë—JN¬à€€ùZ[ô\ãö[õô\íSHà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèêYŸ[ùœŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\ä›[ÀòYŸ[ù»]öXŸ\’ìKõY]öX‹Àú›[[X\ûKòYŸ[ù◊ÿ€›[ù
+_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èê€€õôX›YŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]öXŸ\œŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\ä›[Àô]öXŸ\»]öXŸ\’ìKõY]öX‹Àú›[[X\ûKô]öXŸ\◊ÿ€›[ù
+_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èìX[òYŸYõY]Ÿ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèïõ›Y⁄]
+	‹ò[ôŸSXô[JOŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\äX]úõ›[ô
+õ›Y⁄]
+J_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èë\›[X]YYŸ\À⁄›\èŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèê[\ùœŸ]èÇà	‹ô[ô\ìY]öX‹‘›]\–⁄\ ›]\Ÿ\ _Bà]à€\‹œHõY]öXÀYõ€›õ›HèâŸ]öXŸ\’ìKõY]öX‹Àõ\›ô]⁄Y»	’\]Y	»
+»õ‹õX]ô[]]ôU[YJ]öXŸ\’ìKõY]öX‹Àõ\›ô]⁄Y
+Hà	…ﬂOŸ]èÇàŸ]èÇà¬üBÇôù[ò›[€àôYúô\⁄]öXŸQö[\ú 
+H¬à€€ú›X[ùYòX›\ô\îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€X[ùYòX›\ô\óŸö[\â N¬àYà
+[X[ùYòX›\ô\îŸ[X›
+Hô]\õé¬à€€ú›X[ùYòX›\ô\ú»H\úò^Kôúõ€Jô]»Ÿ]
+
+]öXŸ\’ìKö][\»◊JKõX\
+Oà
+õX[ùYòX›\ô\à	… Kùö[J
+JKôö[\äõ€€X[äJJKú€‹ù
+
+KäHOàKõÿÿ[P€€\\ôJã[ôYö[ôY»Ÿ[ú⁄]]ö]Nà	ÿò\ŸI»JJN¬à]‹[€ú»H	œ‹[€àò[YOHàèê[X[ùYòX›\ô\úœ€‹[€èâŒ¬àX[ùYòX›\ô\úÀôõ‹ëXX⁄
+ò[YHOà¬à‹[€ú»
+œH‹[€àò[YOHâŸ\ÿÿ\R[
+ò[YJ_HèâŸ\ÿÿ\R[
+ò[YJ_O€‹[€èò¬àJN¬àX[ùYòX›\ô\îŸ[X›ö[õô\íSH‹[€úŒ¬àYà
+]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\à	âàX[ùYòX›\ô\úÀö[ò€Y\ ]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\äJH¬àX[ùYòX›\ô\îŸ[X›ùò[YHH]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\é¬àH[ŸH¬àX[ùYòX›\ô\îŸ[X›ùò[YHH	…Œ¬àYà
+]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\äH¬à]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\àH	…Œ¬àBàBüBÇôù[ò›[€àﬁ[ò—]öXŸ\–YŸ[ùö[\ì‹[€ú 
+H¬àYà
+Y]öXŸ\’ìKùZR[ö]X[^ôY
+Hô]\õé¬à€€ú›Ÿ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿYŸ[ùŸö[\â N¬àYà
+\Ÿ[X›
+Hô]\õé¬à€€ú›YŸ[ù»HYŸ[ù\ôX›‹ûKö][\Àú€XŸJ
+Kú€‹ù
+
+KäHOà¬à€€ú›Sò[YHH
+Kõò[YHKö‹›ò[YHKòYŸ[ù⁄Y	… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›ìò[YHH
+ãõò[YHãö‹›ò[YHãòYŸ[ù⁄Y	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+Sò[YHìò[YJHô]\õàLN¬àYà
+Sò[YHàìò[YJHô]\õàN¬àô]\õà¬àJN¬à]‹[€ú»H	œ‹[€àò[YOHàèê[YŸ[ùœ€‹[€èâŒ¬àYŸ[ùÀôõ‹ëXX⁄
+YŸ[ùOà¬à€€ú›Xô[HŸ]YŸ[ù\‹^Sò[YJYŸ[ù
+N¬à‹[€ú»
+œH‹[€àò[YOHâŸ\ÿÿ\R[
+YŸ[ùòYŸ[ù⁄Y
+_HèâŸ\ÿÿ\R[
+Xô[
+_O€‹[€èò¬àJN¬àŸ[X›ö[õô\íSH‹[€úŒ¬àŸ[X›ùò[YHH]öXŸ\’ìKôö[\úÀòYŸ[ùY	…Œ¬üBÇôù[ò›[€à\Q]öXŸQö[\ú 
+H¬àYà
+P\úò^Kö\–\úò^J]öXŸ\’ìKö][\ JH¬àô]\õé¬àBà€€ú›ö[\ú»H]öXŸ\’ìKôö[\úŒ¬à€€ú››[›]\Ÿ\»H‹ôX]T›]\–€›[ùX\
+
+N¬à€€ú›ö[\ôY›]\Ÿ\»H‹ôX]T›]\–€›[ùX\
+
+N¬à€€ú›ö[\ôYH◊N¬à]öXŸ\’ìKö][\Àôõ‹ëXX⁄
+]öXŸHOà¬à€€ú››]\“Ÿ^HH]öXŸKó◊€Y]OÀú›]\œÀò€ŸH	⁄X[IŒ¬àYà
+›[›]\Ÿ\÷‹›]\“Ÿ^WHOOH[ôYö[ôY
+H¬à›[›]\Ÿ\÷‹›]\“Ÿ^WH
+œHN¬àBàYà
+X]⁄\—]öXŸQö[\ú ]öXŸKö[\ú JH¬àö[\ôYú\⁄
+]öXŸJN¬àYà
+ö[\ôY›]\Ÿ\÷‹›]\“Ÿ^WHOOH[ôYö[ôY
+H¬àö[\ôY›]\Ÿ\÷‹›]\“Ÿ^WH
+œHN¬àBàBàJN¬à]öXŸ\’ìKôö[\ôYH€‹ù]öXŸ\ ö[\ôY
+N¬à]öXŸ\’ìKú›]Àôö[\ôYH]öXŸ\’ìKôö[\ôYõ[ô›¬à]öXŸ\’ìKú›]Àù›[H]öXŸ\’ìKö][\Àõ[ô›¬à]öXŸ\’ìKú›]Àù›[›]\Ÿ\»H›[›]\Ÿ\Œ¬à]öXŸ\’ìKú›]Àôö[\ôY›]\Ÿ\»Hö[\ôY›]\Ÿ\Œ¬àô[ô\ë]öXŸ\‘›] 
+N¬àô[ô\ë]öXŸ\–X›]ôQö[\ú 
+N¬àﬁ[ò—]öXŸT]ZX⁄—ö[\ú 
+N¬àYà
+]öXŸ\’ìKùöY]»OOH	›XõI H¬àô[ô\ë]öXŸUXõJ]öXŸ\’ìKôö[\ôY
+N¬àH[ŸH¬àô[ô\ë]öXŸPÿ\ô ]öXŸ\’ìKôö[\ôY
+N¬àBàﬁ[ò—]öXŸUXõT€‹ù[ôXÿ]‹ú 
+N¬üBÇôù[ò›[€àX]⁄\—]öXŸQö[\ú ]öXŸKö[\ú H¬àYà
+Y]öXŸHY]öXŸKó◊€Y]JHô]\õàùYN¬à€€ú›Y]HH]öXŸKó◊€Y]N¬à€€ú›]Y\ûHH
+ö[\úÀú]Y\ûH	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+]Y\ûH	âà
+[Y]KúŸX\ò⁄Y]KúŸX\ò⁄ö[ô^Ÿä]Y\ûJHOOHLJJH¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀòYŸ[ùY	âà]öXŸKòYŸ[ù⁄YOOHö[\úÀòYŸ[ùY
+H¬àô]\õàò[ŸN¬àBà€€ú›[ò[ùYHY]Kù[ò[ùY]öXŸKù[ò[ù⁄Y	…Œ¬àYà
+ö[\úÀù[ò[ùY	âà[ò[ùYOOHö[\úÀù[ò[ùY
+H¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀõX[ùYòX›\ô\à	âà
+]öXŸKõX[ùYòX›\ô\à	… Kùö[J
+HOOHö[\úÀõX[ùYòX›\ô\äH¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀú›]\Ÿ\»	âàö[\úÀú›]\Ÿ\Àú⁄^ôHà	âàYö[\úÀú›]\Ÿ\Àö\ Y]Kú›]\œÀò€ŸH	⁄X[I JH¬àô]\õàò[ŸN¬àBàYà
+ö[\úÀò€€ú›[XXõ\»	âàö[\úÀò€€ú›[XXõ\Àú⁄^ôHà	âàYö[\úÀò€€ú›[XXõ\Àö\ Y]Kò€€ú›[XXõOÀò€ŸH	›[ö€õ›€â JH¬àô]\õàò[ŸN¬àBàô]\õàùYN¬üBÇôù[ò›[€à€‹ù]öXŸ\ \›
+H¬à€€ú›Ÿ^HH]öXŸ\’ìKôö[\úÀú€‹ùŸ^H	€\›‹ŸY[âŒ¬à€€ú›\àH]öXŸ\’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»HàLN¬à€€ú›€‹ùYH\›ú€XŸJ
+N¬à€‹ùYú€‹ù
+
+KäHOà¬à€€ú›Uò[HŸ]]öXŸT€‹ùò[YJKŸ^JN¬à€€ú›ïò[HŸ]]öXŸT€‹ùò[YJãŸ^JN¬àYà
+Uò[ïò[
+Hô]\õàLH
+à\é¬àYà
+Uò[àïò[
+Hô]\õàH
+à\é¬à€€ú›TŸ\öX[H
+KúŸ\öX[	… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›îŸ\öX[H
+ãúŸ\öX[	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+TŸ\öX[îŸ\öX[
+Hô]\õàLN¬àYà
+TŸ\öX[àîŸ\öX[
+Hô]\õàN¬àô]\õà¬àJN¬àô]\õà€‹ùY¬üBÇôù[ò›[€àŸ]]öXŸT€‹ùò[YJ]öXŸKŸ^JH¬à€€ú›Y]HH]öXŸKó◊€Y]HﬂN¬à›⁄]⁄
+Ÿ^JH¬àÿ\ŸH	€X[ùYòX›\ô\âŒÇàô]\õà
+
+]öXŸKõX[ùYòX›\ô\à	… H
+»	»	»
+»
+]öXŸKõ[Ÿ[	… JKù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	ÿYŸ[ù	ŒÇàô]\õà
+Y]KòYŸ[ùò[YH	… Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	›[ò[ù	ŒÇàô]\õàõ‹õX][ò[ù\‹^JY]Kù[ò[ùY]öXŸKù[ò[ù⁄Y	… Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	‹›]\…ŒÇàô]\õàUíP—W‘’UT◊”‘ëTñ€Y]Kú›]\œÀò€ŸH	⁄X[I◊H¬àÿ\ŸH	€ÿÿ][€âŒÇàô]\õà
+Y]Kõÿÿ][€à	… Kù”›Ÿ\êÿ\ŸJ
+N¬àÿ\ŸH	⁄\	ŒÇàô]\õàùZ[€‹ùXõR\ò[YJ]öXŸKö\
+N¬àÿ\ŸH	€\›‹ŸY[âŒÇàYò][Çàô]\õàY]Kõ\›ŸY[ì\»¬àBüBÇôù[ò›[€àùZ[€‹ùXõR\ò[YJò]’ò[YJH¬àYà
+\ò]’ò[YJHô]\õà	ﬁûûâŒ¬à]ò[YHH›ö[ô ò]’ò[YJKùö[J
+N¬àYà
+]ò[YJHô]\õà	ﬁûûâŒ¬ÇàYà
+ò[YKú›\ù’⁄]
+	÷… H	âàò[YKö[ò€Y\ 	◊I JH¬àò[YHHò[YKú€XŸJKò[YKö[ô^Ÿä	◊I JN¬àBÇà€€ú›\ç‹ùX]⁄Hò[YKõX]⁄
+◊äÃKﬂJŒóóÃKﬂJ^ÃﬂJJŒéó
+ O… N¬à€€ú›\çÿ[ôY]HH\ç‹ùX]⁄»\ç‹ùX]⁄ÃWHàò[YN¬àYà
+◊óÃKﬂJóÃKﬂJ^ÃﬂIÀù\›
+\çÿ[ôY]JJH¬à€€ú›ÿ›]»H\çÿ[ôY]Kú‹]
+	Àâ KõX\
+\ùOà¬à€€ú›ù[HH\úŸR[ù
+\ùL
+N¬àYà
+Sù[Xô\ãö\—ö[ö]Jù[JHù[Hù[HàçMJH¬àô]\õàù[¬àBàô]\õà›ö[ô ù[JKúY›\ù
+À	Ã	 N¬àJN¬àYà
+[ÿ›]Àö[ò€Y\ ù[
+JH¬àô]\õà	›çI»
+»ÿ›]Àöõ⁄[ä	Àâ N¬àBàBÇàô]\õà	›çãI»
+»ò[YKù”›Ÿ\êÿ\ŸJ
+N¬üBÇôù[ò›[€àô[ô\ë]öXŸPÿ\ô ]öXŸ\À\[ôHò[ŸJH¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬à€€ú›XõU‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõW›‹ò\\â N¬àYà
+Xÿ\ô Hô]\õé¬àYà
+XõU‹ò\\äH¬àXõU‹ò\\ãò€\‹”\›òY
+	⁄Y[â N¬àBàÿ\ôÀò€\‹”\›úô[[›ôJ	⁄Y[â N¬ÇàYà
+Y]öXŸ\»]öXŸ\Àõ[ô›OOH
+H¬àÿ\ôÀö[õô\íSH	œ]à€\‹œHõ]]Y]^èìõ»]öXŸ\»X]⁄H›\úô[ùö[\úÀèŸ]èâŒ¬à€X[ù\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬àô]\õé¬àBÇàÀ»õŸ‹ô\‹⁄]ôHô[ô\ö[ô»H€õHô[ô\àHYŸH]H[YBàYà
+X\[ô
+H¬à]öXŸ\’ìKúô[ô\ãô\‹^YYH¬àÿ\ôÀö[õô\íSH	…Œ¬àBÇà€€ú››\ùYH]öXŸ\’ìKúô[ô\ãô\‹^YY¬à€€ú›[ôYHX]õZ[ä›\ùY
+»]öXŸ\’ìKúô[ô\ãúYŸT⁄^ôK]öXŸ\Àõ[ô›
+N¬à€€ú›YŸQ]öXŸ\»H]öXŸ\Àú€XŸJ›\ùY[ôY
+N¬ÇàÀ»ô[[›ôH^\›[ô»Ÿ[ù[ô[à€€ú›^\›[ô‘Ÿ[ù[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€ÿY€[‹ôW‹Ÿ[ù[ô[	 N¬àYà
+^\›[ô‘Ÿ[ù[ô[
+H^\›[ô‘Ÿ[ù[ô[úô[[›ôJ
+N¬ÇàÀ»ô[ô\à\»YŸBà€€ú›[HYŸQ]öXŸ\ÀõX\
+]öXŸHOàô[ô\îŸ\ùô\ë]öXŸPÿ\ô
+]öXŸJJKöõ⁄[ä	… N¬àÿ\ôÀö[úŸ\ùYòXŸ[ùS
+	ÿôYõ‹ôY[ô	À[
+N¬à]öXŸ\’ìKúô[ô\ãô\‹^YYH[ôY¬ÇàÀ»YŸ[ù[ô[Yà[‹ôH][\»]òZ[XõBàYà
+[ôY]öXŸ\Àõ[ô›
+H¬à€€ú›Ÿ[ù[ô[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àŸ[ù[ô[öYH	Ÿ]öXŸ\◊€ÿY€[‹ôW‹Ÿ[ù[ô[	Œ¬àŸ[ù[ô[ò€\‹”ò[YHH	Ÿ]öXŸ\À[ÿY\Ÿ[ù[ô[	Œ¬àŸ[ù[ô[ö[õô\íSH	œ]à€\‹œHõÿY[ôÀ\‹[õô\àèèŸ]èè‹[à€\‹œHõ]]Y]^èìÿY[ô»[‹ôH]öXŸ\Àããè‹‹[èâŒ¬àÿ\ôÀò\[ô⁄[
+Ÿ[ù[ô[
+N¬àŸ]\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬àH[ŸH¬à€X[ù\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬àBüBÇã äÇà
+àô[ô\àH]öXŸ\»XõHXY\à\⁄[ô»H›\›€Z^ô\Çà
+ã¬ôù[ò›[€àô[ô\ë]öXŸ\’XõRXY\ä
+H¬à€€ú›XY\îõ›»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõW⁄XY\â N¬àYà
+ZXY\îõ› Hô]\õé¬ÇàYà
+]öXŸ\’ìKùXõP›\›€Z^ô\äH¬àXY\îõ›Àö[õô\íSH]öXŸ\’ìKùXõP›\›€Z^ô\ãúô[ô\íXY\ä
+N¬àÀ»ôKXö[ôXY\à]ô[ù»õ‹à€‹ù[ôÀ‹ô\⁄^ö[ô¬à€€ú›XYHXY\îõ›Àò€‹Ÿ\›
+	›XY	 N¬àYà
+XY
+H¬à]öXŸ\’ìKùXõP›\›€Z^ô\ãòö[ôXY\ë]ô[ù XY
+N¬àBàH[ŸH¬àÀ»ò[òX⁄»»›]X»XY\ÇàÀ»X›[€ú»€€[[àô[[›ôYH\⁄[ô»€€ù^Y[ùH[ú›XY
+öY⁄X€X⁄ BàXY\îõ›Àö[õô\íSHà]K\€‹ùZŸ^OHõX[ùYòX›\ô\àèë]öXŸO›Çà]K\€‹ùZŸ^OHú›]\»èî›]\œ›Çà]K\€‹ùZŸ^OHò€€ú›[XXõ\»èê€€ú›[XXõ\œ›Çà]K\€‹ùZŸ^OHòYŸ[ùèêYŸ[ù›Çà]K\€‹ùZŸ^OHù[ò[ùèï[ò[ù›Çà]K\€‹ùZŸ^OHö\èìô]€‹öœ›Çà]K\€‹ùZŸ^OHõÿÿ][€àèìÿÿ][€è›Çà]K\€‹ùZŸ^OHõ\›‹ŸY[àèì\›ŸY[è›Çà¬àBüBÇôù[ò›[€àô[ô\ë]öXŸUXõJ]öXŸ\À\[ôHò[ŸJH¬à€€ú›ÿ\ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿÿ\ô… N¬à€€ú›‹ò\\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›XõW›‹ò\\â N¬àYà
+]‹ò\\äHô]\õé¬àYà
+ÿ\ô H¬àÿ\ôÀò€\‹”\›òY
+	⁄Y[â N¬àBà‹ò\\ãò€\‹”\›úô[[›ôJ	⁄Y[â N¬ÇàÀ»[ö]X[^ôH‹ö^õ€ù[ÿ‹õ€[ôXÿ]‹ú»õ‹àHXõBà€€ú›XõU‹ò\\àH‹ò\\ãú]Y\ûTŸ[X›‹ä	ÀùXõK]‹ò\\â N¬àYà
+XõU‹ò\\äH¬à[ö]XõTÿ‹õ€[ôXÿ]‹ú XõU‹ò\\äN¬àBÇà€€ú›õŸHH‹ò\\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+]õŸJHô]\õé¬ÇàÀ»Ÿ]ö\⁄XõH€€[[ú»€›[ùõ‹à€€‹[Çà€€ú›ö\⁄XõP€€€›[ùH]öXŸ\’ìKùXõP›\›€Z^ô\èÀôŸ]ö\⁄XõP€€[[ú 
+OÀõ[ô›N¬ÇàYà
+Y]öXŸ\»]öXŸ\Àõ[ô›OOH
+H¬àõŸKö[õô\íSHèè€€‹[èHâ›ö\⁄XõP€€€›[ùHà€\‹œHõ]]Y]^èìõ»]öXŸ\»X]⁄H›\úô[ùö[\úÀè›è›èò¬à€X[ù\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬àô]\õé¬àBÇàÀ»õŸ‹ô\‹⁄]ôHô[ô\ö[ô»H€õHô[ô\àHYŸH]H[YBàYà
+X\[ô
+H¬à]öXŸ\’ìKúô[ô\ãô\‹^YYH¬àõŸKö[õô\íSH	…Œ¬àBÇà€€ú››\ùYH]öXŸ\’ìKúô[ô\ãô\‹^YY¬à€€ú›[ôYHX]õZ[ä›\ùY
+»]öXŸ\’ìKúô[ô\ãúYŸT⁄^ôK]öXŸ\Àõ[ô›
+N¬à€€ú›YŸQ]öXŸ\»H]öXŸ\Àú€XŸJ›\ùY[ôY
+N¬ÇàÀ»ô[[›ôH^\›[ô»Ÿ[ù[ô[à€€ú›^\›[ô‘Ÿ[ù[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€ÿY€[‹ôW‹Ÿ[ù[ô[	 N¬àYà
+^\›[ô‘Ÿ[ù[ô[
+H^\›[ô‘Ÿ[ù[ô[úô[[›ôJ
+N¬ÇàÀ»\ŸH›\›€Z^ô\à»ô[ô\àõ›‹»Yà]òZ[XõBà€€ú›õ›‹»HYŸQ]öXŸ\ÀõX\
+]öXŸHOà¬à€€ú›Y]HH]öXŸKó◊€Y]HﬂN¬à€€ú›Ÿ\öX[H\ÿÿ\R[
+]öXŸKúŸ\öX[	… N¬à€€ú›\H\ÿÿ\R[
+]öXŸKö\	… N¬Çà]õ›–€€ù[ù¬àYà
+]öXŸ\’ìKùXõP›\›€Z^ô\äH¬àõ›–€€ù[ùH]öXŸ\’ìKùXõP›\›€Z^ô\ãúô[ô\îõ› ]öXŸKY]JN¬àH[ŸH¬àÀ»ò[òX⁄»»YÿXﬁHô[ô\ö[ô¬à€€ú›[ò[ùXô[Hõ‹õX][ò[ù\‹^JY]Kù[ò[ùY]öXŸKù[ò[ù⁄Y	… N¬àõ›–€€ù[ùHàÇà]à€\‹œHùXõK\ö[X\ûHèâŸ\ÿÿ\R[
+
+]öXŸKõX[ùYòX›\ô\à	’[ö€õ›€â H
+»	»	»
+»
+]öXŸKõ[Ÿ[	… J_OŸ]èÇà]à€\‹œHõ]]Y]^èîŸ\öX[	Ÿ\ÿÿ\R[
+]öXŸKúŸ\öX[	¯†%	 _OŸ]èÇà›ÇàÇà	‹ô[ô\ë]öXŸT›]\–òYŸJY]Kú›]\ _Bà›ÇàÇà	‹ô[ô\ï€ô\êò\ú Y]Kù€ô\ë]J_Bà›ÇàâŸ\ÿÿ\R[
+Y]KòYŸ[ùò[YH	’[ò\‹⁄Y€ôY	 _O›ÇàâŸ\ÿÿ\R[
+[ò[ùXô[
+_O›ÇàÇà]à€\‹œHùXõK\ö[X\ûHèâŸ\ÿÿ\R[
+]öXŸKö\	”ã–I _OŸ]èÇà	Ÿ]öXŸKö‹›ò[YH»]à€\‹œHõ]]Y]^èâŸ\ÿÿ\R[
+]öXŸKö‹›ò[YJ_OŸ]èòà	…ﬂBà›ÇàâŸ\ÿÿ\R[
+Y]Kõÿÿ][€à	¯†%	 _O›Çà]OHâŸ\ÿÿ\R[
+Y]Kõ\›ŸY[ï€€\	”ô]ô\â _HèâŸ\ÿÿ\R[
+Y]Kõ\›ŸY[îô[]]ôH	”ô]ô\â _O›Çà¬àBÇàô]\õàà]K\Ÿ\öX[Hâ‹Ÿ\öX[Hà]KZ\Hâ⁄\Hà]KXYŸ[ùZYHâŸ\ÿÿ\R[
+]öXŸKòYŸ[ù⁄Y	… _Hà€\‹œHô]öXŸK\õ›ÀX€X⁄ÿXõHà]OHê€X⁄»»öY]»]Z[ÀöY⁄X€X⁄»õ‹àX›[€ú»èâ‹õ›–€€ù[ùO›èò¬àJKöõ⁄[ä	… N¬ÇàõŸKö[úŸ\ùYòXŸ[ùS
+	ÿôYõ‹ôY[ô	Àõ›‹ N¬à]öXŸ\’ìKúô[ô\ãô\‹^YYH[ôY¬ÇàÀ»YŸ[ù[ô[õ›»Yà[‹ôH][\»]òZ[XõBàYà
+[ôY]öXŸ\Àõ[ô›
+H¬à€€ú›Ÿ[ù[ô[õ›»Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	›â N¬àŸ[ù[ô[õ›ÀöYH	Ÿ]öXŸ\◊€ÿY€[‹ôW‹Ÿ[ù[ô[	Œ¬àŸ[ù[ô[õ›Àò€\‹”ò[YHH	Ÿ]öXŸ\À[ÿY\Ÿ[ù[ô[	Œ¬àŸ[ù[ô[õ›Àö[õô\íSH€€‹[èHâ›ö\⁄XõP€€€›[ùHà›[OHù^X[Y€éòŸ[ù\é‹Y[ôŒåMú»èè]à€\‹œHõÿY[ôÀ\‹[õô\àà›[OHô\‹^Nö[õ[ôKXõÿ⁄Œ€X\ô⁄[ã\öY⁄é»èèŸ]èè‹[à€\‹œHõ]]Y]^èìÿY[ô»[‹ôH]öXŸ\Àããè‹‹[èè›ò¬àõŸKò\[ô⁄[
+Ÿ[ù[ô[õ› N¬àŸ]\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬àH[ŸH¬à€X[ù\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬àBüBÇãÀ»Ÿ]\[ù\úŸX›[€ìÿúŸ\ùô\àõ‹à]öXŸ\»[ôö[ö]Hÿ‹õ€ôù[ò›[€àŸ]\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+H¬à€X[ù\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+N¬Çà€€ú›Ÿ[ù[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€ÿY€[‹ôW‹Ÿ[ù[ô[	 N¬àYà
+\Ÿ[ù[ô[
+Hô]\õé¬Çà]öXŸ\’ìKúô[ô\ãõÿúŸ\ùô\àHô]»[ù\úŸX›[€ìÿúŸ\ùô\ä
+[ùöY\ HOà¬à[ùöY\Àôõ‹ëXX⁄
+[ùûHOà¬àYà
+[ùûKö\“[ù\úŸX›[ô»	âà]öXŸ\’ìKúô[ô\ãô\‹^YY]öXŸ\’ìKôö[\ôYõ[ô›
+H¬àÿY[‹ôQ]öXŸ\ 
+N¬àBàJN¬àK¬àõ€›àù[àõ€›X\ô⁄[éà	Ãå	Ààô\⁄€ààJN¬Çà]öXŸ\’ìKúô[ô\ãõÿúŸ\ùô\ãõÿúŸ\ùôJŸ[ù[ô[
+N¬üBÇãÀ»€X[ù\H]öXŸ\»[ôö[ö]Hÿ‹õ€ÿúŸ\ùô\Çôù[ò›[€à€X[ù\]öXŸ\“[ôö[ö]Tÿ‹õ€
+
+H¬àYà
+]öXŸ\’ìKúô[ô\ãõÿúŸ\ùô\äH¬à]öXŸ\’ìKúô[ô\ãõÿúŸ\ùô\ãô\ÿ€€õôX›
+
+N¬à]öXŸ\’ìKúô[ô\ãõÿúŸ\ùô\àHù[¬àBüBÇãÀ»ÿY[‹ôH]öXŸ\»õ‹à[ôö[ö]Hÿ‹õ€ôù[ò›[€àÿY[‹ôQ]öXŸ\ 
+H¬àYà
+]öXŸ\’ìKùöY]»OOH	›XõI H¬àô[ô\ë]öXŸUXõJ]öXŸ\’ìKôö[\ôYùYJN¬àH[ŸH¬àô[ô\ë]öXŸPÿ\ô ]öXŸ\’ìKôö[\ôYùYJN¬àBüBÇôù[ò›[€àô[ô\îŸ\ùô\ë]öXŸPÿ\ô
+]öXŸJH¬à€€ú›Y]HH]öXŸKó◊€Y]HﬂN¬à€€ú›Ÿ\öX[H\ÿÿ\R[
+]öXŸKúŸ\öX[	¯†%	 N¬à€€ú›YŸ[ùYH\ÿÿ\R[
+]öXŸKòYŸ[ù⁄Y	… N¬à€€ú›ô]€‹ö”Xô[H\ÿÿ\R[
+]öXŸKö\	”ã–I N¬à€€ú›‹›ò[YHH]öXŸKö‹›ò[YH»8†(à	Ÿ\ÿÿ\R[
+]öXŸKö‹›ò[YJ_Xà	…Œ¬à€€ú›\‹Ÿ]H]öXŸKò\‹Ÿ]€ù[Xô\à»‹[à€\‹œHô]öXŸKXÿ\ôX⁄\èê\‹Ÿ]	Ÿ\ÿÿ\R[
+]öXŸKò\‹Ÿ]€ù[Xô\ä_O‹‹[èòà	…Œ¬à€€ú›ÿÿ][€àH\ÿÿ\R[
+Y]Kõÿÿ][€à	¯†%	 N¬à€€ú›[ò[ùXô[H\ÿÿ\R[
+õ‹õX][ò[ù\‹^JY]Kù[ò[ùY]öXŸKù[ò[ù⁄Y	… JN¬à€€ú›\›ŸY[ï^H\ÿÿ\R[
+Y]Kõ\›ŸY[îô[]]ôH	”ô]ô\â N¬à€€ú›\›ŸY[ï]HH\ÿÿ\R[
+Y]Kõ\›ŸY[ï€€\	”ô]ô\â N¬à€€ú›YŸ[ùò[YHH\ÿÿ\R[
+Y]KòYŸ[ùò[YH	’[ò\‹⁄Y€ôY	 N¬à€€ú›ÿ\Xö[]PòYŸ\»Hô[ô\ë]öXŸPÿ\Xö[]PòYŸ\ ]öXŸJN¬àô]\õàà]à€\‹œHô]öXŸKXÿ\ô]öXŸKXÿ\ôX€X⁄ÿXõHà]K\Ÿ\öX[Hâ‹Ÿ\öX[Hà]KZ\HâŸ\ÿÿ\R[
+]öXŸKö\	… _Hà]KXYŸ[ùZYHâÿYŸ[ùYHà]K[XXœHâŸ\ÿÿ\R[
+]öXŸKõXX»	… _Hà]K\€›\òŸOHúÿ]ôYà]OHê€X⁄»»öY]»]Z[ÀöY⁄X€X⁄»õ‹àX›[€ú»èÇà]à€\‹œHô]öXŸKXÿ\ôZXY\àèÇà]èÇà]à€\‹œHô]öXŸKXÿ\ô]]HèâŸ\ÿÿ\R[
+]öXŸKõX[ùYòX›\ô\à	’[ö€õ›€â _H	Ÿ\ÿÿ\R[
+]öXŸKõ[Ÿ[	… _OŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\›Xù]HèîŸ\öX[	‹Ÿ\öX[H	ÿ\‹Ÿ]OŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\›Xù]HèâÿYŸ[ùò[Y_OŸ]èÇà	ÿÿ\Xö[]PòYŸ\»»]à€\‹œHô]öXŸKXÿ\ôXÿ\Xö[]Y\»èâÿÿ\Xö[]PòYŸ\ﬂOŸ]èòà	…ﬂBàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\›]\»èÇà	‹ô[ô\ë]öXŸT›]\–òYŸJY]Kú›]\ _Bà	‹ô[ô\ï€ô\êò\ú Y]Kù€ô\ë]J_BàŸ]èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ôZ[ôõ»èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èìô]€‹öœ‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YH€‹XXõHà]KX€‹OHâŸ\ÿÿ\R[
+]öXŸKö\	… _Hèâ€ô]€‹ö”Xô[I⁄‹›ò[Y_O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èï[ò[ù‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ›[ò[ùXô[O‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èìÿÿ][€è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHèâ€ÿÿ][€üO‹‹[èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ô\õ›»èÇà‹[à€\‹œHô]öXŸKXÿ\ô[Xô[èì\›ŸY[è‹‹[èÇà‹[à€\‹œHô]öXŸKXÿ\ô]ò[YHà]OHâ€\›ŸY[ï]_Hèâ€\›ŸY[ï^O‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHô]öXŸKXÿ\ôZ[ù]]Y]^à›[OHôõ€ù\⁄^ôNåL\‹Y[ôŒéLú›^X[Y€éòŸ[ù\éÿõ‹ô\ã]‹å\€€Yò\äKXõ‹ô\äN»èÇàöY⁄X€X⁄»õ‹àX›[€ú¬àŸ]èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\ë]öXŸT›]\–òYŸJ›]\”Y]JH¬à€€ú›€ŸHHÿYôP€\‹’⁄Ÿ[ä›]\”Y]OÀò€ŸKUíP—W‘’UT◊“—VTÀ	⁄X[I N¬à€€ú›Xô[H›]\”Y]OÀõXô[€ŸN¬àô]\õà‹[à€\‹œHú›]\À\[	ÿ€Ÿ_HèâŸ\ÿÿ\R[
+Xô[
+_O‹‹[èò¬üBÇôù[ò›[€àô[ô\ë]öXŸPÿ\Xö[]PòYŸ\ ]öXŸJH¬à€€ú›òYŸ\»H◊N¬à€€ú›ôH]öXŸKúò]◊Ÿ]HﬂN¬ÇàÀ»]öXŸH\HòYŸH
+[‹›\ÿ‹ö\]ôJBàYà
+ôô]öXŸW›\JH¬àòYŸ\Àú\⁄
+‹[à€\‹œHòÿ\Xö[]KXòYŸH\HèâŸ\ÿÿ\R[
+ôô]öXŸW›\J_O‹‹[èò
+N¬àH[ŸH¬àÀ»ò[òX⁄»»[ô]öYX[ÿ\Xö[]Y\¬àYà
+ôö\◊ÿ€€‹äH¬àòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸH€€‹àèê€€‹è‹‹[èâ N¬àH[ŸHYà
+ôö\◊€[€õ H¬àòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸH[€õ»èì[€õœ‹‹[èâ N¬àBàBÇàÀ»ù[ò›[€àÿ\Xö[]Y\»
+€õH⁄›»Yà]öXŸW›\Hõ›Ÿ]»]õ⁄YôY[ô[òﬁJBàYà
+\ôô]öXŸW›\JH¬àYà
+ôö\◊ÿ€‹Y\äHòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸHù[ò›[€àèê€‹Y\è‹‹[èâ N¬àYà
+ôö\◊‹ÿÿ[õô\äHòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸHù[ò›[€àèîÿÿ[õô\è‹‹[èâ N¬àYà
+ôö\◊Ÿò^
+HòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸHù[ò›[€àèëò^‹‹[èâ N¬àBÇàÀ»X⁄õ€ŸﬁHòYŸBàYà
+ôö\◊€\Ÿ\äH¬àòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸHX⁄èì\Ÿ\è‹‹[èâ N¬àH[ŸHYà
+ôö\◊⁄[ö⁄ô]
+H¬àòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸHX⁄èí[ö⁄ô]‹‹[èâ N¬àBÇàÀ»\^òYŸBàYà
+ôö\◊Ÿ\^
+H¬àòYŸ\Àú\⁄
+	œ‹[à€\‹œHòÿ\Xö[]KXòYŸHôX]\ôHèë\^‹‹[èâ N¬àBÇàô]\õàòYŸ\Àöõ⁄[ä	… N¬üBÇôù[ò›[€àô[ô\ë]öXŸP€€ú›[XXõPòYŸJ€€ú›[XXõSY]JH¬àYà
+X€€ú›[XXõSY]JHô]\õà	…Œ¬à€€ú›€ŸHHÿYôP€\‹’⁄Ÿ[ä€€ú›[XXõSY]Kò€ŸKUíP—W–””î’SPPìW“—VTÀ	›[ö€õ›€â N¬à]^HUíP—W–””î’SPPìW”PëS÷ÿ€ŸWH	’[ö€õ›€âŒ¬àYà
+\[Ÿà€€ú›[XXõSY]Kõ]ô[OOH	€ù[Xô\â H¬à^
+œH	ÿ€€ú›[XXõSY]Kõ]ô[IX¬àBàô]\õà‹[à€\‹œHò€€ú›[XXõK\[à]KXò[ôHâÿ€Ÿ_HèâŸ\ÿÿ\R[
+^
+_O‹‹[èò¬üBÇãÀ»X\€ô\àò[Y\»»‘‘»€€‹ú¬ãÀ»€ô\à€€‹àX\[ôÀ[öÀ›€ô\àö[\ö[ôÀ[ô€ô\ãXò\àô[ô\ö[ô»õ›»]ôBãÀ»[à€€[[€ã›ŸXãÿÿ\ôÀöú»
+⁄[ô›Àó◊‹W‹⁄\ôYÿÿ\ôÀôŸ]]öXŸU€ô\êò\ë]H¬ãÀ»ô[ô\ï€ô\êò\ú H€»YŸ[ù[ôŸ\ùô\à⁄\ôHY[ùXÿ[€€‹ö[ô»[ôãÀ»[€õÀÿ€€‹àö[\ö[ô»ôZ]ö[‹ãÇôù[ò›[€àŸ]]öXŸU€ô\ë]J]öXŸJH¬àô]\õà⁄[ô›Àó◊‹W‹⁄\ôYÿÿ\ôÀôŸ]]öXŸU€ô\êò\ë]J]öXŸJN¬üBÇôù[ò›[€àô[ô\ï€ô\êò\ú €ô\ë]JH¬àYà
+]€ô\ë]H€ô\ë]Kõ[ô›OOH
+Hô]\õà	…Œ¬à€€ú›ò\ú»H€ô\ë]KõX\
+Oà¬à€€ú›ò]”]ô[Hù[Xô\ä	âàõ]ô[
+N¬à€€ú›]ô[Hù[Xô\ãö\—ö[ö]Jò]”]ô[
+H»X]õX^
+X]õZ[äLò]”]ô[
+JHà¬à€€ú›]ô[€\‹»H]ô[HL»	ÿ‹ö]Xÿ[	»à]ô[HçH»	€›…»à	…Œ¬à€€ú›€€‹àHŸ]€ô\ê€€‹ä	âàõò[YJN¬àô]\õà]à€\‹œHù€ô\ãXò\à	€]ô[€\‹ﬂHà]OHâŸ\ÿÿ\R[
+	âàõò[YJ_Nà	€]ô[IHà›[OHãK]€ô\ãX€€‹éà	ÿ€€‹üN»K]€ô\ã[]ô[à	€]ô[IHèèŸ]èò¬àJKöõ⁄[ä	… N¬àô]\õà]à€\‹œHù€ô\ãXò\ú»èâÿò\úﬂOŸ]èò¬üBÇôù[ò›[€àô[ô\ë]öXŸ\‘›] 
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹›]… N¬àYà
+X€€ùZ[ô\äHô]\õé¬à€€ú››[H]öXŸ\’ìKú›]Àù›[¬à€€ú›ö[\ôYH]öXŸ\’ìKú›]Àôö[\ôY¬à€€ú››]\Ÿ\»H]öXŸ\’ìKú›]Àôö[\ôY›]\Ÿ\»ﬂN¬à€€ùZ[ô\ãö[õô\íSHà]èè›õ€ôœï›[è‹›õ€ôœà	Ÿõ‹õX]ù[Xô\ä›[
+_OŸ]èÇà]èè›õ€ôœî⁄›⁄[ôŒè‹›õ€ôœà	Ÿõ‹õX]ù[Xô\äö[\ôY
+_OŸ]èÇà]èÇà‹[à€\‹œHú›]\À\[X[HèíX[H	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\ÀöX[H
+_O‹‹[èÇà‹[à€\‹œHú›]\À\[ÿ\õö[ô»èïÿ\õö[ô»	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\Àùÿ\õö[ô»
+_O‹‹[èÇà‹[à€\‹œHú›]\À\[\úõ‹àèë\úõ‹à	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\Àô\úõ‹à
+_O‹‹[èÇà‹[à€\‹œHú›]\À\[ò[Hèíò[H	Ÿõ‹õX]ù[Xô\ä›]\Ÿ\Àöò[H
+_O‹‹[èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\ë]öXŸ\–X›]ôQö[\ú 
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿX›]ôWŸö[\ú… N¬àYà
+X€€ùZ[ô\äHô]\õé¬à€€ú›⁄\»H◊N¬à€€ú›ö[\ú»H]öXŸ\’ìKôö[\úŒ¬àYà
+ö[\úÀú]Y\ûJH¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	‘ŸX\ò⁄	Àö[\úÀú]Y\ûK	‹ŸX\ò⁄	 JN¬àBàYà
+ö[\úÀòYŸ[ùY
+H¬à€€ú›YŸ[ùHŸ]YŸ[ù[ôõ ö[\úÀòYŸ[ùY
+N¬à€€ú›Xô[HYŸ[ù»Ÿ]YŸ[ù\‹^Sò[YJYŸ[ù
+Hàö[\úÀòYŸ[ùY¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	–YŸ[ù	ÀXô[	ÿYŸ[ù	 JN¬àBàYà
+ö[\úÀù[ò[ùY
+H¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	’[ò[ù	Àõ‹õX][ò[ù\‹^Jö[\úÀù[ò[ùY
+K	›[ò[ù	 JN¬àBàYà
+ö[\úÀõX[ùYòX›\ô\äH¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	”X[ùYòX›\ô\âÀö[\úÀõX[ùYòX›\ô\ã	€X[ùYòX›\ô\â JN¬àBàYà
+ö[\úÀú›]\Ÿ\Àú⁄^ôHà	âàö[\úÀú›]\Ÿ\Àú⁄^ôHUíP—W‘’UT◊“—VTÀõ[ô›
+H¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	‘›]\…À\úò^Kôúõ€Jö[\úÀú›]\Ÿ\ Köõ⁄[ä	À	 K	‹›]\Ÿ\… JN¬àBàYà
+ö[\úÀò€€ú›[XXõ\Àú⁄^ôHà	âàö[\úÀò€€ú›[XXõ\Àú⁄^ôHUíP—W–””î’SPPìW“—VTÀõ[ô›
+H¬à⁄\Àú\⁄
+ùZ[ö[\ê⁄\
+	–€€ú›[XXõ\…À\úò^Kôúõ€Jö[\úÀò€€ú›[XXõ\ Köõ⁄[ä	À	 K	ÿ€€ú›[XXõ\… JN¬àBàYà
+⁄\Àõ[ô›OOH
+H¬à€€ùZ[ô\ãö[õô\íSH	…Œ¬à€€ùZ[ô\ãò€\‹”\›òY
+	⁄Y[â N¬àô]\õé¬àBà€€ùZ[ô\ãò€\‹”\›úô[[›ôJ	⁄Y[â N¬à€€ùZ[ô\ãö[õô\íSH⁄\Àöõ⁄[ä	… N¬üBÇôù[ò›[€àùZ[ö[\ê⁄\
+Xô[ò[YKŸ^JH¬àô]\õà‹[à€\‹œHôö[\ãX⁄\èâŸ\ÿÿ\R[
+Xô[
+_Nà	Ÿ\ÿÿ\R[
+ò[YJ_Hù]€à\OHòù]€àà]KYö[\èHâ⁄Ÿ^_Hà\öXK[Xô[Hîô[[›ôH	Ÿ\ÿÿ\R[
+Xô[
+_Hö[\àè∞Âœÿù]€èè‹‹[èò¬üBÇôù[ò›[€à[ôQö[\ê⁄\ô[[›ôJö[\íŸ^JH¬à›⁄]⁄
+ö[\íŸ^JH¬àÿ\ŸH	‹ŸX\ò⁄	Œà¬à]öXŸ\’ìKôö[\úÀú]Y\ûHH	…Œ¬à€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹ŸX\ò⁄	 N¬àYà
+ŸX\ò⁄[ú]
+HŸX\ò⁄[ú]ùò[YHH	…Œ¬àúôXZŒ¬àBàÿ\ŸH	ÿYŸ[ù	Œà¬à]öXŸ\’ìKôö[\úÀòYŸ[ùYH	…Œ¬à€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿYŸ[ùŸö[\â N¬àYà
+YŸ[ùŸ[X›
+HYŸ[ùŸ[X›ùò[YHH	…Œ¬àúôXZŒ¬àBàÿ\ŸH	›[ò[ù	Œà¬à]öXŸ\’ìKôö[\úÀù[ò[ùYH	…Œ¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›[ò[ùŸö[\â N¬àYà
+[ò[ùŸ[X›
+H[ò[ùŸ[X›ùò[YHH	…Œ¬àúôXZŒ¬àBàÿ\ŸH	€X[ùYòX›\ô\âŒà¬à]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\àH	…Œ¬à€€ú›X[ùYòX›\ô\îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€X[ùYòX›\ô\óŸö[\â N¬àYà
+X[ùYòX›\ô\îŸ[X›
+HX[ùYòX›\ô\îŸ[X›ùò[YHH	…Œ¬àúôXZŒ¬àBàÿ\ŸH	‹›]\Ÿ\…ŒÇà]öXŸ\’ìKôö[\úÀú›]\Ÿ\»Hô]»Ÿ]
+UíP—W‘’UT◊“—VT N¬àúôXZŒ¬àÿ\ŸH	ÿ€€ú›[XXõ\…ŒÇà]öXŸ\’ìKôö[\úÀò€€ú›[XXõ\»Hô]»Ÿ]
+UíP—W–””î’SPPìW“—VT N¬àúôXZŒ¬àYò][Çàô]\õé¬àBà\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àﬁ[ò—]öXŸT]ZX⁄—ö[\ú 
+H¬à€€ú››]\‘Ÿ]H]öXŸ\’ìKôö[\úÀú›]\Ÿ\Œ¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	»Ÿ]öXŸ\◊‹›]\◊Ÿö[\àŸ]K\›]\◊I Kôõ‹ëXX⁄
+ùàOà¬à€€ú›Ÿ^HHùãôŸ]]öXù]J	Ÿ]K\›]\… N¬à€€ú›X›]ôHH\›]\‘Ÿ]›]\‘Ÿ]ö\ Ÿ^JN¬àùãò€\‹”\›ùŸŸ€J	ÿX›]ôIÀX›]ôJN¬à€€ú›ò\ŸSXô[HùãôŸ]]öXù]J	Ÿ]K[Xô[	 Hùãù^€€ù[ùùö[J
+N¬à€€ú›€›[ùH]öXŸ\’ìKú›]Àù›[›]\Ÿ\œÀñ⁄Ÿ^WH¬àùãö[õô\íSH	Ÿ\ÿÿ\R[
+ò\ŸSXô[
+_H‹[à€\‹œHú[X€›[ùèâŸõ‹õX]ù[Xô\ä€›[ù
+_O‹‹[èò¬àJN¬Çà€€ú›€€ú›[XXõTŸ]H]öXŸ\’ìKôö[\úÀò€€ú›[XXõ\Œ¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	»Ÿ]öXŸ\◊ÿ€€ú›[XXõWŸö[\àŸ]KXò[ôI Kôõ‹ëXX⁄
+ùàOà¬à€€ú›Ÿ^HHùãôŸ]]öXù]J	Ÿ]KXò[ô	 N¬à€€ú›X›]ôHHX€€ú›[XXõTŸ]€€ú›[XXõTŸ]ö\ Ÿ^JN¬àùãò€\‹”\›ùŸŸ€J	ÿX›]ôIÀX›]ôJN¬à€€ú›ò\ŸSXô[HùãôŸ]]öXù]J	Ÿ]K[Xô[	 Hùãù^€€ù[ùùö[J
+N¬àùãö[õô\íSH	Ÿ\ÿÿ\R[
+ò\ŸSXô[
+_X¬àJN¬üBÇôù[ò›[€àŸŸ€T›]\—ö[\ä›]\“Ÿ^JH¬àYà
+QUíP—W‘’UT◊“—VTÀö[ò€Y\ ›]\“Ÿ^JJHô]\õé¬à€€ú›Ÿ]Hô]»Ÿ]
+]öXŸ\’ìKôö[\úÀú›]\Ÿ\»UíP—W‘’UT◊“—VT N¬àYà
+Ÿ]ö\ ›]\“Ÿ^JJH¬àŸ]ô[]J›]\“Ÿ^JN¬àH[ŸH¬àŸ]òY
+›]\“Ÿ^JN¬àBàYà
+Ÿ]ú⁄^ôHOOH
+H¬àUíP—W‘’UT◊“—VTÀôõ‹ëXX⁄
+Ÿ^HOàŸ]òY
+Ÿ^JJN¬àBà]öXŸ\’ìKôö[\úÀú›]\Ÿ\»HŸ]¬à\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àŸŸ€P€€ú›[XXõQö[\äò[ôŸ^JH¬àYà
+QUíP—W–””î’SPPìW“—VTÀö[ò€Y\ ò[ôŸ^JJHô]\õé¬à€€ú›Ÿ]Hô]»Ÿ]
+]öXŸ\’ìKôö[\úÀò€€ú›[XXõ\»UíP—W–””î’SPPìW“—VT N¬àYà
+Ÿ]ö\ ò[ôŸ^JJH¬àŸ]ô[]Jò[ôŸ^JN¬àH[ŸH¬àŸ]òY
+ò[ôŸ^JN¬àBàYà
+Ÿ]ú⁄^ôHOOH
+H¬àUíP—W–””î’SPPìW“—VTÀôõ‹ëXX⁄
+Ÿ^HOàŸ]òY
+Ÿ^JJN¬àBà]öXŸ\’ìKôö[\úÀò€€ú›[XXõ\»HŸ]¬à\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àô\Ÿ]]öXŸQö[\ú 
+H¬à]öXŸ\’ìKôö[\úÀú]Y\ûHH	…Œ¬à]öXŸ\’ìKôö[\úÀòYŸ[ùYH	…Œ¬à]öXŸ\’ìKôö[\úÀù[ò[ùYH	…Œ¬à]öXŸ\’ìKôö[\úÀõX[ùYòX›\ô\àH	…Œ¬à]öXŸ\’ìKôö[\úÀú›]\Ÿ\»Hô]»Ÿ]
+UíP—W‘’UT◊“—VT N¬à]öXŸ\’ìKôö[\úÀò€€ú›[XXõ\»Hô]»Ÿ]
+UíP—W–””î’SPPìW“—VT N¬à€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹ŸX\ò⁄	 N¬àYà
+ŸX\ò⁄[ú]
+HŸX\ò⁄[ú]ùò[YHH	…Œ¬à€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊ÿYŸ[ùŸö[\â N¬àYà
+YŸ[ùŸ[X›
+HYŸ[ùŸ[X›ùò[YHH	…Œ¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›[ò[ùŸö[\â N¬àYà
+[ò[ùŸ[X›
+H[ò[ùŸ[X›ùò[YHH	…Œ¬à€€ú›X[ùYòX›\ô\îŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊€X[ùYòX›\ô\óŸö[\â N¬àYà
+X[ùYòX›\ô\îŸ[X›
+HX[ùYòX›\ô\îŸ[X›ùò[YHH	…Œ¬à\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àŸ]]öXŸ\’öY] öY] H¬à€€ú›ô^öY]»HUíP—T◊’íQU◊”‘S”îÀö[ò€Y\ öY] H»öY]»à	ÿÿ\ô…Œ¬àYà
+]öXŸ\’ìKùöY]»OOHô^öY] H¬àô]\õé¬àBà]öXŸ\’ìKùöY]»Hô^öY]Œ¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀëUíP—T◊’íQUÀô^öY] N¬àﬁ[ò—]öXŸ\’öY]’ŸŸ€J
+N¬à\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àﬁ[ò—]öXŸ\’öY]’ŸŸ€J
+H¬à€€ú›ŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊›öY]◊›ŸŸ€I N¬àYà
+]ŸŸ€JHô]\õé¬àŸŸ€Kú]Y\ûTŸ[X›‹ê[
+	÷Ÿ]K]öY]◊I Kôõ‹ëXX⁄
+ùàOà¬à€€ú›öY]»HùãôŸ]]öXù]J	Ÿ]K]öY]… N¬à€€ú›X›]ôHHöY]»OOH]öXŸ\’ìKùöY]Œ¬àùãò€\‹”\›ùŸŸ€J	ÿX›]ôIÀX›]ôJN¬àùãúŸ]]öXù]J	ÿ\öXK\ô\‹ŸY	ÀX›]ôH»	›ùYI»à	Ÿò[ŸI N¬àJN¬üBÇôù[ò›[€àŸ]]öXŸT€‹ù
+Ÿ^K\äH¬à€€ú›ô^Ÿ^HHUíP—T◊‘”‘ï“—VTÀö[ò€Y\ Ÿ^JH»Ÿ^Hà	€\›‹ŸY[âŒ¬à€€ú›ô^\àH\àOOH	ÿ\ÿ…»»	ÿ\ÿ…»à	Ÿ\ÿ…Œ¬àYà
+]öXŸ\’ìKôö[\úÀú€‹ùŸ^HOOHô^Ÿ^H	âà]öXŸ\’ìKôö[\úÀú€‹ù\àOOHô^\äH¬àô]\õé¬àBà]öXŸ\’ìKôö[\úÀú€‹ùŸ^HHô^Ÿ^N¬à]öXŸ\’ìKôö[\úÀú€‹ù\àHô^\é¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀëUíP—T◊‘”‘ï“—VKô^Ÿ^JN¬à\ú⁄\›RT›]J—TïëTó’RW‘’UW“—VTÀëUíP—T◊‘”‘ï—Tãô^\äN¬àﬁ[ò—]öXŸT€‹ù€€ùõ€ 
+N¬à\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àﬁ[ò—]öXŸT€‹ù€€ùõ€ 
+H¬à€€ú›€‹ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹€‹ù‹Ÿ[X›	 N¬àYà
+€‹ùŸ[X›	âà€‹ùŸ[X›ùò[YHOOH]öXŸ\’ìKôö[\úÀú€‹ùŸ^JH¬à€‹ùŸ[X›ùò[YHH]öXŸ\’ìKôö[\úÀú€‹ùŸ^N¬àBà€€ú›€‹ù\êùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹€‹ùŸ\óÿùâ N¬à€€ú›€‹ù\íX€€àHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ]öXŸ\◊‹€‹ùŸ\ó⁄X€€â N¬àYà
+€‹ù\êùäH¬à€‹ù\êùãô]\Ÿ]ô\àH]öXŸ\’ìKôö[\úÀú€‹ù\é¬à€‹ù\êùãúŸ]]öXù]J	ÿ\öXK[Xô[	À]öXŸ\’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	‘€‹ù\ÿŸ[ô[ô…»à	‘€‹ù\ÿŸ[ô[ô… N¬àBàYà
+€‹ù\íX€€äH¬à€‹ù\íX€€ãù^€€ù[ùH]öXŸ\’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	¯°§I»à	¯°§…Œ¬àBüBÇôù[ò›[€àﬁ[ò—]öXŸUXõT€‹ù[ôXÿ]‹ú 
+H¬à€€ú›XYHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	»Ÿ]öXŸ\◊›XõHXY	 N¬àYà
+ZXY
+Hô]\õé¬ÇàÀ»\]H›\›€Z^ô\à€‹ù›]HYà]òZ[XõBàYà
+]öXŸ\’ìKùXõP›\›€Z^ô\äH¬à]öXŸ\’ìKùXõP›\›€Z^ô\ãú€‹ù›]KöŸ^HH]öXŸ\’ìKôö[\úÀú€‹ùŸ^N¬à]öXŸ\’ìKùXõP›\›€Z^ô\ãú€‹ù›]Kô\àH]öXŸ\’ìKôö[\úÀú€‹ù\é¬àBÇàXYú]Y\ûTŸ[X›‹ê[
+	›Ÿ]K\€‹ùZŸ^WI Kôõ‹ëXX⁄
+Oà¬à€€ú›Ÿ^HHôŸ]]öXù]J	Ÿ]K\€‹ùZŸ^I N¬àYà
+Ÿ^HOOH]öXŸ\’ìKôö[\úÀú€‹ùŸ^JH¬àò€\‹”\›òY
+	‹€‹ùY	 N¬àúŸ]]öXù]J	ÿ\öXK\€‹ù	À]öXŸ\’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ…»»	ÿ\ÿŸ[ô[ô…»à	Ÿ\ÿŸ[ô[ô… N¬àH[ŸH¬àò€\‹”\›úô[[›ôJ	‹€‹ùY	 N¬àúô[[›ôP]öXù]J	ÿ\öXK\€‹ù	 N¬àBàJN¬üBÇôù[ò›[€à[ôQ]öXŸUXõT€‹ù€X⁄ ]ô[ù
+H¬à€€ú›\ôŸ]H]ô[ùù\ôŸ]ò€‹Ÿ\›
+	›Ÿ]K\€‹ùZŸ^WI N¬àYà
+]\ôŸ]
+H¬àô]\õé¬àBà€€ú›Ÿ^HH\ôŸ]ôŸ]]öXù]J	Ÿ]K\€‹ùZŸ^I N¬àYà
+ZŸ^JH¬àô]\õé¬àBà€€ú›ô^\àH
+]öXŸ\’ìKôö[\úÀú€‹ùŸ^HOOHŸ^H	âà]öXŸ\’ìKôö[\úÀú€‹ù\àOOH	ÿ\ÿ… H»	Ÿ\ÿ…»à	ÿ\ÿ…Œ¬àŸ]]öXŸT€‹ù
+Ÿ^Kô^\äN¬üBÇôù[ò›[€à\Ÿ\ù]öXŸTôX€‹ô
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+H¬àô]\õé¬àBàYà
+P\úò^Kö\–\úò^J]öXŸ\’ìKö][\ JH¬à]öXŸ\’ìKö][\»H◊N¬àBà€€ú›Y[ùYöY\àH
+][JHOà][KúŸ\öX[][Kô]öXŸW⁄Y][KöY][Kù]ZY¬à€€ú›ôX€‹ôYHY[ùYöY\äôX€‹ô
+N¬à]\]YHò[ŸN¬à]öXŸ\’ìKö][\»H]öXŸ\’ìKö][\ÀõX\
+]öXŸHOà¬à€€ú›YHY[ùYöY\ä]öXŸJN¬àYà
+ôX€‹ôY	âàY	âàYOOHôX€‹ôY
+H¬à\]YHùYN¬àô]\õà[úöX⁄⁄[ô€Q]öXŸJ»ããô]öXŸKããúôX€‹ôJN¬àBàYà
+\ôX€‹ôY	âà]öXŸKö\	âàôX€‹ôö\	âà]öXŸKö\OOHôX€‹ôö\
+H¬à\]YHùYN¬àô]\õà[úöX⁄⁄[ô€Q]öXŸJ»ããô]öXŸKããúôX€‹ôJN¬àBàô]\õà]öXŸN¬àJN¬àYà
+]\]Y
+H¬à]öXŸ\’ìKö][\Àú\⁄
+[úöX⁄⁄[ô€Q]öXŸJôX€‹ô
+JN¬àBà]öXŸ\’ìKú›]Àù›[H]öXŸ\’ìKö][\Àõ[ô›¬à]öXŸ\’ìKõÿYYHùYN¬àôYúô\⁄]öXŸQö[\ú 
+N¬üBÇôù[ò›[€à[úöX⁄]öXŸ\ \›
+H¬àYà
+P\úò^Kö\–\úò^J\›
+JHô]\õà◊N¬àô]\õà\›õX\
+][HOà[úöX⁄⁄[ô€Q]öXŸJ][JJN¬üBÇôù[ò›[€à[úöX⁄⁄[ô€Q]öXŸJ]öXŸJH¬àYà
+Y]öXŸH\[Ÿà]öXŸHOOH	€ÿöôX›	 H¬àô]\õà]öXŸN¬àBà€€ú›YŸ[ùHŸ]YŸ[ù[ôõ ]öXŸKòYŸ[ù⁄Y
+N¬à€€ú›YŸ[ùò[YHHYŸ[ù»Ÿ]YŸ[ù\‹^Sò[YJYŸ[ù
+Hà	…Œ¬à€€ú›[ò[ùYH]öXŸKù[ò[ù⁄Y
+YŸ[ù	âàYŸ[ùù[ò[ù⁄Y
+H	…Œ¬à€€ú›[ò[ùXô[H[ò[ùY»[ò[ù\‹^Sò[YPûRY
+[ò[ùY
+Hà	…Œ¬à€€ú›\›ŸY[í\€»H]öXŸKõ\›‹ŸY[à]öXŸKõ\›ŸY[à]öXŸKõ\›‹ŸY[óÿ]]öXŸKù\]Yÿ]]öXŸKõ\›€Y]öX‹◊ÿ]¬à€€ú›\›ŸY[ë]HH\›ŸY[í\€»»ô]»]J\›ŸY[í\€ Hàù[¬à€€ú›ÿÿ][€àH]öXŸKõÿÿ][€à]öXŸKú⁄]H]öXŸKô\\ùY[ù]öXŸKòùZ[[ô»	…Œ¬à€€ú›€ô\ì]ô[»HŸ]]öXŸP€€ú›[XXõS]ô[ ]öXŸJN¬à€€ú›€ô\ë]HHŸ]]öXŸU€ô\ë]J]öXŸJN¬à€€ú››]\»H€\‹⁄YûQ]öXŸT›]\ ]öXŸJN¬à€€ú›€€ú›[XXõHH€\‹⁄YûP€€ú›[XXõPò[ô
+]öXŸK€ô\ì]ô[ N¬àô]\õà¬àããô]öXŸKà◊€Y]Nà¬àYŸ[ùò[YKà[ò[ùYàŸX\ò⁄àùZ[]öXŸTŸX\ò⁄õÿä]öXŸKYŸ[ùò[YK[ò[ùXô[[ò[ùY
+Kàÿÿ][€ãà›]\Àà€€ú›[XXõKà€ô\ë]Kà\›ŸY[îô[]]ôNà\›ŸY[ë]H»õ‹õX]ô[]]ôU[YJ\›ŸY[ë]JHà	”ô]ô\âÀà\›ŸY[ï€€\à\›ŸY[ë]H»\›ŸY[ë]Kù”ÿÿ[T›ö[ô 
+Hà	”ô]ô\âÀà\›ŸY[ì\Œà\›ŸY[ë]H»\›ŸY[ë]KôŸ][YJ
+HààBàN¬üBÇôù[ò›[€àùZ[]öXŸTŸX\ò⁄õÿä]öXŸKYŸ[ùò[YK[ò[ùXô[
+H¬à€€ú›\ù»H¬à]öXŸKúŸ\öX[à]öXŸKö\à]öXŸKö‹›ò[YKà]öXŸKõX[ùYòX›\ô\ãà]öXŸKõ[Ÿ[à]öXŸKò\‹Ÿ]€ù[Xô\ãà]öXŸKõÿÿ][€ãàYŸ[ùò[YKà[ò[ùXô[à]öXŸKù[ò[ù⁄YàKôö[\äõ€€X[äN¬àô]\õà\ùÀöõ⁄[ä	»	 Kù”›Ÿ\êÿ\ŸJ
+N¬üBÇôù[ò›[€à€\‹⁄YûQ]öXŸT›]\ ]öXŸJH¬à€€ú›Y]HH»€ŸNà	⁄X[IÀXô[à	“X[I»N¬à€€ú›Ÿ]ô\ö]HH
+]öXŸKú›]\◊‹Ÿ]ô\ö]H]öXŸKöX[‹›]H	… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›€€\‹⁄]HHŸ]öXŸKú›]\À]öXŸKú›]K]öXŸKöX[]öXŸKò€€õôX›[€ó‹›]WKôö[\äõ€€X[äKöõ⁄[ä	»	 Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+€€\‹⁄]Kö[ò€Y\ 	⁄ò[I JH¬àô]\õà»€ŸNà	⁄ò[IÀXô[à	‘\\àò[I»N¬àBàYà
+Ÿ]ô\ö]Kö[ò€Y\ 	Ÿ\úõ‹â H€€\‹⁄]Kö[ò€Y\ 	Ÿ\úõ‹â H€€\‹⁄]Kö[ò€Y\ 	€Ÿôõ[ôI H€€\‹⁄]Kö[ò€Y\ 	Ÿ›€â JH¬àô]\õà»€ŸNà	Ÿ\úõ‹âÀXô[à	—\úõ‹â»N¬àBàYà
+Ÿ]ô\ö]Kö[ò€Y\ 	›ÿ\õâ H€€\‹⁄]Kö[ò€Y\ 	›ÿ\õâ H€€\‹⁄]Kö[ò€Y\ 	ŸY‹òYY	 JH¬àô]\õà»€ŸNà	›ÿ\õö[ô…ÀXô[à	’ÿ\õö[ô…»N¬àBàYà
+€€\‹⁄]Kö[ò€Y\ 	‹ôXYI H€€\‹⁄]Kö[ò€Y\ 	⁄YI JH¬àô]\õà»€ŸNà	⁄X[IÀXô[à	‘ôXYI»N¬àBàô]\õàY]N¬üBÇôù[ò›[€à€\‹⁄YûP€€ú›[XXõPò[ô
+]öXŸK€ô\ì]ô[ H¬àYà
+]€ô\ì]ô[»€ô\ì]ô[Àõ[ô›OOH
+H¬àô]\õà»€ŸNà	›[ö€õ›€âÀXô[à	’[ö€õ›€â»N¬àBà€€ú›Z[àHX]õZ[äããù€ô\ì]ô[ N¬à€€ú›€ŸHHò[ôõ‹î\òŸ[ùYŸJZ[äN¬àô]\õà»€ŸKXô[àUíP—W–””î’SPPìW”PëS÷ÿ€ŸWH	’[ö€õ›€âÀ]ô[àZ[àN¬üBÇôù[ò›[€àŸ]]öXŸP€€ú›[XXõS]ô[ ]öXŸJH¬àô]\õà⁄[ô›Àó◊‹W‹⁄\ôYÿÿ\ôÀôŸ]]öXŸU€ô\êò\ë]J]öXŸJKõX\
+Oàõ]ô[
+N¬üBÇôù[ò›[€àò[ôõ‹î\òŸ[ùYŸJò[YJH¬àYà
+\[Ÿàò[YHOOH	€ù[Xô\â Hô]\õà	›[ö€õ›€âŒ¬àYà
+ò[YHHL
+Hô]\õà	ÿ‹ö]Xÿ[	Œ¬àYà
+ò[YHHçJHô]\õà	€›…Œ¬àYà
+ò[YHHå
+Hô]\õà	€YY][IŒ¬àô]\õà	⁄Y⁄	Œ¬üBÇôù[ò›[€àŸ]YŸ[ù[ôõ YŸ[ùY
+H¬àYà
+XYŸ[ùY
+H¬àô]\õàù[¬àBàYà
+YŸ[ù\ôX›‹ûKòûRYö\ YŸ[ùY
+JH¬àô]\õàYŸ[ù\ôX›‹ûKòûRYôŸ]
+YŸ[ùY
+N¬àBàô]\õàù[¬üBÇò\ﬁ[ò»ù[ò›[€à[ú›\ôPYŸ[ù\ôX›‹ûJõ‹òŸHHò[ŸJH¬à€€ú›õ›»H]Kõõ› 
+N¬àYà
+Yõ‹òŸH	âàYŸ[ù\ôX›‹ûKö][\Àõ[ô›à	âà
+õ›»HYŸ[ù\ôX›‹ûKõ\›ô]⁄Y
+HÃ
+H¬àô]\õàYŸ[ù\ôX›‹ûKö][\Œ¬àBàûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+	Àÿ\K›åKÿYŸ[ùÀ€\›	 N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	“	»
+»ô\‹€úŸKú›]\ N¬àBà€€ú›YŸ[ù»H]ÿZ]ô\‹€úŸKöú€€ä
+N¬à\]PYŸ[ù\ôX›‹ûJ\úò^Kö\–\úò^JYŸ[ù H»YŸ[ù»à◊JN¬àô]\õàYŸ[ù\ôX›‹ûKö][\Œ¬àHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	Ÿ[ú›\ôPYŸ[ù\ôX›‹ûHòZ[Y	À\úäN¬àô]\õàYŸ[ù\ôX›‹ûKö][\Œ¬àBüBÇôù[ò›[€à\]PYŸ[ù\ôX›‹ûJ\›
+H¬àYà
+P\úò^Kö\–\úò^J\›
+JH¬àô]\õé¬àBàYŸ[ù\ôX›‹ûKö][\»H\›ú€XŸJ
+N¬àYŸ[ù\ôX›‹ûKòûRYHô]»X\
+
+N¬àYŸ[ù\ôX›‹ûKö][\Àôõ‹ëXX⁄
+YŸ[ùOà¬àYà
+YŸ[ù	âàYŸ[ùòYŸ[ù⁄Y
+H¬àYŸ[ù\ôX›‹ûKòûRYúŸ]
+YŸ[ùòYŸ[ù⁄YYŸ[ù
+N¬àBàJN¬àYŸ[ù\ôX›‹ûKõ\›ô]⁄YH]Kõõ› 
+N¬àﬁ[ò—]öXŸ\–YŸ[ùö[\ì‹[€ú 
+N¬üBÇôù[ò›[€à]⁄YŸ[ù\ôX›‹ûJYŸ[ù
+H¬àYà
+XYŸ[ùXYŸ[ùòYŸ[ù⁄Y
+H¬àô]\õé¬àBàYà
+XYŸ[ù\ôX›‹ûKòûRY
+H¬àYŸ[ù\ôX›‹ûKòûRYHô]»X\
+
+N¬àBàYà
+XYŸ[ù\ôX›‹ûKö][\ H¬àYŸ[ù\ôX›‹ûKö][\»H◊N¬àBàYŸ[ù\ôX›‹ûKòûRYúŸ]
+YŸ[ùòYŸ[ù⁄Y»ããòYŸ[ù\ôX›‹ûKòûRYôŸ]
+YŸ[ùòYŸ[ù⁄Y
+KããòYŸ[ùJN¬à]ô\XŸYHò[ŸN¬àYŸ[ù\ôX›‹ûKö][\»HYŸ[ù\ôX›‹ûKö][\ÀõX\
+^\›[ô»Oà¬àYà
+^\›[ô»	âà^\›[ôÀòYŸ[ù⁄YOOHYŸ[ùòYŸ[ù⁄Y
+H¬àô\XŸYHùYN¬àô]\õà»ããô^\›[ôÀããòYŸ[ùN¬àBàô]\õà^\›[ôŒ¬àJN¬àYà
+\ô\XŸY
+H¬àYŸ[ù\ôX›‹ûKö][\Àú\⁄
+YŸ[ù
+N¬àBàYŸ[ù\ôX›‹ûKõ\›ô]⁄YH]Kõõ› 
+N¬àﬁ[ò—]öXŸ\–YŸ[ùö[\ì‹[€ú 
+N¬üBÇôù[ò›[€àõ‹õX[^ôU[ò[ùY
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õà	…Œ¬àô]\õàôX€‹ôöYôX€‹ôù]ZYôX€‹ôù[ò[ù⁄Y	…Œ¬üBÇôù[ò›[€àŸ][ò[ù[ôõ [ò[ùY
+H¬àYà
+][ò[ùY][ò[ù\ôX›‹ûKòûRY
+H¬àô]\õàù[¬àBàô]\õà[ò[ù\ôX›‹ûKòûRYôŸ]
+[ò[ùY
+Hù[¬üBÇò\ﬁ[ò»ù[ò›[€à[ú›\ôU[ò[ù\ôX›‹ûJõ‹òŸHHò[ŸJH¬à€€ú›õ›»H]Kõõ› 
+N¬àYà
+Yõ‹òŸH	âà[ò[ù\ôX›‹ûKö][\Àõ[ô›à	âà
+õ›»H[ò[ù\ôX›‹ûKõ\›ô]⁄Y
+Hå
+H¬àô]\õà[ò[ù\ôX›‹ûKö][\Œ¬àBàûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+	Àÿ\K›åK›[ò[ù… N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	“	»
+»ô\‹€úŸKú›]\ N¬àBà€€ú›[ò[ù»H]ÿZ]ô\‹€úŸKöú€€ä
+N¬à\]U[ò[ù\ôX›‹ûJ\úò^Kö\–\úò^J[ò[ù H»[ò[ù»à◊JN¬àô]\õà[ò[ù\ôX›‹ûKö][\Œ¬àHÿ]⁄
+\úäH¬àYà
+⁄[ô›Àó◊‹W‹⁄\ôY	âà\[Ÿà⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õàOOH	Ÿù[ò›[€â H¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	Ÿ[ú›\ôU[ò[ù\ôX›‹ûHòZ[Y	À\úäN¬àBàô]\õà[ò[ù\ôX›‹ûKö][\Œ¬àBüBÇôù[ò›[€à\]U[ò[ù\ôX›‹ûJ\›
+H¬àYà
+P\úò^Kö\–\úò^J\›
+JH¬àô]\õé¬àBà[ò[ù\ôX›‹ûKö][\»H\›ú€XŸJ
+N¬à[ò[ù\ôX›‹ûKòûRYHô]»X\
+
+N¬à[ò[ù\ôX›‹ûKö][\Àôõ‹ëXX⁄
+[ò[ùOà¬à€€ú›YHõ‹õX[^ôU[ò[ùY
+[ò[ù
+N¬àYà
+Y
+H¬à[ò[ù\ôX›‹ûKòûRYúŸ]
+Y[ò[ù
+N¬àBàJN¬à[ò[ù\ôX›‹ûKõ\›ô]⁄YH]Kõõ› 
+N¬à⁄[ô›Àó›[ò[ù»H[ò[ù\ôX›‹ûKö][\Œ¬àﬁ[ò’[ò[ùö[\ì‹[€ú 	ÿYŸ[ù… N¬àﬁ[ò’[ò[ùö[\ì‹[€ú 	Ÿ]öXŸ\… N¬à\PYŸ[ùö[\ú 
+N¬à\Q]öXŸQö[\ú 
+N¬üBÇôù[ò›[€àﬁ[ò’[ò[ùö[\ì‹[€ú ÿ€‹JH¬à€€ú›Ÿ[X›YHÿ€‹HOOH	ÿYŸ[ù…»»	ÿYŸ[ù◊›[ò[ùŸö[\â»à	Ÿ]öXŸ\◊›[ò[ùŸö[\âŒ¬à€€ú›Ÿ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+Ÿ[X›Y
+N¬àYà
+\Ÿ[X›
+Hô]\õé¬à€€ú›ö[\ïò[YHHÿ€‹HOOH	ÿYŸ[ù…»»YŸ[ù’ìKôö[\úÀù[ò[ùYà]öXŸ\’ìKôö[\úÀù[ò[ùY¬à€€ú›‹[€ú»H…œ‹[€àò[YOHàèê[[ò[ùœ€‹[€èâ◊N¬à]\”X]⁄Hò[ŸN¬à€€ú›€‹ùYH[ò[ù\ôX›‹ûKö][\Àú€XŸJ
+Kú€‹ù
+
+KäHOà¬à€€ú›Sò[YHH
+H	âà
+Kõò[YHõ‹õX[^ôU[ò[ùY
+JH	… JKù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›ìò[YHH
+à	âà
+ãõò[YHõ‹õX[^ôU[ò[ùY
+äH	… JKù”›Ÿ\êÿ\ŸJ
+N¬àYà
+Sò[YHìò[YJHô]\õàLN¬àYà
+Sò[YHàìò[YJHô]\õàN¬àô]\õà¬àJN¬à€‹ùYôõ‹ëXX⁄
+[ò[ùOà¬à€€ú›YHõ‹õX[^ôU[ò[ùY
+[ò[ù
+N¬àYà
+ZY
+Hô]\õé¬à€€ú›Xô[H[ò[ùõò[YH[ò[ùô\‹^W€ò[YHY¬à€€ú›Ÿ[X›YHö[\ïò[YH	âàYOOHö[\ïò[YH»	»Ÿ[X›Y	»à	…Œ¬àYà
+Ÿ[X›Y
+H¬à\”X]⁄HùYN¬àBà‹[€úÀú\⁄
+‹[€àò[YOHâŸ\ÿÿ\R[
+Y
+_Hâ‹Ÿ[X›YOâŸ\ÿÿ\R[
+Xô[
+_O€‹[€èò
+N¬àJN¬àYà
+ö[\ïò[YH	âàZ\”X]⁄
+H¬à‹[€úÀú\⁄
+‹[€àò[YOHâŸ\ÿÿ\R[
+ö[\ïò[YJ_HàŸ[X›YâŸ\ÿÿ\R[
+ö[\ïò[YJ_O€‹[€èò
+N¬àBàŸ[X›ö[õô\íSH‹[€úÀöõ⁄[ä	… N¬àŸ[X›ùò[YHHö[\ïò[YH	…Œ¬üBÇôù[ò›[€à‹ôX]T›]\–€›[ùX\
+
+H¬à€€ú›X\HﬂN¬àUíP—W‘’UT◊“—VTÀôõ‹ëXX⁄
+Ÿ^HOà¬àX\⁄Ÿ^WHH¬àJN¬àô]\õàX\¬üBÇãÀ»⁄›»ö[ù\à]Z[»[Ÿ[ûHö[ô[ô»H]öXŸH[àHÿX⁄Y\›ö\ú›[àò[[ô»òX⁄»»TBò\ﬁ[ò»ù[ò›[€à⁄›‘ö[ù\ë]Z[ \‹îŸ\öX[€›\òŸJH¬àYà
+Z\‹îŸ\öX[
+Hô]\õé¬à€›\òŸHH€›\òŸH	‹ÿ]ôY	Œ¬à]]öXŸHHù[¬àYà
+]öXŸ\’ìKö][\»	âà]öXŸ\’ìKö][\Àõ[ô›à
+H¬à]öXŸHH]öXŸ\’ìKö][\Àôö[ô
+Oàö\OOH\‹îŸ\öX[úŸ\öX[OOH\‹îŸ\öX[
+N¬àBàYà
+Y]öXŸJH¬àûH¬à€€ú›ô\»H]ÿZ]ô]⁄
+	Àÿ\K›åKŸ]öXŸ\À€\›	 N¬àYà
+\ô\Àõ⁄ Hõ›»ô]»\úõ‹ä	—òZ[Y»ô]⁄]öXŸ\… N¬à€€ú›]öXŸ\»H]ÿZ]ô\Àöú€€ä
+N¬àYà
+\úò^Kö\–\úò^J]öXŸ\ JH¬à]öXŸHH]öXŸ\Àôö[ô
+Oà
+ö\	âàö\OOH\‹îŸ\öX[
+H
+úŸ\öX[	âàúŸ\öX[OOH\‹îŸ\öX[
+JN¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—ò[òX⁄»]öXŸHô]⁄òZ[Y	À\úäN¬àBàBàYà
+Y]öXŸJH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—]öXŸHõ›õ›[ô	À	Ÿ\úõ‹â N¬àô]\õé¬àBà€€ú›õ‹õX[^ôYH]öXŸKúö[ù\ó⁄[ôõ»»»ããô]öXŸKúö[ù\ó⁄[ôõÀŸ\öX[à]öXŸKúŸ\öX[]öXŸKúö[ù\ó⁄[ôõÀúŸ\öX[Hà]öXŸN¬à⁄[ô›Àó◊‹W‹⁄\ôYÿÿ\ôÀú⁄›‘ö[ù\ë]Z[—]Jõ‹õX[^ôY€›\òŸKù[
+N¬üBÇãÀ»OOOOOH][]Hù[ò›[€ú»OOOOOBôù[ò›[€à€‹U–€\õÿ\ô
+^
+H¬àYà
+]^
+Hô]\õé¬Çàò]öYÿ]‹ãò€\õÿ\ôù‹ö]U^
+^
+Kù[ä
+
+HOà¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–€‹YY»€\õÿ\ô	À	‹›XÿŸ\‹…ÀML
+N¬àJKòÿ]⁄
+\úàOà¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»€‹NâÀ\úäN¬àJN¬üBÇãÀ»OOOOOHõﬁHù[ò›[€ú»OOOOOBôù[ò›[€à‹[êYŸ[ùRJYŸ[ùY
+H¬àÀ»‹[àYŸ[ù	‹»ŸXàRHõ›Y⁄ŸXî€ÿ⁄Ÿ]õﬁH[àHô]»⁄[ô›¬àÀ»[ú›\ôHYŸ[ùY\»TìY[ò€ŸY»]õ⁄Y[XôY[ô»‹XŸ\»‹à[úÿYôH⁄\ú¬à€€ú›õﬁU\õHÿ\K›åK‹õﬁKÿYŸ[ù…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùY
+_Kÿ¬à⁄[ô›Àõ‹[äõﬁU\õYŸ[ù]ZKIŸ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùY
+_X	›⁄YLLåZY⁄Nõ€‹[ô\ãõ‹ôYô\úô\â N¬üBÇôù[ò›[€à‹[ë]öXŸURJŸ\öX[ù[Xô\äH¬àÀ»‹[à]öXŸI‹»ŸXàRHõ›Y⁄ŸXî€ÿ⁄Ÿ]õﬁH[àHô]»⁄[ô›¬à€€ú›õﬁU\õHÿ\K›åK‹õﬁKŸ]öXŸK…Ÿ[ò€ŸUTíP€€\€ô[ù
+Ÿ\öX[ù[Xô\ä_Kÿ¬à⁄[ô›Àõ‹[äõﬁU\õ]öXŸK]ZKIŸ[ò€ŸUTíP€€\€ô[ù
+Ÿ\öX[ù[Xô\ä_X	›⁄YLLåZY⁄Nõ€‹[ô\ãõ‹ôYô\úô\â N¬üBÇãÀ»‹[àH⁄\ôYY]öX‹»[Ÿ[õ‹àH]öXŸBôù[ò›[€à‹[ë]öXŸSY]öX‹ Ÿ\öX[
+H¬àYà
+\Ÿ\öX[
+Hô]\õé¬àYà
+\[Ÿà⁄[ô›Àú⁄›”Y]öX‹”[Ÿ[OOH	Ÿù[ò›[€â H¬à⁄[ô›Àú⁄›”Y]öX‹”[Ÿ[
+»Ÿ\öX[JN¬àH[ŸH¬àÀ»ò[òX⁄Œàò]öYÿ]H»]öXŸ\»\›‹à⁄›»Hÿ\›à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	”Y]öX‹»RHõ›]òZ[XõIÀ	Ÿ\úõ‹â N¬àBüBÇãÀ»OOOOOHX[òYŸYŸ][ô‹»RHOOOOOBò€€ú›—USë‘◊‘—P’S”ó”PëS»H¬à\ÿ€›ô\ûNà	—\ÿ€›ô\ûIÀà€õ\à	‘”ìT	ÀàôX]\ô\Œà	—ôX]\ô\…Àà‹€€\éà	”ÿÿ[ö[ù\àòX⁄⁄[ô…ÀàŸŸ⁄[ôŒà	”ŸŸ⁄[ô…ÀàŸXéà	’ŸXàŸ\ùô\â¬üN¬ò€€ú›—USë‘◊‘—P’S”ó”‘ëTàH…Ÿ\ÿ€›ô\ûIÀ	‹€õ\	À	ŸôX]\ô\…À	‹‹€€\âÀ	€ŸŸ⁄[ô…À	›ŸXâ◊N¬ÇãÀ»›XúŸX›[€à‹õ›\[ô‹»õ‹à\ÿ€›ô\ûHŸX›[€ÇãÀ»öY[»\ôH‹õ›\Y[à‹ô\àH[ûHöY[õ›\›Y€Ÿ\»»ì›\àÇò€€ú›T–”’ëTñW‘’Pî—P’S”î»H¬à¬àŸ^Nà	⁄\‹ÿÿ[õö[ô…ÀàXô[à	“Tÿÿ[õö[ô…ÀàöY[Œà…Ÿ\ÿ€›ô\ûKö\‹ÿÿ[õö[ô◊Ÿ[òXõY	À	Ÿ\ÿ€›ô\ûKú›Xõô]‹ÿÿ[âÀ	Ÿ\ÿ€›ô\ûKõX[ùX[‹ò[ôŸ\…À	Ÿ\ÿ€›ô\ûKúò[ôŸ\◊›^	À	Ÿ\ÿ€›ô\ûKò€€ò›\úô[òﬁI◊BàKà¬àŸ^Nà	‹õÿôW€Y]Ÿ…ÀàXô[à	‘õÿôHY]Ÿ…ÀàöY[Œà…Ÿ\ÿ€›ô\ûKò\úŸ[òXõY	À	Ÿ\ÿ€›ô\ûKöX€\Ÿ[òXõY	À	Ÿ\ÿ€›ô\ûKù‹Ÿ[òXõY	À	Ÿ\ÿ€›ô\ûKú€õ\Ÿ[òXõY	À	Ÿ\ÿ€›ô\ûKõYú◊Ÿ[òXõY	◊BàKà¬àŸ^Nà	ÿ]]◊Ÿ\ÿ€›ô\ûIÀàXô[à	–]]€X]X»\ÿ€›ô\ûIÀàöY[Œà…Ÿ\ÿ€›ô\ûKò]]◊Ÿ\ÿ€›ô\óŸ[òXõY	À	Ÿ\ÿ€›ô\ûKò]]‹ÿ]ôWŸ\ÿ€›ô\ôYŸ]öXŸ\…À	Ÿ\ÿ€›ô\ûKú⁄›◊Ÿ\ÿ€›ô\óÿù]€óÿ[û]ÿ^IÀ	Ÿ\ÿ€›ô\ûKú⁄›◊Ÿ\ÿ€›ô\ôYŸ]öXŸ\◊ÿ[û]ÿ^I◊BàKà¬àŸ^Nà	‹\‹⁄]ôW€\›[ô\ú…ÀàXô[à	‘\‹⁄]ôH\›[ô\ú…ÀàöY[Œà…Ÿ\ÿ€›ô\ûKú\‹⁄]ôWŸ\ÿ€›ô\ûWŸ[òXõY	À	Ÿ\ÿ€›ô\ûKò]]◊Ÿ\ÿ€›ô\ó€]ôW€Yú…À	Ÿ\ÿ€›ô\ûKò]]◊Ÿ\ÿ€›ô\ó€]ôW›‹Ÿ	À	Ÿ\ÿ€›ô\ûKò]]◊Ÿ\ÿ€›ô\ó€]ôW‹‹Ÿ	À	Ÿ\ÿ€›ô\ûKò]]◊Ÿ\ÿ€›ô\ó€]ôW‹€õ\ò\	À	Ÿ\ÿ€›ô\ûKò]]◊Ÿ\ÿ€›ô\ó€]ôW€[úâ◊BàKà¬àŸ^Nà	€Y]öX‹…ÀàXô[à	”Y]öX‹»€€X›[€âÀàöY[Œà…Ÿ\ÿ€›ô\ûKõY]öX‹◊‹ô\ÿÿ[óŸ[òXõY	À	Ÿ\ÿ€›ô\ûKõY]öX‹◊‹ô\ÿÿ[ó⁄[ù\ùò[€Z[ù]\…◊BàBóN¬Çò€€ú›QêUS’TUW‘”P÷W‘‘P»H¬à\]Wÿ⁄X⁄◊Ÿ^\ŒàÀàô\ú⁄[€ó‹[ó‹›ò]YﬁNà	€Z[õ‹âÀà[›◊€XZõ‹ó›\‹òYNàò[ŸKà\ôŸ]›ô\ú⁄[€éà	…Àà€€X››[[Y]ûNàùYKàXZ[ù[ò[òŸW›⁄[ô›Œà¬à[òXõYàò[ŸKà[Y^õ€ôNà	’U…Àà›\ù⁄›\éàà›\ù€Z[éàà[ô⁄›\éàãà[ô€Z[éàà^\◊€Ÿó›ŸYZŒà◊BàKàõ€›]ÿ€€ùõ€à¬à›YŸŸ\ôYàùYKàX^ÿ€€ò›\úô[ùààò]⁄‹⁄^ôNàà[^Wÿô]ŸY[ó›ÿ]ô\ŒàÃàö]\ó‹ŸX€€ôŒàåà[Y\ôŸ[òﬁWÿXõ‹ùàùYBàBüN¬Çò€€ú›”P÷W’ëTî“S”ó‘Só”‘S”î»H¬à»ò[YNà	€XZõ‹âÀXô[à	”XZõ‹à
+›^H€àåû
+I»Kà»ò[YNà	€Z[õ‹âÀXô[à	”Z[õ‹à
+›^H€àåéKû
+I»Kà»ò[YNà	‹]⁄	ÀXô[à	‘]⁄
+›^H€àåéKåM
+I»BóN¬Çò€€ú›”P÷W—VT◊”—ó’—QR»H¬à»ò[YNàXô[à	‘›[â»Kà»ò[YNàKXô[à	”[€â»Kà»ò[YNàãXô[à	’YI»Kà»ò[YNàÀXô[à	’ŸY	»Kà»ò[YNàXô[à	’I»Kà»ò[YNàKXô[à	—úöI»Kà»ò[YNàãXô[à	‘ÿ]	»BóN¬Çò€€ú›Ÿ][ô‹’RT›]HH¬à[ö]X[^ôYàò[ŸKàÿY[ôŒàò[ŸKàÿY[ô‘õ€Z\ŸNàù[àÿ€‹Nà	Ÿ€ÿò[	Ààÿ⁄[XNàù[à‹õ›\YöY[ŒàﬂKà€ÿò[€ò\⁄›àù[à€ÿò[òYùàù[à€ÿò[\ùNàò[ŸKà€ÿò[Ÿ][ô‹—\ùNàò[ŸKàÀ»X[òYŸYŸX›[€ú»€€ùõ€
+⁄X⁄ÿ]Y€‹öY\»\ôHŸ\ùô\ã[X[òYŸY
+BàX[òYŸYŸX›[€úŒàô]»Ÿ]
+…Ÿ\ÿ€›ô\ûIÀ	‹€õ\	À	ŸôX]\ô\…À	‹‹€€\â◊JKà‹öY⁄[ò[X[òYŸYŸX›[€úŒàô]»Ÿ]
+…Ÿ\ÿ€›ô\ûIÀ	‹€õ\	À	ŸôX]\ô\…À	‹‹€€\â◊JKàX[òYŸYŸX›[€ú—\ùNàò[ŸKà[ò[ù\›à◊KàŸ[X›Y[ò[ùYà	…Àà[ò[ù€ò\⁄›àù[à[ò[ùòYùàù[à[ò[ù›ô\úöY\—òYùàﬂKà[ò[ù[ôõ‹òŸYŸX›[€úŒàô]»Ÿ]
+
+Kà‹öY⁄[ò[[ò[ù[ôõ‹òŸYŸX›[€úŒàô]»Ÿ]
+
+Kà[ò[ù[ôõ‹òŸYŸX›[€ú—\ùNàò[ŸKà[ò[ù\ùNàò[ŸKà[ò[ùŸ][ô‹—\ùNàò[ŸKÇàYŸ[ù\›à◊KàŸ[X›YYŸ[ùYà	…ÀàYŸ[ù€ò\⁄›àù[àYŸ[ùò\ŸT€ò\⁄›àù[àYŸ[ùòYùàù[àYŸ[ù›ô\úöY\—òYùàﬂKàYŸ[ù[ôõ‹òŸYŸX›[€úŒàô]»Ÿ]
+
+KàYŸ[ù\ùNàò[ŸKàYŸ[ùŸ][ô‹—\ùNàò[ŸKÇàÿ]ö[ôŒàò[ŸKà]ô[ù–õ›[ôàò[ŸKàÿ⁄ŸYŸ^\Œàô]»Ÿ]
+
+KÀ»Ÿ^\»ÿ⁄ŸYûH[ùö\õ€õY[ùò\öXXõ\¬à\]T€XﬁNà¬à€ÿò[à‹ôX]T€XﬁT›]J
+Kà[ò[ùà‹ôX]T€XﬁT›]J
+BàBüN¬Çôù[ò›[€àô\€€ôU[ò[ùY
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õà	…Œ¬àô]\õàôX€‹ôöYôX€‹ôù]ZYôX€‹ôù[ò[ù⁄Y	…Œ¬üBÇôù[ò›[€àõ‹õX[^ôU[ò[ù\›
+\›
+H¬àYà
+P\úò^Kö\–\úò^J\›
+JHô]\õà◊N¬à€€ú›õ‹õX[^ôYH◊N¬à\›ôõ‹ëXX⁄
+][HOà¬à€€ú›YHô\€€ôU[ò[ùY
+][JN¬àYà
+ZY
+H¬àô]\õé¬àBàõ‹õX[^ôYú\⁄
+»ããö][KYJN¬àJN¬àô]\õàõ‹õX[^ôY¬üBÇôù[ò›[€àô\€€ôPYŸ[ùY
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õà	…Œ¬àô]\õàôX€‹ôòYŸ[ù⁄YôX€‹ôòYŸ[ùYôX€‹ôöY	…Œ¬üBÇôù[ò›[€àõ‹õX[^ôPYŸ[ù\›
+\›
+H¬àYà
+P\úò^Kö\–\úò^J\›
+JHô]\õà◊N¬à€€ú›õ‹õX[^ôYH◊N¬à\›ôõ‹ëXX⁄
+][HOà¬à€€ú›YHô\€€ôPYŸ[ùY
+][JN¬àYà
+ZY
+H¬àô]\õé¬àBàõ‹õX[^ôYú\⁄
+»ããö][KYJN¬àJN¬àô]\õàõ‹õX[^ôY¬üBÇôù[ò›[€à‹ôX]T€XﬁT›]J
+H¬àô]\õà¬à€XﬁNà€€ôT€XﬁT‹X QêUS’TUW‘”P÷W‘‘P Kà‹öY⁄[ò[€XﬁNà€€ôT€XﬁT‹X QêUS’TUW‘”P÷W‘‘P Kà[òXõYàò[ŸKà‹öY⁄[ò[[òXõYàò[ŸKà\ùNàò[ŸKàÿYYàò[ŸBàN¬üBÇôù[ò›[€à€€ôT€XﬁT‹X ‹X H¬àô]\õàî””ãú\úŸJî””ãú›ö[ô⁄YûJ‹X»QêUS’TUW‘”P÷W‘‘P JN¬üBÇôù[ò›[€àõ‹õX[^ôT€XﬁT‹X ‹X H¬à€€ú›õ‹õX[^ôYH€€ôT€XﬁT‹X QêUS’TUW‘”P÷W‘‘P N¬àYà
+\‹X»\[Ÿà‹X»OOH	€ÿöôX›	 H¬àô]\õàõ‹õX[^ôY¬àBàYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\ä‹XÀù\]Wÿ⁄X⁄◊Ÿ^\ JJH¬àõ‹õX[^ôYù\]Wÿ⁄X⁄◊Ÿ^\»Hù[Xô\ä‹XÀù\]Wÿ⁄X⁄◊Ÿ^\ N¬àBàYà
+\[Ÿà‹XÀùô\ú⁄[€ó‹[ó‹›ò]YﬁHOOH	‹›ö[ô… H¬à€€ú›ò[YHH‹XÀùô\ú⁄[€ó‹[ó‹›ò]YﬁKù”›Ÿ\êÿ\ŸJ
+N¬àõ‹õX[^ôYùô\ú⁄[€ó‹[ó‹›ò]YﬁHH”P÷W’ëTî“S”ó‘Só”‘S”îÀú€€YJ‹Oà‹ùò[YHOOHò[YJH»ò[YHàõ‹õX[^ôYùô\ú⁄[€ó‹[ó‹›ò]YﬁN¬àBàYà
+\[Ÿà‹XÀò[›◊€XZõ‹ó›\‹òYHOOH	ÿõ€€X[â H¬àõ‹õX[^ôYò[›◊€XZõ‹ó›\‹òYHH‹XÀò[›◊€XZõ‹ó›\‹òYN¬àBàYà
+\[Ÿà‹XÀù\ôŸ]›ô\ú⁄[€àOOH	‹›ö[ô… H¬àõ‹õX[^ôYù\ôŸ]›ô\ú⁄[€àH‹XÀù\ôŸ]›ô\ú⁄[€é¬àBàYà
+\[Ÿà‹XÀò€€X››[[Y]ûHOOH	ÿõ€€X[â H¬àõ‹õX[^ôYò€€X››[[Y]ûHH‹XÀò€€X››[[Y]ûN¬àBàYà
+‹XÀõXZ[ù[ò[òŸW›⁄[ô›»	âà\[Ÿà‹XÀõXZ[ù[ò[òŸW›⁄[ô›»OOH	€ÿöôX›	 H¬à€€ú›]»H‹XÀõXZ[ù[ò[òŸW›⁄[ô›Œ¬àYà
+\[Ÿà]Àô[òXõYOOH	ÿõ€€X[â Hõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àô[òXõYH]Àô[òXõY¬àYà
+\[Ÿà]Àù[Y^õ€ôHOOH	‹›ö[ô… Hõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àù[Y^õ€ôHH]Àù[Y^õ€ôN¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\ä]Àú›\ù⁄›\äJJHõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àú›\ù⁄›\àHù[Xô\ä]Àú›\ù⁄›\äN¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\ä]Àú›\ù€Z[äJJHõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àú›\ù€Z[àHù[Xô\ä]Àú›\ù€Z[äN¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\ä]Àô[ô⁄›\äJJHõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àô[ô⁄›\àHù[Xô\ä]Àô[ô⁄›\äN¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\ä]Àô[ô€Z[äJJHõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àô[ô€Z[àHù[Xô\ä]Àô[ô€Z[äN¬àYà
+\úò^Kö\–\úò^J]Àô^\◊€Ÿó›ŸYZ JH¬àõ‹õX[^ôYõXZ[ù[ò[òŸW›⁄[ô›Àô^\◊€Ÿó›ŸYZ»Hõ‹õX[^ôT€XﬁQ^\ ]Àô^\◊€Ÿó›ŸYZ N¬àBàBàYà
+‹XÀúõ€›]ÿ€€ùõ€	âà\[Ÿà‹XÀúõ€›]ÿ€€ùõ€OOH	€ÿöôX›	 H¬à€€ú›ò»H‹XÀúõ€›]ÿ€€ùõ€¬àYà
+\[ŸàòÀú›YŸŸ\ôYOOH	ÿõ€€X[â Hõ‹õX[^ôYúõ€›]ÿ€€ùõ€ú›YŸŸ\ôYHòÀú›YŸŸ\ôY¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\äòÀõX^ÿ€€ò›\úô[ù
+JJHõ‹õX[^ôYúõ€›]ÿ€€ùõ€õX^ÿ€€ò›\úô[ùHù[Xô\äòÀõX^ÿ€€ò›\úô[ù
+N¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\äòÀòò]⁄‹⁄^ôJJJHõ‹õX[^ôYúõ€›]ÿ€€ùõ€òò]⁄‹⁄^ôHHù[Xô\äòÀòò]⁄‹⁄^ôJN¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\äòÀô[^Wÿô]ŸY[ó›ÿ]ô\ JJHõ‹õX[^ôYúõ€›]ÿ€€ùõ€ô[^Wÿô]ŸY[ó›ÿ]ô\»Hù[Xô\äòÀô[^Wÿô]ŸY[ó›ÿ]ô\ N¬àYà
+ù[Xô\ãö\—ö[ö]Jù[Xô\äòÀöö]\ó‹ŸX€€ô JJHõ‹õX[^ôYúõ€›]ÿ€€ùõ€öö]\ó‹ŸX€€ô»Hù[Xô\äòÀöö]\ó‹ŸX€€ô N¬àYà
+\[ŸàòÀô[Y\ôŸ[òﬁWÿXõ‹ùOOH	ÿõ€€X[â Hõ‹õX[^ôYúõ€›]ÿ€€ùõ€ô[Y\ôŸ[òﬁWÿXõ‹ùHòÀô[Y\ôŸ[òﬁWÿXõ‹ù¬àBàô]\õàõ‹õX[^ôY¬üBÇôù[ò›[€àõ‹õX[^ôT€XﬁQ^\ ^\ H¬àYà
+P\úò^Kö\–\úò^J^\ JH¬àô]\õà◊N¬àBà€€ú›õ‹õX[^ôYH\úò^Kôúõ€Jô]»Ÿ]
+^\ÀõX\
+ò[Oàù[Xô\äò[
+JKôö[\äò[Oàù[Xô\ãö\—ö[ö]Jò[
+H	âàò[èH	âàò[HäJJKú€‹ù
+
+KäHOàHHäN¬àô]\õàõ‹õX[^ôY¬üBÇôù[ò›[€àŸ]€XﬁT›]Jÿ€‹JH¬àYà
+\Ÿ][ô‹’RT›]Kù\]T€XﬁJH¬àŸ][ô‹’RT›]Kù\]T€XﬁHH»€ÿò[à‹ôX]T€XﬁT›]J
+K[ò[ùà‹ôX]T€XﬁT›]J
+HN¬àBàô]\õàŸ][ô‹’RT›]Kù\]T€XﬁV‹ÿ€‹WHù[¬üBÇôù[ò›[€à\T€XﬁT€ò\⁄›
+ÿ€‹K[òXõY€XﬁT‹X H¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]JHô]\õé¬à›]Kú€XﬁHH€€ôT€XﬁT‹X €XﬁT‹X N¬à›]Kõ‹öY⁄[ò[€XﬁHH€€ôT€XﬁT‹X €XﬁT‹X N¬à›]Kô[òXõYHHY[òXõY¬à›]Kõ‹öY⁄[ò[[òXõYHHY[òXõY¬à›]Kô\ùHHò[ŸN¬à›]KõÿYYHùYN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬üBÇôù[ò›[€àôX€€\]T€XﬁQ\ùJÿ€‹JH¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]JHô]\õé¬à€€ú›€XﬁP⁄[ôŸYH›]Kô[òXõY	âàYY\\]X[
+›]Kú€XﬁK›]Kõ‹öY⁄[ò[€XﬁJN¬à€€ú›[òXõY⁄[ôŸYH›]Kô[òXõYOOH›]Kõ‹öY⁄[ò[[òXõY¬à›]Kô\ùHH€XﬁP⁄[ôŸY[òXõY⁄[ôŸY¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬üBÇôù[ò›[€àô\Ÿ]€XﬁQòYù
+ÿ€‹JH¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]JHô]\õé¬à›]Kú€XﬁHH€€ôT€XﬁT‹X ›]Kõ‹öY⁄[ò[€XﬁJN¬à›]Kô[òXõYH›]Kõ‹öY⁄[ò[[òXõY¬à›]Kô\ùHHò[ŸN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬üBÇôù[ò›[€àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+H¬à€€ú›€XﬁHHŸ][ô‹’RT›]Kù\]T€XﬁHﬂN¬à€€ú›€ÿò[€XﬁQ\ùHH€XﬁKô€ÿò[»€XﬁKô€ÿò[ô\ùHàò[ŸN¬à€€ú›[ò[ù€XﬁQ\ùHH€XﬁKù[ò[ù»€XﬁKù[ò[ùô\ùHàò[ŸN¬àÀ»[ò€YHX[òYŸYŸX›[€ú—\ùH[à€ÿò[\ùH⁄X⁄¬àŸ][ô‹’RT›]Kô€ÿò[\ùHHHJŸ][ô‹’RT›]Kô€ÿò[Ÿ][ô‹—\ùH€ÿò[€XﬁQ\ùHŸ][ô‹’RT›]KõX[òYŸYŸX›[€ú—\ùJN¬àŸ][ô‹’RT›]Kù[ò[ù\ùHHHJŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú—\ùH[ò[ù€XﬁQ\ùJN¬àŸ][ô‹’RT›]KòYŸ[ù\ùHHHJŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùJN¬üBÇôù[ò›[€àŸ]Ÿ][ô‹‘^[ÿY
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õàﬂN¬àô]\õàôX€‹ôúŸ][ô‹»ôX€‹ôîŸ][ô‹»ﬂN¬üBÇôù[ò›[€àŸ]›ô\úöY\‘^[ÿY
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õàﬂN¬àô]\õàôX€‹ôõ›ô\úöY\»ôX€‹ôì›ô\úöY\»ﬂN¬üBÇôù[ò›[€àŸ]\]Y]
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õàù[¬àô]\õàôX€‹ôù\]Yÿ]ôX€‹ôù\]Y]ôX€‹ôï\]Y]ù[¬üBÇôù[ò›[€àŸ]\]YûJôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õà	…Œ¬àô]\õàôX€‹ôù\]YÿûHôX€‹ôù\]YûHôX€‹ôï\]YûH	…Œ¬üBÇôù[ò›[€àŸ]›ô\úöY\’\]Y]
+ôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õàù[¬àô]\õàôX€‹ôõ›ô\úöY\◊›\]Yÿ]ôX€‹ôõ›ô\úöY\’\]Y]ôX€‹ôì›ô\úöY\’\]Y]ù[¬üBÇôù[ò›[€àŸ]›ô\úöY\’\]YûJôX€‹ô
+H¬àYà
+\ôX€‹ô
+Hô]\õà	…Œ¬àô]\õàôX€‹ôõ›ô\úöY\◊›\]YÿûHôX€‹ôõ›ô\úöY\’\]YûHôX€‹ôì›ô\úöY\’\]YûH	…Œ¬üBÇôù[ò›[€àô\€€ôQöY[ò[YJöY[ò[YJH¬àYà
+ò[YHOOH[ôYö[ôYò[YHOOHù[
+H¬àYà
+öY[	âàÿöôX›úõ››\Kö\”›€îõ‹\ùKòÿ[
+öY[	ŸYò][	 JH¬àô]\õàöY[ôYò][¬àBàBàô]\õàò[YN¬üBÇôù[ò›[€à\]TŸ][ô‹’[ò[ù\ôX›‹ûJò]”\›
+H¬à€€ú›õ‹õX[^ôYHõ‹õX[^ôU[ò[ù\›
+ò]”\›
+N¬à€€ú›ô]ö[›\‘Ÿ[X›[€àHŸ][ô‹’RT›]KúŸ[X›Y[ò[ùY¬àŸ][ô‹’RT›]Kù[ò[ù\›Hõ‹õX[^ôY¬à€€ú›Ÿ[X›[€î›[ò[YHô]ö[›\‘Ÿ[X›[€à	âàõ‹õX[^ôYú€€YJOàöYOOHô]ö[›\‘Ÿ[X›[€äN¬àYà
+\Ÿ[X›[€î›[ò[Y
+H¬àŸ][ô‹’RT›]KúŸ[X›Y[ò[ùYHõ‹õX[^ôYõ[ô›»õ‹õX[^ôYÃKöYà	…Œ¬àBàYà
+\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬àŸ][ô‹’RT›]Kù[ò[ù€ò\⁄›Hù[¬àŸ][ô‹’RT›]Kù[ò[ùòYùHù[¬àŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYùHﬂN¬àŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHHò[ŸN¬à\T€XﬁT€ò\⁄›
+	›[ò[ù	Àò[ŸKQêUS’TUW‘”P÷W‘‘P N¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àBàYà
+\Ÿ][ô‹’RT›]Kö[ö]X[^ôY
+H¬àô]\õé¬àBàYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	»	âà\Ÿ[X›[€î›[ò[Y	âàŸ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬àÿY[ò[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+Bàù[ä
+
+HOàô[ô\îŸ][ô‹’RJ
+JBàòÿ]⁄
+\úàOàô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»ôYúô\⁄[ò[ù›ô\úöY\…À\úäJN¬àô]\õé¬àBàô[ô\îŸ][ô‹’RJ
+N¬üBÇôù[ò›[€àõ›YûSX[òYŸYŸ][ô‹’[ò[ù\ôX›‹ûJ\›
+H¬à\]TŸ][ô‹’[ò[ù\ôX›‹ûJ\›
+N¬üBÇò\ﬁ[ò»ù[ò›[€à[ö]Ÿ][ô‹’RJ
+H¬à€€ú›[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€X[òYŸY‹Ÿ][ô‹◊‹[ô[	 N¬àYà
+\[ô[
+Hô]\õé¬àYà
+Ÿ][ô‹’RT›]KõÿY[ô H¬àô]\õàŸ][ô‹’RT›]KõÿY[ô‘õ€Z\ŸN¬àBàYà
+Ÿ][ô‹’RT›]Kö[ö]X[^ôY
+H¬àÀ»õ‹à[ò[ù\ÿ€‹Y\Ÿ\úÀ[ÿ^\»›\ù€à[ò[ùÿ€‹H
+õ›€ÿò[
+BàYà
+\’[ò[ùÿ€‹Y\Ÿ\ä
+H	âàŸ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	 H¬àŸ][ô‹’RT›]Kúÿ€‹HH	›[ò[ù	Œ¬àBàô[ô\îŸ][ô‹’RJ
+N¬àô]\õé¬àBàŸ][ô‹’RT›]KõÿY[ô»HùYN¬àŸ][ô‹’RT›]KõÿY[ô‘õ€Z\ŸHH
+\ﬁ[ò»
+
+HOà¬àûH¬àÀ»õ‹à[ò[ù\ÿ€‹Y\Ÿ\úÀYò][»[ò[ùÿ€‹BàYà
+\’[ò[ùÿ€‹Y\Ÿ\ä
+JH¬àŸ][ô‹’RT›]Kúÿ€‹HH	›[ò[ù	Œ¬àBà]ÿZ]õ€››ò\Ÿ][ô‹’RJ
+N¬àŸ][ô‹’RT›]Kö[ö]X[^ôYHùYN¬àô[ô\îŸ][ô‹’RJ
+N¬àHÿ]⁄
+\úäH¬àô[ô\îŸ][ô‹—\úõ‹ä\úäN¬àHö[ò[H¬àŸ][ô‹’RT›]KõÿY[ô»Hò[ŸN¬àBàJJ
+N¬àô]\õàŸ][ô‹’RT›]KõÿY[ô‘õ€Z\ŸN¬üBÇò\ﬁ[ò»ù[ò›[€àõ€››ò\Ÿ][ô‹’RJ
+H¬à]ÿZ]ÿYŸ][ô‹‘ÿ⁄[XJ
+N¬à]ÿZ]ÿYŸ][ô‹‘€›\òŸ\ 
+N»À»ô]⁄ÿ⁄ŸYŸ^\¬à]ÿZ]ÿY€ÿò[Ÿ][ô‹‘€ò\⁄›
+
+N¬à]ÿZ]ÿY€ÿò[\]T€XﬁJ
+N¬à]ÿZ]ÿY[ò[ù\ôX›‹ûJ
+N¬à]ÿZ]ÿYYŸ[ù\ôX›‹ûQõ‹îŸ][ô‹ 
+N¬àYà
+Ÿ][ô‹’RT›]Kù[ò[ù\›õ[ô›à
+H¬àŸ][ô‹’RT›]KúŸ[X›Y[ò[ùYHŸ][ô‹’RT›]Kù[ò[ù\›ÃKöY¬àYà
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬à]ÿZ]ÿY[ò[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+N¬àBàBüBÇò\ﬁ[ò»ù[ò›[€àÿYŸ][ô‹‘ÿ⁄[XJ
+H¬àûH¬à€€ú›ÿ⁄[XHH]ÿZ]ô]⁄î””ä	Àÿ\K›åK‹Ÿ][ô‹À‹ÿ⁄[XI N¬àŸ][ô‹’RT›]Kúÿ⁄[XHHÿ⁄[XN¬àŸ][ô‹’RT›]Kô‹õ›\YöY[»H‹õ›\ÿ⁄[XQöY[ ÿ⁄[XH	âà\úò^Kö\–\úò^Jÿ⁄[XKôöY[ H»ÿ⁄[XKôöY[»à◊JN¬àHÿ]⁄
+\úäH¬àYà
+\úà	âà\úãú›]\»OOH
+H¬àõ›»ô]»\úõ‹ä	”X[òYŸYŸ][ô‹»\ôH\ÿXõY€à\»Ÿ\ùô\àùZ[à[òXõH[ò[òﬁKŸôX]\ô\»»\ŸH\»Xãâ N¬àBàõ›»\úé¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿYŸ][ô‹‘€›\òŸ\ 
+H¬àûH¬à€€ú›€›\òŸ\»H]ÿZ]ô]⁄î””ä	Àÿ\K›åK‹Ÿ\ùô\ã‹Ÿ][ô‹À‹€›\òŸ\… N¬àŸ][ô‹’RT›]Kõÿ⁄ŸYŸ^\»Hô]»Ÿ]
+€›\òŸ\Àõÿ⁄ŸY⁄Ÿ^\»◊JN¬àŸ][ô‹’RT›]KôYôôX›]ôUò[Y\»H€›\òŸ\ÀôYôôX›]ôW›ò[Y\»ﬂN¬àHÿ]⁄
+\úäH¬àÀ»Yà[ô⁄[ùŸ\€â›^\›‹à\úõ‹úÀ\‹›[YHõ»ÿ⁄‹¬àŸ][ô‹’RT›]Kõÿ⁄ŸYŸ^\»Hô]»Ÿ]
+
+N¬àŸ][ô‹’RT›]KôYôôX›]ôUò[Y\»HﬂN¬àBüBÇôù[ò›[€à‹õ›\ÿ⁄[XQöY[ öY[ H¬à€€ú›‹õ›\»HﬂN¬àöY[Àôõ‹ëXX⁄
+öY[Oà¬àYà
+YöY[YöY[ú]
+Hô]\õé¬à€€ú›ÿ€‹HH
+öY[úÿ€‹H	… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+ÿ€‹HOOH	ÿYŸ[ù	 H¬àô]\õé¬àBà€€ú›ŸX›[€àHöY[ú]ú‹]
+	Àâ VÃN¬àYà
+Y‹õ›\÷‹ŸX›[€óJH¬à‹õ›\÷‹ŸX›[€óHH◊N¬àBà‹õ›\÷‹ŸX›[€óKú\⁄
+öY[
+N¬àJN¬àô]\õà‹õ›\Œ¬üBÇôù[ò›[€à‹ô\ôYŸ][ô‹‘ŸX›[€ú 
+H¬à€€ú›ŸX›[€ú»H◊N¬à€€ú›ŸY[àHô]»Ÿ]
+
+N¬à—USë‘◊‘—P’S”ó”‘ëTãôõ‹ëXX⁄
+ŸX›[€íŸ^HOà¬à€€ú›‹õ›\HŸ][ô‹’RT›]Kô‹õ›\YöY[÷‹ŸX›[€íŸ^WN¬àYà
+‹õ›\	âà‹õ›\õ[ô›
+H¬àŸX›[€úÀú\⁄
+ŸX›[€íŸ^JN¬àŸY[ãòY
+ŸX›[€íŸ^JN¬àBàJN¬àÿöôX›öŸ^\ Ÿ][ô‹’RT›]Kô‹õ›\YöY[ Kú€‹ù
+
+Kôõ‹ëXX⁄
+ŸX›[€íŸ^HOà¬à€€ú›‹õ›\HŸ][ô‹’RT›]Kô‹õ›\YöY[÷‹ŸX›[€íŸ^WN¬àYà
+\ŸY[ãö\ ŸX›[€íŸ^JH	âà‹õ›\	âà‹õ›\õ[ô›
+H¬àŸX›[€úÀú\⁄
+ŸX›[€íŸ^JN¬àBàJN¬àô]\õàŸX›[€úŒ¬üBÇò\ﬁ[ò»ù[ò›[€àÿY€ÿò[Ÿ][ô‹‘€ò\⁄›
+
+H¬à€€ú›€ò\⁄›H]ÿZ]ô]⁄î””ä	Àÿ\K›åK‹Ÿ][ô‹ÀŸ€ÿò[	 N¬àŸ][ô‹’RT›]Kô€ÿò[€ò\⁄›H€ò\⁄›¬àŸ][ô‹’RT›]Kô€ÿò[òYùH€€ôTŸ][ô‹ Ÿ]Ÿ][ô‹‘^[ÿY
+€ò\⁄›
+JN¬àŸ][ô‹’RT›]Kô€ÿò[Ÿ][ô‹—\ùHHò[ŸN¬àÀ»ﬁ[ò»X[òYŸYŸX›[€ú»úõ€H€ò\⁄›à€€ú›X[òYŸY\úàH
+€ò\⁄›	âà\úò^Kö\–\úò^J€ò\⁄›õX[òYŸY‹ŸX›[€ú JBà»€ò\⁄›õX[òYŸY‹ŸX›[€ú¬àà…Ÿ\ÿ€›ô\ûIÀ	‹€õ\	À	ŸôX]\ô\…À	‹‹€€\â◊N¬àŸ][ô‹’RT›]KõX[òYŸYŸX›[€ú»Hô]»Ÿ]
+X[òYŸY\úäN¬àŸ][ô‹’RT›]Kõ‹öY⁄[ò[X[òYŸYŸX›[€ú»Hô]»Ÿ]
+X[òYŸY\úäN¬àŸ][ô‹’RT›]KõX[òYŸYŸX›[€ú—\ùHHò[ŸN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬üBÇò\ﬁ[ò»ù[ò›[€àÿY€ÿò[\]T€XﬁJ
+H¬à€€ú››]HHŸ]€XﬁT›]J	Ÿ€ÿò[	 N¬àYà
+\›]JHô]\õé¬àûH¬à€€ú›ô\‹H]ÿZ]ô]⁄î””ä	Àÿ\K›åK›\]K\€X⁄Y\ÀŸ€ÿò[	 N¬à€€ú›€XﬁHHô\‹	âàô\‹ú€XﬁH»õ‹õX[^ôT€XﬁT‹X ô\‹ú€XﬁJHà€€ôT€XﬁT‹X QêUS’TUW‘”P÷W‘‘P N¬à\T€XﬁT€ò\⁄›
+	Ÿ€ÿò[	ÀùYK€XﬁJN¬àHÿ]⁄
+\úäH¬àYà
+\úà	âà\úãú›]\»OOH
+H¬à\T€XﬁT€ò\⁄›
+	Ÿ€ÿò[	Àò[ŸKQêUS’TUW‘”P÷W‘‘P N¬àô]\õé¬àBàõ›»\úé¬àBüBÇãÀ»ÿY[ôô[ô\àYŸ[ù\]H€XﬁH[àH\]\»XÇò\ﬁ[ò»ù[ò›[€àÿYYŸ[ù\]T€XﬁQõ‹ï\]\’Xä
+H¬à€€ú›õ€›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ù›\]W‹€XﬁW‹õ€›	 N¬àYà
+\õ€›
+Hô]\õé¬Çàõ€›ö[õô\íSH	œ]à€\‹œHõ]]Y]^èìÿY[ô»YŸ[ù\]H€Xﬁx†)èŸ]èâŒ¬ÇàûH¬à€€ú›ô\‹H]ÿZ]ô]⁄î””ä	Àÿ\K›åK›\]K\€X⁄Y\ÀŸ€ÿò[	 N¬à€€ú›€XﬁHHô\‹	âàô\‹ú€XﬁH»õ‹õX[^ôT€XﬁT‹X ô\‹ú€XﬁJHà€€ôT€XﬁT‹X QêUS’TUW‘”P÷W‘‘P N¬à€€ú›[òXõYHô\‹	âàô\‹ô[òXõYOOH[ôYö[ôY»ô\‹ô[òXõYàò[ŸN¬àô[ô\êYŸ[ù\]T€XﬁR[ï\]\’Xäõ€›[òXõY€XﬁJN¬àHÿ]⁄
+\úäH¬àYà
+\úà	âà\úãú›]\»OOH
+H¬àô[ô\êYŸ[ù\]T€XﬁR[ï\]\’Xäõ€›ò[ŸKQêUS’TUW‘”P÷W‘‘P N¬àô]\õé¬àBàõ€›ö[õô\íSH]à›[OHò€€‹éùò\äKY[ôŸ\äN»èëòZ[Y»ÿYYŸ[ù\]H€XﬁNà	Ÿ\ÿÿ\R[
+\úãõY\‹ÿYŸH\úä_OŸ]èò¬àBüBÇôù[ò›[€àô[ô\êYŸ[ù\]T€XﬁR[ï\]\’Xäõ€›[òXõY€XﬁJH¬à€€ú›ÿ[ëY]H\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I N¬Çà][Hà]à€\‹œHúŸ][ô‹À\ŸX›[€ã\[ô[]]À]\]K\€XﬁHà›[OHõX\ô⁄[ãXõ›€Nå»èÇà]à€\‹œHúŸ][ô‹À\ŸX›[€ãZXY\àèÇàH›[OHõX\ô⁄[éå»èëYò][YŸ[ù\]H€XﬁO⁄OÇà›[OHõX\ô⁄[éåÿ€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåLú»èê€€ùõ€›»YŸ[ù»⁄X⁄»õ‹à\]\À⁄X⁄ô\ú⁄[€ú»^H\ôŸ][ô›»õ€›]»\ôH›YŸYà\ŸHŸ][ô‹»\H»[[ò[ù»[õ\‹»›ô\úöY[à[àõY]Ÿ][ô‹Àè‹ÇàŸ]èÇà]à€\‹œHúŸ][ô‹ÀYöY[[\›]]À]\]KYöY[[\›èÇà¬ÇàÀ»€XﬁH[òXõYŸŸ€Bà[
+œHà]à€\‹œHúŸ][ô‹ÀYöY[\õ›»èÇà]à€\‹œHúŸ][ô‹ÀYöY[[Xô[èÇà]à€\‹œHôöY[]]Hèë[ôõ‹òŸH]]À]\]H€XﬁOŸ]èÇà]à€\‹œHôöY[Y\ÿ‹ö\[€àèï⁄[à[òXõYYŸ[ù»⁄[õ€›»\ŸH\]HŸ][ô‹ÀèŸ]èÇàŸ]èÇà]à€\‹œHúŸ][ô‹ÀYöY[X€€ùõ€èÇàXô[€\‹œHõZ[öK]ŸŸ€KX€€ùZ[ô\àŸ][ô‹À]ŸŸ€HèÇà[ú]\OHò⁄X⁄ÿõﬁàYHù\]\◊‹€XﬁWŸ[òXõYà	Ÿ[òXõY»	ÿ⁄X⁄ŸY	»à	…ﬂH	»Xÿ[ëY]»	Ÿ\ÿXõY	»à	…ﬂH]K\€XﬁKYöY[Hô[òXõYèÇà‹[à€\‹œHúŸ][ô‹À]ŸŸ€K\›]HèâŸ[òXõY»	—[òXõY	»à	—\ÿXõY	ﬂO‹‹[èÇà€Xô[ÇàŸ]èÇàŸ]èÇà¬ÇàYà
+[òXõY
+H¬à€€ú›\ÿXõYHXÿ[ëY]»	Ÿ\ÿXõY	»à	…Œ¬ÇàÀ»⁄X⁄»ÿY[òŸBà[
+œHùZ[\]\’Xî€XﬁTõ› 	–⁄X⁄»ÿY[òŸH
+^\ IÀ	‘Ÿ]»»]\ŸH[ò][ôY\]H⁄X⁄‹ÀâÀà[ú]\OHõù[Xô\àà€\‹œHú€XﬁKZ[ú]àYHù\]\◊‹€XﬁWÿ⁄X⁄◊Ÿ^\»àò[YOHâ‹€XﬁKù\]Wÿ⁄X⁄◊Ÿ^\»_HàZ[èHåàX^HåÕçHà	Ÿ\ÿXõYH]K\€XﬁKYöY[Hù\]Wÿ⁄X⁄◊Ÿ^\»à]]ÿ€€\]OHõŸôàà]KL\ZY€õ‹ôH]K[Y€õ‹ôOHùùYHèò
+N¬ÇàÀ»ô\ú⁄[€à[à›ò]YﬁBà€€ú›[ì‹[€ú»H”P÷W’ëTî“S”ó‘Só”‘S”îÀõX\
+‹OÇà‹[€àò[YOHâ€‹ùò[Y_Hà	‹€XﬁKùô\ú⁄[€ó‹[ó‹›ò]YﬁHOOH‹ùò[YH»	‹Ÿ[X›Y	»à	…ﬂOâ€‹õXô[O€‹[€èòà
+Köõ⁄[ä	… N¬à[
+œHùZ[\]\’Xî€XﬁTõ› 	’ô\ú⁄[€à[à›ò]YﬁIÀ	–€€ùõ€»⁄]\àYŸ[ù»›^H€àXZõ‹ãZ[õ‹ã‹à]⁄[ô\ÀâÀàŸ[X›€\‹œHú€XﬁKZ[ú]àYHù\]\◊‹€XﬁW‹[ó‹›ò]YﬁHà	Ÿ\ÿXõYH]K\€XﬁKYöY[Hùô\ú⁄[€ó‹[ó‹›ò]YﬁHèâ‹[ì‹[€úﬂO‹Ÿ[X›ò
+N¬ÇàÀ»[›»XZõ‹à\‹òY\¬à[
+œHùZ[\]\’Xî€XﬁTõ› 	–[›»XZõ‹à\‹òY\…À	’⁄[à\ÿXõYYŸ[ù»⁄[õ›‹õ‹‹»XZõ‹àô\ú⁄[€àõ›[ô\öY\»[õ\‹»õ‹òŸYX[ùX[KâÀàXô[€\‹œHõZ[öK]ŸŸ€KX€€ùZ[ô\àŸ][ô‹À]ŸŸ€HèÇà[ú]\OHò⁄X⁄ÿõﬁàYHù\]\◊‹€XﬁW€XZõ‹àà	‹€XﬁKò[›◊€XZõ‹ó›\‹òYH»	ÿ⁄X⁄ŸY	»à	…ﬂH	Ÿ\ÿXõYH]K\€XﬁKYöY[Hò[›◊€XZõ‹ó›\‹òYHèÇà‹[à€\‹œHúŸ][ô‹À]ŸŸ€K\›]Hèâ‹€XﬁKò[›◊€XZõ‹ó›\‹òYH»	—[òXõY	»à	—\ÿXõY	ﬂO‹‹[èÇà€Xô[ò
+N¬ÇàÀ»\ôŸ]ô\ú⁄[€Çà[
+œHùZ[\]\’Xî€XﬁTõ› 	’\ôŸ]ô\ú⁄[€à
+‹[€ò[
+IÀ	‘õ›öYH[à^X›Ÿ[X[ùX»ô\ú⁄[€à»[àHõY]âÀà[ú]\OHù^à€\‹œHú€XﬁKZ[ú]àYHù\]\◊‹€XﬁW›\ôŸ]àò[YOHâ‹€XﬁKù\ôŸ]›ô\ú⁄[€à	…ﬂHàXŸZ€\èHôKôÀãKåãå»à	Ÿ\ÿXõYH]K\€XﬁKYöY[Hù\ôŸ]›ô\ú⁄[€àà]]ÿ€€\]OHõŸôàà]KL\ZY€õ‹ôH]K[Y€õ‹ôOHùùYHèò
+N¬ÇàÀ»€€X›[[Y]ûBà[
+œHùZ[\]\’Xî€XﬁTõ› 	–€€X›[[Y]ûH\ö[ô»õ€›]	À	–[›‹»HŸ\ùô\à»ÿ]\à[õ€û[Z^ôY\]HY]öX‹ÀâÀàXô[€\‹œHõZ[öK]ŸŸ€KX€€ùZ[ô\àŸ][ô‹À]ŸŸ€HèÇà[ú]\OHò⁄X⁄ÿõﬁàYHù\]\◊‹€XﬁW›[[Y]ûHà	‹€XﬁKò€€X››[[Y]ûH»	ÿ⁄X⁄ŸY	»à	…ﬂH	Ÿ\ÿXõYH]K\€XﬁKYöY[Hò€€X››[[Y]ûHèÇà‹[à€\‹œHúŸ][ô‹À]ŸŸ€K\›]Hèâ‹€XﬁKò€€X››[[Y]ûH»	—[òXõY	»à	—\ÿXõY	ﬂO‹‹[èÇà€Xô[ò
+N¬àH[ŸH¬à[
+œH]à€\‹œHõ]]Y]^à›[OHúY[ôŒé»èìõ»€ÿò[]]À]\]H€XﬁH\»›\úô[ùH[ôõ‹òŸYàYŸ[ù»⁄[ô[H€àZ\àÿÿ[›ô\úöYHŸ][ô‹ÀèŸ]èò¬àBÇà[
+œHàŸ]èÇàŸ]èÇà¬ÇàÀ»X›[€àù]€ú¬àYà
+ÿ[ëY]
+H¬à[
+œHà]à€\‹œHúŸ][ô‹ÀXX›[€ú»à›[OHõX\ô⁄[ã]‹åLú‹Y[ôÀ]‹åLúÿõ‹ô\ã]‹å\€€Yò\äKXõ‹ô\äN»èÇà]à€\‹œHúŸ][ô‹À\›]\»àYHù\]\◊‹€XﬁW‹›]\»èèŸ]èÇà]à€\‹œHúŸ][ô‹ÀXX›[€ãXù]€ú»èÇàù]€àYHù\]\◊‹€XﬁW‹ÿ]ôWÿùàà€\‹œHúö[X\ûHà›[OHõZ[ã]⁄YåLå»èîÿ]ôH€XﬁOÿù]€èÇàŸ]èÇàŸ]èÇà¬àBÇàõ€›ö[õô\íSH[¬ÇàÀ»ö[ô]ô[ù¬à€€ú›[òXõYŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁWŸ[òXõY	 N¬àYà
+[òXõYŸŸ€JH¬à[òXõYŸŸ€KòY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à€€ú››]T‹[àH[òXõYŸŸ€Kú\ô[ù[[Y[ùú]Y\ûTŸ[X›‹ä	ÀúŸ][ô‹À]ŸŸ€K\›]I N¬àYà
+›]T‹[äH›]T‹[ãù^€€ù[ùH[òXõYŸŸ€Kò⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬àÀ»ôK\ô[ô\à»⁄›À⁄YH€XﬁHöY[¬àÿYYŸ[ù\]T€XﬁQõ‹ï\]\’Xä
+N¬àJN¬àBÇàÀ»ö[ôŸŸ€H›]H\]\»õ‹à⁄X⁄ÿõﬁ\¬àõ€›ú]Y\ûTŸ[X›‹ê[
+	⁄[ú]›\OHò⁄X⁄ÿõﬁóVŸ]K\€XﬁKYöY[I Kôõ‹ëXX⁄
+ÿàOà¬àYà
+ÿãöYOOH	›\]\◊‹€XﬁWŸ[òXõY	 Hô]\õé»À»[ôXYH[ôYàÿãòY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à€€ú››]T‹[àHÿãú\ô[ù[[Y[ùú]Y\ûTŸ[X›‹ä	ÀúŸ][ô‹À]ŸŸ€K\›]I N¬àYà
+›]T‹[äH›]T‹[ãù^€€ù[ùHÿãò⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬àJN¬àJN¬ÇàÀ»ö[ôÿ]ôHù]€Çà€€ú›ÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW‹ÿ]ôWÿùâ N¬àYà
+ÿ]ôPùäH¬àÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOàÿ]ôPYŸ[ù\]T€XﬁQúõ€U\]\’Xä
+JN¬àBüBÇôù[ò›[€àùZ[\]\’Xî€XﬁTõ› Xô[\ÿ‹ö\[€ã€€ùõ€[
+H¬àô]\õàà]à€\‹œHúŸ][ô‹ÀYöY[\õ›»èÇà]à€\‹œHúŸ][ô‹ÀYöY[[Xô[èÇà]à€\‹œHôöY[]]HèâŸ\ÿÿ\R[
+Xô[
+_OŸ]èÇà]à€\‹œHôöY[Y\ÿ‹ö\[€àèâŸ\ÿÿ\R[
+\ÿ‹ö\[€ä_OŸ]èÇàŸ]èÇà]à€\‹œHúŸ][ô‹ÀYöY[X€€ùõ€èÇà	ÿ€€ùõ€[BàŸ]èÇàŸ]èÇà¬üBÇò\ﬁ[ò»ù[ò›[€àÿ]ôPYŸ[ù\]T€XﬁQúõ€U\]\’Xä
+H¬à€€ú››]\—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW‹›]\… N¬à€€ú›ÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW‹ÿ]ôWÿùâ N¬ÇàYà
+ÿ]ôPùäHÿ]ôPùãô\ÿXõYHùYN¬àYà
+›]\—[
+H¬à›]\—[ù^€€ù[ùH	‘ÿ]ö[ô¯†)âŒ¬à›]\—[ú›[Kò€€‹àH	›ò\äK[]]Y
+IŒ¬àBÇàûH¬à€€ú›[òXõYHÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁWŸ[òXõY	 OÀò⁄X⁄ŸYò[ŸN¬Çà€€ú›€XﬁHH¬à\]Wÿ⁄X⁄◊Ÿ^\Œà\úŸR[ù
+ÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁWÿ⁄X⁄◊Ÿ^\… OÀùò[YH	ÃIÀL
+Kàô\ú⁄[€ó‹[ó‹›ò]YﬁNàÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW‹[ó‹›ò]YﬁI OÀùò[YH	€]\›	Àà[›◊€XZõ‹ó›\‹òYNàÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW€XZõ‹â OÀò⁄X⁄ŸYò[ŸKà\ôŸ]›ô\ú⁄[€éàÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW›\ôŸ]	 OÀùò[YH	…Àà€€X››[[Y]ûNàÿ›[Y[ùôŸ][[Y[ùûRY
+	›\]\◊‹€XﬁW›[[Y]ûI OÀò⁄X⁄ŸYò[ŸKàXZ[ù[ò[òŸW›⁄[ô›ŒàQêUS’TUW‘”P÷W‘‘PÀõXZ[ù[ò[òŸW›⁄[ô›Ààõ€›]ÿ€€ùõ€àQêUS’TUW‘”P÷W‘‘PÀúõ€›]ÿ€€ùõ€àN¬Çà]ÿZ]ô]⁄î””ä	Àÿ\K›åK›\]K\€X⁄Y\ÀŸ€ÿò[	À¬àY]Ÿà	‘U	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»[òXõY€XﬁHJBàJN¬ÇàYà
+›]\—[
+H¬à›]\—[ù^€€ù[ùH	‘ÿ]ôY›XÿŸ\‹Ÿù[IŒ¬à›]\—[ú›[Kò€€‹àH	›ò\äK\›XÿŸ\‹ IŒ¬àBÇàÀ»[€»\]HHõY]Ÿ][ô‹»›]HYàÿYYàYà
+Ÿ][ô‹’RT›]Kù\]T€XﬁH	âàŸ][ô‹’RT›]Kù\]T€XﬁKô€ÿò[
+H¬à\T€XﬁT€ò\⁄›
+	Ÿ€ÿò[	À[òXõY€XﬁJN¬àBÇàŸ][Y[›]
+
+
+HOà¬àYà
+›]\—[
+H›]\—[ù^€€ù[ùH	…Œ¬àKÃ
+N¬àHÿ]⁄
+\úäH¬àYà
+›]\—[
+H¬à›]\—[ù^€€ù[ùH\úõ‹éà	Ÿ\úãõY\‹ÿYŸH\úüX¬à›]\—[ú›[Kò€€‹àH	›ò\äKY[ôŸ\äIŒ¬àBàHö[ò[H¬àYà
+ÿ]ôPùäHÿ]ôPùãô\ÿXõYHò[ŸN¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿY[ò[ù\ôX›‹ûJ
+H¬àûH¬àÀ»õ‹à[ò[ù\ÿ€‹Y\Ÿ\úÀ^Hÿ[â›XÿŸ\‹»ÿ\K›åK›[ò[ù¬àÀ»[ú›XY\ŸHZ\à[ò[ù⁄Y»úõ€H]][ôô]⁄[ô]öYX[[ò[ù]Z[¬àYà
+\’[ò[ùÿ€‹Y\Ÿ\ä
+JH¬à€€ú›\Ÿ\ï[ò[ùY»HŸ]\Ÿ\ï[ò[ùY 
+N¬àYà
+\Ÿ\ï[ò[ùYÀõ[ô›OOH
+H¬àŸ][ô‹’RT›]Kù[ò[ù\›H◊N¬àô]\õé¬àBàÀ»ùZ[[ò[ù\›úõ€H\Ÿ\â‹»[›ŸY[ò[ù¬àÀ»ŸH€õHôYYY[ôò[YHõ‹àHõ‹›€Çà€€ú›[ò[ù\›H◊N¬àõ‹à
+€€ú›YŸà\Ÿ\ï[ò[ùY H¬àûH¬àÀ»ûH»ô]⁄[ò[ù]Z[»HX^Hõ›€‹ö»õ‹à[[ò[ù\ÿ€‹Y\Ÿ\ú¬à€€ú›[ò[ùH]ÿZ]ô]⁄î””äÿ\K›åK›[ò[ùÀ…›YX
+N¬à[ò[ù\›ú\⁄
+[ò[ù
+N¬àHÿ]⁄
+ô]⁄\úäH¬àÀ»YàŸHÿ[â›ô]⁄]Z[À‹ôX]HHò\⁄X»[ùûH⁄]ù\›HQà[ò[ù\›ú\⁄
+»YàYò[YNàYJN¬àBàBà\]TŸ][ô‹’[ò[ù\ôX›‹ûJ[ò[ù\›
+N¬àô]\õé¬àBÇà€€ú›[ò[ù»H]ÿZ]ô]⁄î””ä	Àÿ\K›åK›[ò[ù… N¬à\]TŸ][ô‹’[ò[ù\ôX›‹ûJ[ò[ù N¬àHÿ]⁄
+\úäH¬àYà
+\úà	âà
+\úãú›]\»OOH»\úãú›]\»OOH
+JH¬àÀ»õ‹àÀûH»\ŸH\Ÿ\â‹»[ò[ù⁄Y»\»ò[òX⁄¬àYà
+\’[ò[ùÿ€‹Y\Ÿ\ä
+JH¬à€€ú›\Ÿ\ï[ò[ùY»HŸ]\Ÿ\ï[ò[ùY 
+N¬à€€ú›ò[òX⁄”\›H\Ÿ\ï[ò[ùYÀõX\
+YOà
+»YàYò[YNàYJJN¬à\]TŸ][ô‹’[ò[ù\ôX›‹ûJò[òX⁄”\›
+N¬àô]\õé¬àBàŸ][ô‹’RT›]Kù[ò[ù\›H◊N¬àô]\õé¬àBàõ›»\úé¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿYYŸ[ù\ôX›‹ûQõ‹îŸ][ô‹ 
+H¬àûH¬à€€ú›YŸ[ù»H]ÿZ]ô]⁄î””ä	Àÿ\K›åKÿYŸ[ùÀ€\›	 N¬à€€ú›õ‹õX[^ôYHõ‹õX[^ôPYŸ[ù\›
+\úò^Kö\–\úò^JYŸ[ù H»YŸ[ù»à◊JN¬à€€ú›ô]ö[›\‘Ÿ[X›[€àHŸ][ô‹’RT›]KúŸ[X›YYŸ[ùY¬àŸ][ô‹’RT›]KòYŸ[ù\›Hõ‹õX[^ôY¬à€€ú›Ÿ[X›[€î›[ò[YHô]ö[›\‘Ÿ[X›[€à	âàõ‹õX[^ôYú€€YJHOàKöYOOHô]ö[›\‘Ÿ[X›[€äN¬àYà
+\Ÿ[X›[€î›[ò[Y
+H¬àŸ][ô‹’RT›]KúŸ[X›YYŸ[ùYHõ‹õX[^ôYõ[ô›»õ‹õX[^ôYÃKöYà	…Œ¬àBàYà
+\Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+H¬àŸ][ô‹’RT›]KòYŸ[ù€ò\⁄›Hù[¬àŸ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›Hù[¬àŸ][ô‹’RT›]KòYŸ[ùòYùHù[¬àŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYùHﬂN¬àŸ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+
+N¬àŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùHHò[ŸN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àBàHÿ]⁄
+\úäH¬àYà
+\úà	âà
+\úãú›]\»OOH»\úãú›]\»OOH
+JH¬àŸ][ô‹’RT›]KòYŸ[ù\›H◊N¬àô]\õé¬àBàõ›»\úé¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿY[ò[ù€ò\⁄›
+[ò[ùY
+H¬àYà
+][ò[ùY
+H¬àŸ][ô‹’RT›]Kù[ò[ù€ò\⁄›Hù[¬àŸ][ô‹’RT›]Kù[ò[ùòYùHù[¬àŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYùHﬂN¬àŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHHò[ŸN¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+
+N¬àŸ][ô‹’RT›]Kõ‹öY⁄[ò[[ò[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+
+N¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú—\ùHHò[ŸN¬àYà
+Ÿ][ô‹’RT›]Kù\]T€XﬁH	âàŸ][ô‹’RT›]Kù\]T€XﬁKù[ò[ù
+H¬àŸ][ô‹’RT›]Kù\]T€XﬁKù[ò[ùH‹ôX]T€XﬁT›]J
+N¬àBàﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àô]\õé¬àBà€€ú›€ò\⁄›H]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹À›[ò[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X
+N¬àŸ][ô‹’RT›]Kù[ò[ù€ò\⁄›H€ò\⁄›¬à€€ú›ò\Ÿ[[ôHHŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+N¬à€€ú›[ò[ùŸ][ô‹»H€ò\⁄›»Ÿ]Ÿ][ô‹‘^[ÿY
+€ò\⁄›
+Hàò\Ÿ[[ôN¬àŸ][ô‹’RT›]Kù[ò[ùòYùH€€ôTŸ][ô‹ ÿöôX›öŸ^\ [ò[ùŸ][ô‹ Kõ[ô›»[ò[ùŸ][ô‹»àò\Ÿ[[ôJN¬àŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYùH€€ôTŸ][ô‹ Ÿ]›ô\úöY\‘^[ÿY
+€ò\⁄›
+JN¬à€€ú›[ôõ‹òŸY\úàH
+€ò\⁄›	âà\úò^Kö\–\úò^J€ò\⁄›ô[ôõ‹òŸY‹ŸX›[€ú JH»€ò\⁄›ô[ôõ‹òŸY‹ŸX›[€ú»à◊N¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+[ôõ‹òŸY\úäN¬àŸ][ô‹’RT›]Kõ‹öY⁄[ò[[ò[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+[ôõ‹òŸY\úäN¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú—\ùHHò[ŸN¬àŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHHò[ŸN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬à]ÿZ]ÿY[ò[ù\]T€XﬁJ[ò[ùY
+N¬üBÇò\ﬁ[ò»ù[ò›[€àÿYYŸ[ù€ò\⁄›
+YŸ[ùY
+H¬àYà
+XYŸ[ùY
+H¬àŸ][ô‹’RT›]KòYŸ[ù€ò\⁄›Hù[¬àŸ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›Hù[¬àŸ][ô‹’RT›]KòYŸ[ùòYùHù[¬àŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYùHﬂN¬àŸ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+
+N¬àŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùHHò[ŸN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àô]\õé¬àBÇà€€ú›€ò\⁄›H]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹ÀÿYŸ[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùY
+_X
+N¬àŸ][ô‹’RT›]KòYŸ[ù€ò\⁄›H€ò\⁄›¬àŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYùH€€ôTŸ][ô‹ Ÿ]›ô\úöY\‘^[ÿY
+€ò\⁄›
+JN¬Çà€€ú›[ò[ùYH
+€ò\⁄›	âà
+€ò\⁄›ù[ò[ù⁄Y€ò\⁄›ù[ò[ùY
+JH»
+€ò\⁄›ù[ò[ù⁄Y€ò\⁄›ù[ò[ùY
+Hà	…Œ¬à€€ú›[ôõ‹òŸY\úàH
+€ò\⁄›	âà\úò^Kö\–\úò^J€ò\⁄›ô[ôõ‹òŸY‹ŸX›[€ú JH»€ò\⁄›ô[ôõ‹òŸY‹ŸX›[€ú»à◊N¬àŸ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+[ôõ‹òŸY\úäN¬ÇàÀ»ò\ŸH€ò\⁄›\»Hô\€€ôY[ò[ù€ò\⁄›
+õ»YŸ[ù›ô\úöY\ K‹à€ÿò[⁄[à[ò\‹⁄Y€ôYÇàYà
+[ò[ùY
+H¬àûH¬àŸ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›H]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹À›[ò[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X
+N¬àHÿ]⁄
+\úäH¬àŸ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›HŸ][ô‹’RT›]Kô€ÿò[€ò\⁄›¬àBàH[ŸH¬àŸ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›HŸ][ô‹’RT›]Kô€ÿò[€ò\⁄›¬àBÇà€€ú›ò\ŸTŸ][ô‹»HŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›
+HﬂN¬à€€ú›YôôX›]ôTŸ][ô‹»H€ò\⁄›»Ÿ]Ÿ][ô‹‘^[ÿY
+€ò\⁄›
+Hàò\ŸTŸ][ô‹Œ¬àŸ][ô‹’RT›]KòYŸ[ùòYùH€€ôTŸ][ô‹ ÿöôX›öŸ^\ YôôX›]ôTŸ][ô‹ Kõ[ô›»YôôX›]ôTŸ][ô‹»àò\ŸTŸ][ô‹ N¬àŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùHHò[ŸN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬üBÇò\ﬁ[ò»ù[ò›[€àÿY[ò[ù\]T€XﬁJ[ò[ùY
+H¬à€€ú››]HHŸ]€XﬁT›]J	›[ò[ù	 N¬àYà
+\›]JHô]\õé¬àYà
+][ò[ùY
+H¬à\T€XﬁT€ò\⁄›
+	›[ò[ù	Àò[ŸKQêUS’TUW‘”P÷W‘‘P N¬àô]\õé¬àBàûH¬à€€ú›ô\‹H]ÿZ]ô]⁄î””äÿ\K›åK›\]K\€X⁄Y\À…Ÿ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X
+N¬à€€ú›€XﬁHHô\‹	âàô\‹ú€XﬁH»õ‹õX[^ôT€XﬁT‹X ô\‹ú€XﬁJHà€€ôT€XﬁT‹X QêUS’TUW‘”P÷W‘‘P N¬à\T€XﬁT€ò\⁄›
+	›[ò[ù	ÀùYK€XﬁJN¬àHÿ]⁄
+\úäH¬àYà
+\úà	âà\úãú›]\»OOH
+H¬à\T€XﬁT€ò\⁄›
+	›[ò[ù	Àò[ŸKQêUS’TUW‘”P÷W‘‘P N¬àô]\õé¬àBàõ›»\úé¬àBüBÇôù[ò›[€àô[ô\îŸ][ô‹’RJ
+H¬àö[ôŸ][ô‹—]ô[ù 
+N¬àô[ô\îÿ€‹Pù]€ú 
+N¬à\]U[ò[ùŸ[X›
+
+N¬à\]PYŸ[ùŸ[X›
+
+N¬àô[ô\îŸ][ô‹—õ‹õJ
+N¬àô[ô\ì›ô\úöYT›[[X\ûJ
+N¬à\]PX›[€êù]€ú 
+N¬à\]S\›\]YY]J
+N¬üBÇôù[ò›[€àô[ô\îŸ][ô‹—\úõ‹ä\úäH¬à€€ú›õ€›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿõ‹õW‹õ€›	 N¬àYà
+õ€›
+H¬à]Y\‹ÿYŸHH	”X[òYŸYŸ][ô‹»\ôH[ò]òZ[XõKâŒ¬àYà
+\úäH¬àYà
+\úãú›]\»OOH H¬àY\‹ÿYŸHH	÷[›H»õ›]ôH\õZ\‹⁄[€à»öY]»X[òYŸYŸ][ô‹ÀâŒ¬àH[ŸHYà
+\úãú›]\»OOH
+H¬àY\‹ÿYŸHH	”X[òYŸYŸ][ô‹»\ôH\ÿXõY€à\»Ÿ\ùô\àùZ[âŒ¬àH[ŸHYà
+\úãõY\‹ÿYŸJH¬àY\‹ÿYŸHH\úãõY\‹ÿYŸN¬àBàBàõ€›ö[õô\íSH]à€\‹œHô\úõ‹ã]^èâŸ\ÿÿ\R[
+Y\‹ÿYŸJ_OŸ]èò¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+Y\‹ÿYŸK	Ÿ\úõ‹âÀL
+N¬àBà€€ú›X›[€ú»Hÿ›[Y[ùú]Y\ûTŸ[X›‹ä	ÀúŸ][ô‹ÀXX›[€ú… N¬àYà
+X›[€ú H¬àX›[€úÀú›[Kô\‹^HH	€õ€ôIŒ¬àBüBÇôù[ò›[€àö[ôŸ][ô‹—]ô[ù 
+H¬àYà
+Ÿ][ô‹’RT›]Kô]ô[ù–õ›[ô
+Hô]\õé¬à€€ú›õ‹õTõ€›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿõ‹õW‹õ€›	 N¬àYà
+õ‹õTõ€›
+H¬àõ‹õTõ€›òY]ô[ù\›[ô\ä	⁄[ú]	À[ôTŸ][ô‹—öY[⁄[ôŸJN¬àõ‹õTõ€›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ[ôTŸ][ô‹—öY[⁄[ôŸJN¬àõ‹õTõ€›òY]ô[ù\›[ô\ä	ÿ€X⁄…À[ôTŸ][ô‹—öY[€X⁄ N¬àõ‹õTõ€›òY]ô[ù\›[ô\ä	⁄[ú]	À[ôT€XﬁQöY[⁄[ôŸJN¬àõ‹õTõ€›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ[ôT€XﬁQöY[⁄[ôŸJN¬àBà€€ú›ÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹ÿ]ôWÿùâ N¬àYà
+ÿ]ôPùäHÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À[ôTŸ][ô‹‘ÿ]ôJN¬à€€ú›\ÿÿ\ôùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿ\ÿÿ\ôÿùâ N¬àYà
+\ÿÿ\ôùäH\ÿÿ\ôùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À[ôQ\ÿÿ\ô⁄[ôŸ\ N¬à€€ú›ô\Ÿ]ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹ô\Ÿ]€›ô\úöY\◊ÿùâ N¬àYà
+ô\Ÿ]ùäHô\Ÿ]ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àô\Ÿ][ò[ù›ô\úöY\ N¬Çà€€ú›ô\Ÿ]YŸ[ùùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹ô\Ÿ]ÿYŸ[ù€›ô\úöY\◊ÿùâ N¬àYà
+ô\Ÿ]YŸ[ùùäHô\Ÿ]YŸ[ùùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àô\Ÿ]YŸ[ù›ô\úöY\ N¬Çàÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	ÀúŸ][ô‹À\ÿ€‹KXùâ Kôõ‹ëXX⁄
+ùàOà¬àùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà[ôTŸ][ô‹‘ÿ€‹P⁄[ôŸJùãô]\Ÿ]úÿ€‹JJN¬àJN¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊›[ò[ù‹Ÿ[X›	 N¬àYà
+[ò[ùŸ[X›
+H[ò[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ[ôU[ò[ùŸ[X›
+N¬Çà€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊ÿYŸ[ù‹Ÿ[X›	 N¬àYà
+YŸ[ùŸ[X›
+HYŸ[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ[ôPYŸ[ùŸ[X›
+N¬àŸ][ô‹’RT›]Kô]ô[ù–õ›[ôHùYN¬üBÇôù[ò›[€àô[ô\îÿ€‹Pù]€ú 
+H¬à€€ú›[ò[ùÿ€‹YH\’[ò[ùÿ€‹Y\Ÿ\ä
+N¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	ÀúŸ][ô‹À\ÿ€‹KXùâ Kôõ‹ëXX⁄
+ùàOà¬à€€ú›ÿ€‹HHùãô]\Ÿ]úÿ€‹H	Ÿ€ÿò[	Œ¬ÇàÀ»YH€ÿò[ÿ€‹Hù]€àõ‹à[ò[ù\ÿ€‹Y\Ÿ\ú¬àYà
+ÿ€‹HOOH	Ÿ€ÿò[	»	âà[ò[ùÿ€‹Y
+H¬àùãú›[Kô\‹^HH	€õ€ôIŒ¬àô]\õé¬àBàùãú›[Kô\‹^HH	…Œ¬ÇàÀ»\]Hù]€à^õ‹à[ò[ù\ÿ€‹Y\Ÿ\ú¬àYà
+ÿ€‹HOOH	›[ò[ù	»	âà[ò[ùÿ€‹Y
+H¬àùãù^€€ù[ùH	—Yò][…Œ¬àBÇàùãò€\‹”\›ùŸŸ€J	ÿX›]ôIÀÿ€‹HOOHŸ][ô‹’RT›]Kúÿ€‹JN¬àJN¬üBÇôù[ò›[€à\]U[ò[ùŸ[X›
+
+H¬à€€ú›Ÿ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊›[ò[ù‹Ÿ[X›	 N¬àYà
+\Ÿ[X›
+Hô]\õé¬àŸ[X›ö[õô\íSH	…Œ¬àYà
+\Ÿ][ô‹’RT›]Kù[ò[ù\›õ[ô›
+H¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHH	…Œ¬à‹ù^€€ù[ùH	”õ»[ò[ù»]òZ[XõIŒ¬àŸ[X›ò\[ô⁄[
+‹
+N¬àŸ[X›ô\ÿXõYHùYN¬àô]\õé¬àBàŸ[X›ô\ÿXõYHò[ŸN¬àŸ][ô‹’RT›]Kù[ò[ù\›ôõ‹ëXX⁄
+[ò[ùOà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à€€ú›[ò[ùYHô\€€ôU[ò[ùY
+[ò[ù
+N¬à‹ùò[YHH[ò[ùY¬à‹ù^€€ù[ùH[ò[ùõò[YH[ò[ùY¬àYà
+[ò[ùYOOHŸ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬à‹úŸ[X›YHùYN¬àBàŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬üBÇôù[ò›[€à\]PYŸ[ùŸ[X›
+
+H¬à€€ú›Ÿ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊ÿYŸ[ù‹Ÿ[X›	 N¬àYà
+\Ÿ[X›
+Hô]\õé¬àŸ[X›ö[õô\íSH	…Œ¬àYà
+\Ÿ][ô‹’RT›]KòYŸ[ù\›õ[ô›
+H¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHH	…Œ¬à‹ù^€€ù[ùH	”õ»YŸ[ù»]òZ[XõIŒ¬àŸ[X›ò\[ô⁄[
+‹
+N¬àŸ[X›ô\ÿXõYHùYN¬àô]\õé¬àBàŸ[X›ô\ÿXõYHò[ŸN¬àŸ][ô‹’RT›]KòYŸ[ù\›ôõ‹ëXX⁄
+YŸ[ùOà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à€€ú›YŸ[ùYHô\€€ôPYŸ[ùY
+YŸ[ù
+N¬à€€ú›Xô[HŸ]YŸ[ù\‹^Sò[YJYŸ[ùYŸ[ùY
+N¬à‹ùò[YHHYŸ[ùY¬à‹ù^€€ù[ùHXô[¬àYà
+YŸ[ùYOOHŸ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+H¬à‹úŸ[X›YHùYN¬àBàŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬üBÇôù[ò›[€àô[ô\îŸ][ô‹—õ‹õJ
+H¬à€€ú›õ€›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿõ‹õW‹õ€›	 N¬àYà
+\õ€›
+Hô]\õé¬àYà
+\Ÿ][ô‹’RT›]Kúÿ⁄[XH\Ÿ][ô‹’RT›]Kô€ÿò[òYù
+H¬àõ€›ö[õô\íSH	œ]à€\‹œHõ]]Y]^èìX[òYŸYŸ][ô‹»\ôH[ö]X[^ö[ô¯†)èŸ]èâŒ¬àô]\õé¬àBà€€ú›ÿ€‹HHŸ][ô‹’RT›]Kúÿ€‹N¬à]òYù¬àYà
+ÿ€‹HOOH	Ÿ€ÿò[	 H¬àòYùHŸ][ô‹’RT›]Kô€ÿò[òYù¬àH[ŸHYà
+ÿ€‹HOOH	›[ò[ù	 H¬àòYùHŸ][ô‹’RT›]Kù[ò[ùòYùŸ][ô‹’RT›]Kô€ÿò[òYù¬àH[ŸH¬à€€ú›ò\ŸHHŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+HﬂN¬àòYùHŸ][ô‹’RT›]KòYŸ[ùòYù€€ôTŸ][ô‹ ÿöôX›öŸ^\ ò\ŸJKõ[ô›»ò\ŸHàŸ][ô‹’RT›]Kô€ÿò[òYù
+N¬àBàõ€›ö[õô\íSH	…Œ¬ÇàÀ»YŸX›[€àX[òYŸ[Y[ù€€ùõ€»]‹⁄[à[à€ÿò[ÿ€‹BàYà
+ÿ€‹HOOH	Ÿ€ÿò[	 H¬à€€ú›€€ùõ€[ô[Hô[ô\ìX[òYŸYŸX›[€ú‘[ô[
+
+N¬àYà
+€€ùõ€[ô[
+H¬àõ€›ò\[ô⁄[
+€€ùõ€[ô[
+N¬àBàH[ŸHYà
+ÿ€‹HOOH	›[ò[ù	 H¬à€€ú›[ôõ‹òŸ[Y[ù[ô[Hô[ô\ï[ò[ù[ôõ‹òŸ[Y[ù[ô[
+
+N¬àYà
+[ôõ‹òŸ[Y[ù[ô[
+H¬àõ€›ò\[ô⁄[
+[ôõ‹òŸ[Y[ù[ô[
+N¬àBàBÇà‹ô\ôYŸ][ô‹‘ŸX›[€ú 
+Kôõ‹ëXX⁄
+ŸX›[€íŸ^HOà¬à€€ú›öY[»HŸ][ô‹’RT›]Kô‹õ›\YöY[÷‹ŸX›[€íŸ^WN¬àYà
+YöY[»YöY[Àõ[ô›
+H¬àô]\õé¬àBàÀ»⁄X⁄»Yà\»ŸX›[€à\»X[òYŸY
+€õHô[]ò[ùõ‹à€ÿò[ÿ€‹JBà€€ú›\‘ŸX›[€ìX[òYŸYHŸ][ô‹’RT›]KõX[òYŸYŸX›[€úÀö\ ŸX›[€íŸ^JN¬à€€ú›\‘ŸX›[€ë[ôõ‹òŸYHÿ€‹HOOH	ÿYŸ[ù	»	âàŸ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€ú»	âàŸ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€úÀö\ ŸX›[€íŸ^JN¬Çà€€ú›ŸX›[€ë[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àŸX›[€ë[ò€\‹”ò[YHH	‹Ÿ][ô‹À\ŸX›[€ã\[ô[	Œ¬àYà
+ÿ€‹HOOH	Ÿ€ÿò[	»	âàZ\‘ŸX›[€ìX[òYŸY
+H¬àŸX›[€ë[ò€\‹”\›òY
+	‹ŸX›[€ãY\ÿXõY	 N¬àBàYà
+ÿ€‹HOOH	ÿYŸ[ù	»	âà
+Z\‘ŸX›[€ìX[òYŸY\‘ŸX›[€ë[ôõ‹òŸY
+JH¬àŸX›[€ë[ò€\‹”\›òY
+	‹ŸX›[€ãY\ÿXõY	 N¬àBà€€ú›XY\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àXY\ãò€\‹”ò[YHH	‹Ÿ][ô‹À\ŸX›[€ãZXY\âŒ¬à]X[òYŸYòYŸHH	…Œ¬àYà
+
+ÿ€‹HOOH	Ÿ€ÿò[	»ÿ€‹HOOH	ÿYŸ[ù	 H	âàZ\‘ŸX›[€ìX[òYŸY
+H¬àX[òYŸYòYŸHH	œ‹[à€\‹œHúŸX›[€ã\›]\ÀXòYŸHYŸ[ùX€€ùõ€YèêYŸ[ù€€ùõ€Y‹‹[èâŒ¬àH[ŸHYà
+ÿ€‹HOOH	ÿYŸ[ù	»	âà\‘ŸX›[€ë[ôõ‹òŸY
+H¬àX[òYŸYòYŸHH	œ‹[à€\‹œHúŸX›[€ã\›]\ÀXòYŸHYŸ[ùX€€ùõ€Yèï[ò[ù[ôõ‹òŸY‹‹[èâŒ¬àBàXY\ãö[õô\íSHâŸ\ÿÿ\R[
+—USë‘◊‘—P’S”ó”PëS÷‹ŸX›[€íŸ^WHŸX›[€íŸ^J_O⁄â€X[òYŸYòYŸ_X¬àŸX›[€ë[ò\[ô⁄[
+XY\äN¬Çà€€ú›\›Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à\›ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[[\›	Œ¬ÇàÀ»\ŸH›XúŸX›[€ú»õ‹à\ÿ€›ô\ûK›\ù⁄\ŸHô[ô\àõ]\›àYà
+ŸX›[€íŸ^HOOH	Ÿ\ÿ€›ô\ûI H¬àô[ô\ë\ÿ€›ô\ûU⁄]›XúŸX›[€ú \›öY[ÀòYùÿ€‹K\‘ŸX›[€ìX[òYŸY\‘ŸX›[€ë[ôõ‹òŸY
+N¬àH[ŸH¬àöY[Àôõ‹ëXX⁄
+öY[Oà¬à€€ú›ò[YHHŸ]ò[YPûT]
+òYùöY[ú]
+N¬à€€ú›õ›»Hô[ô\îŸ][ô‹—öY[õ› öY[ò[YKÿ€‹K\‘ŸX›[€ìX[òYŸY\‘ŸX›[€ë[ôõ‹òŸY
+N¬àYà
+õ› H¬à\›ò\[ô⁄[
+õ› N¬àBàJN¬àBàŸX›[€ë[ò\[ô⁄[
+\›
+N¬àõ€›ò\[ô⁄[
+ŸX›[€ë[
+N¬àJN¬àYà
+\õ€›ò⁄[ô[ãõ[ô›
+H¬àõ€›ö[õô\íSH	œ]à€\‹œHõ]]Y]^èìõ»Ÿ\ùô\ã[X[òYŸYŸ][ô‹»\ôH]òZ[XõH[à\»ùZ[èŸ]èâŒ¬àBàYà
+ÿ€‹HOOH	Ÿ€ÿò[	»ÿ€‹HOOH	›[ò[ù	 H¬àôYúô\⁄€XﬁT[ô[
+
+N¬àBüBÇã äÇà
+àô[ô\àHX[òYŸYŸX›[€ú»€€ùõ€[ô[à
+ã¬ôù[ò›[€àô[ô\ìX[òYŸYŸX›[€ú‘[ô[
+
+H¬à€€ú›[ô[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à[ô[ò€\‹”ò[YHH	€X[òYŸY\ŸX›[€úÀ\[ô[	Œ¬à[ô[ö[õô\íSHà]à€\‹œHõX[òYŸY\ŸX›[€úÀZXY\àèÇàîŸX›[€àX[òYŸ[Y[ù⁄Çà‹[à€\‹œHõX[òYŸY\ŸX›[€úÀZ[ùèê€€ùõ€⁄X⁄Ÿ][ô‹»ÿ]Y€‹öY\»\ôHŸ[ùò[HX[òYŸYú»YŸ[ùX€€ùõ€Y‹‹[èÇàŸ]èÇà]à€\‹œHõX[òYŸY\ŸX›[€úÀ]ŸŸ€\»èÇà	‹ô[ô\ìX[òYŸYŸX›[€ïŸŸ€J	Ÿ\ÿ€›ô\ûIÀ	—\ÿ€›ô\ûIÀ	“Tÿÿ[õö[ôÀõÿôHY]ŸÀ[ô]]ÀY\ÿ€›ô\ûHôZ]ö[‹â _Bà	‹ô[ô\ìX[òYŸYŸX›[€ïŸŸ€J	‹€õ\	À	‘”ìT	À	–€€[][ö]H›ö[ô‹»[ô”ìTõ›ÿ€€Ÿ][ô‹… _Bà	‹ô[ô\ìX[òYŸYŸX›[€ïŸŸ€J	ŸôX]\ô\…À	—ôX]\ô\…À	—ôX]\ôHõY‹»[ô‹[€ò[ÿ\Xö[]Y\… _Bà	‹ô[ô\ìX[òYŸYŸX›[€ïŸŸ€J	‹‹€€\âÀ	”ÿÿ[ö[ù\ú…À	’T–ã€ÿÿ[ö[ù\àòX⁄⁄[ô»öXH‘»‹€€\â _BàŸ]èÇà¬àÀ»ö[ôŸŸ€H]ô[ù¬à[ô[ú]Y\ûTŸ[X›‹ê[
+	ÀõX[òYŸY\ŸX›[€ã]ŸŸ€H[ú]	 Kôõ‹ëXX⁄
+[ú]Oà¬à[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+JHOà¬à[ôSX[òYŸYŸX›[€ïŸŸ€JKù\ôŸ]ô]\Ÿ]úŸX›[€ãKù\ôŸ]ò⁄X⁄ŸY
+N¬àJN¬àJN¬àô]\õà[ô[¬üBÇôù[ò›[€àô[ô\ï[ò[ù[ôõ‹òŸ[Y[ù[ô[
+
+H¬à€€ú›[ô[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à[ô[ò€\‹”ò[YHH	€X[òYŸY\ŸX›[€úÀ\[ô[	Œ¬à€€ú›ÿ[ëY]H\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I N¬à€€ú›\’[ò[ùHH\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY¬à[ô[ö[õô\íSHà]à€\‹œHõX[òYŸY\ŸX›[€úÀZXY\àèÇàêYŸ[ù›ô\úöYHÿ⁄‹œ⁄Çà‹[à€\‹œHõX[òYŸY\ŸX›[€úÀZ[ùèìÿ⁄»Hÿ]Y€‹ûH€»YŸ[ù»[à\»[ò[ùÿ[õõ››ô\úöYH]è‹‹[èÇàŸ]èÇà]à€\‹œHõX[òYŸY\ŸX›[€úÀ]ŸŸ€\»èÇà	‹ô[ô\ï[ò[ù[ôõ‹òŸ[Y[ùŸŸ€J	Ÿ\ÿ€›ô\ûIÀ	—\ÿ€›ô\ûIÀ	‘ô]ô[ù\ãXYŸ[ù⁄[ôŸ\»»\ÿ€›ô\ûHôZ]ö[‹â _Bà	‹ô[ô\ï[ò[ù[ôõ‹òŸ[Y[ùŸŸ€J	‹€õ\	À	‘”ìT	À	‘ô]ô[ù\ãXYŸ[ù⁄[ôŸ\»»”ìTŸ][ô‹… _Bà	‹ô[ô\ï[ò[ù[ôõ‹òŸ[Y[ùŸŸ€J	ŸôX]\ô\…À	—ôX]\ô\…À	‘ô]ô[ù\ãXYŸ[ù⁄[ôŸ\»»ôX]\ôHõY‹… _Bà	‹ô[ô\ï[ò[ù[ôõ‹òŸ[Y[ùŸŸ€J	‹‹€€\âÀ	”ÿÿ[ö[ù\ú…À	‘ô]ô[ù\ãXYŸ[ù⁄[ôŸ\»»‹€€\àŸ][ô‹… _BàŸ]èÇà¬à[ô[ú]Y\ûTŸ[X›‹ê[
+	Àù[ò[ùY[ôõ‹òŸ[Y[ù]ŸŸ€H[ú]	 Kôõ‹ëXX⁄
+[ú]Oà¬à[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+JHOà¬à[ôU[ò[ù[ôõ‹òŸ[Y[ùŸŸ€JKù\ôŸ]ô]\Ÿ]úŸX›[€ãKù\ôŸ]ò⁄X⁄ŸY
+N¬àJN¬à[ú]ô\ÿXõYHXÿ[ëY]Z\’[ò[ù¬àJN¬àYà
+Z\’[ò[ù
+H¬à[ô[ò€\‹”\›òY
+	‹ŸX›[€ãY\ÿXõY	 N¬àBàô]\õà[ô[¬üBÇôù[ò›[€àô[ô\ï[ò[ù[ôõ‹òŸ[Y[ùŸŸ€JŸX›[€íŸ^KXô[\ÿ‹ö\[€äH¬à€€ú›\—[ôõ‹òŸYHŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú»	âàŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€úÀö\ ŸX›[€íŸ^JN¬àô]\õààXô[€\‹œHõX[òYŸY\ŸX›[€ã]ŸŸ€H[ò[ùY[ôõ‹òŸ[Y[ù]ŸŸ€H	⁄\—[ôõ‹òŸY»	ÿX›]ôI»à	…ﬂHèÇà]à€\‹œHùŸŸ€KX€€ù[ùèÇà‹[à€\‹œHùŸŸ€K[Xô[èâŸ\ÿÿ\R[
+Xô[
+_O‹‹[èÇà‹[à€\‹œHùŸŸ€KY\ÿ‹ö\[€àèâŸ\ÿÿ\R[
+\ÿ‹ö\[€ä_O‹‹[èÇàŸ]èÇà]à€\‹œHùŸŸ€K\›⁄]⁄èÇà[ú]\OHò⁄X⁄ÿõﬁà]K\ŸX›[€èHâ‹ŸX›[€íŸ^_Hà	⁄\—[ôõ‹òŸY»	ÿ⁄X⁄ŸY	»à	…ﬂOÇà‹[à€\‹œHùŸŸ€K\€Y\àèè‹‹[èÇàŸ]èÇà€Xô[Çà¬üBÇôù[ò›[€à[ôU[ò[ù[ôõ‹òŸ[Y[ùŸŸ€JŸX›[€íŸ^K\—[ôõ‹òŸY
+H¬àYà
+\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬àô]\õé¬àBàYà
+\Ÿ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú H¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+
+N¬àBàYà
+\—[ôõ‹òŸY
+H¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€úÀòY
+ŸX›[€íŸ^JN¬àH[ŸH¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€úÀô[]JŸX›[€íŸ^JN¬àBà€€ú›‹öY⁄[ò[Ÿ]HŸ][ô‹’RT›]Kõ‹öY⁄[ò[[ò[ù[ôõ‹òŸYŸX›[€ú»ô]»Ÿ]
+
+N¬à€€ú››\úô[ùŸ]HŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€úŒ¬à€€ú›⁄[ôŸYH‹öY⁄[ò[Ÿ]ú⁄^ôHOOH›\úô[ùŸ]ú⁄^ôHàÀããõ‹öY⁄[ò[Ÿ]Kú€€YJ»OàX›\úô[ùŸ]ö\  JHàÀããò›\úô[ùŸ]Kú€€YJ»Oà[‹öY⁄[ò[Ÿ]ö\  JN¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú—\ùHH⁄[ôŸY¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àô[ô\ì›ô\úöYT›[[X\ûJ
+N¬à\]PX›[€êù]€ú 
+N¬üBÇôù[ò›[€àô[ô\ìX[òYŸYŸX›[€ïŸŸ€JŸX›[€íŸ^KXô[\ÿ‹ö\[€äH¬à€€ú›\”X[òYŸYHŸ][ô‹’RT›]KõX[òYŸYŸX›[€úÀö\ ŸX›[€íŸ^JN¬à€€ú›ÿ[ëY]H\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I N¬àô]\õààXô[€\‹œHõX[òYŸY\ŸX›[€ã]ŸŸ€H	⁄\”X[òYŸY»	ÿX›]ôI»à	…ﬂHèÇà]à€\‹œHùŸŸ€KX€€ù[ùèÇà‹[à€\‹œHùŸŸ€K[Xô[èâŸ\ÿÿ\R[
+Xô[
+_O‹‹[èÇà‹[à€\‹œHùŸŸ€KY\ÿ‹ö\[€àèâŸ\ÿÿ\R[
+\ÿ‹ö\[€ä_O‹‹[èÇàŸ]èÇà]à€\‹œHùŸŸ€K\›⁄]⁄èÇà[ú]\OHò⁄X⁄ÿõﬁà]K\ŸX›[€èHâ‹ŸX›[€íŸ^_Hà	⁄\”X[òYŸY»	ÿ⁄X⁄ŸY	»à	…ﬂH	ÿÿ[ëY]»	…»à	Ÿ\ÿXõY	ﬂOÇà‹[à€\‹œHùŸŸ€K\€Y\àèè‹‹[èÇàŸ]èÇà€Xô[Çà¬üBÇôù[ò›[€à[ôSX[òYŸYŸX›[€ïŸŸ€JŸX›[€íŸ^K\”X[òYŸY
+H¬àYà
+\”X[òYŸY
+H¬àŸ][ô‹’RT›]KõX[òYŸYŸX›[€úÀòY
+ŸX›[€íŸ^JN¬àH[ŸH¬àŸ][ô‹’RT›]KõX[òYŸYŸX›[€úÀô[]JŸX›[€íŸ^JN¬àBàÀ»⁄X⁄»YàX[òYŸYŸX›[€ú»⁄[ôŸYúõ€H‹öY⁄[ò[à€€ú›‹öY⁄[ò[Ÿ]HŸ][ô‹’RT›]Kõ‹öY⁄[ò[X[òYŸYŸX›[€úŒ¬à€€ú››\úô[ùŸ]HŸ][ô‹’RT›]KõX[òYŸYŸX›[€úŒ¬à€€ú›⁄[ôŸYH‹öY⁄[ò[Ÿ]ú⁄^ôHOOH›\úô[ùŸ]ú⁄^ôHàÀããõ‹öY⁄[ò[Ÿ]Kú€€YJ»OàX›\úô[ùŸ]ö\  JHàÀããò›\úô[ùŸ]Kú€€YJ»Oà[‹öY⁄[ò[Ÿ]ö\  JN¬àŸ][ô‹’RT›]KõX[òYŸYŸX›[€ú—\ùHH⁄[ôŸY¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àÀ»ôK\ô[ô\à»\]HŸX›[€à\ÿXõY›]\¬àô[ô\îŸ][ô‹—õ‹õJ
+N¬à\]PX›[€êù]€ú 
+N¬üBÇã äÇà
+àô[ô\à\ÿ€›ô\ûHöY[»‹ôÿ[ö^ôY[ù»Ÿ⁄Xÿ[›XúŸX›[€ú¬à
+ã¬ôù[ò›[€àô[ô\ë\ÿ€›ô\ûU⁄]›XúŸX›[€ú €€ùZ[ô\ãöY[ÀòYùÿ€‹K\‘ŸX›[€ìX[òYŸYHùYK\‘ŸX›[€ë[ôõ‹òŸYHò[ŸJH¬à€€ú›öY[X\HﬂN¬àöY[Àôõ‹ëXX⁄
+àOà»öY[X\Ÿãú]HHé»JN¬à€€ú›ô[ô\ôYHô]»Ÿ]
+
+N¬ÇàT–”’ëTñW‘’Pî—P’S”îÀôõ‹ëXX⁄
+
+›XúŸX›[€ãY
+HOà¬à€€ú››XúŸX›[€ëöY[»H›XúŸX›[€ãôöY[¬àõX\
+]OàöY[X\‹]JBàôö[\äàOàà	âà\ô[ô\ôYö\ ãú]
+JN¬ÇàYà
+\›XúŸX›[€ëöY[Àõ[ô›
+Hô]\õé¬ÇàÀ»Y›XúŸX›[€àXY\Çà€€ú››XíXY\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à›XíXY\ãò€\‹”ò[YHH	‹Ÿ][ô‹À\›XúŸX›[€ãZXY\âŒ¬à›XíXY\ãù^€€ù[ùH›XúŸX›[€ãõXô[¬à€€ùZ[ô\ãò\[ô⁄[
+›XíXY\äN¬ÇàÀ»YöY[»[à\»›XúŸX›[€Çà›XúŸX›[€ëöY[Àôõ‹ëXX⁄
+öY[Oà¬àô[ô\ôYòY
+öY[ú]
+N¬à€€ú›ò[YHHŸ]ò[YPûT]
+òYùöY[ú]
+N¬à€€ú›õ›»Hô[ô\îŸ][ô‹—öY[õ› öY[ò[YKÿ€‹K\‘ŸX›[€ìX[òYŸY\‘ŸX›[€ë[ôõ‹òŸY
+N¬àYà
+õ› H¬à€€ùZ[ô\ãò\[ô⁄[
+õ› N¬àBàJN¬àJN¬ÇàÀ»ô[ô\à[ûHô[XZ[ö[ô»öY[»õ›[àH›XúŸX›[€Çà€€ú›ô[XZ[ö[ô»HöY[Àôö[\äàOà\ô[ô\ôYö\ ãú]
+JN¬àYà
+ô[XZ[ö[ôÀõ[ô›
+H¬à€€ú››XíXY\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à›XíXY\ãò€\‹”ò[YHH	‹Ÿ][ô‹À\›XúŸX›[€ãZXY\âŒ¬à›XíXY\ãù^€€ù[ùH	”›\âŒ¬à€€ùZ[ô\ãò\[ô⁄[
+›XíXY\äN¬Çàô[XZ[ö[ôÀôõ‹ëXX⁄
+öY[Oà¬à€€ú›ò[YHHŸ]ò[YPûT]
+òYùöY[ú]
+N¬à€€ú›õ›»Hô[ô\îŸ][ô‹—öY[õ› öY[ò[YKÿ€‹K\‘ŸX›[€ìX[òYŸY\‘ŸX›[€ë[ôõ‹òŸY
+N¬àYà
+õ› H¬à€€ùZ[ô\ãò\[ô⁄[
+õ› N¬àBàJN¬àBÇàÀ»Yù\àô[ô\ö[ôÀ\]Hö\⁄Xö[]HŸà\[ô[ùöY[¬à\]Q\[ô[ùöY[ö\⁄Xö[]J€€ùZ[ô\äN¬üBÇã äÇà
+à⁄›À⁄YHöY[»]\[ô€à[õ›\àöY[	‹»õ€€X[àò[YKÇà
+àöY[»⁄]]KY\[ôÀ[€à\ôHY[à⁄[àH\[ô[òﬁHöY[\»[ò⁄X⁄ŸYÇà
+ã¬ôù[ò›[€à\]Q\[ô[ùöY[ö\⁄Xö[]J€€ùZ[ô\äH¬àYà
+X€€ùZ[ô\äH€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿõ‹õW‹õ€›	 N¬àYà
+X€€ùZ[ô\äHô]\õé¬Çà€€ú›\[ô[ùõ›‹»H€€ùZ[ô\ãú]Y\ûTŸ[X›‹ê[
+	÷Ÿ]KY\[ôÀ[€óI N¬à\[ô[ùõ›‹Àôõ‹ëXX⁄
+õ›»Oà¬à€€ú›\[ô”€î]Hõ›Àô]\Ÿ]ô\[ô”€é¬àÀ»ö[ôH[ú]õ‹àH\[ô[òﬁHöY[à€€ú›\[ú]H€€ùZ[ô\ãú]Y\ûTŸ[X›‹ä[ú]Ÿ]K\Ÿ][ô‹À\]HâŸ\[ô”€î]HóX
+N¬àYà
+\[ú]	âà\[ú]ù\HOOH	ÿ⁄X⁄ÿõﬁ	 H¬àõ›Àú›[Kô\‹^HH\[ú]ò⁄X⁄ŸY»	…»à	€õ€ôIŒ¬àBàJN¬üBÇôù[ò›[€àô[ô\îŸ][ô‹—öY[õ› öY[ò[YKÿ€‹K\‘ŸX›[€ìX[òYŸYHùYK\‘ŸX›[€ë[ôõ‹òŸYHò[ŸJH¬à€€ú›õ›»Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àõ›Àò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[\õ›…Œ¬àõ›Àô]\Ÿ]ôöY[\HH
+öY[ù\H	›^	 Kù”›Ÿ\êÿ\ŸJ
+N¬àõ›Àô]\Ÿ]úŸ][ô‹‘]HöY[ú]¬ÇàÀ»öY[\[ô[ò⁄Y\Œà⁄›À⁄YHò\ŸY€à[õ›\àöY[	‹»ò[YBà€€ú›íQS—TSëSê“QT»H¬à	Ÿ\ÿ€›ô\ûKúò[ôŸ\◊›^	Œà	Ÿ\ÿ€›ô\ûKõX[ùX[‹ò[ôŸ\…¬àN¬àYà
+íQS—TSëSê“QT÷ŸöY[ú]JH¬àõ›Àô]\Ÿ]ô\[ô”€àHíQS—TSëSê“QT÷ŸöY[ú]N¬àBÇàÀ»⁄X⁄»Yà\»öY[\»ÿ⁄ŸYûH[ùö\õ€õY[ùò\öXXõBà€€ú›\”ÿ⁄ŸYHŸ][ô‹’RT›]Kõÿ⁄ŸYŸ^\Àö\ öY[ú]
+N¬àÀ»ŸX›[€àõ›X[òYŸYYX[ú»öY[»\ôHôXY[€õH[ôXÿ]‹ú¬à€€ú›ŸX›[€ìõ›X[òYŸYH
+ÿ€‹HOOH	Ÿ€ÿò[	»ÿ€‹HOOH	ÿYŸ[ù	 H	âàZ\‘ŸX›[€ìX[òYŸY¬à€€ú›ŸX›[€ï[ò[ù[ôõ‹òŸYHÿ€‹HOOH	ÿYŸ[ù	»	âàHZ\‘ŸX›[€ë[ôõ‹òŸY¬ÇàÀ»õ‹àÿ⁄ŸYöY[À\ŸHHYôôX›]ôHù[ù[YHò[YH[ú›XYŸààò[YBà]\‹^Uò[YHHò[YN¬àYà
+\”ÿ⁄ŸY	âàŸ][ô‹’RT›]KôYôôX›]ôUò[Y\»	âàŸ][ô‹’RT›]KôYôôX›]ôUò[Y\Àö\”›€îõ‹\ùJöY[ú]
+JH¬à\‹^Uò[YHHŸ][ô‹’RT›]KôYôôX›]ôUò[Y\÷ŸöY[ú]N¬àBÇà€€ú›Xô[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àXô[ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[[Xô[	Œ¬àXô[ö[õô\íSHà]à€\‹œHôöY[]]HèâŸ\ÿÿ\R[
+öY[ù]HöY[ú]
+_OŸ]èÇà]à€\‹œHôöY[Y\ÿ‹ö\[€àèâŸ\ÿÿ\R[
+öY[ô\ÿ‹ö\[€à	… _OŸ]èÇà¬Çà€€ú›€€ùõ€Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à€€ùõ€ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[X€€ùõ€	Œ¬à€€ú›[ú]úòY€Y[ùH‹ôX]R[ú]õ‹ëöY[
+öY[\‹^Uò[YJN¬àYà
+Z[ú]úòY€Y[ùZ[ú]úòY€Y[ùö[ú]Z[ú]úòY€Y[ùô[[Y[ù
+H¬àô]\õàù[¬àBà€€ú›»[ú][[Y[ùHH[ú]úòY€Y[ù¬à€€ú›ÿ[ëY]H\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I N¬àÀ»\ÿXõH[ú]Yà\Ÿ\àÿ[â›Y]õ»[ò[ùŸ[X›Y
+õ‹à[ò[ùÿ€‹JKÿ⁄ŸYûH[ùã‘àŸX›[€àõ›X[òYŸYà[ú]ô\ÿXõYHXÿ[ëY]à
+ÿ€‹HOOH	›[ò[ù	»	âà\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+Hà
+ÿ€‹HOOH	ÿYŸ[ù	»	âà\Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+Hà\”ÿ⁄ŸYàŸX›[€ìõ›X[òYŸYàŸX›[€ï[ò[ù[ôõ‹òŸY¬à€€ùõ€ò\[ô⁄[
+[[Y[ù
+N¬ÇàÀ»⁄›»ÿ⁄»òYŸHYàÿ⁄ŸYûH[ùö\õ€õY[ùò\öXXõBàYà
+\”ÿ⁄ŸY
+H¬à€€ú›ÿ⁄–òYŸHHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹‹[â N¬àÿ⁄–òYŸKò€\‹”ò[YHH	‹Ÿ][ô‹ÀXòYŸHÿ⁄ŸY	Œ¬àÿ⁄–òYŸKù^€€ù[ùH	¸'Â$àSïâŒ¬àÿ⁄–òYŸKù]HH	’\»Ÿ][ô»\»Ÿ]ûH[à[ùö\õ€õY[ùò\öXXõH[ôÿ[õõ›ôH⁄[ôŸYõ›Y⁄X[òYŸYŸ][ô‹…Œ¬à€€ùõ€ò\[ô⁄[
+ÿ⁄–òYŸJN¬àBÇàYà
+ÿ€‹HOOH	›[ò[ù	»ÿ€‹HOOH	ÿYŸ[ù	 H¬à€€ú›\”›ô\úöYHH\”›ô\úöYJ]–\úò^JöY[ú]
+JN¬à€€ú›òYŸHHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹‹[â N¬àòYŸKò€\‹”ò[YHHŸ][ô‹ÀXòYŸH	⁄\”›ô\úöYH»	€›ô\úöYI»à	⁄[ö\ö]Y	ﬂX¬àòYŸKù^€€ù[ùH\”›ô\úöYH»	”›ô\úöYI»à	“[ö\ö]Y	Œ¬à€€ùõ€ò\[ô⁄[
+òYŸJN¬àYà
+\”›ô\úöYH	âàÿ[ëY]	âàZ\”ÿ⁄ŸY	âà\ŸX›[€ìõ›X[òYŸY	âà\ŸX›[€ï[ò[ù[ôõ‹òŸY
+H¬à€€ú›[ö\ö]ùàHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	ÿù]€â N¬à[ö\ö]ùãù\HH	ÿù]€âŒ¬à[ö\ö]ùãò€\‹”ò[YHH	Ÿ⁄‹›Xùà[ö\ö]XùâŒ¬à[ö\ö]ùãù^€€ù[ùH	“[ö\ö]	Œ¬à[ö\ö]ùãô]\Ÿ]ö[ö\ö]]HöY[ú]¬à€€ùõ€ò\[ô⁄[
+[ö\ö]ùäN¬àBàBÇàõ›Àò\[ô⁄[
+Xô[
+N¬àõ›Àò\[ô⁄[
+€€ùõ€
+N¬àô]\õàõ›Œ¬üBÇôù[ò›[€àôYúô\⁄€XﬁT[ô[
+
+H¬à€€ú›õ€›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿõ‹õW‹õ€›	 N¬àYà
+\õ€›
+Hô]\õé¬à€€ú›^\›[ô»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]]◊›\]W‹€XﬁW‹ŸX›[€â N¬àYà
+^\›[ô H¬à^\›[ôÀúô[[›ôJ
+N¬àBàô[ô\ï\]T€XﬁTŸX›[€äõ€›
+N¬üBÇôù[ò›[€àô[ô\ï\]T€XﬁTŸX›[€äõ€›
+H¬àYà
+\õ€›
+Hô]\õé¬à€€ú›[ô[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à[ô[ò€\‹”ò[YHH	‹Ÿ][ô‹À\ŸX›[€ã\[ô[]]À]\]K\€XﬁIŒ¬à[ô[öYH	ÿ]]◊›\]W‹€XﬁW‹ŸX›[€âŒ¬Çà€€ú›XY\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àXY\ãò€\‹”ò[YHH	‹Ÿ][ô‹À\ŸX›[€ãZXY\âŒ¬àXY\ãö[õô\íSHê]]ÀU\]H€XﬁO⁄èê€€ùõ€›»Ÿù[àYŸ[ù»⁄X⁄»õ‹à\]\À⁄X⁄ô\ú⁄[€ú»^H\ôŸ][ô›»õ€›]»\ôH›YŸYè‹ò¬à[ô[ò\[ô⁄[
+XY\äN¬Çà€€ú›õŸHHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àõŸKò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[[\›]]À]\]KYöY[[\›	Œ¬à€€ú›ÿ€‹HHŸ][ô‹’RT›]Kúÿ€‹N¬à€€ú›€XﬁT›]HHŸ]€XﬁT›]Jÿ€‹JN¬à€€ú›ÿ[ëY]H\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I N¬ÇàYà
+ÿ€‹HOOH	›[ò[ù	»	âà\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬àõŸKö[õô\íSH	œ]à€\‹œHõ]]Y]^èîŸ[X›H›\›€Y\à»X[òYŸH]]À]\]H›ô\úöY\ÀèŸ]èâŒ¬à[ô[ò\[ô⁄[
+õŸJN¬àõ€›ò\[ô⁄[
+[ô[
+N¬àô]\õé¬àBÇàYà
+\€XﬁT›]H\€XﬁT›]KõÿYY
+H¬àõŸKö[õô\íSH	œ]à€\‹œHõ]]Y]^èìÿY[ô»]]À]\]H€Xﬁx†)èŸ]èâŒ¬à[ô[ò\[ô⁄[
+õŸJN¬àõ€›ò\[ô⁄[
+[ô[
+N¬àô]\õé¬àBÇà€€ú›ŸŸ€Tõ›»Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àŸŸ€Tõ›Àò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[\õ›…Œ¬à€€ú›ŸŸ€SXô[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àŸŸ€SXô[ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[[Xô[	Œ¬à€€ú›ŸŸ€U]HHÿ€‹HOOH	Ÿ€ÿò[	»»	—[ôõ‹òŸH]]À]\]H€XﬁI»à	”›ô\úöYH€ÿò[€XﬁIŒ¬à€€ú›ŸŸ€Q\ÿ‹ö\[€àHÿ€‹HOOH	Ÿ€ÿò[	¬à»	–\Y\»»]ô\ûH[ò[ù[õ\‹»H‹X⁄YöX»›ô\úöYH\»€€ôöY›\ôYâ¬àà	”€õH€€ôöY›\ôH⁄[à\»›\›€Y\àôYY»HYôô\ô[ùÿY[òŸH[àH€ÿò[Yò][ÀâŒ¬àŸŸ€SXô[ö[õô\íSH]à€\‹œHôöY[]]HèâŸ\ÿÿ\R[
+ŸŸ€U]J_OŸ]èè]à€\‹œHôöY[Y\ÿ‹ö\[€àèâŸ\ÿÿ\R[
+ŸŸ€Q\ÿ‹ö\[€ä_OŸ]èò¬à€€ú›ŸŸ€P€€ùõ€Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àŸŸ€P€€ùõ€ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[X€€ùõ€	Œ¬à€€ú›ŸŸ€HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€Xô[	 N¬àŸŸ€Kò€\‹”ò[YHH	€Z[öK]ŸŸ€KX€€ùZ[ô\àŸ][ô‹À]ŸŸ€IŒ¬à€€ú›ŸŸ€R[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬àŸŸ€R[ú]ù\HH	ÿ⁄X⁄ÿõﬁ	Œ¬àŸŸ€R[ú]ò⁄X⁄ŸYHH\€XﬁT›]Kô[òXõY¬àŸŸ€R[ú]ô\ÿXõYHXÿ[ëY]¬àŸŸ€R[ú]ô]\Ÿ]ú€XﬁUŸŸ€HH	Ÿ[òXõY	Œ¬àŸŸ€R[ú]ô]\Ÿ]ú€XﬁTÿ€‹HHÿ€‹N¬à€€ú›ŸŸ€T›]HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹‹[â N¬àŸŸ€T›]Kò€\‹”ò[YHH	‹Ÿ][ô‹À]ŸŸ€K\›]IŒ¬àŸŸ€T›]Kù^€€ù[ùH€XﬁT›]Kô[òXõY»	—[òXõY	»à	—\ÿXõY	Œ¬àŸŸ€R[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬àŸŸ€T›]Kù^€€ù[ùHŸŸ€R[ú]ò⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬àJN¬àŸŸ€Kò\[ô⁄[
+ŸŸ€R[ú]
+N¬àŸŸ€Kò\[ô⁄[
+ŸŸ€T›]JN¬àŸŸ€P€€ùõ€ò\[ô⁄[
+ŸŸ€JN¬àŸŸ€Tõ›Àò\[ô⁄[
+ŸŸ€SXô[
+N¬àŸŸ€Tõ›Àò\[ô⁄[
+ŸŸ€P€€ùõ€
+N¬àõŸKò\[ô⁄[
+ŸŸ€Tõ› N¬ÇàYà
+\€XﬁT›]Kô[òXõY
+H¬à€€ú›[ö\ö]\Ÿ»Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à[ö\ö]\ŸÀò€\‹”ò[YHH	€]]Y]^	Œ¬à[ö\ö]\ŸÀù^€€ù[ùHÿ€‹HOOH	Ÿ€ÿò[	¬à»	”õ»€ÿò[]]À]\]H€XﬁH\»›\úô[ùH[ôõ‹òŸYàYŸ[ù»⁄[ô[H€àZ\àÿÿ[›ô\úöYHŸ][ô‹Àâ¬àà	’\»›\›€Y\à›\úô[ùH[ö\ö]»H€ÿò[]]À]\]H€XﬁKâŒ¬àõŸKò\[ô⁄[
+[ö\ö]\Ÿ N¬à[ô[ò\[ô⁄[
+õŸJN¬àõ€›ò\[ô⁄[
+[ô[
+N¬àô]\õé¬àBÇà\[ô€XﬁR[ú] õŸKÿ€‹K€XﬁT›]Kÿ[ëY]
+N¬à[ô[ò\[ô⁄[
+õŸJN¬àõ€›ò\[ô⁄[
+[ô[
+N¬üBÇôù[ò›[€à\[ô€XﬁR[ú] €€ùZ[ô\ãÿ€‹K€XﬁT›]Kÿ[ëY]
+H¬à€€ú›€XﬁHH€XﬁT›]Kú€XﬁHQêUS’TUW‘”P÷W‘‘PŒ¬à€€ú›\ÿXõYHXÿ[ëY]\€XﬁT›]Kô[òXõY¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	–⁄X⁄»ÿY[òŸH
+^\ IÀ	‘Ÿ]»»]\ŸH[ò][ôY\]H⁄X⁄‹ÀâÀà‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	›\]Wÿ⁄X⁄◊Ÿ^\…À€XﬁKù\]Wÿ⁄X⁄◊Ÿ^\À\ÿXõYÕçJJJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	’ô\ú⁄[€à[à›ò]YﬁIÀ	–€€ùõ€»⁄]\àYŸ[ù»›^H€àXZõ‹ãZ[õ‹ã‹à]⁄[ô\ÀâÀà‹ôX]T€XﬁTŸ[X›[ú]
+ÿ€‹K	›ô\ú⁄[€ó‹[ó‹›ò]YﬁIÀ€XﬁKùô\ú⁄[€ó‹[ó‹›ò]YﬁK\ÿXõY”P÷W’ëTî“S”ó‘Só”‘S”î JJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	–[›»XZõ‹à\‹òY\…À	’⁄[à\ÿXõYYŸ[ù»⁄[õ›‹õ‹‹»XZõ‹àô\ú⁄[€àõ›[ô\öY\»[õ\‹»õ‹òŸYX[ùX[KâÀà‹ôX]T€XﬁP⁄X⁄ÿõﬁ[ú]
+ÿ€‹K	ÿ[›◊€XZõ‹ó›\‹òYIÀ€XﬁKò[›◊€XZõ‹ó›\‹òYK\ÿXõY
+JJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	’\ôŸ]ô\ú⁄[€à
+‹[€ò[
+IÀ	‘õ›öYH[à^X›Ÿ[X[ùX»ô\ú⁄[€à»[àHõY]àX]ôHõ[ö»»õ€›»H]\›[›ŸYô\ú⁄[€ãâÀà‹ôX]T€XﬁU^[ú]
+ÿ€‹K	›\ôŸ]›ô\ú⁄[€âÀ€XﬁKù\ôŸ]›ô\ú⁄[€ã\ÿXõY
+JJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	–€€X›[[Y]ûH\ö[ô»õ€›]	À	–[›‹»HŸ\ùô\à»ÿ]\à[õ€û[Z^ôY\]HY]öX‹»õ‹à\⁄õÿ\ôÀâÀà‹ôX]T€XﬁP⁄X⁄ÿõﬁ[ú]
+ÿ€‹K	ÿ€€X››[[Y]ûIÀ€XﬁKò€€X››[[Y]ûK\ÿXõY
+JJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁT›XöXY\ä	”XZ[ù[ò[òŸH⁄[ô›… JN¬à€€ú›]—\ÿXõYH\ÿXõY¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	’⁄[ô›»[òXõY	À	‘ô\›öX›\]\»»H‹X⁄YöX»[YH⁄[ô›»[àH[ò[ù	‹»[Y^õ€ôKâÀà‹ôX]T€XﬁP⁄X⁄ÿõﬁ[ú]
+ÿ€‹K	€XZ[ù[ò[òŸW›⁄[ô›Àô[òXõY	À€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àô[òXõY]—\ÿXõY
+JJN¬Çà€€ú›XZ[ù[ò[òŸR[ú]—\ÿXõYH]—\ÿXõY\€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àô[òXõY¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	’[Y^õ€ôIÀ	“PSêH[Y^õ€ôH›X⁄\»U»‹à[Y\öXÿK”ô]◊÷[‹öÀâÀà‹ôX]T€XﬁU^[ú]
+ÿ€‹K	€XZ[ù[ò[òŸW›⁄[ô›Àù[Y^õ€ôIÀ€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àù[Y^õ€ôKXZ[ù[ò[òŸR[ú]—\ÿXõY
+JJN¬Çà€€ú››\ù‹ò\\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à›\ù‹ò\\ãò€\‹”ò[YHH	‹€XﬁKZ[õ[ôKZ[ú]…Œ¬à›\ù‹ò\\ãò\[ô⁄[
+‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	€XZ[ù[ò[òŸW›⁄[ô›Àú›\ù⁄›\âÀ€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àú›\ù⁄›\ãXZ[ù[ò[òŸR[ú]—\ÿXõYå JN¬à›\ù‹ò\\ãò\[ô⁄[
+ÿ›[Y[ùò‹ôX]U^õŸJ	»à	 JN¬à›\ù‹ò\\ãò\[ô⁄[
+‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	€XZ[ù[ò[òŸW›⁄[ô›Àú›\ù€Z[âÀ€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àú›\ù€Z[ãXZ[ù[ò[òŸR[ú]—\ÿXõYNJJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	‘›\ù[YH
+ìSJIÀ	ÃçZ›\àõ‹õX]âÀ›\ù‹ò\\äJN¬Çà€€ú›[ô‹ò\\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à[ô‹ò\\ãò€\‹”ò[YHH	‹€XﬁKZ[õ[ôKZ[ú]…Œ¬à[ô‹ò\\ãò\[ô⁄[
+‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	€XZ[ù[ò[òŸW›⁄[ô›Àô[ô⁄›\âÀ€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àô[ô⁄›\ãXZ[ù[ò[òŸR[ú]—\ÿXõYå JN¬à[ô‹ò\\ãò\[ô⁄[
+ÿ›[Y[ùò‹ôX]U^õŸJ	»à	 JN¬à[ô‹ò\\ãò\[ô⁄[
+‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	€XZ[ù[ò[òŸW›⁄[ô›Àô[ô€Z[âÀ€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àô[ô€Z[ãXZ[ù[ò[òŸR[ú]—\ÿXõYNJJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	—[ô[YH
+ìSJIÀ	ÃçZ›\àõ‹õX]âÀ[ô‹ò\\äJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	—^\»ŸàŸYZ…À	‘Ÿ[X›€ôH‹à[‹ôH^\»õ‹àXZ[ù[ò[òŸKâÀà‹ôX]T€XﬁQ^\–€€ùõ€
+ÿ€‹K€XﬁKõXZ[ù[ò[òŸW›⁄[ô›Àô^\◊€Ÿó›ŸYZÀXZ[ù[ò[òŸR[ú]—\ÿXõY
+JJN¬Çà€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁT›XöXY\ä	‘õ€›]€€ùõ€	 JN¬à€€ú›õ€›]\ÿXõYH\ÿXõY¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	‘›YŸŸ\ôYõ€›]	À	—\ÿXõ[ô»\⁄\»\]\»»[YŸ[ù»⁄[][[ô[›\€KâÀà‹ôX]T€XﬁP⁄X⁄ÿõﬁ[ú]
+ÿ€‹K	‹õ€›]ÿ€€ùõ€ú›YŸŸ\ôY	À€XﬁKúõ€›]ÿ€€ùõ€ú›YŸŸ\ôYõ€›]\ÿXõY
+JJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	”X^€€ò›\úô[ùYŸ[ù…À	”[Z]Hù[Xô\àŸàYŸ[ù»\][ô»]Hÿ[YH[YH
+H]] KâÀà‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	‹õ€›]ÿ€€ùõ€õX^ÿ€€ò›\úô[ù	À€XﬁKúõ€›]ÿ€€ùõ€õX^ÿ€€ò›\úô[ùõ€›]\ÿXõYL
+JJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	–ò]⁄⁄^ôIÀ	”ù[Xô\àŸàYŸ[ù»\àÿ]ôH⁄[à›YŸŸ\ö[ôÀâÀà‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	‹õ€›]ÿ€€ùõ€òò]⁄‹⁄^ôIÀ€XﬁKúõ€›]ÿ€€ùõ€òò]⁄‹⁄^ôKõ€›]\ÿXõYL
+JJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	—[^Hô]ŸY[àÿ]ô\»
+ŸX€€ô IÀ	‘]\ŸHô]ŸY[à›YŸŸ\ôYò]⁄\ÀâÀà‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	‹õ€›]ÿ€€ùõ€ô[^Wÿô]ŸY[ó›ÿ]ô\…À€XﬁKúõ€›]ÿ€€ùõ€ô[^Wÿô]ŸY[ó›ÿ]ô\Àõ€›]\ÿXõYç
+JJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	“ö]\à
+ŸX€€ô IÀ	‘ò[ô€Z^ôY[^HYY»ôYXŸH[ô\ö[ô»\ôÀâÀà‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K	‹õ€›]ÿ€€ùõ€öö]\ó‹ŸX€€ô…À€XﬁKúõ€›]ÿ€€ùõ€öö]\ó‹ŸX€€ôÀõ€›]\ÿXõYÕå
+JJN¬à€€ùZ[ô\ãò\[ô⁄[
+ùZ[€XﬁTõ› 	—[Y\ôŸ[òﬁHXõ‹ù]òZ[XõIÀ	–[›»YZ[ú»»›‹[à[ãYõY⁄õ€›]úõ€HHRKâÀà‹ôX]T€XﬁP⁄X⁄ÿõﬁ[ú]
+ÿ€‹K	‹õ€›]ÿ€€ùõ€ô[Y\ôŸ[òﬁWÿXõ‹ù	À€XﬁKúõ€›]ÿ€€ùõ€ô[Y\ôŸ[òﬁWÿXõ‹ùõ€›]\ÿXõY
+JJN¬üBÇôù[ò›[€àùZ[€XﬁTõ› Xô[\ÿ‹ö\[€ã€€ùõ€[[Y[ù
+H¬à€€ú›õ›»Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àõ›Àò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[\õ›…Œ¬à€€ú›Xô[[Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àXô[[ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[[Xô[	Œ¬àXô[[ö[õô\íSH]à€\‹œHôöY[]]HèâŸ\ÿÿ\R[
+Xô[
+_OŸ]èè]à€\‹œHôöY[Y\ÿ‹ö\[€àèâŸ\ÿÿ\R[
+\ÿ‹ö\[€à	… _OŸ]èò¬à€€ú›€€ùõ€Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à€€ùõ€ò€\‹”ò[YHH	‹Ÿ][ô‹ÀYöY[X€€ùõ€	Œ¬à€€ùõ€ò\[ô⁄[
+€€ùõ€[[Y[ù
+N¬àõ›Àò\[ô⁄[
+Xô[[
+N¬àõ›Àò\[ô⁄[
+€€ùõ€
+N¬àô]\õàõ›Œ¬üBÇôù[ò›[€àùZ[€XﬁT›XöXY\ä]JH¬à€€ú›]öY\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à]öY\ãò€\‹”ò[YHH	‹€XﬁK\›XöXY\âŒ¬à]öY\ãù^€€ù[ùH]N¬àô]\õà]öY\é¬üBÇôù[ò›[€à‹ôX]T€XﬁSù[Xô\í[ú]
+ÿ€‹K]ò[YK\ÿXõYZ[ãX^
+H¬à€€ú›[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	€ù[Xô\âŒ¬à[ú]ùò[YHHò[YHOOHù[ò[YHOOH[ôYö[ôY»	…»àò[YN¬àYà
+Z[àOOH[ôYö[ôY
+H[ú]õZ[àHZ[é¬àYà
+X^OOH[ôYö[ôY
+H[ú]õX^HX^¬à[ú]ô]\Ÿ]ú€XﬁT]H]¬à[ú]ô]\Ÿ]ú€XﬁU\HH	€ù[Xô\âŒ¬à[ú]ô]\Ÿ]ú€XﬁTÿ€‹HHÿ€‹N¬à[ú]ô\ÿXõYHHY\ÿXõY¬àô]\õà[ú]¬üBÇôù[ò›[€à‹ôX]T€XﬁU^[ú]
+ÿ€‹K]ò[YK\ÿXõY
+H¬à€€ú›[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	›^	Œ¬à[ú]ùò[YHHò[YHOOHù[ò[YHOOH[ôYö[ôY»	…»àò[YN¬à[ú]ô]\Ÿ]ú€XﬁT]H]¬à[ú]ô]\Ÿ]ú€XﬁU\HH	›^	Œ¬à[ú]ô]\Ÿ]ú€XﬁTÿ€‹HHÿ€‹N¬à[ú]ô\ÿXõYHHY\ÿXõY¬àô]\õà[ú]¬üBÇôù[ò›[€à‹ôX]T€XﬁTŸ[X›[ú]
+ÿ€‹K]ò[YK\ÿXõY‹[€ú H¬à€€ú›Ÿ[X›Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹Ÿ[X›	 N¬à
+‹[€ú»◊JKôõ‹ëXX⁄
+‹[€àOà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHH‹[€ãùò[YN¬à‹ù^€€ù[ùH‹[€ãõXô[¬àYà
+‹[€ãùò[YHOOHò[YJH¬à‹úŸ[X›YHùYN¬àBàŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬àŸ[X›ô]\Ÿ]ú€XﬁT]H]¬àŸ[X›ô]\Ÿ]ú€XﬁU\HH	›^	Œ¬àŸ[X›ô]\Ÿ]ú€XﬁTÿ€‹HHÿ€‹N¬àŸ[X›ô\ÿXõYHHY\ÿXõY¬àô]\õàŸ[X›¬üBÇôù[ò›[€à‹ôX]T€XﬁP⁄X⁄ÿõﬁ[ú]
+ÿ€‹K]⁄X⁄ŸY\ÿXõY
+H¬à€€ú›ŸŸ€HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€Xô[	 N¬àŸŸ€Kò€\‹”ò[YHH	€Z[öK]ŸŸ€KX€€ùZ[ô\àŸ][ô‹À]ŸŸ€IŒ¬à€€ú›[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	ÿ⁄X⁄ÿõﬁ	Œ¬à[ú]ò⁄X⁄ŸYHHX⁄X⁄ŸY¬à[ú]ô\ÿXõYHHY\ÿXõY¬à[ú]ô]\Ÿ]ú€XﬁT]H]¬à[ú]ô]\Ÿ]ú€XﬁU\HH	ÿõ€€	Œ¬à[ú]ô]\Ÿ]ú€XﬁTÿ€‹HHÿ€‹N¬à€€ú››]HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹‹[â N¬à›]Kò€\‹”ò[YHH	‹Ÿ][ô‹À]ŸŸ€K\›]IŒ¬à›]Kù^€€ù[ùH⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬à[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à›]Kù^€€ù[ùH[ú]ò⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬àJN¬àŸŸ€Kò\[ô⁄[
+[ú]
+N¬àŸŸ€Kò\[ô⁄[
+›]JN¬àô]\õàŸŸ€N¬üBÇôù[ò›[€à‹ôX]T€XﬁQ^\–€€ùõ€
+ÿ€‹KŸ[X›Y^\À\ÿXõY
+H¬à€€ú›‹ò\\àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬à‹ò\\ãò€\‹”ò[YHH	‹€XﬁKY^\ÀX€€ùZ[ô\âŒ¬à‹ò\\ãò€\‹”\›ùŸŸ€J	Ÿ\ÿXõY	ÀHY\ÿXõY
+N¬à€€ú›^TŸ]Hô]»Ÿ]
+\úò^Kö\–\úò^JŸ[X›Y^\ H»Ÿ[X›Y^\»à◊JN¬à”P÷W—VT◊”—ó’—QRÀôõ‹ëXX⁄
+^HOà¬à€€ú›⁄\Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€Xô[	 N¬à⁄\ò€\‹”ò[YHH	‹€XﬁKY^KX⁄\	Œ¬à€€ú›[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	ÿ⁄X⁄ÿõﬁ	Œ¬à[ú]ò⁄X⁄ŸYH^TŸ]ö\ ^Kùò[YJN¬à[ú]ô\ÿXõYHHY\ÿXõY¬à[ú]ô]\Ÿ]ú€XﬁTÿ€‹HHÿ€‹N¬à[ú]ô]\Ÿ]ú€XﬁQ^HH›ö[ô ^Kùò[YJN¬à⁄\ò\[ô⁄[
+[ú]
+N¬à€€ú›^Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹‹[â N¬à^ù^€€ù[ùH^KõXô[¬à⁄\ò\[ô⁄[
+^
+N¬àﬁ[ò‘€XﬁQ^P⁄\›]J[ú]
+N¬à‹ò\\ãò\[ô⁄[
+⁄\
+N¬àJN¬àô]\õà‹ò\\é¬üBÇôù[ò›[€àﬁ[ò‘€XﬁQ^P⁄\›]J[ú]
+H¬àYà
+Z[ú]
+Hô]\õé¬à€€ú›⁄\H[ú]ò€‹Ÿ\›
+	Àú€XﬁKY^KX⁄\	 N¬àYà
+X⁄\
+Hô]\õé¬à⁄\ò€\‹”\›ùŸŸ€J	‹Ÿ[X›Y	ÀHZ[ú]ò⁄X⁄ŸY
+N¬à⁄\ò€\‹”\›ùŸŸ€J	Ÿ\ÿXõY	À[ú]ô\ÿXõY
+N¬üBÇôù[ò›[€à[ôT€XﬁQöY[⁄[ôŸJ]ô[ù
+H¬à€€ú›\ôŸ]H]ô[ùù\ôŸ]¬àYà
+]\ôŸ]]\ôŸ]ô]\Ÿ]
+H¬àô]\õé¬àBàYà
+\ôŸ]ô]\Ÿ]ú€XﬁUŸŸ€JH¬à[ôT€XﬁUŸŸ€P⁄[ôŸJ\ôŸ]
+N¬àô]\õé¬àBàYà
+ÿöôX›úõ››\Kö\”›€îõ‹\ùKòÿ[
+\ôŸ]ô]\Ÿ]	‹€XﬁQ^I JH¬à[ôT€XﬁQ^UŸŸ€J\ôŸ]
+N¬àô]\õé¬àBàYà
+]\ôŸ]ô]\Ÿ]ú€XﬁT]
+H¬àô]\õé¬àBà€€ú›ÿ€‹HHô\€€ôT€XﬁTÿ€‹J\ôŸ]ô]\Ÿ]ú€XﬁTÿ€‹JN¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]H\›]Kú€XﬁJH¬àô]\õé¬àBà€€ú›\HH\ôŸ]ô]\Ÿ]ú€XﬁU\H\ôŸ]ù\H	›^	Œ¬à€€ú›ò[YHHôXY[ú]ò[YJ\ôŸ]\JN¬àŸ]ô\›Yò[YJ›]Kú€XﬁK\ôŸ]ô]\Ÿ]ú€XﬁT]ò[YJN¬àôX€€\]T€XﬁQ\ùJÿ€‹JN¬à\]PX›[€êù]€ú 
+N¬àYà
+\ôŸ]ô]\Ÿ]ú€XﬁT]OOH	€XZ[ù[ò[òŸW›⁄[ô›Àô[òXõY	 H¬àôYúô\⁄€XﬁT[ô[
+
+N¬àBüBÇôù[ò›[€à[ôT€XﬁUŸŸ€P⁄[ôŸJ[ú]
+H¬à€€ú›ÿ€‹HHô\€€ôT€XﬁTÿ€‹J[ú]ô]\Ÿ]ú€XﬁTÿ€‹JN¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]JHô]\õé¬à›]Kô[òXõYHHZ[ú]ò⁄X⁄ŸY¬àôX€€\]T€XﬁQ\ùJÿ€‹JN¬à\]PX›[€êù]€ú 
+N¬àôYúô\⁄€XﬁT[ô[
+
+N¬üBÇôù[ò›[€à[ôT€XﬁQ^UŸŸ€J[ú]
+H¬à€€ú›ÿ€‹HHô\€€ôT€XﬁTÿ€‹J[ú]ô]\Ÿ]ú€XﬁTÿ€‹JN¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]JHô]\õé¬à€€ú›ò]’ò[YHHù[Xô\ä[ú]ô]\Ÿ]ú€XﬁQ^JN¬àYà
+Sù[Xô\ãö\—ö[ö]Jò]’ò[YJJH¬àô]\õé¬àBà€€ú››\úô[ùHŸ]ò[YPûT]
+›]Kú€XﬁK	€XZ[ù[ò[òŸW›⁄[ô›Àô^\◊€Ÿó›ŸYZ… N¬à€€ú›ô^Hô]»Ÿ]
+\úò^Kö\–\úò^J›\úô[ù
+H»›\úô[ùà◊JN¬àYà
+[ú]ò⁄X⁄ŸY
+H¬àô^òY
+ò]’ò[YJN¬àH[ŸH¬àô^ô[]Jò]’ò[YJN¬àBàŸ]ô\›Yò[YJ›]Kú€XﬁK	€XZ[ù[ò[òŸW›⁄[ô›Àô^\◊€Ÿó›ŸYZ…À\úò^Kôúõ€Jô^
+Kú€‹ù
+
+KäHOàHHäJN¬àôX€€\]T€XﬁQ\ùJÿ€‹JN¬à\]PX›[€êù]€ú 
+N¬àﬁ[ò‘€XﬁQ^P⁄\›]J[ú]
+N¬üBÇôù[ò›[€àô\€€ôT€XﬁTÿ€‹Jÿ€‹R[ù
+H¬àYà
+ÿ€‹R[ùOOH	Ÿ€ÿò[	»ÿ€‹R[ùOOH	›[ò[ù	 H¬àô]\õàÿ€‹R[ù¬àBàô]\õàŸ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	»»	›[ò[ù	»à	Ÿ€ÿò[	Œ¬üBÇôù[ò›[€à‹ôX]R[ú]õ‹ëöY[
+öY[ò[YJH¬à€€ú›\HH
+öY[ù\H	›^	 Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›ô\€€ôYò[YHHô\€€ôQöY[ò[YJöY[ò[YJN¬à][ú]¬à][[Y[ù¬àYà
+\HOOH	ÿõ€€	 H¬à[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	ÿ⁄X⁄ÿõﬁ	Œ¬à[ú]ò⁄X⁄ŸYHH\ô\€€ôYò[YN¬à€€ú›ŸŸ€HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€Xô[	 N¬àŸŸ€Kò€\‹”ò[YHH	€Z[öK]ŸŸ€KX€€ùZ[ô\àŸ][ô‹À]ŸŸ€IŒ¬àŸŸ€Kù]HHöY[ù]HöY[ú]¬à€€ú››]HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹‹[â N¬à›]Kò€\‹”ò[YHH	‹Ÿ][ô‹À]ŸŸ€K\›]IŒ¬à›]Kù^€€ù[ùH[ú]ò⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬à[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à›]Kù^€€ù[ùH[ú]ò⁄X⁄ŸY»	—[òXõY	»à	—\ÿXõY	Œ¬àJN¬àŸŸ€Kò\[ô⁄[
+[ú]
+N¬àŸŸ€Kò\[ô⁄[
+›]JN¬à[[Y[ùHŸŸ€N¬àH[ŸHYà
+\HOOH	€ù[Xô\â H¬à[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	€ù[Xô\âŒ¬à[ú]ùò[YHHô\€€ôYò[YHOOHù[ô\€€ôYò[YHOOH[ôYö[ôY»	…»àô\€€ôYò[YN¬àYà
+öY[õZ[àOOH[ôYö[ôY
+H[ú]õZ[àHöY[õZ[é¬àYà
+öY[õX^OOH[ôYö[ôY
+H[ú]õX^HöY[õX^¬à[[Y[ùH[ú]¬àH[ŸHYà
+\HOOH	‹Ÿ[X›	»	âà\úò^Kö\–\úò^JöY[ô[ù[JJH¬à[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	‹Ÿ[X›	 N¬àöY[ô[ù[Kôõ‹ëXX⁄
+‹[€ïò[YHOà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHH‹[€ïò[YN¬à‹ù^€€ù[ùH‹[€ïò[YN¬àYà
+‹[€ïò[YHOOHô\€€ôYò[YJH¬à‹úŸ[X›YHùYN¬àBà[ú]ò\[ô⁄[
+‹
+N¬àJN¬à[[Y[ùH[ú]¬àH[ŸHYà
+\HOOH	›^\ôXI H¬à[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	›^\ôXI N¬à[ú]ùò[YHHô\€€ôYò[YHOOHù[ô\€€ôYò[YHOOH[ôYö[ôY»	…»àô\€€ôYò[YN¬à[ú]úõ›‹»H¬à[ú]ò€\‹”ò[YHH	‹Ÿ][ô‹À]^\ôXIŒ¬à[ú]úXŸZ€\àHöY[ô\ÿ‹ö\[€à	…Œ¬à[[Y[ùH[ú]¬àH[ŸH¬à[ú]Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	⁄[ú]	 N¬à[ú]ù\HH	›^	Œ¬à[ú]ùò[YHHô\€€ôYò[YHOOHù[ô\€€ôYò[YHOOH[ôYö[ôY»	…»àô\€€ôYò[YN¬à[[Y[ùH[ú]¬àBà[ú]ô]\Ÿ]úŸ][ô‹‘]HöY[ú]¬à[ú]ô]\Ÿ]ôöY[\HH
+öY[ù\H	›^	 Kù”›Ÿ\êÿ\ŸJ
+N¬àô]\õà»[ú][[Y[ùN¬üBÇôù[ò›[€à[ôTŸ][ô‹—öY[⁄[ôŸJ]ô[ù
+H¬à€€ú›\ôŸ]H]ô[ùù\ôŸ]¬àYà
+]\ôŸ]]\ôŸ]ô]\Ÿ]]\ôŸ]ô]\Ÿ]úŸ][ô‹‘]
+H¬àô]\õé¬àBà€€ú›]H\ôŸ]ô]\Ÿ]úŸ][ô‹‘]¬à€€ú›öY[\HH\ôŸ]ô]\Ÿ]ôöY[\H	›^	Œ¬à€€ú›ô]’ò[YHHôXY[ú]ò[YJ\ôŸ]öY[\JN¬àYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	 H¬à\]Q€ÿò[òYù
+]ô]’ò[YJN¬àH[ŸHYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	 H¬à\]U[ò[ùòYù
+]ô]’ò[YJN¬àH[ŸH¬à\]PYŸ[ùòYù
+]ô]’ò[YJN¬àBÇàÀ»\]Hö\⁄Xö[]HŸàöY[»]\[ô€à\»⁄X⁄ÿõﬁàYà
+öY[\HOOH	ÿõ€€	 H¬à\]Q\[ô[ùöY[ö\⁄Xö[]J
+N¬àBüBÇôù[ò›[€à[ôTŸ][ô‹—öY[€X⁄ ]ô[ù
+H¬à€€ú›\ôŸ]H]ô[ùù\ôŸ]¬àYà
+\ôŸ]	âà\ôŸ]ô]\Ÿ]	âà\ôŸ]ô]\Ÿ]ö[ö\ö]]
+H¬à]ô[ùúô]ô[ùYò][
+
+N¬àYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	 H¬à€X\ï[ò[ù›ô\úöYJ\ôŸ]ô]\Ÿ]ö[ö\ö]]
+N¬àH[ŸHYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	ÿYŸ[ù	 H¬à€X\êYŸ[ù›ô\úöYJ\ôŸ]ô]\Ÿ]ö[ö\ö]]
+N¬àBàBüBÇôù[ò›[€àôXY[ú]ò[YJ[ú]öY[\JH¬à›⁄]⁄
+öY[\JH¬àÿ\ŸH	ÿõ€€	ŒÇàô]\õàHZ[ú]ò⁄X⁄ŸY¬àÿ\ŸH	€ù[Xô\âŒÇàô]\õà[ú]ùò[YHOOH	…»»ù[àù[Xô\ä[ú]ùò[YJN¬àYò][Çàô]\õà[ú]ùò[YN¬àBüBÇôù[ò›[€à\]Q€ÿò[òYù
+]ò[YJH¬àŸ]ô\›Yò[YJŸ][ô‹’RT›]Kô€ÿò[òYù]ò[YJN¬à€€ú›ò\Ÿ[[ôHHŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+N¬àŸ][ô‹’RT›]Kô€ÿò[Ÿ][ô‹—\ùHHYY\\]X[
+Ÿ][ô‹’RT›]Kô€ÿò[òYùò\Ÿ[[ôJN¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬à\]PX›[€êù]€ú 
+N¬üBÇôù[ò›[€à\]U[ò[ùòYù
+]ò[YJH¬àYà
+\Ÿ][ô‹’RT›]Kù[ò[ùòYù
+H¬àŸ][ô‹’RT›]Kù[ò[ùòYùH€€ôTŸ][ô‹ Ÿ][ô‹’RT›]Kô€ÿò[òYù
+N¬àBàŸ]ô\›Yò[YJŸ][ô‹’RT›]Kù[ò[ùòYù]ò[YJN¬à€€ú›ò\ŸUò[YHHŸ]ò[YPûT]
+Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+K]
+N¬àYà
+ò[Y\—\]X[
+ò[YKò\ŸUò[YJJH¬à[]Sô\›Yò[YJŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù]
+N¬àH[ŸH¬àŸ]ô\›Yò[YJŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù]ò[YJN¬àBà€€ú›‹öY⁄[ò[›ô\úöY\»HŸ]›ô\úöY\‘^[ÿY
+Ÿ][ô‹’RT›]Kù[ò[ù€ò\⁄›
+N¬àŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHHYY\\]X[
+Ÿ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù‹öY⁄[ò[›ô\úöY\ N¬àô[ô\ì›ô\úöYT›[[X\ûJ
+N¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬à\]PX›[€êù]€ú 
+N¬üBÇôù[ò›[€à\]PYŸ[ùòYù
+]ò[YJH¬à€€ú›ŸX›[€àH›ö[ô ]	… Kú‹]
+	Àâ VÃN¬àYà
+Ÿ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€ú»	âàŸ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€úÀö\ ŸX›[€äJH¬àô]\õé¬àBàYà
+\Ÿ][ô‹’RT›]KòYŸ[ùòYù
+H¬à€€ú›ò\ŸTŸ][ô‹»HŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›
+HﬂN¬àŸ][ô‹’RT›]KòYŸ[ùòYùH€€ôTŸ][ô‹ ò\ŸTŸ][ô‹ N¬àBàŸ]ô\›Yò[YJŸ][ô‹’RT›]KòYŸ[ùòYù]ò[YJN¬à€€ú›ò\ŸUò[YHHŸ]ò[YPûT]
+Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›
+K]
+N¬àYà
+ò[Y\—\]X[
+ò[YKò\ŸUò[YJJH¬à[]Sô\›Yò[YJŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù]
+N¬àH[ŸH¬àŸ]ô\›Yò[YJŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù]ò[YJN¬àBà€€ú›‹öY⁄[ò[›ô\úöY\»HŸ]›ô\úöY\‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ù€ò\⁄›
+N¬àŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùHHYY\\]X[
+Ÿ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù‹öY⁄[ò[›ô\úöY\ N¬àô[ô\ì›ô\úöYT›[[X\ûJ
+N¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬à\]PX›[€êù]€ú 
+N¬üBÇôù[ò›[€à€X\ï[ò[ù›ô\úöYJ]
+H¬àYà
+\Ÿ][ô‹’RT›]Kù[ò[ùòYù
+Hô]\õé¬à[]Sô\›Yò[YJŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù]
+N¬à€€ú›ò\ŸUò[YHHŸ]ò[YPûT]
+Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+K]
+N¬àŸ]ô\›Yò[YJŸ][ô‹’RT›]Kù[ò[ùòYù]ò\ŸUò[YJN¬à€€ú›‹öY⁄[ò[›ô\úöY\»HŸ]›ô\úöY\‘^[ÿY
+Ÿ][ô‹’RT›]Kù[ò[ù€ò\⁄›
+N¬àŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHHYY\\]X[
+Ÿ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù‹öY⁄[ò[›ô\úöY\ N¬àô[ô\îŸ][ô‹—õ‹õJ
+N¬àô[ô\ì›ô\úöYT›[[X\ûJ
+N¬à\]PX›[€êù]€ú 
+N¬üBÇôù[ò›[€à€X\êYŸ[ù›ô\úöYJ]
+H¬àYà
+\Ÿ][ô‹’RT›]KòYŸ[ùòYù
+Hô]\õé¬à[]Sô\›Yò[YJŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù]
+N¬à€€ú›ò\ŸUò[YHHŸ]ò[YPûT]
+Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›
+K]
+N¬àŸ]ô\›Yò[YJŸ][ô‹’RT›]KòYŸ[ùòYù]ò\ŸUò[YJN¬à€€ú›‹öY⁄[ò[›ô\úöY\»HŸ]›ô\úöY\‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ù€ò\⁄›
+N¬àŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùHHYY\\]X[
+Ÿ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù‹öY⁄[ò[›ô\úöY\ N¬àﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àô[ô\îŸ][ô‹—õ‹õJ
+N¬àô[ô\ì›ô\úöYT›[[X\ûJ
+N¬à\]PX›[€êù]€ú 
+N¬üBÇôù[ò›[€à[ôTŸ][ô‹‘ÿ€‹P⁄[ôŸJÿ€‹JH¬àYà
+\ÿ€‹Hÿ€‹HOOHŸ][ô‹’RT›]Kúÿ€‹JH¬àô]\õé¬àBÇàÀ»ô]ô[ù[ò[ù\ÿ€‹Y\Ÿ\ú»úõ€HXÿŸ\‹⁄[ô»€ÿò[ÿ€‹BàYà
+ÿ€‹HOOH	Ÿ€ÿò[	»	âà\’[ò[ùÿ€‹Y\Ÿ\ä
+JH¬àô]\õé¬àBÇàŸ][ô‹’RT›]Kúÿ€‹HHÿ€‹N¬àô[ô\îŸ][ô‹’RJ
+N¬ÇàYà
+ÿ€‹HOOH	›[ò[ù	»	âàŸ][ô‹’RT›]KúŸ[X›Y[ò[ùY	âà\Ÿ][ô‹’RT›]Kù[ò[ù€ò\⁄›
+H¬àÿY[ò[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+Kù[ä
+
+HOà¬àô[ô\îŸ][ô‹’RJ
+N¬àJKòÿ]⁄
+\úàOà¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»ÿY[ò[ùŸ][ô‹…À\úäN¬àJN¬àBÇàYà
+ÿ€‹HOOH	ÿYŸ[ù	»	âàŸ][ô‹’RT›]KúŸ[X›YYŸ[ùY	âà\Ÿ][ô‹’RT›]KòYŸ[ù€ò\⁄›
+H¬àÿYYŸ[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+Kù[ä
+
+HOà¬àô[ô\îŸ][ô‹’RJ
+N¬àJKòÿ]⁄
+\úàOà¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»ÿYYŸ[ù›ô\úöY\…À\úäN¬àJN¬àBüBÇôù[ò›[€à[ôU[ò[ùŸ[X›
+]ô[ù
+H¬à€€ú›[ò[ùYH]ô[ùù\ôŸ]ùò[YN¬àŸ][ô‹’RT›]KúŸ[X›Y[ò[ùYH[ò[ùY¬àÿY[ò[ù€ò\⁄›
+[ò[ùY
+Kù[ä
+
+HOà¬àô[ô\îŸ][ô‹’RJ
+N¬àJKòÿ]⁄
+\úàOà¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»ÿY[ò[ùŸ][ô‹…À\úäN¬àJN¬üBÇôù[ò›[€à[ôPYŸ[ùŸ[X›
+]ô[ù
+H¬à€€ú›YŸ[ùYH]ô[ùù\ôŸ]ùò[YN¬àŸ][ô‹’RT›]KúŸ[X›YYŸ[ùYHYŸ[ùY¬àÿYYŸ[ù€ò\⁄›
+YŸ[ùY
+Kù[ä
+
+HOà¬àô[ô\îŸ][ô‹’RJ
+N¬àJKòÿ]⁄
+\úàOà¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»ÿYYŸ[ù›ô\úöY\…À\úäN¬àJN¬üBÇò\ﬁ[ò»ù[ò›[€à[ôTŸ][ô‹‘ÿ]ôJ]ô[ù
+H¬à]ô[ùúô]ô[ùYò][
+
+N¬àYà
+]\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I JH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	÷[›H»õ›]ôH\õZ\‹⁄[€à»\]HŸ][ô‹…À	Ÿ\úõ‹â N¬àô]\õé¬àBàŸ][ô‹’RT›]Kúÿ]ö[ô»HùYN¬à\]PX›[€êù]€ú 
+N¬àûH¬àYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	 H¬à]ÿZ]ÿ]ôQ€ÿò[Ÿ][ô‹ 
+N¬àH[ŸHYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	 H¬à]ÿZ]ÿ]ôU[ò[ùŸ][ô‹ 
+N¬àH[ŸH¬à]ÿZ]ÿ]ôPYŸ[ùŸ][ô‹ 
+N¬àBàHÿ]⁄
+\úäH¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»ÿ]ôHŸ][ô‹…À\úäN¬àHö[ò[H¬àŸ][ô‹’RT›]Kúÿ]ö[ô»Hò[ŸN¬à\]PX›[€êù]€ú 
+N¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿ]ôQ€ÿò[Ÿ][ô‹ 
+H¬àYà
+\Ÿ][ô‹’RT›]Kô€ÿò[\ùJH¬àô]\õé¬àBà€€ú›[ô[ô»H◊N¬à€€ú›Ÿ][ô‹–⁄[ôŸYHH\Ÿ][ô‹’RT›]Kô€ÿò[Ÿ][ô‹—\ùN¬à€€ú›X[òYŸYŸX›[€ú–⁄[ôŸYHH\Ÿ][ô‹’RT›]KõX[òYŸYŸX›[€ú—\ùN¬à€€ú›€XﬁT›]HHŸ]€XﬁT›]J	Ÿ€ÿò[	 N¬à€€ú›€XﬁP⁄[ôŸYHHJ€XﬁT›]H	âà€XﬁT›]Kô\ùJN¬ÇàÀ»YàŸ][ô‹»‹àX[òYŸYŸX›[€ú»⁄[ôŸYÿ]ôHõ›ŸŸ]\ÇàYà
+Ÿ][ô‹–⁄[ôŸYX[òYŸYŸX›[€ú–⁄[ôŸY
+H¬à€€ú›^[ÿYH¬àããúŸ][ô‹’RT›]Kô€ÿò[òYùàX[òYŸY‹ŸX›[€úŒà\úò^Kôúõ€JŸ][ô‹’RT›]KõX[òYŸYŸX›[€ú BàN¬à[ô[ôÀú\⁄
+ô]⁄î””ä	Àÿ\K›åK‹Ÿ][ô‹ÀŸ€ÿò[	À¬àY]Ÿà	‘U	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ^[ÿY
+BàJJN¬àBàYà
+€XﬁP⁄[ôŸY
+H¬à[ô[ôÀú\⁄
+ÿ]ôT€XﬁP⁄[ôŸ\ 	Ÿ€ÿò[	 JN¬àBàYà
+\[ô[ôÀõ[ô›
+H¬àô]\õé¬àBà]ÿZ]õ€Z\ŸKò[
+[ô[ô N¬àYà
+Ÿ][ô‹–⁄[ôŸYX[òYŸYŸX›[€ú–⁄[ôŸY
+H¬à]ÿZ]ÿY€ÿò[Ÿ][ô‹‘€ò\⁄›
+
+N¬àYà
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬à]ÿZ]ÿY[ò[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+N¬àBàBàYà
+€XﬁP⁄[ôŸY
+H¬à]ÿZ]ÿY€ÿò[\]T€XﬁJ
+N¬àBàô[ô\îŸ][ô‹’RJ
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—€ÿò[Ÿ][ô‹»ÿ]ôY	À	‹›XÿŸ\‹… N¬üBÇò\ﬁ[ò»ù[ò›[€àÿ]ôU[ò[ùŸ][ô‹ 
+H¬àYà
+\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	‘Ÿ[X›H[ò[ù»Y]›ô\úöY\…À	Ÿ\úõ‹â N¬àô]\õé¬àBà€€ú›[ò[ùYHŸ][ô‹’RT›]KúŸ[X›Y[ò[ùY¬àYà
+\Ÿ][ô‹’RT›]Kù[ò[ù\ùJH¬àô]\õé¬àBà€€ú›[ô[ô»H◊N¬à€€ú›Ÿ][ô‹–⁄[ôŸYHH\Ÿ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùN¬à€€ú›[ôõ‹òŸ[Y[ù⁄[ôŸYHH\Ÿ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú—\ùN¬à€€ú›€XﬁT›]HHŸ]€XﬁT›]J	›[ò[ù	 N¬à€€ú›€XﬁP⁄[ôŸYHHJ€XﬁT›]H	âà€XﬁT›]Kô\ùJN¬àYà
+Ÿ][ô‹–⁄[ôŸY[ôõ‹òŸ[Y[ù⁄[ôŸY
+H¬à€€ú››ô\úöY\»H€€ôTŸ][ô‹ Ÿ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù
+N¬à€€ú›[ôõ‹òŸY‹ŸX›[€ú»H\úò^Kôúõ€JŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú»◊JN¬à€€ú›\”›ô\úöY\»Hõ][ì›ô\úöY\ ›ô\úöY\ Kõ[ô›à¬à€€ú›\—[ôõ‹òŸ[Y[ùH[ôõ‹òŸY‹ŸX›[€úÀõ[ô›à¬àYà
+Z\”›ô\úöY\»	âàZ\—[ôõ‹òŸ[Y[ù
+H¬à[ô[ôÀú\⁄
+ô]⁄î””äÿ\K›åK‹Ÿ][ô‹À›[ò[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X»Y]Ÿà	—SUI»JJN¬àH[ŸH¬à[ô[ôÀú\⁄
+ô]⁄î””äÿ\K›åK‹Ÿ][ô‹À›[ò[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X¬àY]Ÿà	‘U	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»›ô\úöY\À[ôõ‹òŸY‹ŸX›[€ú»JBàJJN¬àBàBàYà
+€XﬁP⁄[ôŸY
+H¬à[ô[ôÀú\⁄
+ÿ]ôT€XﬁP⁄[ôŸ\ 	›[ò[ù	À[ò[ùY
+JN¬àBàYà
+\[ô[ôÀõ[ô›
+H¬àô]\õé¬àBà]ÿZ]õ€Z\ŸKò[
+[ô[ô N¬à]ÿZ]ÿY[ò[ù€ò\⁄›
+[ò[ùY
+N¬àô[ô\îŸ][ô‹’RJ
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	’[ò[ù€€ôöY›\ò][€àÿ]ôY	À	‹›XÿŸ\‹… N¬üBÇò\ﬁ[ò»ù[ò›[€àÿ]ôPYŸ[ùŸ][ô‹ 
+H¬àYà
+\Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	‘Ÿ[X›[àYŸ[ù»Y]›ô\úöY\…À	Ÿ\úõ‹â N¬àô]\õé¬àBà€€ú›YŸ[ùYHŸ][ô‹’RT›]KúŸ[X›YYŸ[ùY¬àYà
+\Ÿ][ô‹’RT›]KòYŸ[ù\ùJH¬àô]\õé¬àBà€€ú››ô\úöY\»H€€ôTŸ][ô‹ Ÿ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù
+N¬à
+Ÿ][ô‹’RT›]KòYŸ[ù[ôõ‹òŸYŸX›[€ú»ô]»Ÿ]
+
+JKôõ‹ëXX⁄
+ŸX›[€àOà¬à[]H›ô\úöY\÷‹ŸX›[€óN¬àJN¬à€€ú›\”›ô\úöY\»Hõ][ì›ô\úöY\ ›ô\úöY\ Kõ[ô›à¬àYà
+Z\”›ô\úöY\ H¬àûH¬à]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹ÀÿYŸ[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùY
+_X»Y]Ÿà	—SUI»JN¬àHÿ]⁄
+\úäH¬àYà
+Y\úà\úãú›]\»OOH
+H¬àõ›»\úé¬àBàBàH[ŸH¬à]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹ÀÿYŸ[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+YŸ[ùY
+_X¬àY]Ÿà	‘U	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ›ô\úöY\ BàJN¬àBà]ÿZ]ÿYYŸ[ù€ò\⁄›
+YŸ[ùY
+N¬àô[ô\îŸ][ô‹’RJ
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–YŸ[ù›ô\úöY\»ÿ]ôY	À	‹›XÿŸ\‹… N¬üBÇò\ﬁ[ò»ù[ò›[€àÿ]ôT€XﬁP⁄[ôŸ\ ÿ€‹K[ò[ùY
+H¬à€€ú››]HHŸ]€XﬁT›]Jÿ€‹JN¬àYà
+\›]H\›]Kô\ùJH¬àô]\õé¬àBà][ô⁄[ùH	Àÿ\K›åK›\]K\€X⁄Y\ÀŸ€ÿò[	Œ¬àYà
+ÿ€‹HOOH	›[ò[ù	 H¬àYà
+][ò[ùY
+H¬àõ›»ô]»\úõ‹ä	’[ò[ùQ\»ô\]Z\ôY»ÿ]ôH[ò[ù€XﬁH›ô\úöY\… N¬àBà[ô⁄[ùHÿ\K›åK›\]K\€X⁄Y\À…Ÿ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X¬àBàYà
+\›]Kô[òXõY
+H¬àûH¬à]ÿZ]ô]⁄î””ä[ô⁄[ù»Y]Ÿà	—SUI»JN¬àHÿ]⁄
+\úäH¬àYà
+Y\úà\úãú›]\»OOH
+H¬àõ›»\úé¬àBàBàô]\õé¬àBà]ÿZ]ô]⁄î””ä[ô⁄[ù¬àY]Ÿà	‘U	ÀàXY\úŒà»	–€€ù[ùU\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KàõŸNàî””ãú›ö[ô⁄YûJ»€XﬁNà€€ôT€XﬁT‹X ›]Kú€XﬁJHJBàJN¬üBÇôù[ò›[€à[ôQ\ÿÿ\ô⁄[ôŸ\ ]ô[ù
+H¬à]ô[ùúô]ô[ùYò][
+
+N¬àYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	 H¬àŸ][ô‹’RT›]Kô€ÿò[òYùH€€ôTŸ][ô‹ Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+JN¬àŸ][ô‹’RT›]Kô€ÿò[Ÿ][ô‹—\ùHHò[ŸN¬àô\Ÿ]€XﬁQòYù
+	Ÿ€ÿò[	 N¬àH[ŸHYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	 H¬à€€ú›[ò[ùŸ][ô‹»HŸ][ô‹’RT›]Kù[ò[ù€ò\⁄›à»Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kù[ò[ù€ò\⁄›
+BààŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+N¬àŸ][ô‹’RT›]Kù[ò[ùòYùH€€ôTŸ][ô‹ [ò[ùŸ][ô‹ N¬àŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYùH€€ôTŸ][ô‹ Ÿ]›ô\úöY\‘^[ÿY
+Ÿ][ô‹’RT›]Kù[ò[ù€ò\⁄›
+JN¬àŸ][ô‹’RT›]Kù[ò[ùŸ][ô‹—\ùHHò[ŸN¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú»Hô]»Ÿ]
+Ÿ][ô‹’RT›]Kõ‹öY⁄[ò[[ò[ù[ôõ‹òŸYŸX›[€ú»◊JN¬àŸ][ô‹’RT›]Kù[ò[ù[ôõ‹òŸYŸX›[€ú—\ùHHò[ŸN¬àô\Ÿ]€XﬁQòYù
+	›[ò[ù	 N¬àH[ŸH¬à€€ú›YŸ[ùŸ][ô‹»HŸ][ô‹’RT›]KòYŸ[ù€ò\⁄›à»Ÿ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ù€ò\⁄›
+BààŸ]Ÿ][ô‹‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ùò\ŸT€ò\⁄›
+N¬àŸ][ô‹’RT›]KòYŸ[ùòYùH€€ôTŸ][ô‹ YŸ[ùŸ][ô‹ N¬àŸ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYùH€€ôTŸ][ô‹ Ÿ]›ô\úöY\‘^[ÿY
+Ÿ][ô‹’RT›]KòYŸ[ù€ò\⁄›
+JN¬àŸ][ô‹’RT›]KòYŸ[ùŸ][ô‹—\ùHHò[ŸN¬àBàﬁ[ò‘Ÿ][ô‹—\ùQõY‹ 
+N¬àô[ô\îŸ][ô‹’RJ
+N¬üBÇò\ﬁ[ò»ù[ò›[€àô\Ÿ]YŸ[ù›ô\úöY\ ]ô[ù
+H¬à]ô[ùúô]ô[ùYò][
+
+N¬àYà
+\Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+H¬àô]\õé¬àBàYà
+X€€ôö\õJ	–€X\à[›ô\úöY\»õ‹à\»YŸ[ù… JH¬àô]\õé¬àBàûH¬à]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹ÀÿYŸ[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+_X»Y]Ÿà	—SUI»JN¬à]ÿZ]ÿYYŸ[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+N¬àô[ô\îŸ][ô‹’RJ
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–YŸ[ùõ›»[ö\ö]»[ò[ùYò][…À	‹›XÿŸ\‹… N¬àHÿ]⁄
+\úäH¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»€X\àYŸ[ù›ô\úöY\…À\úäN¬àBüBÇò\ﬁ[ò»ù[ò›[€àô\Ÿ][ò[ù›ô\úöY\ ]ô[ù
+H¬à]ô[ùúô]ô[ùYò][
+
+N¬àYà
+\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬àô]\õé¬àBàYà
+X€€ôö\õJ	–€X\à[›ô\úöY\»õ‹à\»[ò[ù… JH¬àô]\õé¬àBàûH¬à]ÿZ]ô]⁄î””äÿ\K›åK‹Ÿ][ô‹À›[ò[ùÀ…Ÿ[ò€ŸUTíP€€\€ô[ù
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+_X»Y]Ÿà	—SUI»JN¬à]ÿZ]ÿY[ò[ù€ò\⁄›
+Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+N¬àô[ô\îŸ][ô‹’RJ
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	’[ò[ùõ›»[ö\ö]»€ÿò[Yò][…À	‹›XÿŸ\‹… N¬àHÿ]⁄
+\úäH¬àô\‹ùŸ][ô‹—\úõ‹ä	—òZ[Y»€X\à[ò[ù›ô\úöY\…À\úäN¬àBüBÇôù[ò›[€àô[ô\ì›ô\úöYT›[[X\ûJ
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊€›ô\úöYW€\›	 N¬à€€ú›]Q[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹›[[X\ûW›]I N¬àYà
+X€€ùZ[ô\äHô]\õé¬ÇàÀ»[à€ÿò[ÿ€‹K⁄›»X[òYŸYŸX›[€ú»›[[X\ûBàYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	 H¬àYà
+]Q[
+H]Q[ù^€€ù[ùH	”X[òYŸ[Y[ù›[[X\ûIŒ¬à€€ú›X[òYŸY\úàH\úò^Kôúõ€JŸ][ô‹’RT›]KõX[òYŸYŸX›[€ú N¬à€€ú›[ŸX›[€ú»H…Ÿ\ÿ€›ô\ûIÀ	‹€õ\	À	ŸôX]\ô\…◊N¬à€€ú›YŸ[ù€€ùõ€YH[ŸX›[€úÀôö[\ä»Oà\Ÿ][ô‹’RT›]KõX[òYŸYŸX›[€úÀö\  JN¬ÇàYà
+YŸ[ù€€ùõ€Yõ[ô›OOH
+H¬à€€ùZ[ô\ãö[õô\íSHà]à€\‹œHõ›ô\úöYK\›[[X\ûKX€›[ùèê[ŸX›[€ú»Ÿ[ùò[HX[òYŸYŸ]èÇà]à€\‹œHõ›ô\úöYK\›[[X\ûKY[\HèÇà‹[à›[OHôõ€ù\⁄^ôNåLú»èêYŸ[ù»⁄[ôXŸZ]ôHŸ\ùô\ãYYö[ôYŸ][ô‹»õ‹à[ÿ]Y€‹öY\Àè‹‹[èÇàŸ]èÇà¬àH[ŸH¬à€€ú›ÿ\ô»HYŸ[ù€€ùõ€YõX\
+ŸX›[€àOà¬à€€ú›Xô[H—USë‘◊‘—P’S”ó”PëS÷‹ŸX›[€óHŸX›[€é¬àô]\õàà]à€\‹œHõ›ô\úöYKXÿ\ôèÇà]à€\‹œHõ›ô\úöYKXÿ\ô\]èêYŸ[ùP€€ùõ€YŸ]èÇà]à€\‹œHõ›ô\úöYKXÿ\ô]ò[YHèâŸ\ÿÿ\R[
+Xô[
+_OŸ]èÇàŸ]èÇà¬àJKöõ⁄[ä	… N¬à€€ùZ[ô\ãö[õô\íSHà]à€\‹œHõ›ô\úöYK\›[[X\ûKX€›[ùèâÿYŸ[ù€€ùõ€Yõ[ô›HŸX›[€âÿYŸ[ù€€ùõ€Yõ[ô›àH»	‹…»à	…ﬂH€€ùõ€Yÿÿ[HûHYŸ[ùœŸ]èÇà	ÿÿ\ôﬂBà¬àBàô]\õé¬àBÇàÀ»[ò[ù–YŸ[ùÿ€‹Nà⁄›»›ô\úöYH]Z[¬à]Q[ù^€€ù[ùH	”›ô\úöYH›[[X\ûIŒ¬à€€ú›ÿ€‹HHŸ][ô‹’RT›]Kúÿ€‹N¬àYà
+ÿ€‹HOOH	›[ò[ù	»	âà\Ÿ][ô‹’RT›]KúŸ[X›Y[ò[ùY
+H¬à€€ùZ[ô\ãö[õô\íSH	œ]à€\‹œHõ›ô\úöYK\›[[X\ûKY[\Hèè‹[èîŸ[X›H[ò[ù»öY]»›ô\úöYH]Z[Àè‹‹[èèŸ]èâŒ¬àô]\õé¬àBàYà
+ÿ€‹HOOH	ÿYŸ[ù	»	âà\Ÿ][ô‹’RT›]KúŸ[X›YYŸ[ùY
+H¬à€€ùZ[ô\ãö[õô\íSH	œ]à€\‹œHõ›ô\úöYK\›[[X\ûKY[\Hèè‹[èîŸ[X›[àYŸ[ù»öY]»›ô\úöYH]Z[Àè‹‹[èèŸ]èâŒ¬àô]\õé¬àBà€€ú››ô\úöY\»Hõ][ì›ô\úöY\ ÿ€‹HOOH	ÿYŸ[ù	»»Ÿ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYùàŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù
+N¬àYà
+[›ô\úöY\Àõ[ô›
+H¬à€€ùZ[ô\ãö[õô\íSHÿ€‹HOOH	ÿYŸ[ù	¬à»	œ]à€\‹œHõ›ô\úöYK\›[[X\ûKY[\Hèè‹[èìõ»›ô\úöY\Àà\»YŸ[ù[ö\ö]»[ò[ùYò][Àè‹‹[èèŸ]èâ¬àà	œ]à€\‹œHõ›ô\úöYK\›[[X\ûKY[\Hèè‹[èìõ»›ô\úöY\Àà\»[ò[ù[ö\ö]»[€ÿò[Yò][Àè‹‹[èèŸ]èâŒ¬àô]\õé¬àBÇàÀ»‹õ›\›ô\úöY\»ûHŸX›[€àõ‹àô]\à‹ôÿ[ö^ò][€Çà€€ú›‹õ›\YHﬂN¬à›ô\úöY\Àôõ‹ëXX⁄
+][HOà¬à€€ú›ŸX›[€àH][Kú]ú‹]
+	Àâ VÃH	€›\âŒ¬àYà
+Y‹õ›\Y‹ŸX›[€óJH¬à‹õ›\Y‹ŸX›[€óHH◊N¬àBà‹õ›\Y‹ŸX›[€óKú\⁄
+][JN¬àJN¬Çà][H]à€\‹œHõ›ô\úöYK\›[[X\ûKX€›[ùèâ€›ô\úöY\Àõ[ô›H›ô\úöYI€›ô\úöY\Àõ[ô›àH»	‹…»à	…ﬂHX›]ôOŸ]èò¬ÇàÿöôX›ô[ùöY\ ‹õ›\Y
+Kôõ‹ëXX⁄
+
+‹ŸX›[€ã][\◊JHOà¬à€€ú›ŸX›[€ìXô[H—USë‘◊‘—P’S”ó”PëS÷‹ŸX›[€óHŸX›[€é¬à[
+œH]à›[OHôõ€ù\⁄^ôNåL\›^]ò[úŸõ‹õNù\\òÿ\ŸNÿ€€‹éùò\äK[]]Y
+N€X\ô⁄[éåLúú€]\ã\‹X⁄[ôŒååY[N»èâŸ\ÿÿ\R[
+ŸX›[€ìXô[
+_OŸ]èò¬à][\Àôõ‹ëXX⁄
+][HOà¬à]ò[YP€\‹»H	…Œ¬à]\‹^Uò[YHH›ö[ô ][Kùò[YJN¬àYà
+\[Ÿà][Kùò[YHOOH	ÿõ€€X[â H¬àò[YP€\‹»H][Kùò[YH»	ÿõ€€]ùYI»à	ÿõ€€Yò[ŸIŒ¬à\‹^Uò[YHH][Kùò[YH»	¯ß$»[òXõY	»à	¯ß%»\ÿXõY	Œ¬àBà[
+œHà]à€\‹œHõ›ô\úöYKXÿ\ôèÇà]à€\‹œHõ›ô\úöYKXÿ\ô\]èâŸ\ÿÿ\R[
+][Kú]
+_OŸ]èÇà]à€\‹œHõ›ô\úöYKXÿ\ô]ò[YH	›ò[YP€\‹ﬂHèâŸ\ÿÿ\R[
+\‹^Uò[YJ_OŸ]èÇàŸ]èÇà¬àJN¬àJN¬Çà€€ùZ[ô\ãö[õô\íSH[¬üBÇôù[ò›[€à\]PX›[€êù]€ú 
+H¬à€€ú›ÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹ÿ]ôWÿùâ N¬à€€ú›\ÿÿ\ôùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊Ÿ\ÿÿ\ôÿùâ N¬à€€ú›ô\Ÿ]ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹ô\Ÿ]€›ô\úöY\◊ÿùâ N¬à€€ú›ô\Ÿ]YŸ[ùùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹ô\Ÿ]ÿYŸ[ù€›ô\úöY\◊ÿùâ N¬à€€ú››]\»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊‹›]\… N¬à€€ú›ÿ[ëY]H\Ÿ\êÿ[ä	‹Ÿ][ô‹ÀôõY]ù‹ö]I N¬à€€ú›\ùHHŸ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	¬à»Ÿ][ô‹’RT›]Kô€ÿò[\ùBàà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	»»Ÿ][ô‹’RT›]Kù[ò[ù\ùHàŸ][ô‹’RT›]KòYŸ[ù\ùJN¬àYà
+ÿ]ôPùäH¬àÿ]ôPùãô\ÿXõYHXÿ[ëY]Ÿ][ô‹’RT›]Kúÿ]ö[ô»Y\ùN¬àBàYà
+\ÿÿ\ôùäH¬à\ÿÿ\ôùãô\ÿXõYHY\ùN¬àBàYà
+ô\Ÿ]ùäH¬à€€ú›\”›ô\úöY\»Hõ][ì›ô\úöY\ Ÿ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù
+Kõ[ô›à¬àô\Ÿ]ùãò€\‹”\›ùŸŸ€J	⁄Y[âÀŸ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	 N¬àô\Ÿ]ùãô\ÿXõYHXÿ[ëY]Z\”›ô\úöY\»Ÿ][ô‹’RT›]Kúÿ]ö[ôŒ¬àBàYà
+ô\Ÿ]YŸ[ùùäH¬à€€ú›\–YŸ[ù›ô\úöY\»Hõ][ì›ô\úöY\ Ÿ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYù
+Kõ[ô›à¬àô\Ÿ]YŸ[ùùãô\ÿXõYHXÿ[ëY]Ÿ][ô‹’RT›]Kúÿ]ö[ô»Z\–YŸ[ù›ô\úöY\Œ¬àBà€€ú›[ò[ù€€ùõ€»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊›[ò[ùÿ€€ùõ€… N¬àYà
+[ò[ù€€ùõ€ H¬à€€ú›⁄›’[ò[ù€€ùõ€»HŸ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	»	âàŸ][ô‹’RT›]Kù[ò[ù\›õ[ô›à¬à€€ú›[ò[ùÿ€‹YH\’[ò[ùÿ€‹Y\Ÿ\ä
+N¬à[ò[ù€€ùõ€Àò€\‹”\›ùŸŸ€J	⁄Y[âÀ\⁄›’[ò[ù€€ùõ€ N¬ÇàÀ»õ‹à[ò[ù\ÿ€‹Y\Ÿ\ú»⁄]€õH€ôH[ò[ùYHHõ‹›€àù]⁄›»€€ùõ€¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊›[ò[ù‹Ÿ[X›	 N¬à€€ú›[ò[ùŸ[X›Xô[H[ò[ùŸ[X›Àú\ô[ù[[Y[ù¬àYà
+[ò[ùŸ[X›Xô[	âà[ò[ùÿ€‹Y	âàŸ][ô‹’RT›]Kù[ò[ù\›õ[ô›OOHJH¬àÀ»ô\XŸHõ‹›€à⁄]›]X»[ò[ùò[YH\‹^Bà[ò[ùŸ[X›Xô[ú›[Kô\‹^HH	€õ€ôIŒ¬àH[ŸHYà
+[ò[ùŸ[X›Xô[
+H¬à[ò[ùŸ[X›Xô[ú›[Kô\‹^HH	…Œ¬àBàBà€€ú›YŸ[ù€€ùõ€»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊ÿYŸ[ùÿ€€ùõ€… N¬àYà
+YŸ[ù€€ùõ€ H¬àYŸ[ù€€ùõ€Àò€\‹”\›ùŸŸ€J	⁄Y[âÀŸ][ô‹’RT›]Kúÿ€‹HOOH	ÿYŸ[ù	»Ÿ][ô‹’RT›]KòYŸ[ù\›õ[ô›OOH
+N¬àBàYà
+›]\ H¬àYà
+Ÿ][ô‹’RT›]Kúÿ]ö[ô H¬à›]\Àù^€€ù[ùH	‘ÿ]ö[ô¯†)âŒ¬àH[ŸHYà
+\ùJH¬à›]\Àù^€€ù[ùH	’[úÿ]ôY⁄[ôŸ\…Œ¬àH[ŸH¬à›]\Àù^€€ù[ùH	…Œ¬àBàBüBÇôù[ò›[€à\]S\›\]YY]J
+H¬à€€ú›[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊€\››\]Y	 N¬àYà
+Y[
+Hô]\õé¬à]^H	…Œ¬àYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	Ÿ€ÿò[	»	âàŸ][ô‹’RT›]Kô€ÿò[€ò\⁄›
+H¬à€€ú›€ò\HŸ][ô‹’RT›]Kô€ÿò[€ò\⁄›¬à€€ú›\]Y]HŸ]\]Y]
+€ò\
+N¬àYà
+\]Y]
+H¬à^H\]Y	Ÿõ‹õX]ô[]]ôU[YJ\]Y]
+_HûH	Ÿ\ÿÿ\R[
+Ÿ]\]YûJ€ò\
+H	‹ﬁ\›[I _X¬àBàH[ŸHYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	›[ò[ù	»	âàŸ][ô‹’RT›]Kù[ò[ù€ò\⁄›
+H¬à€€ú›€ò\HŸ][ô‹’RT›]Kù[ò[ù€ò\⁄›¬à€€ú››ô\úöY\’\]Y]HŸ]›ô\úöY\’\]Y]
+€ò\
+N¬àYà
+›ô\úöY\’\]Y]
+H¬à^H›ô\úöY\»\]Y	Ÿõ‹õX]ô[]]ôU[YJ›ô\úöY\’\]Y]
+_HûH	Ÿ\ÿÿ\R[
+Ÿ]›ô\úöY\’\]YûJ€ò\
+H	‹ﬁ\›[I _X¬àH[ŸH¬à^H	“[ö\ö][ô»€ÿò[Yò][…Œ¬àBàH[ŸHYà
+Ÿ][ô‹’RT›]Kúÿ€‹HOOH	ÿYŸ[ù	»	âàŸ][ô‹’RT›]KòYŸ[ù€ò\⁄›
+H¬à€€ú›€ò\HŸ][ô‹’RT›]KòYŸ[ù€ò\⁄›¬à€€ú››ô\úöY\’\]Y]HŸ]›ô\úöY\’\]Y]
+€ò\
+N¬àYà
+›ô\úöY\’\]Y]
+H¬à^H›ô\úöY\»\]Y	Ÿõ‹õX]ô[]]ôU[YJ›ô\úöY\’\]Y]
+_HûH	Ÿ\ÿÿ\R[
+Ÿ]›ô\úöY\’\]YûJ€ò\
+H	‹ﬁ\›[I _X¬àH[ŸH¬à^H	“[ö\ö][ô»[ò[ùYò][…Œ¬àBàBà[ù^€€ù[ùH^¬üBÇôù[ò›[€àõ][ì›ô\úöY\ ›ô\úöY\ÀôYö^H	…ÀXÿ»H◊JH¬àYà
+[›ô\úöY\»\[Ÿà›ô\úöY\»OOH	€ÿöôX›	 H¬àô]\õàXÿŒ¬àBàÿöôX›öŸ^\ ›ô\úöY\ Kôõ‹ëXX⁄
+Ÿ^HOà¬à€€ú›]HôYö^»	‹ôYö^Kâ⁄Ÿ^_XàŸ^N¬à€€ú›ò[YHH›ô\úöY\÷⁄Ÿ^WN¬àYà
+ò[YH	âà\[Ÿàò[YHOOH	€ÿöôX›	»	âàP\úò^Kö\–\úò^Jò[YJJH¬àõ][ì›ô\úöY\ ò[YK]Xÿ N¬àH[ŸH¬àXÿÀú\⁄
+»]ò[YHJN¬àBàJN¬àô]\õàXÿŒ¬üBÇôù[ò›[€à\”›ô\úöYJ]\ù H¬à]›\ú€‹àHŸ][ô‹’RT›]Kúÿ€‹HOOH	ÿYŸ[ù	»»Ÿ][ô‹’RT›]KòYŸ[ù›ô\úöY\—òYùàŸ][ô‹’RT›]Kù[ò[ù›ô\úöY\—òYù¬àõ‹à
+]HH»H]\ùÀõ[ô›»J  H¬à€€ú›\ùH]\ù÷⁄WN¬àYà
+X›\ú€‹à\[Ÿà›\ú€‹àOOH	€ÿöôX›	»J\ù[à›\ú€‹äJH¬àô]\õàò[ŸN¬àBà›\ú€‹àH›\ú€‹ñ‹\ùN¬àBàô]\õàùYN¬üBÇãÀ»Ÿ^\»]€›[]H‹òYùY]ôXX⁄€]]]HÿöôX›úõ››\H
+õ››\H€][€äKÇò€€ú›Sî–QëW‘U“—VT»Hô]»Ÿ]
+…◊◊‹õ›◊◊…À	ÿ€€ú›ùX›‹âÀ	‹õ››\I◊JN¬Çôù[ò›[€à]–\úò^J]
+H¬àô]\õà
+]	… Kú‹]
+	Àâ Kôö[\äŸ^HOàUSî–QëW‘U“—VTÀö\ Ÿ^JJN¬üBÇôù[ò›[€àôXYô\›Y
+ÿöã\ù H¬à]›\ú€‹àHÿöé¬àõ‹à
+]HH»H\ùÀõ[ô›»J  H¬àYà
+X›\ú€‹äHô]\õà[ôYö[ôY¬à›\ú€‹àH›\ú€‹ñ‹\ù÷⁄WWN¬àBàô]\õà›\ú€‹é¬üBÇôù[ò›[€àŸ]ô\›Yò[YJÿöã]ò[YJH¬àYà
+[ÿöäHô]\õé¬à€€ú›\ù»H]–\úò^J]
+N¬àYà
+\ùÀõ[ô›OOH
+Hô]\õé¬à]›\ú€‹àHÿöé¬àõ‹à
+]HH»H\ùÀõ[ô›HN»J  H¬à€€ú›Ÿ^HH\ù÷⁄WN¬àYà
+\[Ÿà›\ú€‹ñ⁄Ÿ^WHOOH	€ÿöôX›	»›\ú€‹ñ⁄Ÿ^WHOOHù[
+H¬à›\ú€‹ñ⁄Ÿ^WHHﬂN¬àBà›\ú€‹àH›\ú€‹ñ⁄Ÿ^WN¬àBà›\ú€‹ñ‹\ù÷‹\ùÀõ[ô›HWWHHò[YN¬üBÇôù[ò›[€à[]Sô\›Yò[YJÿöã]
+H¬àYà
+[ÿöäHô]\õé¬à€€ú›\ù»H]–\úò^J]
+N¬à€€ú››X⁄»H◊N¬à]›\ú€‹àHÿöé¬àõ‹à
+]HH»H\ùÀõ[ô›HN»J  H¬à€€ú›Ÿ^HH\ù÷⁄WN¬àYà
+\[Ÿà›\ú€‹ñ⁄Ÿ^WHOOH	€ÿöôX›	»›\ú€‹ñ⁄Ÿ^WHOOHù[
+H¬àô]\õé¬àBà›X⁄Àú\⁄
+ÿ›\ú€‹ãŸ^WJN¬à›\ú€‹àH›\ú€‹ñ⁄Ÿ^WN¬àBà[]H›\ú€‹ñ‹\ù÷‹\ùÀõ[ô›HWWN¬àõ‹à
+]HH›X⁄Àõ[ô›HN»HèH»KKJH¬à€€ú›‹\ô[ùŸ^WHH›X⁄÷⁄WN¬àYà
+\ô[ù⁄Ÿ^WH	âàÿöôX›öŸ^\ \ô[ù⁄Ÿ^WJKõ[ô›OOH
+H¬à[]H\ô[ù⁄Ÿ^WN¬àBàBüBÇôù[ò›[€àŸ]ò[YPûT]
+ÿöã]
+H¬àô]\õàôXYô\›Y
+ÿöã]–\úò^J]
+JN¬üBÇôù[ò›[€àò[Y\—\]X[
+KäH¬àYà
+\[ŸàHOOH	€ù[Xô\â»	âà\[ŸààOOH	€ù[Xô\â H¬àô]\õàù[Xô\äJHOOHù[Xô\ääN¬àBàYà
+\[ŸàHOOH	ÿõ€€X[â»\[ŸààOOH	ÿõ€€X[â H¬àô]\õàHXHOOHHXé¬àBàô]\õàHOOHé¬üBÇôù[ò›[€à€€ôTŸ][ô‹ ÿöäH¬àô]\õàÿöà»î””ãú\úŸJî””ãú›ö[ô⁄YûJÿöäJHàﬂN¬üBÇôù[ò›[€àY\\]X[
+KäH¬àYà
+HOOHäH¬àô]\õàùYN¬àBàYà
+ù[Xô\ãö\”òSäJH	âàù[Xô\ãö\”òSääJH¬àô]\õàùYN¬àBàYà
+\úò^Kö\–\úò^JJH\úò^Kö\–\úò^JäJH¬àYà
+P\úò^Kö\–\úò^JJHP\úò^Kö\–\úò^JäHKõ[ô›OOHãõ[ô›
+H¬àô]\õàò[ŸN¬àBàõ‹à
+]HH»HKõ[ô›»J  H¬àYà
+YY\\]X[
+V⁄WKñ⁄WJJH¬àô]\õàò[ŸN¬àBàBàô]\õàùYN¬àBàYà
+H	âàà	âà\[ŸàHOOH	€ÿöôX›	»	âà\[ŸààOOH	€ÿöôX›	 H¬à€€ú›Ÿ^\–HHÿöôX›öŸ^\ JN¬à€€ú›Ÿ^\–àHÿöôX›öŸ^\ äN¬àYà
+Ÿ^\–Kõ[ô›OOHŸ^\–ãõ[ô›
+H¬àô]\õàò[ŸN¬àBàõ‹à
+€€ú›Ÿ^HŸàŸ^\–JH¬àYà
+YY\\]X[
+V⁄Ÿ^WKñ⁄Ÿ^WJJH¬àô]\õàò[ŸN¬àBàBàô]\õàùYN¬àBàô]\õàò[ŸN¬üBÇò\ﬁ[ò»ù[ò›[€àô]⁄î””ä\õ‹[€ú»HﬂJH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+\õ‹[€ú N¬àYà
+\ô\‹€úŸKõ⁄ H¬à€€ú›\úàHô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬à\úãú›]\»Hô\‹€úŸKú›]\Œ¬àûH¬à\úãòõŸHH]ÿZ]ô\‹€úŸKù^
+
+N¬àHÿ]⁄
+ H¬à\úãòõŸHH	…Œ¬àBàõ›»\úé¬àBàYà
+ô\‹€úŸKú›]\»OOHå
+H¬àô]\õàù[¬àBà€€ú›^H]ÿZ]ô\‹€úŸKù^
+
+N¬àô]\õà^»î””ãú\úŸJ^
+Hàù[¬üBÇôù[ò›[€àô\‹ùŸ][ô‹—\úõ‹äY\‹ÿYŸK\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹äY\‹ÿYŸK\úäN¬à]]Z[H	…Œ¬àYà
+\úäH¬à€€ú›^òHH\úãòõŸH\úãõY\‹ÿYŸN¬àYà
+^òJH¬à]Z[H	Œà	»
+»›ö[ô ^òJKú€XŸJå
+N¬àBàBà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+Y\‹ÿYŸH
+»]Z[	Ÿ\úõ‹âÀL
+N¬üBÇãÀ»OOOOOHŸ‹»X[òYŸ[Y[ùOOOOOBôù[ò›[€à[ö]]Y]ö[\ê€€ùõ€ 
+H¬àYà
+]Y]ö[\ú“[ö]X[^ôY
+H¬àô]\õé¬àBà]Y]ö[\ú“[ö]X[^ôYHùYN¬Çà€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]‹ŸX\ò⁄Ÿö[\â N¬àYà
+ŸX\ò⁄[ú]
+H¬à€€ú›[ô\àHXõ›[òŸJ
+
+HOà¬à]Y]ö[\î›]KúŸX\ò⁄H
+ŸX\ò⁄[ú]ùò[YH	… Kùö[J
+Kù”›Ÿ\êÿ\ŸJ
+N¬à\P]Y]ö[\ú 
+N¬àKå
+N¬àŸX\ò⁄[ú]òY]ô[ù\›[ô\ä	⁄[ú]	À[ô\äN¬àBÇà€€ú›X›[€í[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]ÿX›[€óŸö[\â N¬àYà
+X›[€í[ú]
+H¬à€€ú›[ô\àHXõ›[òŸJ
+
+HOà¬à]Y]ö[\î›]KòX›[€àH
+X›[€í[ú]ùò[YH	… Kùö[J
+Kù”›Ÿ\êÿ\ŸJ
+N¬à\P]Y]ö[\ú 
+N¬àKå
+N¬àX›[€í[ú]òY]ô[ù\›[ô\ä	⁄[ú]	À[ô\äN¬àBÇà€€ú›[ò[ù[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]›[ò[ùŸö[\â N¬àYà
+[ò[ù[ú]
+H¬à€€ú›[ô\àHXõ›[òŸJ
+
+HOà¬à]Y]ö[\î›]Kù[ò[ùH
+[ò[ù[ú]ùò[YH	… Kùö[J
+Kù”›Ÿ\êÿ\ŸJ
+N¬à\P]Y]ö[\ú 
+N¬àKå
+N¬à[ò[ù[ú]òY]ô[ù\›[ô\ä	⁄[ú]	À[ô\äN¬àBÇà€€ú›Ÿ]ô\ö]P€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]‹Ÿ]ô\ö]WŸö[\â N¬àYà
+Ÿ]ô\ö]P€€ùZ[ô\äH¬à€€ú›⁄X⁄ÿõﬁ\»H\úò^Kôúõ€JŸ]ô\ö]P€€ùZ[ô\ãú]Y\ûTŸ[X›‹ê[
+	Àò]Y]\Ÿ]ô\ö]K[‹[€â JN¬à€€ú›\]HH
+
+HOà\]P]Y]Ÿ]ô\ö]T›]J⁄X⁄ÿõﬁ\ N¬à⁄X⁄ÿõﬁ\Àôõ‹ëXX⁄
+ÿàOà¬àŸŸ€TŸ]ô\ö]T[›]JÿäN¬àÿãòY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ\]JN¬àJN¬àBÇà€€ú›ô\Ÿ]ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]ÿ€X\óŸö[\ú◊ÿùâ N¬àYà
+ô\Ÿ]ùäH¬àô\Ÿ]ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]äHOà¬à]ãúô]ô[ùYò][
+
+N¬àô\Ÿ]]Y]ö[\ú 
+N¬àJN¬àBÇà€€ú›]ôUŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€]ôW›ŸŸ€I N¬àYà
+]ôUŸŸ€JH¬à]ôUŸŸ€KòY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬àŸŸ€P]Y]]ôU\]\ õ€€X[ä]ôUŸŸ€Kò⁄X⁄ŸY
+JN¬àJN¬àBüBÇôù[ò›[€à\]P]Y]Ÿ]ô\ö]T›]J⁄X⁄ÿõﬁ\ H¬à€€ú›Ÿ[X›YHô]»Ÿ]
+
+N¬à⁄X⁄ÿõﬁ\Àôõ‹ëXX⁄
+ÿàOà¬àŸŸ€TŸ]ô\ö]T[›]JÿäN¬àYà
+ÿãò⁄X⁄ŸY
+H¬àŸ[X›YòY
+
+ÿãùò[YH	… Kù”›Ÿ\êÿ\ŸJ
+JN¬àBàJN¬àYà
+Ÿ[X›Yú⁄^ôHOOH
+H¬à⁄X⁄ÿõﬁ\Àôõ‹ëXX⁄
+ÿàOà¬àÿãò⁄X⁄ŸYHùYN¬àŸŸ€TŸ]ô\ö]T[›]JÿäN¬àŸ[X›YòY
+
+ÿãùò[YH	… Kù”›Ÿ\êÿ\ŸJ
+JN¬àJN¬àYà
+⁄[ô›Àó◊‹W‹⁄\ôY	âà\[Ÿà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›OOH	Ÿù[ò›[€â H¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	‘Ÿ[X›]X\›€ôHŸ]ô\ö]H»ö[\âÀ	⁄[ôõ… N¬àBàBà]Y]ö[\î›]KúŸ]ô\ö]Y\»HŸ[X›Y¬à\P]Y]ö[\ú 
+N¬üBÇôù[ò›[€àŸŸ€TŸ]ô\ö]T[›]J⁄X⁄ÿõﬁ
+H¬àYà
+X⁄X⁄ÿõﬁ
+Hô]\õé¬à€€ú›[H⁄X⁄ÿõﬁò€‹Ÿ\›
+	Àò]Y]\Ÿ]ô\ö]K\[	 N¬àYà
+[
+H¬à[ò€\‹”\›ùŸŸ€J	ÿX›]ôIÀ⁄X⁄ÿõﬁò⁄X⁄ŸY
+N¬àBüBÇôù[ò›[€àô\Ÿ]]Y]ö[\ú 
+H¬à€€ú›X›[€í[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]ÿX›[€óŸö[\â N¬à€€ú›[ò[ù[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]›[ò[ùŸö[\â N¬à€€ú›ŸX\ò⁄[ú]Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]‹ŸX\ò⁄Ÿö[\â N¬àYà
+X›[€í[ú]
+HX›[€í[ú]ùò[YHH	…Œ¬àYà
+[ò[ù[ú]
+H[ò[ù[ú]ùò[YHH	…Œ¬àYà
+ŸX\ò⁄[ú]
+HŸX\ò⁄[ú]ùò[YHH	…Œ¬à]Y]ö[\î›]KòX›[€àH	…Œ¬à]Y]ö[\î›]Kù[ò[ùH	…Œ¬à]Y]ö[\î›]KúŸX\ò⁄H	…Œ¬à€€ú›Ÿ]ô\ö]P⁄X⁄ÿõﬁ\»Hÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	Àò]Y]\Ÿ]ô\ö]K[‹[€â N¬àŸ]ô\ö]P⁄X⁄ÿõﬁ\Àôõ‹ëXX⁄
+ÿàOà¬àÿãò⁄X⁄ŸYHùYN¬àŸŸ€TŸ]ô\ö]T[›]JÿäN¬àJN¬à]Y]ö[\î›]KúŸ]ô\ö]Y\»Hô]»Ÿ]
+UQU‘—UëTíUW’êSQT N¬à\P]Y]ö[\ú 
+N¬üBÇôù[ò›[€àŸ]]Y][ùöY\ [ùöY\ H¬à]Y]]SÿYYHùYN¬à]Y]Ÿ—[ùöY\»H\úò^Kö\–\úò^J[ùöY\ H»[ùöY\»à◊N¬à\]P]Y]X›[€î›YŸŸ\›[€ú ]Y]Ÿ—[ùöY\ N¬à\P]Y]ö[\ú 
+N¬üBÇôù[ò›[€à\–X›]ôP]Y]ö[\ú 
+H¬à€€ú›Ÿ]ô\ö]Y\»H]Y]ö[\î›]KúŸ]ô\ö]Y\»[ú›[òŸ[ŸàŸ]»]Y]ö[\î›]KúŸ]ô\ö]Y\»àô]»Ÿ]
+UQU‘—UëTíUW’êSQT N¬à€€ú›[Ÿ]ô\ö]Y\‘Ÿ[X›YHŸ]ô\ö]Y\Àú⁄^ôHOOHUQU‘—UëTíUW’êSQTÀõ[ô›¬àô]\õàõ€€X[ä]Y]ö[\î›]KúŸX\ò⁄]Y]ö[\î›]KòX›[€à]Y]ö[\î›]Kù[ò[ùX[Ÿ]ô\ö]Y\‘Ÿ[X›Y
+N¬üBÇôù[ò›[€à\P]Y]ö[\ú 
+H¬à€€ú›[ùöY\»H\úò^Kö\–\úò^J]Y]Ÿ—[ùöY\ H»]Y]Ÿ—[ùöY\»à◊N¬à€€ú›Ÿ]ô\ö]TŸ]H]Y]ö[\î›]KúŸ]ô\ö]Y\»[ú›[òŸ[ŸàŸ]	âà]Y]ö[\î›]KúŸ]ô\ö]Y\Àú⁄^ôHàà»]Y]ö[\î›]KúŸ]ô\ö]Y\¬ààô]»Ÿ]
+UQU‘—UëTíUW’êSQT N¬à€€ú›X›[€î]Y\ûHH]Y]ö[\î›]KòX›[€é¬à€€ú›[ò[ù]Y\ûHH]Y]ö[\î›]Kù[ò[ù¬à€€ú›ŸX\ò⁄⁄Ÿ[ú»H]Y]ö[\î›]KúŸX\ò⁄»]Y]ö[\î›]KúŸX\ò⁄ú‹]
+◊ À Kôö[\äõ€€X[äHà◊N¬Çà€€ú›ö[\ôYH[ùöY\Àôö[\ä[ùûHOà¬à€€ú›Ÿ]ô\ö]HH›ö[ô [ùûH	âà[ùûKúŸ]ô\ö]H»[ùûKúŸ]ô\ö]Hà	⁄[ôõ… Kù”›Ÿ\êÿ\ŸJ
+N¬àYà
+Ÿ]ô\ö]TŸ]ú⁄^ôHà	âà\Ÿ]ô\ö]TŸ]ö\ Ÿ]ô\ö]JJH¬àô]\õàò[ŸN¬àBÇàYà
+X›[€î]Y\ûH	âàJ›ö[ô [ùûKòX›[€à	… Kù”›Ÿ\êÿ\ŸJ
+Kö[ò€Y\ X›[€î]Y\ûJJJH¬àô]\õàò[ŸN¬àBÇàYà
+[ò[ù]Y\ûJH¬à€€ú›[ò[ùX]⁄\»H¬à[ùûKù[ò[ù⁄Yà[ùûKõY]Y]H	âà
+[ùûKõY]Y]Kù[ò[ù€ò[YH[ùûKõY]Y]Kù[ò[ùŸ\‹^H[ùûKõY]Y]Kù[ò[ù
+KàKôö[\äõ€€X[äKõX\
+àOà›ö[ô äKù”›Ÿ\êÿ\ŸJ
+JN¬àYà
+][ò[ùX]⁄\Àú€€YJò[Oàò[ö[ò€Y\ [ò[ù]Y\ûJJJH¬àô]\õàò[ŸN¬àBàBÇàYà
+ŸX\ò⁄⁄Ÿ[úÀõ[ô›à
+H¬à€€ú›^\›X⁄»HùZ[]Y]ŸX\ò⁄^\›X⁄ [ùûJN¬àYà
+\ŸX\ò⁄⁄Ÿ[úÀô]ô\ûJ⁄Ÿ[àOà^\›X⁄Àö[ò€Y\ ⁄Ÿ[äJJH¬àô]\õàò[ŸN¬àBàBÇàô]\õàùYN¬àJN¬ÇàÀ»›‹ôHö[\ôY[ùöY\»õ‹àõŸ‹ô\‹⁄]ôHô[ô\ö[ô»[ôô\Ÿ]\‹^H›]Bà]Y]ô[ô\î›]Kôö[\ôY[ùöY\»Hö[\ôY¬à]Y]ô[ô\î›]Kô\‹^YYH¬àô[ô\ê]Y]Ÿ‹ ö[\ôY»ö[\ú–X›]ôNà\–X›]ôP]Y]ö[\ú 
+HJN¬à\]P]Y]›[[X\ûJ[ùöY\Àõ[ô›ö[\ôYõ[ô›
+N¬üBÇôù[ò›[€àùZ[]Y]ŸX\ò⁄^\›X⁄ [ùûJH¬àYà
+Y[ùûJHô]\õà	…Œ¬à]Y]Y]PõÿàH	…Œ¬àYà
+[ùûKõY]Y]JH¬àûH¬àY]Y]PõÿàHî””ãú›ö[ô⁄YûJ[ùûKõY]Y]JN¬àHÿ]⁄
+\úäH¬àY]Y]PõÿàH	…Œ¬àBàBàô]\õà¬à[ùûKúŸ]ô\ö]Kà[ùûKòX›‹ó€ò[YKà[ùûKòX›‹ó⁄Yà[ùûKòX›‹ó›\Kà[ùûKòX›[€ãà[ùûKù\ôŸ]›\Kà[ùûKù\ôŸ]⁄Yà[ùûKù[ò[ù⁄Yà[ùûKô]Z[Àà[ùûKö\ÿYô\‹Àà[ùûKù\Ÿ\óÿYŸ[ùà[ùûKúô\]Y\›⁄YàY]Y]PõÿãàKôö[\äõ€€X[äKöõ⁄[ä	»	 Kù”›Ÿ\êÿ\ŸJ
+N¬üBÇôù[ò›[€à\]P]Y]›[[X\ûJ›[ö[\ôY
+H¬à€€ú››[[X\ûHHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]‹›[[X\ûI N¬àYà
+\›[[X\ûJHô]\õé¬àYà
+X]Y]]SÿYY
+H¬à›[[X\ûKúŸ]]öXù]J	⁄Y[âÀ	⁄Y[â N¬àô]\õé¬àBà€€ú›€›[ù—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]‹›[[X\ûWÿ€›[ù… N¬àYà
+€›[ù—[
+H¬àYà
+›[OOHö[\ôY
+H¬à€›[ù—[ö[õô\íSH›õ€ôœâŸö[\ôYO‹›õ€ôœà	Ÿö[\ôYOOHH»	Ÿ[ùûI»à	Ÿ[ùöY\…ﬂX¬àH[ŸH¬à€›[ù—[ö[õô\íSH›õ€ôœâŸö[\ôYO‹›õ€ôœàŸà	››[H[ùöY\ÿ¬àBàBà›[[X\ûKúô[[›ôP]öXù]J	⁄Y[â N¬üBÇôù[ò›[€àŸ]]Y]\›\]Y
+]HHô]»]J
+JH¬à]Y]\›\]YH]N¬à€€ú›\]Y[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]‹›[[X\ûW›\]Y	 N¬àYà
+]\]Y[
+Hô]\õé¬à€€ú›\€’ò[YHH]H[ú›[òŸ[Ÿà]H»]Kù“T”‘›ö[ô 
+Hà]N¬à€€ú›ô[]]ôHHõ‹õX]ô[]]ôU[YJ\€’ò[YJN¬à€€ú›^X›H]H[ú›[òŸ[Ÿà]H»]Kù”ÿÿ[U[YT›ö[ô 
+Hà›ö[ô ]JN¬à\]Y[ù^€€ù[ùH\]Y	‹ô[]]ô_H
+	Ÿ^X›JX¬üBÇôù[ò›[€à\]P]Y]X›[€î›YŸŸ\›[€ú [ùöY\ H¬à€€ú›]S\›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]ÿX›[€ó‹›YŸŸ\›[€ú… N¬àYà
+Y]S\›
+Hô]\õé¬à]S\›ö[õô\íSH	…Œ¬à€€ú›[ö\]YHHô]»Ÿ]
+
+N¬à[ùöY\Àôõ‹ëXX⁄
+[ùûHOà¬àYà
+[ùûH	âà[ùûKòX›[€äH¬à[ö\]YKòY
+[ùûKòX›[€äN¬àBàJN¬à\úò^Kôúõ€J[ö\]YJKú€‹ù
+
+Kú€XŸJL
+Kôõ‹ëXX⁄
+X›[€àOà¬à€€ú›‹[€àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹[€ãùò[YHHX›[€é¬à]S\›ò\[ô⁄[
+‹[€äN¬àJN¬üBÇôù[ò›[€àŸŸ€P]Y]]ôU\]\ [òXõY
+H¬à]Y]]ôTô\]Y\›YH[òXõY¬à€€ú›ŸŸ€HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€]ôW›ŸŸ€I N¬àYà
+ŸŸ€H	âàŸŸ€Kò⁄X⁄ŸYOOH[òXõY
+H¬àŸŸ€Kò⁄X⁄ŸYH[òXõY¬àBàﬁ[ò–]Y]]ôU[Y\ä
+N¬àYà
+[òXõY	âàX›]ôSŸ’öY]»OOH	ÿ]Y]	 H¬àÿY]Y]Ÿ‹ »⁄[[ùàùYHJN¬àBüBÇôù[ò›[€àﬁ[ò–]Y]]ôU[Y\ä
+H¬àYà
+]Y]]]‘ôYúô\⁄[ôJH¬à€X\í[ù\ùò[
+]Y]]]‘ôYúô\⁄[ôJN¬à]Y]]]‘ôYúô\⁄[ôHHù[¬àBàYà
+]Y]]ôTô\]Y\›Y	âàX›]ôSŸ’öY]»OOH	ÿ]Y]	 H¬à]Y]]]‘ôYúô\⁄[ôHHŸ][ù\ùò[
+
+
+HOà¬àÿY]Y]Ÿ‹ »⁄[[ùàùYHJN¬àKUQU–UU◊‘ëQîëT““SïTïêS”T N¬àBà\]P]Y]]ôT›]\ 
+N¬üBÇôù[ò›[€à\]P]Y]]ôT›]\ 
+H¬à€€ú››]\—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€]ôW‹›]\… N¬àYà
+\›]\—[
+Hô]\õé¬àYà
+X]Y]]ôTô\]Y\›Y
+H¬à›]\—[ù^€€ù[ùH	–]]À\ôYúô\⁄ŸôâŒ¬àô]\õé¬àBàYà
+X›]ôSŸ’öY]»OOH	ÿ]Y]	 H¬à›]\—[ù^€€ù[ùH	–]]À\ôYúô\⁄]\ŸY	Œ¬àô]\õé¬àBà›]\—[ù^€€ù[ùH]Y]]]‘ôYúô\⁄[ôH»	–]]À\ôYúô\⁄€â»à	–]]À\ôYúô\⁄ôXYIŒ¬üBÇãÀ»€‹H›\úô[ùŸ‹»»€\õÿ\ôò\ﬁ[ò»ù[ò›[€à€‹SŸ‹ 
+H¬àûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+	Àÿ\K€Ÿ‹… N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬àBà€€ú›]HH]ÿZ]ô\‹€úŸKöú€€ä
+N¬à€€ú›[ô\»H]KõŸ‹»◊N¬à€€ú›^H[ô\Àöõ⁄[ä	◊â N¬à]ÿZ]ò]öYÿ]‹ãò€\õÿ\ôù‹ö]U^
+^
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	”Ÿ‹»€‹YY»€\õÿ\ô	À	‹›XÿŸ\‹…ÀML
+N¬àHÿ]⁄
+JH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	–€‹HŸ‹»òZ[YâÀJN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»€‹HŸ‹Œà	»
+»KõY\‹ÿYŸK	Ÿ\úõ‹â N¬àBüBÇãÀ»›€õÿYŸ‹»\»ö[Bò\ﬁ[ò»ù[ò›[€à›€õÿYŸ‹ 
+H¬àûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+	Àÿ\K€Ÿ‹… N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬àBà€€ú›]HH]ÿZ]ô\‹€úŸKöú€€ä
+N¬à€€ú›[ô\»H]KõŸ‹»◊N¬à€€ú›^H[ô\Àöõ⁄[ä	◊â N¬à€€ú›õÿàHô]»õÿä›^K»\Nà	›^‹Z[â»JN¬à€€ú›ö[[ò[YHHŸ\ùô\ã[Ÿ‹ÀI€ô]»]J
+Kù“T”‘›ö[ô 
+Kú€XŸJNJKúô\XŸJ÷’óKŸÀ	ÀI _KõŸÿ¬à€€ú›\õHTìò‹ôX]SÿöôX›Tì
+õÿäN¬à€€ú›HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	ÿI N¬àKöôYàH\õ¬àKô›€õÿYHö[[ò[YN¬àÿ›[Y[ùòõŸKò\[ô⁄[
+JN¬àKò€X⁄ 
+N¬àKúô[[›ôJ
+N¬àTìúô]õ⁄ŸSÿöôX›Tì
+\õ
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	”Ÿ‹»›€õÿYY	À	‹›XÿŸ\‹… N¬àHÿ]⁄
+JH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—›€õÿYŸ‹»òZ[YâÀJN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»›€õÿYŸ‹Œà	»
+»KõY\‹ÿYŸK	Ÿ\úõ‹â N¬àBüBÇãÀ»€X\àŸ\ùô\àŸ‹»
+õ›]JBò\ﬁ[ò»ù[ò›[€à€X\ìŸ‹ 
+H¬àûH¬à€€ú›€€ôö\õYYH]ÿZ]⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–€€ôö\õJà	–€X\àŸ\ùô\àŸ‹œ»\»⁄[õ›]HH›\úô[ùŸ»ö[KâÀà	–€X\àŸ‹…¬à
+N¬àYà
+X€€ôö\õYY
+Hô]\õé¬Çà€€ú›ô\‹H]ÿZ]ô]⁄
+	Àÿ\K€Ÿ‹Àÿ€X\âÀ»Y]Ÿà	‘‘’	»JN¬àYà
+\ô\‹õ⁄ H¬à€€ú›^H]ÿZ]ô\‹ù^
+
+N¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	–€X\àŸ‹»òZ[Yà	»
+»^	Ÿ\úõ‹â N¬àô]\õé¬àBÇàÀ»€X\àH\‹^H[ôô\Ÿ]›]Bà›\úô[ùŸ”[ô\»H◊N¬àŸ‹‘›]Kô[ùöY\»H◊N¬àŸ‹‘›]Kù›[H¬àŸ‹‘›]KõŸôúŸ]H¬àŸ‹‘›]Kö\”[‹ôHHò[ŸN¬àŸ‹‘›]Kö\‘ô]ö[›\»Hò[ŸN¬à€X[ù\Ÿ‹“[ôö[ö]Tÿ‹õ€
+
+N¬Çà€€ú›Ÿ—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ… N¬àYà
+Ÿ—[
+H¬àŸ—[ö[õô\íSH	œ‹[à›[OHò€€‹éàÕNôMÕHèäŸ‹»€X\ôYHÿZ][ô»õ‹àô]»[ùöY\ O‹‹[èâŒ¬àBà€€ú›õŸHHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ◊›XõWÿõŸI N¬àYà
+õŸJH¬àõŸKö[õô\íSH	œèè€€‹[èHçà›[OHù^X[Y€éòŸ[ù\éÿ€€‹éàÕNôMÕHèäŸ‹»€X\ôYHÿZ][ô»õ‹àô]»[ùöY\ O›è›èâŒ¬àBà\]SŸ‹‘⁄›⁄[ô–€›[ù
+
+N¬Çà⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	”Ÿ‹»€X\ôY[ôõ›]Y	À	‹›XÿŸ\‹… N¬àHÿ]⁄
+JH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	–€X\àŸ‹»òZ[YâÀJN¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	—òZ[Y»€X\àŸ‹Œà	»
+»KõY\‹ÿYŸK	Ÿ\úõ‹â N¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿYŸ‹ ‹[€ú»HﬂJH¬à€€ú›»\[ôHò[ŸKô\[ôHò[ŸHHH‹[€úŒ¬ÇàYà
+Ÿ‹‘›]KõÿY[ô Hô]\õé¬àŸ‹‘›]KõÿY[ô»HùYN¬ÇàûH¬àÀ»ùZ[]Y\ûH\ò[\¬à€€ú›\ò[\»Hô]»TìŸX\ò⁄\ò[\ 
+N¬à\ò[\ÀúŸ]
+	€[Z]	À›ö[ô Ÿ‹‘›]Kõ[Z]
+JN¬ÇàÀ»ÿ[›[]HŸôúŸ]ò\ŸY€à\[ô‹ô\[ô[ŸBà]ô\]Y\›ŸôúŸ]HŸ‹‘›]KõŸôúŸ]¬àYà
+\[ô	âàŸ‹‘›]Kô[ùöY\Àõ[ô›à
+H¬àÀ»ÿY[ô»€\àŸ‹»HŸôúŸ]\»Yù\à›\úô[ù[ùöY\¬àô\]Y\›ŸôúŸ]HŸ‹‘›]Kô[ùöY\Àõ[ô›¬àH[ŸHYà
+ô\[ô
+H¬àÀ»ÿY[ô»ô]Ÿ\àŸ‹»HŸôúŸ]\»
+ô]Ÿ\›ö\ú›
+Bàô\]Y\›ŸôúŸ]H¬àBà\ò[\ÀúŸ]
+	€ŸôúŸ]	À›ö[ô ô\]Y\›ŸôúŸ]
+JN¬ÇàÀ»Y]ô[ö[\Çà€€ú›]ô[ö[\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ◊€]ô[Ÿö[\â N¬à€€ú›]ô[H]ô[ö[\à»]ô[ö[\ãùò[YHà	…Œ¬àYà
+]ô[
+H¬à\ò[\ÀúŸ]
+	€]ô[	À]ô[
+N¬àBÇàÀ»YŸX\ò⁄ö[\Çà€€ú›ŸX\ò⁄ö[\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ◊‹ŸX\ò⁄Ÿö[\â N¬à€€ú›ŸX\ò⁄HŸX\ò⁄ö[\à»ŸX\ò⁄ö[\ãùò[YKùö[J
+Hà	…Œ¬àYà
+ŸX\ò⁄
+H¬à\ò[\ÀúŸ]
+	‹ŸX\ò⁄	ÀŸX\ò⁄
+N¬àBÇà€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+ÿ\K€Ÿ‹œ…‹\ò[\Àù‘›ö[ô 
+_X
+N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬àBÇà€€ú›]HH]ÿZ]ô\‹€úŸKöú€€ä
+N¬à€€ú›ô]—[ùöY\»H
+]KõŸ‹»◊JKõX\
+\úŸSŸ”[ôJN¬ÇàÀ»\]H›]BàŸ‹‘›]Kù›[H]Kù›[¬àŸ‹‘›]Kö\”[‹ôHH]Kö\◊€[‹ôHò[ŸN¬àŸ‹‘›]Kö\‘ô]ö[›\»H]Kö\◊‹ô]ö[›\»ò[ŸN¬ÇàYà
+\[ô	âàŸ‹‘›]Kô[ùöY\Àõ[ô›à
+H¬àÀ»\[ô€\àŸ‹»»H[ôàŸ‹‘›]Kô[ùöY\»HÀããõŸ‹‘›]Kô[ùöY\Àããõô]—[ùöY\◊N¬àÀ»›[úõ€HHôY⁄[õö[ô»
+ô]Ÿ\›
+HYà€»X[ûBàYà
+Ÿ‹‘›]Kô[ùöY\Àõ[ô›àŸ‹‘›]KõX^ÿYY
+H¬à€€ú›^Ÿ\‹»HŸ‹‘›]Kô[ùöY\Àõ[ô›HŸ‹‘›]KõX^ÿYY¬àŸ‹‘›]Kô[ùöY\»HŸ‹‘›]Kô[ùöY\Àú€XŸJ^Ÿ\‹ N¬àŸ‹‘›]Kö\‘ô]ö[›\»HùYN»À»ŸH›[Yô]Ÿ\àŸ‹¬àBàH[ŸHYà
+ô\[ô	âàŸ‹‘›]Kô[ùöY\Àõ[ô›à
+H¬àÀ»ô\[ôô]Ÿ\àŸ‹»»HôY⁄[õö[ô¬àŸ‹‘›]Kô[ùöY\»HÀããõô]—[ùöY\ÀããõŸ‹‘›]Kô[ùöY\◊N¬àÀ»›[úõ€HH[ô
+€\›
+HYà€»X[ûBàYà
+Ÿ‹‘›]Kô[ùöY\Àõ[ô›àŸ‹‘›]KõX^ÿYY
+H¬àŸ‹‘›]Kô[ùöY\»HŸ‹‘›]Kô[ùöY\Àú€XŸJŸ‹‘›]KõX^ÿYY
+N¬àŸ‹‘›]Kö\”[‹ôHHùYN»À»ŸH›[Y€\àŸ‹¬àBàH[ŸH¬àÀ»úô\⁄ÿYàŸ‹‘›]Kô[ùöY\»Hô]—[ùöY\Œ¬àŸ‹‘›]KõŸôúŸ]H¬àBÇàÀ»\]H›\úô[ùŸ”[ô\»õ‹à€€\]Xö[]Bà›\úô[ùŸ”[ô\»HŸ‹‘›]Kô[ùöY\Œ¬ÇàÀ»ô[ô\à
+\‹»\[ôõY»»⁄⁄\]]À\ÿ‹õ€
+Bàô[ô\ìŸ‹ »Ÿ‹ŒàŸ‹‘›]Kô[ùöY\ÀõX\
+HOàKúò] K\[ôJN¬ÇàÀ»Ÿ]\[ôö[ö]Hÿ‹õ€ÿúŸ\ùô\à
+€õHYà[‹ôH»ÿY
+BàYà
+Ÿ‹‘›]Kö\”[‹ôJH¬àŸ]\Ÿ‹“[ôö[ö]Tÿ‹õ€
+
+N¬àBÇàHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»ÿYŸ‹ŒâÀ\úõ‹äN¬à€€ú›Ÿ—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ… N¬àYà
+Ÿ—[
+H¬àŸ—[ù^€€ù[ùH	—òZ[Y»ÿYŸ‹Œà	»
+»\úõ‹ãõY\‹ÿYŸN¬àBàHö[ò[H¬àŸ‹‘›]KõÿY[ô»Hò[ŸN¬àBüBÇò\ﬁ[ò»ù[ò›[€àÿY]Y]Ÿ‹ ‹[€ú H¬àYà
+]\Ÿ\êÿ[ä	ÿ]Y]õŸ‹ÀúôXY	 JH¬àô]\õé¬àBÇà€€ú›‹»H‹[€ú»ﬂN¬à€€ú›⁄[[ùHõ€€X[ä‹Àú⁄[[ù
+N¬Çà€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€Ÿ‹◊›XõI N¬àYà
+X€€ùZ[ô\äH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	€ÿY]Y]Ÿ‹Œà€€ùZ[ô\àõ›õ›[ô	 N¬àô]\õé¬àBÇà€€ú›\ò[\»Hô]»TìŸX\ò⁄\ò[\ 
+N¬à€€ú›[YQö[\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]›[YWŸö[\â N¬à€€ú››\ú»H[YQö[\à»\úŸR[ù
+[YQö[\ãùò[YKL
+Hàç¬àYà
+›\ú»	âà›\ú»à
+H¬à\ò[\ÀúŸ]
+	⁄›\ú…À›ö[ô ›\ú JN¬àBÇà€€ú›X›‹ëö[\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]ÿX›‹óŸö[\â N¬à€€ú›X›‹ïò[YHHX›‹ëö[\à»X›‹ëö[\ãùò[YKùö[J
+Hà	…Œ¬àYà
+X›‹ïò[YJH¬à\ò[\ÀúŸ]
+	ÿX›‹ó⁄Y	ÀX›‹ïò[YJN¬àBÇàYà
+\⁄[[ù
+H¬à€€ùZ[ô\ãö[õô\íSH	œ]à€\‹œHõ]]Y]^èìÿY[ô»]Y]ŸÀããèŸ]èâŒ¬àBÇà€€ú›]Y\ûT›ö[ô»H\ò[\Àù‘›ö[ô 
+N¬à€€ú›[ô⁄[ùH]Y\ûT›ö[ô»»ÿ\Kÿ]Y]€Ÿ‹œ…‹]Y\ûT›ö[ôﬂXà	Àÿ\Kÿ]Y]€Ÿ‹…Œ¬ÇàûH¬à€€ú›ô\‹€úŸHH]ÿZ]ô]⁄
+[ô⁄[ù
+N¬àYà
+\ô\‹€úŸKõ⁄ H¬àõ›»ô]»\úõ‹ä	‹ô\‹€úŸKú›]\ﬂX
+N¬àBÇà€€ú›^[ÿYH]ÿZ]ô\‹€úŸKöú€€ä
+N¬à][ùöY\»H◊N¬àYà
+^[ÿY	âà\úò^Kö\–\úò^J^[ÿYô[ùöY\ JH¬à[ùöY\»H^[ÿYô[ùöY\Œ¬àH[ŸHYà
+\úò^Kö\–\úò^J^[ÿY
+JH¬à[ùöY\»H^[ÿY¬àBàŸ]]Y][ùöY\ [ùöY\ N¬àŸ]]Y]\›\]Y
+ô]»]J
+JN¬àHÿ]⁄
+\úõ‹äH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	—òZ[Y»ÿY]Y]Ÿ‹ŒâÀ\úõ‹äN¬àYà
+\⁄[[ù
+H¬à€€ú›Y\‹ÿYŸHH\ÿÿ\R[
+\úõ‹à	âà\úõ‹ãõY\‹ÿYŸH»\úõ‹ãõY\‹ÿYŸHà›ö[ô \úõ‹äJN¬à€€ùZ[ô\ãö[õô\íSH]à€\‹œHô\úõ‹ã]^èëòZ[Y»ÿY]Y]Ÿ‹Œà	€Y\‹ÿYŸ_OŸ]èò¬àBàBüBÇãÀ»OOOOOHY]öX‹»OOOOOBò€€ú›Ÿ\ùô\ìY]öX‹’ìHH¬à[Y\Ÿ\öY\Œàù[àÿY[ôŒàò[ŸKà\úõ‹éàù[üN¬Çò\ﬁ[ò»ù[ò›[€àÿYY]öX‹ õ‹òŸJH¬à€€ú›XàHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	÷Ÿ]K]XèHõY]öX‹»óI N¬àYà
+]XäHô]\õé¬àYà
+Y]öX‹’ìKõÿY[ô»	âàYõ‹òŸJHô]\õé¬Çà€€ú›⁄[òŸHHô]»]J]Kõõ› 
+HHŸ]Y]öX‹‘ò[ôŸU⁄[ô› Y]öX‹’ìKúò[ôŸJJN¬à€€ú›\ò[\»Hô]»TìŸX\ò⁄\ò[\ »⁄[òŸNà⁄[òŸKù“T”‘›ö[ô 
+HJN¬ÇàÀ»Yö[\à\ò[\»YàŸ]àYà
+Y]öX‹’ìKôö[\úÀù[ò[ùY
+H¬à\ò[\ÀúŸ]
+	›[ò[ù⁄Y	ÀY]öX‹’ìKôö[\úÀù[ò[ùY
+N¬àBàYà
+Y]öX‹’ìKôö[\úÀòYŸ[ùY
+H¬à\ò[\ÀúŸ]
+	ÿYŸ[ù⁄Y	ÀY]öX‹’ìKôö[\úÀòYŸ[ùY
+N¬àBàYà
+Y]öX‹’ìKôö[\úÀô]öXŸTŸ\öX[
+H¬à\ò[\ÀúŸ]
+	Ÿ]öXŸW‹Ÿ\öX[	ÀY]öX‹’ìKôö[\úÀô]öXŸTŸ\öX[
+N¬àBÇàÀ»Ÿ\ùô\à[YK\Ÿ\öY\»\ò[\»Hô\]Y\›[Ÿ\öY\»õ‹à€€\ôZ[ú⁄]ôH\⁄õÿ\ô¬à€€ú›‘\ò[\»Hô]»TìŸX\ò⁄\ò[\ ¬à›\ùà⁄[òŸKù“T”‘›ö[ô 
+Kà[ôàô]»]J
+Kù“T”‘›ö[ô 
+Kàô\€€][€éà	ÿ]]…ÀàŸ\öY\Œà	Ÿ€‹õ›][ô\ÀX\ÿ[ÿÀó‹⁄^ôK›[‹YŸ\À€€‹ó‹YŸ\À[€õ◊‹YŸ\Àÿÿ[óÿ€›[ù€ô\ó⁄Y⁄€ô\ó€YY][K€ô\ó€›À€ô\óÿ‹ö]Xÿ[‹◊ÿ€€õôX›[€úÀYŸ[ùÀ]öXŸ\À]öXŸ\◊€€õ[ôK]öXŸ\◊Ÿ\úõ‹ãYŸ[ù◊›‹ÀYŸ[ù◊⁄YŸ[ù◊€Ÿôõ[ôIÀàJN¬ÇàY]öX‹’ìKõÿY[ô»HùYN¬àŸ\ùô\ìY]öX‹’ìKõÿY[ô»HùYN¬àô[ô\ìY]öX‹”ÿY[ô 
+N¬ÇàÀ»]\õZ[ôHYàŸH⁄›[ÿYŸ\ùô\àY]öX‹»
+€õHõ‹à€ÿò[YZ[ú Bà€€ú›ÿYŸ\ùô\ìY]öX‹»H\—€ÿò[YZ[ä
+N¬ÇàûH¬à€€ú›ô]⁄õ€Z\Ÿ\»H¬àô]⁄
+	Àÿ\K€Y]öX‹… Kàô]⁄
+ÿ\K€Y]öX‹ÀÿYŸ‹ôYÿ]Y…‹\ò[\Àù‘›ö[ô 
+_X
+KàN¬àÀ»€õHô]⁄Ÿ\ùô\à[YK\Ÿ\öY\»õ‹à€ÿò[YZ[ú¬àYà
+ÿYŸ\ùô\ìY]öX‹ H¬àô]⁄õ€Z\Ÿ\Àú\⁄
+ô]⁄
+ÿ\K€Y]öX‹À›[Y\Ÿ\öY\œ…›‘\ò[\Àù‘›ö[ô 
+_X
+JN¬àBÇà€€ú›ô\‹€úŸ\»H]ÿZ]õ€Z\ŸKò[
+ô]⁄õ€Z\Ÿ\ N¬à€€ú›‹›[[X\ûTô\‹YŸ‹ôYÿ]Yô\‹HHô\‹€úŸ\Œ¬à€€ú›[Y\Ÿ\öY\‘ô\‹HÿYŸ\ùô\ìY]öX‹»»ô\‹€úŸ\÷ÃóHàù[¬ÇàYà
+\›[[X\ûTô\‹õ⁄ H¬àõ›»ô]»\úõ‹ä	‘›[[X\ûHô\]Y\›òZ[Yà	»
+»›[[X\ûTô\‹ú›]\ N¬àBàYà
+XYŸ‹ôYÿ]Yô\‹õ⁄ H¬àõ›»ô]»\úõ‹ä	–YŸ‹ôYÿ]Yô\]Y\›òZ[Yà	»
+»YŸ‹ôYÿ]Yô\‹ú›]\ N¬àBÇàY]öX‹’ìKú›[[X\ûHH]ÿZ]›[[X\ûTô\‹öú€€ä
+N¬àY]öX‹’ìKòYŸ‹ôYÿ]YH]ÿZ]YŸ‹ôYÿ]Yô\‹öú€€ä
+N¬àY]öX‹’ìKõ\›ô]⁄YHô]»]J
+N¬àY]öX‹’ìKô\úõ‹àHù[¬ÇàÀ»ÿYŸ\ùô\à[YK\Ÿ\öY\»]H
+õ€ãXõÿ⁄⁄[ô»€à\úõ‹ã€õHõ‹àYZ[ú BàYà
+[Y\Ÿ\öY\‘ô\‹	âà[Y\Ÿ\öY\‘ô\‹õ⁄ H¬àŸ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\»H]ÿZ][Y\Ÿ\öY\‘ô\‹öú€€ä
+N¬àŸ\ùô\ìY]öX‹’ìKô\úõ‹àHù[¬àH[ŸH¬àŸ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\»Hù[¬àBÇàô[ô\ìY]öX‹—\⁄õÿ\ô
+
+N¬àHÿ]⁄
+\úäH¬àY]öX‹’ìKô\úõ‹àH\úé¬àô[ô\ìY]öX‹—\úõ‹ä\úäN¬àHö[ò[H¬àY]öX‹’ìKõÿY[ô»Hò[ŸN¬àŸ\ùô\ìY]öX‹’ìKõÿY[ô»Hò[ŸN¬àBüBÇãÀ»[\à»Ÿ[ô\ò]H⁄\ù⁄Ÿ[]€àÿY[ô»Sôù[ò›[€à⁄\ù⁄Ÿ[]€íS
+^€›[ùHJH¬à€€ú›⁄Ÿ[]€àH]à€\‹œHõY]öXÀX⁄\ùXÿ\ôÿY[ô»èè]à€\‹œHò⁄\ù\⁄Ÿ[]€àèè]à€\‹œHò⁄\ù\‹[õô\àèèŸ]èè‹[à€\‹œHò⁄\ù[ÿY[ôÀ]^èâ›^O‹‹[èèŸ]èèŸ]èò¬àô]\õà€›[ùàH»\úò^J€›[ù
+Kôö[
+⁄Ÿ[]€äKöõ⁄[ä	… Hà⁄Ÿ[]€é¬üBÇôù[ò›[€àô[ô\ìY]öX‹”ÿY[ô 
+H¬à€€ú››]—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹›]… N¬à€€ú›⁄\ù—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ⁄\ùŸ‹öY	 N¬à€€ú›€€ú›[XXõ\–⁄\ù—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ€€ú›[XXõ\◊ÿ⁄\ù… N¬à€€ú›YŸ[ùõY]⁄\ù—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿYŸ[ùŸõY]ÿ⁄\ù… N¬à€€ú›Ÿ\ùô\ê⁄\ù—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹Ÿ\ùô\óÿ⁄\ù… N¬à€€ú›Ÿ\ùô\ë[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹Ÿ\ùô\ó‹[ô[	 N¬à€€ú›€€ú›[XXõ\—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ€€ú›[XXõ\… N¬àYà
+›]—[	âà[Y]öX‹’ìKú›[[X\ûJH¬à›]—[ö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èìÿY[ô»Y]öX‹¯†)èŸ]èâŒ¬àBàYà
+⁄\ù—[	âà[Y]öX‹’ìKòYŸ‹ôYÿ]Y
+H¬à⁄\ù—[ö[õô\íSH⁄\ù⁄Ÿ[]€íS
+	”ÿY[ô»õ›Y⁄]]x†)âÀ N¬àBàYà
+€€ú›[XXõ\–⁄\ù—[	âà\Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ H¬à€€ú›[XXõ\–⁄\ù—[ö[õô\íSH⁄\ù⁄Ÿ[]€íS
+	”ÿY[ô»€€ú›[XXõ\»\›‹ûx†)âÀäN¬àBàYà
+YŸ[ùõY]⁄\ù—[	âà\Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ H¬àYŸ[ùõY]⁄\ù—[ö[õô\íSH⁄\ù⁄Ÿ[]€íS
+	”ÿY[ô»YŸ[ùõY]]x†)âÀäN¬àBàYà
+Ÿ\ùô\ê⁄\ù—[	âà\Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ H¬àŸ\ùô\ê⁄\ù—[ö[õô\íSH⁄\ù⁄Ÿ[]€íS
+	”ÿY[ô»Ÿ\ùô\à[YK\Ÿ\öY\¯†)âÀ N¬àBàYà
+Ÿ\ùô\ë[	âà[Y]öX‹’ìKòYŸ‹ôYÿ]Y
+H¬àŸ\ùô\ë[ö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èê€€X›[ô»Ÿ\ùô\à›]¯†)èŸ]èâŒ¬àBàYà
+€€ú›[XXõ\—[	âà[Y]öX‹’ìKòYŸ‹ôYÿ]Y
+H¬à€€ú›[XXõ\—[ö[õô\íSH	œ]à€\‹œHòÿ\ô]]Hèê€€ú›[XXõ\œŸ]èè]à€\‹œHõ]]Y]^èìÿY[ô¯†)èŸ]èâŒ¬àBüBÇôù[ò›[€àô[ô\ìY]öX‹—\⁄õÿ\ô
+
+H¬àÀ»YK‹⁄›»Ÿ\ùô\ã[€õHŸX›[€ú»ò\ŸY€àõ€Bà\]SY]öX‹‘Ÿ\ùô\ïö\⁄Xö[]J
+N¬Çàô[ô\ìY]öX‹”›ô\ùöY] Y]öX‹’ìKú›[[X\ûKY]öX‹’ìKòYŸ‹ôYÿ]Y
+N¬àô[ô\ëõY]⁄\ù Y]öX‹’ìKòYŸ‹ôYÿ]Y
+N¬àô[ô\ê€€ú›[XXõ\’[YTŸ\öY\–⁄\ù Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ N¬àô[ô\êYŸ[ùõY]⁄\ù Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ N¬ÇàÀ»€õHô[ô\àŸ\ùô\àY]öX‹»õ‹à€ÿò[YZ[ú¬àYà
+\—€ÿò[YZ[ä
+JH¬àô[ô\îŸ\ùô\ï[YTŸ\öY\–⁄\ù Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ N¬àô[ô\îŸ\ùô\î[ô[
+Y]öX‹’ìKòYŸ‹ôYÿ]YÀúŸ\ùô\äN¬àBÇàô[ô\ê€€ú›[XXõ\ Y]öX‹’ìKòYŸ‹ôYÿ]YÀôõY]
+N¬àô[ô\ìY]öX‹–X›]ö]JY]öX‹’ìKòYŸ‹ôYÿ]Y
+N¬à\]SY]öX‹‘ò[ôŸPù]€ú 
+N¬üBÇã äÇà
+à⁄›À⁄YHŸ\ùô\àY]öX‹»ŸX›[€ú»ò\ŸY€à\Ÿ\àõ€KÇà
+àŸ\ùô\àù[ù[YH›]»\ôH€õHö\⁄XõH»€ÿò[YZ[úÀÇà
+ã¬ôù[ò›[€à\]SY]öX‹‘Ÿ\ùô\ïö\⁄Xö[]J
+H¬à€€ú›Ÿ\ùô\îŸX›[€àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹Ÿ\ùô\ó‹ŸX›[€â N¬à€€ú›Ÿ\ùô\î[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹Ÿ\ùô\ó‹[ô[	 N¬à€€ú›⁄›‘Ÿ\ùô\àH\—€ÿò[YZ[ä
+N¬ÇàYà
+Ÿ\ùô\îŸX›[€äH¬àŸ\ùô\îŸX›[€ãú›[Kô\‹^HH⁄›‘Ÿ\ùô\à»	…»à	€õ€ôIŒ¬àBàYà
+Ÿ\ùô\î[ô[
+H¬àŸ\ùô\î[ô[ú›[Kô\‹^HH⁄›‘Ÿ\ùô\à»	…»à	€õ€ôIŒ¬àBüBÇôù[ò›[€àô[ô\ìY]öX‹”›ô\ùöY] ›[[X\ûKYŸ‹ôYÿ]Y
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹›]… N¬àYà
+X€€ùZ[ô\äHô]\õé¬àYà
+\›[[X\ûHXYŸ‹ôYÿ]Y
+H¬à€€ùZ[ô\ãö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èïÿZ][ô»õ‹àõY]]x†)èŸ]èâŒ¬àô]\õé¬àBÇà€€ú››[»HYŸ‹ôYÿ]YÀôõY]Àù›[»ﬂN¬à€€ú››]\Ÿ\»HYŸ‹ôYÿ]YÀôõY]Àú›]\Ÿ\»ﬂN¬à€€ú›\›‹ûHHYŸ‹ôYÿ]YÀôõY]Àö\›‹ûOÀù›[⁄[\ô\‹⁄[€ú»YŸ‹ôYÿ]YÀôõY]Àö\›‹ûOÀï›[[\ô\‹⁄[€ú»◊N¬à€€ú›õ›Y⁄]Hÿ[›[]Uõ›Y⁄]
+\›‹ûJN¬à€€ú›ò[ôŸSXô[HY]öX‹‘ò[ôŸSXô[
+Y]öX‹’ìKúò[ôŸJN¬Çà€€ùZ[ô\ãö[õô\íSHà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèêYŸ[ùœŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\ä›[ÀòYŸ[ù»›[[X\ûKòYŸ[ù◊ÿ€›[ù
+_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èê€€õôX›YŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]öXŸ\œŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\ä›[Àô]öXŸ\»›[[X\ûKô]öXŸ\◊ÿ€›[ù
+_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èìX[òYŸYX‹õ‹‹»õY]Ÿ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèïõ›Y⁄]
+	‹ò[ôŸSXô[JOŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHèâŸõ‹õX]ù[Xô\äX]úõ›[ô
+õ›Y⁄]
+J_OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èë\›[X]YYŸ\»\à›\èŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèê[\ùœŸ]èÇà	‹ô[ô\ìY]öX‹‘›]\–⁄\ ›]\Ÿ\ _Bà]à€\‹œHõY]öXÀYõ€›õ›Hèâ€Y]öX‹’ìKõ\›ô]⁄Y»	’\]Y	»
+»õ‹õX]ô[]]ôU[YJY]öX‹’ìKõ\›ô]⁄Y
+Hà	…ﬂOŸ]èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\ìY]öX‹‘›]\–⁄\ ›]\Ÿ\ H¬à€€ú›\úõ‹àH›]\Ÿ\œÀô\úõ‹à¬à€€ú›ÿ\õàH›]\Ÿ\œÀùÿ\õö[ô»¬à€€ú›ò[HH›]\Ÿ\œÀöò[H¬àô]\õàà]à€\‹œHõY]öXÀ\›]\ÀX⁄\»èÇà‹[à€\‹œHõY]öXÀX⁄\\úõ‹àèë\úõ‹ú»›õ€ôœâŸõ‹õX]ù[Xô\ä\úõ‹ä_O‹›õ€ôœè‹‹[èÇà‹[à€\‹œHõY]öXÀX⁄\ÿ\õàèïÿ\õö[ô‹»›õ€ôœâŸõ‹õX]ù[Xô\äÿ\õä_O‹›õ€ôœè‹‹[èÇà‹[à€\‹œHõY]öXÀX⁄\ò[Hèíò[\»›õ€ôœâŸõ‹õX]ù[Xô\äò[J_O‹›õ€ôœè‹‹[èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\ëõY]⁄\ù YŸ‹ôYÿ]Y
+H¬à€€ú›‹öYHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ⁄\ùŸ‹öY	 N¬àYà
+Y‹öY
+Hô]\õé¬à€€ú›\›‹ûHHYŸ‹ôYÿ]YÀôõY]Àö\›‹ûN¬à€€ú››[»HYŸ‹ôYÿ]YÀôõY]Àù›[»ﬂN¬àYà
+Z\›‹ûJH¬à‹öYö[õô\íSHà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèï›[[\ô\‹⁄[€úœŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èìõ»õY]\›‹ûHY]‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèê€€‹àú»[€õœŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èìõ»õY]\›‹ûHY]‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèîÿÿ[àõ€[YOŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èìõ»õY]\›‹ûHY]‹‹[èÇàŸ]èÇàŸ]èò¬àô]\õé¬àBÇàÀ»[\à»€€\]H›[][]]ôHŸ\öY\»úõ€Hò]H]BàÀ»ZŸ\»ò]H⁄[ù»[ôYô][YH›[€‹ö‹»òX⁄›ÿ\ô»»€€\]H›[][]]ôH]XX⁄⁄[ùà€€ú›–›[][]]ôTŸ\öY\»H
+ò]T⁄[ùÀYô][YU›[
+HOà¬àYà
+P\úò^Kö\–\úò^Jò]T⁄[ù Hò]T⁄[ùÀõ[ô›OOH
+Hô]\õà◊N¬àÀ»›[H[[\»»Ÿ]›[ö[ùY\ö[ô»\»⁄[ô›¬à€€ú›⁄[ô›’›[Hò]T⁄[ùÀúôYXŸJ
+›[K
+HOà›[H
+»
+ùò[YH
+K
+N¬àÀ»›\ù[ô»›[][]]ôH\»
+Yô][YHH⁄[ô›»›[
+Bà]›[][]]ôHHYô][YU›[H⁄[ô›’›[¬àô]\õàò]T⁄[ùÀõX\
+Oà¬à›[][]]ôH
+œHùò[YH¬àô]\õà»[YNàù[YKò[YNà›[][]]ôHN¬àJN¬àN¬Çà€€ú››[ò]T⁄[ù»H‘Ÿ\öY\‘⁄[ù \›‹ûKù›[⁄[\ô\‹⁄[€ú»\›‹ûKï›[[\ô\‹⁄[€ú N¬à€€ú›€€‹îò]T⁄[ù»H‘Ÿ\öY\‘⁄[ù \›‹ûKò€€‹ó⁄[\ô\‹⁄[€ú»\›‹ûKê€€‹í[\ô\‹⁄[€ú N¬à€€ú›[€õ‘ò]T⁄[ù»H‘Ÿ\öY\‘⁄[ù \›‹ûKõ[€õ◊⁄[\ô\‹⁄[€ú»\›‹ûKì[€õ“[\ô\‹⁄[€ú N¬à€€ú›ÿÿ[îò]T⁄[ù»H‘Ÿ\öY\‘⁄[ù \›‹ûKúÿÿ[ó›õ€[YH\›‹ûKîÿÿ[ïõ€[YJN¬Çà€€ú›ÿ\ô»H¬à¬àYà	ŸõY]››[ÿ⁄\ù	Àà]Nà	’›[[\ô\‹⁄[€ú…Ààò]TŸ\öY\Œàﬁ»Xô[à	“›\õHò]IÀ€€‹éàìQU‘—TíQT◊–””‘î÷ÃK⁄[ùŒà›[ò]T⁄[ù»WKà›[][]]ôTŸ\öY\Œàﬁ»Xô[à	–›[][]]ôIÀ€€‹éà	»ŒYçÿYXIÀ⁄[ùŒà–›[][]]ôTŸ\öY\ ›[ò]T⁄[ùÀ›[ÀúYŸWÿ€›[ù
+HWKàKà¬àYà	ŸõY]ÿ€€‹ó€[€õ◊ÿ⁄\ù	Àà]Nà	–€€‹àú»[€õ…Ààò]TŸ\öY\Œà¬à»Xô[à	–€€‹ã⁄âÀ€€‹éàìQU‘—TíQT◊–””‘î÷ÃWK⁄[ùŒà€€‹îò]T⁄[ù»Kà»Xô[à	”[€õÀ⁄âÀ€€‹éàìQU‘—TíQT◊–””‘î÷ÃóK⁄[ùŒà[€õ‘ò]T⁄[ù»KàKà›[][]]ôTŸ\öY\Œà¬à»Xô[à	–€€‹à›[	À€€‹éà	»ÃòŸ	À⁄[ùŒà–›[][]]ôTŸ\öY\ €€‹îò]T⁄[ùÀ›[Àò€€‹ó‹YŸ\»
+HKà»Xô[à	”[€õ»›[	À€€‹éà	»ÕŒLX…À⁄[ùŒà–›[][]]ôTŸ\öY\ [€õ‘ò]T⁄[ùÀ›[Àõ[€õ◊‹YŸ\»
+HKàKàKà¬àYà	ŸõY]‹ÿÿ[óÿ⁄\ù	Àà]Nà	‘ÿÿ[àõ€[YIÀàò]TŸ\öY\Œàﬁ»Xô[à	‘ÿÿ[úÀ⁄âÀ€€‹éàìQU‘—TíQT◊–””‘î÷Ã◊K⁄[ùŒàÿÿ[îò]T⁄[ù»WKà›[][]]ôTŸ\öY\Œàﬁ»Xô[à	’›[ÿÿ[ú…À€€‹éà	»ÃçòMéXIÀ⁄[ùŒà–›[][]]ôTŸ\öY\ ÿÿ[îò]T⁄[ùÀ›[Àúÿÿ[óÿ€›[ù
+HWKàKàN¬Çà‹öYö[õô\íSHÿ\ôÀõX\
+ÿ\ôOàà]à€\‹œHõY]öXÀX⁄\ùXÿ\ô]K[ÿY[ô»èÇà]à€\‹œHòÿ\ô]]Hèâÿÿ\ôù]_OŸ]èÇàÿ[ùò\»YHâÿÿ\ôöYHà€\‹œHõY]öXÀX⁄\ùXÿ[ùò\»àZY⁄Håååèèÿÿ[ùò\œÇàŸ]èÇà
+Köõ⁄[ä	… N¬ÇàÀ»€X[[^Hõ‹à”H»Ÿ]K[àò]»[ôô]ôX[àô\]Y\›[ö[X][€ëúò[YJ
+
+HOà¬àÿ\ôÀôõ‹ëXX⁄
+ÿ\ôOà¬à€€ú›ÿ[ùò\»Hÿ›[Y[ùôŸ][[Y[ùûRY
+ÿ\ôöY
+N¬àYà
+ÿ[ùò\ H¬àò]—õY]⁄\ùX[^\ ÿ[ùò\Àÿ\ôúò]TŸ\öY\Àÿ\ôò›[][]]ôTŸ\öY\À»Xô[àÿ\ôù]HJN¬àÀ»ô[[›ôHÿY[ô»€\‹»»öYŸŸ\àòYKZ[Çàÿ[ùò\Àò€‹Ÿ\›
+	ÀõY]öXÀX⁄\ùXÿ\ô	 OÀò€\‹”\›úô[[›ôJ	Ÿ]K[ÿY[ô… N¬àBàJN¬àJN¬üBÇãÀ»Ÿ\ùô\àù[ù[YH[YKTŸ\öY\»⁄\ù»Hô]]K\›[Hù[]⁄YÇãÀ»[\à»õ‹õX[^ôH⁄\ùŸ\öY\»⁄[ù»úõ€H›üH»›[YKò[Y_Hõ‹õX]ãÀ»òX⁄Ÿ[ôŸ[ô»€€\X››üHù]›\à⁄\ùù[ò›[€ú»^X››[YKò[Y_BãÀ»ô]\õú»ù[Yà[ú]\»ò[ﬁKŸ[\H€»ò[òX⁄»ÿ[à€‹ö»⁄]‹\ò]‹Çôù[ò›[€àõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄[ù H¬àYà
+P\úò^Kö\–\úò^J⁄[ù H⁄[ùÀõ[ô›OOH
+Hô]\õàù[¬àÀ»⁄X⁄»Yà[ôXYH[à€‹úôX›õ‹õX]àYà
+⁄[ù÷ÃKù[YHOOH[ôYö[ôY
+Hô]\õà⁄[ùŒ¬àÀ»ò[úŸõ‹õHúõ€H›üH»›[YKò[Y_Bàô]\õà⁄[ùÀõX\
+Oà
+»[YNàùò[YNàùàJJN¬üBÇò€€ú›—TïëTó‘—TíQT◊–””‘î»H¬à€‹õ›][ô\Œà	»ÕéNYLIÀàX\ÿ[ÿŒà	»ÕòçŒ	Ààó‹⁄^ôNà	»ŸYLÕâÀà‹◊ÿ€€õôX›[€úŒà	»ŒYçÿYXIÀà›[‹YŸ\Œà	»ÕMMMé	Àà€€‹ó‹YŸ\Œà	»ÃòŸ	Àà[€õ◊‹YŸ\Œà	»ÕÃNMâÀàÿÿ[ó›õ€[YNà	»ÃŒåòX…Àà€ô\ó€›Œà	»ŸXÿŒMâÀà€ô\óÿ‹ö]Xÿ[à	»ŸçMçMçIÀà€ô\ó⁄Y⁄à	»ÕéNYLIÀà€ô\ó€YY][Nà	»ÕòçŒ	ÀàYŸ[ùŒà	»ŒYçÿYXIÀà]öXŸ\Œà	»ŸYLÕâÀà]öXŸ\◊€€õ[ôNà	»ÕòçŒ	Àà]öXŸ\◊Ÿ\úõ‹éà	»ŸçMçMçIÀàYŸ[ù◊›‹Œà	»ÕòçŒ	ÀÀ»‹ôY[àõ‹àŸXî€ÿ⁄Ÿ]€€õôX›YàYŸ[ù◊⁄à	»ŸXÿŒMâÀÀ»Y[›»õ‹àò[òX⁄¬àYŸ[ù◊€Ÿôõ[ôNà	»ŸçMçMçIÀÀ»ôYõ‹àŸôõ[ôBüN¬Çã äÇà
+à[\à»ô[ô\à⁄\ùÿ\ô»⁄]›]õ\⁄[ôÀÇà
+àô]\Ÿ\»^\›[ô»ÿ[ùò\»[[Y[ù»⁄[à‹‹⁄XõH»]õ⁄Y”Hò\⁄[ô»\ö[ô»]ôH\]\ÀÇà
+à\ò[H“S[[Y[ùH‹öYH€€ùZ[ô\à[[Y[ùà
+à\ò[H–\úò^_Hÿ\ô»H\úò^HŸà⁄Y]KŸ\öY\Àõ‹õX]OﬂHÿöôX›¬à
+à\ò[H—ù[ò›[€üHò]—õàH⁄\ùò]⁄[ô»ù[ò›[€à
+ò]—õY]⁄\ù‹à›\›€JBà
+à\ò[H‹›ö[ôﬂHõ—]R[HS»⁄›»⁄[àõ»]Bà
+ã¬ôù[ò›[€àô[ô\ê⁄\ùÿ\ô‘€[€›
+‹öYÿ\ôÀò]—õãõ—]R[
+H¬àYà
+Y‹öY
+Hô]\õé¬ÇàÀ»ö[\à»ÿ\ô»⁄]X›X[]Bà€€ú›ò[Yÿ\ô»Hÿ\ôÀôö[\äÿ\ôOÇàÿ\ôúŸ\öY\»	âàÿ\ôúŸ\öY\Àú€€YJ»OàÀú⁄[ù»	âàÀú⁄[ùÀõ[ô›à
+Bà
+N¬ÇàYà
+ò[Yÿ\ôÀõ[ô›OOH
+H¬à‹öYö[õô\íSHõ—]R[¬àô]\õé¬àBÇàÀ»⁄X⁄»YàŸHÿ[àô]\ŸH^\›[ô»ÿ[ùò\Ÿ\»
+ÿ[YHÿ\ôQ»[àÿ[YH‹ô\äBà€€ú›^\›[ô“Y»H\úò^Kôúõ€J‹öYú]Y\ûTŸ[X›‹ê[
+	ÿÿ[ùò\ÀõY]öXÀX⁄\ùXÿ[ùò\… JKõX\
+»OàÀöY
+N¬à€€ú›ô]“Y»Hò[Yÿ\ôÀõX\
+»OàÀöY
+N¬à€€ú›ÿ[îô]\ŸHH^\›[ô“YÀõ[ô›OOHô]“YÀõ[ô›	âà^\›[ô“YÀô]ô\ûJ
+YJHOàYOOHô]“Y÷⁄WJN¬ÇàYà
+Xÿ[îô]\ŸJH¬àÀ»ôYY»ôXùZ[”H›ùX›\ôBà‹öYö[õô\íSHò[Yÿ\ôÀõX\
+ÿ\ôOàà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèâÿÿ\ôù]_OŸ]èÇàÿ[ùò\»YHâÿÿ\ôöYHà€\‹œHõY]öXÀX⁄\ùXÿ[ùò\»àZY⁄Håååèèÿÿ[ùò\œÇàŸ]èÇà
+Köõ⁄[ä	… N¬àBÇàÀ»ò]»⁄\ù»
+ô]\Ÿ\»^\›[ô»ÿ[ùò\»[[Y[ù»Yà›ùX›\ôHX]⁄\ Bàô\]Y\›[ö[X][€ëúò[YJ
+
+HOà¬àò[Yÿ\ôÀôõ‹ëXX⁄
+ÿ\ôOà¬à€€ú›ÿ[ùò\»Hÿ›[Y[ùôŸ][[Y[ùûRY
+ÿ\ôöY
+N¬àYà
+ÿ[ùò\ H¬àò]—õäÿ[ùò\Àÿ\ôúŸ\öY\À¬àXô[àÿ\ôù]Kàõ‹õX]Nàÿ\ôôõ‹õX]KàJN¬àBàJN¬àJN¬üBÇãÀ»€€ú›[XXõ\»[YKTŸ\öY\»⁄\ù»H\›‹öXÿ[öY]»Ÿà€ô\à]ô[»X‹õ‹‹»õY]ôù[ò›[€àô[ô\ê€€ú›[XXõ\’[YTŸ\öY\–⁄\ù [Y\Ÿ\öY\ H¬à€€ú›‹öYHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ€€ú›[XXõ\◊ÿ⁄\ù… N¬àYà
+Y‹öY
+Hô]\õé¬ÇàYà
+][Y\Ÿ\öY\»][Y\Ÿ\öY\Àú€ò\⁄›»[Y\Ÿ\öY\Àú€ò\⁄›Àõ[ô›OOH
+H¬à‹öYö[õô\íSHà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèê€€ú›[XXõ\»\›öXù][€à›ô\à[YOŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèì›»	à‹ö]Xÿ[€€ú›[XXõ\»ô[ôŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èò¬àô]\õé¬àBÇà€€ú›⁄\ùŸ\öY\»H[Y\Ÿ\öY\Àò⁄\ù‹Ÿ\öY\»ﬂN¬à€€ú›€ò\⁄›»H[Y\Ÿ\öY\Àú€ò\⁄›»◊N¬Çà€€ú›ùZ[Ÿ\öY\—úõ€T€ò\⁄›»H
+Ÿ^KXÿŸ\‹€‹äHOà¬àô]\õà€ò\⁄›ÀõX\
+»Oà
+¬à[YNàô]»]JÀù[Y\›[\
+KôŸ][YJ
+Kàò[YNàXÿŸ\‹€‹ä KàJJKôö[\äOàùò[YHOOH[ôYö[ôY	âàùò[YHOOHù[
+N¬àN¬Çà€€ú›ÿ\ô»H¬à¬àYà	ÿ€€ú›[XXõ\◊⁄\›‹ûWÿ⁄\ù	Àà]Nà	–€€ú›[XXõ\»\›öXù][€à›ô\à[YIÀàŸ\öY\Œà¬à¬àXô[à	“Y⁄
+çL	JIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\ó⁄Y⁄à⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\ó⁄Y⁄
+HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\ó⁄Y⁄	À»OàÀôõY]Àù€ô\ó⁄Y⁄
+KàKà¬àXô[à	”YY][H
+çKML	JIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\ó€YY][Kà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\ó€YY][JHùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\ó€YY][IÀ»OàÀôõY]Àù€ô\ó€YY][JKàKà¬àXô[à	”›»
+LLçIJIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\ó€›Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\ó€› HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\ó€›…À»OàÀôõY]Àù€ô\ó€› KàKà¬àXô[à	–‹ö]Xÿ[
+L	JIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\óÿ‹ö]Xÿ[à⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\óÿ‹ö]Xÿ[
+HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\óÿ‹ö]Xÿ[	À»OàÀôõY]Àù€ô\óÿ‹ö]Xÿ[
+KàKàKàKà¬àYà	ÿ€€ú›[XXõ\◊ÿ[\ù◊ÿ⁄\ù	Àà]Nà	”›»	à‹ö]Xÿ[€€ú›[XXõ\»ô[ô	ÀàŸ\öY\Œà¬à¬àXô[à	”›…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\ó€›Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\ó€› HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\ó€›…À»OàÀôõY]Àù€ô\ó€› KàKà¬àXô[à	–‹ö]Xÿ[	Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\óÿ‹ö]Xÿ[à⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\óÿ‹ö]Xÿ[
+HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\óÿ‹ö]Xÿ[	À»OàÀôõY]Àù€ô\óÿ‹ö]Xÿ[
+KàKàKàKàN¬Çà€€ú›õ—]R[Hà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèê€€ú›[XXõ\»\›öXù][€à›ô\à[YOŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèì›»	à‹ö]Xÿ[€€ú›[XXõ\»ô[ôŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èò¬Çàô[ô\ê⁄\ùÿ\ô‘€[€›
+‹öYÿ\ôÀò]—õY]⁄\ùõ—]R[
+N¬üBÇãÀ»YŸ[ùõY][YKTŸ\öY\»⁄\ù»H\›‹öXÿ[öY]»ŸàYŸ[ùõY]X[ôù[ò›[€àô[ô\êYŸ[ùõY]⁄\ù [Y\Ÿ\öY\ H¬à€€ú›‹öYHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿYŸ[ùŸõY]ÿ⁄\ù… N¬àYà
+Y‹öY
+Hô]\õé¬ÇàYà
+][Y\Ÿ\öY\»][Y\Ÿ\öY\Àú€ò\⁄›»[Y\Ÿ\öY\Àú€ò\⁄›Àõ[ô›OOH
+H¬à‹öYö[õô\íSHà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèêYŸ[ù	à]öXŸH€›[ùŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]öXŸH›]\œŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èò¬àô]\õé¬àBÇà€€ú›⁄\ùŸ\öY\»H[Y\Ÿ\öY\Àò⁄\ù‹Ÿ\öY\»ﬂN¬à€€ú›€ò\⁄›»H[Y\Ÿ\öY\Àú€ò\⁄›»◊N¬Çà€€ú›ùZ[Ÿ\öY\—úõ€T€ò\⁄›»H
+Ÿ^KXÿŸ\‹€‹äHOà¬àô]\õà€ò\⁄›ÀõX\
+»Oà
+¬à[YNàô]»]JÀù[Y\›[\
+KôŸ][YJ
+Kàò[YNàXÿŸ\‹€‹ä KàJJKôö[\äOàùò[YHOOH[ôYö[ôY	âàùò[YHOOHù[
+N¬àN¬Çà€€ú›ÿ\ô»H¬à¬àYà	ÿYŸ[ùÿ€›[ùÿ⁄\ù	Àà]Nà	–YŸ[ù	à]öXŸH€›[ù	ÀàŸ\öY\Œà¬à¬àXô[à	–YŸ[ù…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀòYŸ[ùÀà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\ÀòYŸ[ù HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	ÿYŸ[ù…À»OàÀôõY]Àù›[ÿYŸ[ù KàKà¬àXô[à	—]öXŸ\…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀô]öXŸ\Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àô]öXŸ\ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	Ÿ]öXŸ\…À»OàÀôõY]Àù›[Ÿ]öXŸ\ KàKàKàKà¬àYà	Ÿ]öXŸW⁄X[ÿ⁄\ù	Àà]Nà	—]öXŸHX[	ÀàŸ\öY\Œà¬à¬àXô[à	”€õ[ôIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀô]öXŸ\◊€€õ[ôKà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àô]öXŸ\◊€€õ[ôJHùZ[Ÿ\öY\—úõ€T€ò\⁄› 	Ÿ]öXŸ\◊€€õ[ôIÀ»OàÀôõY]Àô]öXŸ\◊€€õ[ôJKàKà¬àXô[à	—\úõ‹ú…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀô]öXŸ\◊Ÿ\úõ‹ãà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àô]öXŸ\◊Ÿ\úõ‹äHùZ[Ÿ\öY\—úõ€T€ò\⁄› 	Ÿ]öXŸ\◊Ÿ\úõ‹âÀ»OàÀôõY]Àô]öXŸ\◊Ÿ\úõ‹äKàKàKàKàN¬Çà€€ú›õ—]R[Hà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèêYŸ[ù	à]öXŸH€›[ùŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]öXŸHX[Ÿ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èò¬Çàô[ô\ê⁄\ùÿ\ô‘€[€›
+‹öYÿ\ôÀò]—õY]⁄\ùõ—]R[
+N¬üBÇôù[ò›[€àô[ô\îŸ\ùô\ï[YTŸ\öY\–⁄\ù [Y\Ÿ\öY\ H¬à€€ú›‹öYHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹Ÿ\ùô\óÿ⁄\ù… N¬àYà
+Y‹öY
+Hô]\õé¬ÇàYà
+][Y\Ÿ\öY\»][Y\Ÿ\öY\Àú€ò\⁄›»[Y\Ÿ\öY\Àú€ò\⁄›Àõ[ô›OOH
+H¬à‹öYö[õô\íSHà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë€‹õ›][ô\œŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèìY[[‹ûH
+X\
+OŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]Xò\ŸH⁄^ôOŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èò¬àô]\õé¬àBÇà€€ú›⁄\ùŸ\öY\»H[Y\Ÿ\öY\Àò⁄\ù‹Ÿ\öY\»ﬂN¬à€€ú›€ò\⁄›»H[Y\Ÿ\öY\Àú€ò\⁄›»◊N¬ÇàÀ»ùZ[⁄\ù]Húõ€H€ò\⁄›»Yà⁄\ù‹Ÿ\öY\»õ›õ›öYYà€€ú›ùZ[Ÿ\öY\—úõ€T€ò\⁄›»H
+Ÿ^KXÿŸ\‹€‹äHOà¬àô]\õà€ò\⁄›ÀõX\
+»Oà
+¬à[YNàô]»]JÀù[Y\›[\
+KôŸ][YJ
+Kàò[YNàXÿŸ\‹€‹ä KàJJKôö[\äOàùò[YHOOH[ôYö[ôY	âàùò[YHOOHù[
+N¬àN¬Çà€€ú›ÿ\ô»H¬à¬àYà	‹Ÿ\ùô\óŸ€‹õ›][ô\◊ÿ⁄\ù	Àà]Nà	—€‹õ›][ô\…ÀàŸ\öY\Œàﬁ¬àXô[à	—€‹õ›][ô\…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀô€‹õ›][ô\Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àô€‹õ›][ô\ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	Ÿ€‹õ›][ô\…À»OàÀúŸ\ùô\èÀô€‹õ›][ô\ BàWKàKà¬àYà	‹Ÿ\ùô\ó€Y[[‹ûWÿ⁄\ù	Àà]Nà	”Y[[‹ûH
+X\
+IÀàŸ\öY\Œàﬁ¬àXô[à	“X\[ÿ…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀöX\ÿ[ÿÀà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\ÀöX\ÿ[ÿ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	⁄X\ÿ[ÿ…À»OàÀúŸ\ùô\èÀöX\ÿ[ÿ◊€XäKàWKàõ‹õX]NààOàõ‹õX]û]\ à
+àLç
+àLç
+KÀ»X\ÿ[ÿ◊€Xà\»[àPÇàKà¬àYà	‹Ÿ\ùô\óŸóÿ⁄\ù	Àà]Nà	—]Xò\ŸH⁄^ôIÀàŸ\öY\Œàﬁ¬àXô[à	—à⁄^ôIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀôó‹⁄^ôKà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àôó‹⁄^ôJHùZ[Ÿ\öY\—úõ€T€ò\⁄› 	Ÿó‹⁄^ôIÀ»OàÀúŸ\ùô\èÀôó‹⁄^ôWÿû]\ KàWKàõ‹õX]Nàõ‹õX]û]\ÀàKà¬àYà	‹Ÿ\ùô\ó›‹◊ÿ⁄\ù	Àà]Nà	–YŸ[ù€€õôX›[€ú…ÀàŸ\öY\Œà¬à¬àXô[à	’ŸXî€ÿ⁄Ÿ]	Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀòYŸ[ù◊›‹Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\ÀòYŸ[ù◊›‹ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	ÿYŸ[ù◊›‹…À»OàÀôõY]ÀòYŸ[ù◊›‹ KàKà¬àXô[à	“	Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀòYŸ[ù◊⁄à⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\ÀòYŸ[ù◊⁄
+HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	ÿYŸ[ù◊⁄	À»OàÀôõY]ÀòYŸ[ù◊⁄
+KàKà¬àXô[à	”Ÿôõ[ôIÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀòYŸ[ù◊€Ÿôõ[ôKà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\ÀòYŸ[ù◊€Ÿôõ[ôJHùZ[Ÿ\öY\—úõ€T€ò\⁄› 	ÿYŸ[ù◊€Ÿôõ[ôIÀ»OàÀôõY]ÀòYŸ[ù◊€Ÿôõ[ôJKàKàKàKà¬àYà	‹Ÿ\ùô\ó‹YŸ\◊ÿ⁄\ù	Àà]Nà	—õY]YŸH€›[ù…ÀàŸ\öY\Œà¬à¬àXô[à	’›[	Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù›[‹YŸ\Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù›[‹YŸ\ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	››[‹YŸ\…À»OàÀôõY]Àù›[‹YŸ\ KàKà¬àXô[à	–€€‹âÀà€€‹éà—TïëTó‘—TíQT◊–””‘îÀò€€‹ó‹YŸ\Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àò€€‹ó‹YŸ\ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	ÿ€€‹ó‹YŸ\…À»OàÀôõY]Àò€€‹ó‹YŸ\ KàKà¬àXô[à	”[€õ…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀõ[€õ◊‹YŸ\Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àõ[€õ◊‹YŸ\ HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	€[€õ◊‹YŸ\…À»OàÀôõY]Àõ[€õ◊‹YŸ\ KàKàKàKà¬àYà	‹Ÿ\ùô\ó›€ô\óÿ⁄\ù	Àà]Nà	’€ô\à]ô[…ÀàŸ\öY\Œà¬à¬àXô[à	”›…Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\ó€›Àà⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\ó€› HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\ó€›…À»OàÀôõY]Àù€ô\ó€› KàKà¬àXô[à	–‹ö]Xÿ[	Àà€€‹éà—TïëTó‘—TíQT◊–””‘îÀù€ô\óÿ‹ö]Xÿ[à⁄[ùŒàõ‹õX[^ôP⁄\ùŸ\öY\‘⁄[ù ⁄\ùŸ\öY\Àù€ô\óÿ‹ö]Xÿ[
+HùZ[Ÿ\öY\—úõ€T€ò\⁄› 	›€ô\óÿ‹ö]Xÿ[	À»OàÀôõY]Àù€ô\óÿ‹ö]Xÿ[
+KàKàKàKàN¬Çà€€ú›õ—]R[Hà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë€‹õ›][ô\œŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèìY[[‹ûH
+X\
+OŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èÇà]à€\‹œHõY]öXÀX⁄\ùXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]Xò\ŸH⁄^ôOŸ]èÇà]à€\‹œHõõÀY]K\XŸZ€\àèÇà›ô»€\‹œHõõÀY]KZX€€àà⁄YHçàZY⁄HçàöY]–õﬁHåççàö[Hõõ€ôHà›õ⁄ŸOHò›\úô[ù€€‹àà›õ⁄ŸK]⁄YHåKçHèè]HìL»›åNNãœè]HìLNM’éHãœè]HìLL»M’çHãœè]HìNM›ãL»ãœè‹›ôœÇà‹[èê€€X›[ô»]x†)è‹‹[èÇàŸ]èÇàŸ]èò¬Çàô[ô\ê⁄\ùÿ\ô‘€[€›
+‹öYÿ\ôÀò]—õY]⁄\ùõ—]R[
+N¬üBÇôù[ò›[€àô[ô\îŸ\ùô\î[ô[
+Ÿ\ùô\äH¬à€€ú›[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹Ÿ\ùô\ó‹[ô[	 N¬àYà
+\[ô[
+Hô]\õé¬àYà
+\Ÿ\ùô\äH¬à[ô[ö[õô\íSH	œ]à€\‹œHõY]öXÀXÿ\ôÿY[ô»èîŸ\ùô\àY]öX‹»[ò]òZ[XõKèŸ]èâŒ¬àô]\õé¬àBÇà€€ú›ù[ù[YHHŸ\ùô\ãúù[ù[YHﬂN¬à€€ú›Y[[‹ûHHù[ù[YKõY[[‹ûHﬂN¬à€€ú›àHŸ\ùô\ãô]Xò\ŸHﬂN¬à€€ú›\[YHHõ‹õX]\ò][€äŸ\ùô\ãù\[YW‹ŸX€€ô N¬à€€ú›\ùYòX›–û]\»Hãúô[X\ŸWÿ\ùYòX›◊ÿû]\»ãúô[X\ŸWÿû]\»¬à€€ú›ÿX⁄Pû]\»H\ùYòX›–û]\Œ¬Çà[ô[ö[õô\íSHà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]HèîŸ\ùô\àù[ù[YOŸ]èÇà]à€\‹œHõY]öXÀZ‹K]ò[YHà›[OHôõ€ù\⁄^ôNåN»èâŸ\ÿÿ\R[
+Ÿ\ùô\ãö‹›ò[YH	‘ö[ùX\›\â _OŸ]èÇà]à€\‹œHõY]öXÀZ‹K[Xô[èï\	›\[Y_K	Ÿ\ÿÿ\R[
+ù[ù[YKô€◊›ô\ú⁄[€à	—€… _OŸ]èÇà[›[OHõ\›\›[Nõõ€ôN‹Y[ôŒå€X\ô⁄[éåLúŸõ€ù\⁄^ôNåL‹€[ôKZZY⁄åKçé»èÇàOë€‹õ›][ô\Œà›õ€ôœâŸõ‹õX]ù[Xô\äù[ù[YKõù[WŸ€‹õ›][ôH
+_O‹›õ€ôœè€OÇàOíX\à›õ€ôœâŸõ‹õX]û]\ Y[[‹ûKöX\ÿ[ÿ◊ÿû]\»Y[[‹ûKöX\ÿ[ÿ»
+_O‹›õ€ôœè€OÇàOï›[[ÿŒà›õ€ôœâŸõ‹õX]û]\ Y[[‹ûKù›[ÿ[ÿ◊ÿû]\»Y[[‹ûKù›[ÿ[ÿ»
+_O‹›õ€ôœè€OÇà›[ÇàŸ]èÇà]à€\‹œHõY]öXÀXÿ\ôèÇà]à€\‹œHòÿ\ô]]Hèë]Xò\ŸOŸ]èÇà	Ÿà»à[›[OHõ\›\›[Nõõ€ôN‹Y[ôŒå€X\ô⁄[éåŸõ€ù\⁄^ôNåL‹€[ôKZZY⁄åKçé»èÇàOêYŸ[ùŒà›õ€ôœâŸõ‹õX]ù[Xô\äãòYŸ[ù»
+_O‹›õ€ôœè€OÇàOë]öXŸ\Œà›õ€ôœâŸõ‹õX]ù[Xô\äãô]öXŸ\»
+_O‹›õ€ôœè€OÇàOìY]öX‹»õ›‹Œà›õ€ôœâŸõ‹õX]ù[Xô\äãõY]öX‹◊‹€ò\⁄›»
+_O‹›õ€ôœè€OÇàOîŸ\‹⁄[€úŒà›õ€ôœâŸõ‹õX]ù[Xô\äãúŸ\‹⁄[€ú»
+_O‹›õ€ôœè€OÇàOï\Ÿ\úŒà›õ€ôœâŸõ‹õX]ù[Xô\äãù\Ÿ\ú»
+_O‹›õ€ôœè€OÇàOê]Y][ùöY\Œà›õ€ôœâŸõ‹õX]ù[Xô\äãò]Y]Ÿ[ùöY\»
+_O‹›õ€ôœè€OÇàOê\ùYòX›Œà›õ€ôœâŸõ‹õX]ù[Xô\äãúô[X\ŸWÿ\ùYòX›»
+_O‹›õ€ôœà
+	Ÿõ‹õX]û]\ \ùYòX›–û]\ _JO€OÇàOï›[ÿX⁄H⁄^ôNà›õ€ôœâŸõ‹õX]û]\ ÿX⁄Pû]\ _O‹›õ€ôœè€OÇà›[Çàà	œ]à€\‹œHõ]]Y]^èìõ»à›]»]òZ[XõKèŸ]èâﬂBàŸ]èÇà¬üBÇãÀ»€€ú›[XXõ\»€ù]⁄\ù€€‹ú»X]⁄[ô»HY\àŸ[X[ùX‹¬ò€€ú›””î’SPPìW’QTó–””‘î»H¬à‹ö]Xÿ[à	»ŸçMçMçIÀÀ»ôYõ‹à‹ö]Xÿ[à›Œà	»ŸXÿŒMâÀÀ»Y[›Àÿ[Xô\àõ‹à›¬àYY][Nà	»ÕòçŒ	ÀÀ»‹ôY[àõ‹àYY][BàY⁄à	»ÕéNYLIÀÀ»õYHõ‹àY⁄à[ö€õ›€éà	»ÕÃNMâÀÀ»‹ò^Hõ‹à[ö€õ›€ÇüN¬Çôù[ò›[€àô[ô\ê€€ú›[XXõ\ õY]
+H¬à€€ú›ÿ\ôHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ€€ú›[XXõ\… N¬àYà
+Xÿ\ô
+Hô]\õé¬àÿ\ôö[õô\íSH	œ]à€\‹œHòÿ\ô]]Hèê€€ú›[XXõ\œŸ]èâŒ¬àYà
+YõY]YõY]ò€€ú›[XXõ\ H¬àÿ\ôö[õô\íS
+œH	œ]à€\‹œHõ]]Y]^èìõ»€€ú›[XXõH]HY]èŸ]èâŒ¬àô]\õé¬àBà€€ú››[»HõY]ù›[»ﬂN¬à€€ú›€€ú›[XXõ\»HõY]ò€€ú›[XXõ\Œ¬à€€ú››[]öXŸ\»H
+€€ú›[XXõ\Àò‹ö]Xÿ[
+H
+»
+€€ú›[XXõ\Àõ›»
+H
+»
+€€ú›[XXõ\ÀõYY][H
+H
+»
+€€ú›[XXõ\ÀöY⁄
+H
+»
+€€ú›[XXõ\Àù[ö€õ›€à
+N¬ÇàYà
+›[]öXŸ\»OOH
+H¬àÿ\ôö[õô\íS
+œH	œ]à€\‹œHõ]]Y]^èìõ»]öXŸ\»⁄]€€ú›[XXõH]KèŸ]èâŒ¬àô]\õé¬àBÇà€€ú›Y\ú»H¬à»Ÿ^Nà	ÿ‹ö]Xÿ[	ÀXô[à	–‹ö]Xÿ[
+L	JIÀò[YNà€€ú›[XXõ\Àò‹ö]Xÿ[€€‹éà””î’SPPìW’QTó–””‘îÀò‹ö]Xÿ[Kà»Ÿ^Nà	€›…ÀXô[à	”›»
+LLçIJIÀò[YNà€€ú›[XXõ\Àõ›»€€‹éà””î’SPPìW’QTó–””‘îÀõ›»Kà»Ÿ^Nà	€YY][IÀXô[à	”YY][H
+çKML	JIÀò[YNà€€ú›[XXõ\ÀõYY][H€€‹éà””î’SPPìW’QTó–””‘îÀõYY][HKà»Ÿ^Nà	⁄Y⁄	ÀXô[à	“Y⁄
+çL	JIÀò[YNà€€ú›[XXõ\ÀöY⁄€€‹éà””î’SPPìW’QTó–””‘îÀöY⁄Kà»Ÿ^Nà	›[ö€õ›€âÀXô[à	’[ö€õ›€âÀò[YNà€€ú›[XXõ\Àù[ö€õ›€à€€‹éà””î’SPPìW’QTó–””‘îÀù[ö€õ›€àKàN¬ÇàÀ»ùZ[€ù]⁄\ù€€ùZ[ô\à⁄]YŸ[ôàÿ\ôö[õô\íS
+œHà]à€\‹œHò€€ú›[XXõ\ÀX⁄\ùX€€ùZ[ô\àèÇàÿ[ùò\»YHò€€ú›[XXõ\◊Ÿ€ù]ÿ⁄\ùà⁄YHåMåàZY⁄HåMåèèÿÿ[ùò\œÇà]à€\‹œHò€€ú›[XXõ\À[YŸ[ôèÇà	›Y\úÀõX\
+Y\àOàà]à€\‹œHò€€ú›[XXõ\À[YŸ[ôZ][HèÇà‹[à€\‹œHò€€ú›[XXõ\À[YŸ[ô\›ÿ]⁄à›[OHòòX⁄Ÿ‹õ›[ôâ›Y\ãò€€‹üN»èè‹‹[èÇà‹[à€\‹œHò€€ú›[XXõ\À[YŸ[ô[Xô[èâ›Y\ãõXô[Nè‹‹[èÇà›õ€ôœâŸõ‹õX]ù[Xô\äY\ãùò[YJ_O‹›õ€ôœÇà‹[à€\‹œHò€€ú›[XXõ\À[YŸ[ô\›èä	”X]úõ›[ô
+
+Y\ãùò[YH»›[]öXŸ\ H
+àL
+_IJO‹‹[èÇàŸ]èÇà
+Köõ⁄[ä	… _BàŸ]èÇàŸ]èÇà¬ÇàÀ»ò]»H€ù]⁄\ùà€€ú›ÿ[ùò\»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ€€ú›[XXõ\◊Ÿ€ù]ÿ⁄\ù	 N¬àYà
+ÿ[ùò\ H¬àò]–€€ú›[XXõ\—€ù]
+ÿ[ùò\ÀY\úÀ›[]öXŸ\ N¬àBüBÇôù[ò›[€àò]–€€ú›[XXõ\—€ù]
+ÿ[ùò\ÀY\úÀ›[
+H¬à€€ú››Hÿ[ùò\ÀôŸ]€€ù^
+	Ãô	 N¬àYà
+X›
+Hô]\õé¬Çà€€ú›àH⁄[ô›Àô]öXŸT^[ò][»N¬à€€ú›⁄^ôHHMå¬àÿ[ùò\Àù⁄YH⁄^ôH
+àé¬àÿ[ùò\ÀöZY⁄H⁄^ôH
+àé¬à›úÿÿ[JãäN¬à›ò€X\îôX›
+⁄^ôK⁄^ôJN¬Çà€€ú›Ÿ[ù\ñH⁄^ôH»é¬à€€ú›Ÿ[ù\ñHH⁄^ôH»é¬à€€ú››]\îòY]\»HÃ¬à€€ú›[õô\îòY]\»HN¬Çà]›\ù[ô€HHSX]îH»é»À»›\ùúõ€H‹ÇàÀ»ò]»ŸY€Y[ù¬àY\úÀôõ‹ëXX⁄
+Y\àOà¬àYà
+Y\ãùò[YHOOH
+Hô]\õé¬à€€ú›€XŸP[ô€HH
+Y\ãùò[YH»›[
+H
+àX]îH
+àé¬à€€ú›[ô[ô€HH›\ù[ô€H
+»€XŸP[ô€N¬Çà›òôY⁄[î]
+
+N¬à›ò\ò Ÿ[ù\ñŸ[ù\ñK›]\îòY]\À›\ù[ô€K[ô[ô€JN¬à›ò\ò Ÿ[ù\ñŸ[ù\ñK[õô\îòY]\À[ô[ô€K›\ù[ô€KùYJN¬à›ò€‹ŸT]
+
+N¬à›ôö[›[HHY\ãò€€‹é¬à›ôö[
+
+N¬Çà›\ù[ô€HH[ô[ô€N¬àJN¬ÇàÀ»ò]»Ÿ[ù\à^⁄›⁄[ô»›[à›ôö[›[HH	‹ôÿòJçMKçMKçMKéJIŒ¬à›ôõ€ùH	ÿõ€åÿ[úÀ\Ÿ\öYâŒ¬à›ù^[Y€àH	ÿŸ[ù\âŒ¬à›ù^ò\Ÿ[[ôHH	€ZYIŒ¬à›ôö[^
+õ‹õX]ù[Xô\ä›[
+KŸ[ù\ñŸ[ù\ñHHäN¬à›ôõ€ùH	ÃLÿ[úÀ\Ÿ\öYâŒ¬à›ôö[›[HH	‹ôÿòJçMKçMKçMKçäIŒ¬à›ôö[^
+	Ÿ]öXŸ\…ÀŸ[ù\ñŸ[ù\ñH
+»L
+N¬üBÇôù[ò›[€àô[ô\ìY]öX‹–X›]ö]JYŸ‹ôYÿ]Y
+H¬à€€ú›ÿ\ôHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿX›]ö]I N¬àYà
+Xÿ\ô
+Hô]\õé¬àÿ\ôö[õô\íSH	œ]à€\‹œHòÿ\ô]]HèêX›]ö]OŸ]èâŒ¬àYà
+XYŸ‹ôYÿ]YXYŸ‹ôYÿ]YôõY]
+H¬àÿ\ôö[õô\íS
+œH	œ]à€\‹œHõ]]Y]^èìõ»X›]ö]HY]èŸ]èâŒ¬àô]\õé¬àBÇà€€ú››[»HYŸ‹ôYÿ]YôõY]ù›[»ﬂN¬à€€ú›\›‹ûHHYŸ‹ôYÿ]YôõY]ö\›‹ûOÀù›[⁄[\ô\‹⁄[€ú»◊N¬à€€ú›\›⁄[ùH\›‹ûV⁄\›‹ûKõ[ô›HWN¬à€€ú›\ö[Ÿ›[H\›‹ûKúôYXŸJ
+›[K
+HOà›[H
+»ù[Xô\äÀùò[YH
+K
+N¬à€€ú›\›[Y\›[\H\›⁄[ù»õ‹õX]]U[YJ\›⁄[ùù[Y\›[\
+Hà	€ãÿIŒ¬Çàÿ\ôö[õô\íS
+œHà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\éŸõ€ù\⁄^ôNåL‹»èÇà]èï›[Yô][YHYŸ\Œà›õ€ôœâŸõ‹õX]ù[Xô\ä›[ÀúYŸWÿ€›[ù
+_O‹›õ€ôœèŸ]èÇà]èî\ö[ŸYŸ\»
+	€Y]öX‹‘ò[ôŸSXô[
+Y]öX‹’ìKúò[ôŸJ_JNà›õ€ôœâŸõ‹õX]ù[Xô\ä\ö[Ÿ›[
+_O‹›õ€ôœèŸ]èÇà]èì\›Y]öXŒà›õ€ôœâŸ\ÿÿ\R[
+\›[Y\›[\
+_O‹›õ€ôœèŸ]èÇàŸ]èÇà¬üBÇôù[ò›[€àô[ô\ìY]öX‹—\úõ‹ä\úäH¬à€€ú››]—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹›]… N¬àYà
+›]—[
+H¬à›]—[ö[õô\íSH]à€\‹œHõY]öXÀXÿ\ôà›[OHò€€‹éùò\äKY[ôŸ\äN»èëòZ[Y»ÿYY]öX‹Œà	Ÿ\ÿÿ\R[
+\úèÀõY\‹ÿYŸH\úä_OŸ]èò¬àBà€€ú›⁄\ù—[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿ⁄\ùŸ‹öY	 N¬àYà
+⁄\ù—[
+H¬à⁄\ù—[ö[õô\íSH	œ]à€\‹œHõY]öXÀX⁄\ùXÿ\ôà›[OHò€€‹éùò\äKY[ôŸ\äN»èï[òXõH»ô[ô\à⁄\ùÀèŸ]èâŒ¬àBüBÇôù[ò›[€àŸ]Y]öX‹‘ò[ôŸU⁄[ô› ò[ôŸJH¬àô]\õàQUíP‘◊‘êSë—W’“Së’‘÷‹ò[ôŸWHQUíP‘◊‘êSë—W’“Së’‘÷”QUíP‘◊—QêUS‘êSë—WN¬üBÇôù[ò›[€àY]öX‹‘ò[ôŸSXô[
+ò[ôŸJH¬à›⁄]⁄
+ò[ôŸJH¬àÿ\ŸH	Õ[IŒàô]\õà	ÕHZ[ù]\…Œ¬àÿ\ŸH	ÃM[IŒàô]\õà	ÃMHZ[ù]\…Œ¬àÿ\ŸH	ÃÃIŒàô]\õà	ÃÃZ[ù]\…Œ¬àÿ\ŸH	ÃZ	Œàô]\õà	ÃH›\âŒ¬àÿ\ŸH	Õö	Œàô]\õà	Õà›\ú…Œ¬àÿ\ŸH	ÃLö	Œàô]\õà	ÃLà›\ú…Œ¬àÿ\ŸH	Ãç	Œàô]\õà	Ãç›\ú…Œ¬àÿ\ŸH	ÕŸ	Œàô]\õà	Õ»^\…Œ¬àÿ\ŸH	ÃÃ	Œàô]\õà	ÃÃ^\…Œ¬àÿ\ŸH	ŒL	Œàô]\õà	ŒL^\…Œ¬àÿ\ŸH	ÃÕçY	Œàô]\õà	ÃHYX\âŒ¬àYò][àô]\õàò[ôŸN¬àBüBÇôù[ò›[€à[ö]Y]öX‹‘ò[ôŸP€€ùõ€ 
+H¬à€€ú›€€ùõ€»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹ò[ôŸWÿ€€ùõ€… N¬àYà
+X€€ùõ€»€€ùõ€Àó€Y]öX‹–õ›[ô
+Hô]\õé¬à€€ùõ€Àó€Y]öX‹–õ›[ôHùYN¬à€€ùõ€ÀòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ù
+HOà¬à€€ú›ùàH]ùù\ôŸ]ò€‹Ÿ\›
+	÷Ÿ]K\ò[ôŸWI N¬àYà
+XùäHô]\õé¬àŸ]Y]öX‹‘ò[ôŸJùãôŸ]]öXù]J	Ÿ]K\ò[ôŸI JN¬àJN¬à\]SY]öX‹‘ò[ôŸPù]€ú 
+N¬üBÇã äÇà
+à[ö]X[^ôHY]öX‹»ö[\à€€ùõ€»
+[ò[ùYŸ[ù]öXŸHõ‹›€ú KÇà
+àÿ\ÿÿY[ô»ö[\à]\õéÇà
+àH€ÿò[YZ[úŒà⁄›»[ò[ùö[\àö\ú›8°§àYŸ[ùö[\à\X\ú»⁄[à[ò[ùŸ[X›Y8°§à]öXŸHö[\à\X\ú»⁄[àYŸ[ùŸ[X›Yà
+àHõ€ãXYZ[à\Ÿ\úŒà⁄›»YŸ[ùö[\àö\ú›
+ÿ€‹Y»Z\à[ò[ù
+H8°§à]öXŸHö[\à\X\ú»⁄[àYŸ[ùŸ[X›Yà
+ã¬ôù[ò›[€à[ö]Y]öX‹—ö[\ê€€ùõ€ 
+H¬à€€ú›ö[\ú–€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊Ÿö[\ú… N¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊›[ò[ùŸö[\â N¬à€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿYŸ[ùŸö[\â N¬à€€ú›]öXŸTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊Ÿ]öXŸWŸö[\â N¬ÇàYà
+Yö[\ú–€€ùZ[ô\äHô]\õé¬àYà
+ö[\ú–€€ùZ[ô\ãóŸö[\ú–õ›[ô
+Hô]\õé¬àö[\ú–€€ùZ[ô\ãóŸö[\ú–õ›[ôHùYN¬ÇàÀ»ÿ\ÿÿY[ô»ö[\àŸ]\àYH›€ú›ôX[Hö[\ú»[ö]X[BàYà
+\—€ÿò[YZ[ä
+JH¬àÀ»€ÿò[YZ[ú»›\ù⁄][ò[ùö[\à€õBàYà
+[ò[ùŸ[X›
+H¬à[ò[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ€ìY]öX‹’[ò[ù⁄[ôŸJN¬àBàYà
+YŸ[ùŸ[X›
+H¬àYŸ[ùŸ[X›ú›[Kô\‹^HH	€õ€ôIŒ»À»Y[à[ù[[ò[ùŸ[X›YàYŸ[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ€ìY]öX‹–YŸ[ù⁄[ôŸJN¬àBàH[ŸH¬àÀ»õ€ãY€ÿò[\Ÿ\úŒàYH[ò[ùö[\ã⁄›»YŸ[ùö[\ÇàYà
+[ò[ùŸ[X›
+H¬à[ò[ùŸ[X›ú›[Kô\‹^HH	€õ€ôIŒ¬àBàYà
+YŸ[ùŸ[X›
+H¬àYŸ[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ€ìY]öX‹–YŸ[ù⁄[ôŸJN¬àBàBÇàÀ»]öXŸHö[\à[ÿ^\»Y[à[ù[YŸ[ùŸ[X›YàYà
+]öXŸTŸ[X›
+H¬à]öXŸTŸ[X›ú›[Kô\‹^HH	€õ€ôIŒ¬à]öXŸTŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ€ìY]öX‹—]öXŸP⁄[ôŸJN¬àBÇàÀ»[ö]X[‹[][€àŸàö[\ú¬à‹[]SY]öX‹—ö[\ú 
+N¬üBÇã äÇà
+à‹[]HY]öX‹»ö[\àõ‹›€ú»⁄]]òZ[XõH‹[€úÀÇà
+àÿ\ÿÿY[ô»]\õéÇà
+àH€ÿò[YZ[úŒà‹[]H[ò[ù€õN»YŸ[ùö[\à‹[]Y⁄[à[ò[ùŸ[X›Yà
+àHõ€ãXYZ[à\Ÿ\úŒà‹[]HYŸ[ùö[\à[[YYX][H
+ÿ€‹Y»Z\à[ò[ù
+Bà
+ã¬ò\ﬁ[ò»ù[ò›[€à‹[]SY]öX‹—ö[\ú 
+H¬à€€ú›[ò[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊›[ò[ùŸö[\â N¬à€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿYŸ[ùŸö[\â N¬à€€ú›]öXŸTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊Ÿ]öXŸWŸö[\â N¬ÇàÀ»‹[]H[ò[ùö[\à
+€ÿò[YZ[ú»€õJBàYà
+[ò[ùŸ[X›	âà\—€ÿò[YZ[ä
+JH¬àûH¬à€€ú›[ò[ù‘ô\‹H]ÿZ]ô]⁄
+	Àÿ\K›åK›[ò[ù… N¬àYà
+[ò[ù‘ô\‹õ⁄ H¬à€€ú›[ò[ù»H]ÿZ][ò[ù‘ô\‹öú€€ä
+N¬à[ò[ùŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[[ò[ùœ€‹[€èâŒ¬à
+[ò[ù»◊JKôõ‹ëXX⁄
+Oà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHHöY¬à‹ù^€€ù[ùHõò[YHöY¬à[ò[ùŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»ÿY[ò[ù»õ‹àY]öX‹»ö[\âÀ\úäN¬àBàÀ»YŸ[ùö[\à›^\»Y[à[ù[[ò[ù\»Ÿ[X›Y
+õ‹à€ÿò[YZ[ú Bàô]\õé¬àBÇàÀ»õ‹àõ€ãY€ÿò[\Ÿ\úŒà‹[]HYŸ[ùö[\à[[YYX][H
+ÿ€‹Y»Z\à[ò[ù
+BàYà
+YŸ[ùŸ[X›
+H¬àûH¬à€€ú›YŸ[ù‘ô\‹H]ÿZ]ô]⁄
+	Àÿ\K›åKÿYŸ[ùÀ€\›	 N¬àYà
+YŸ[ù‘ô\‹õ⁄ H¬à€€ú›YŸ[ù»H]ÿZ]YŸ[ù‘ô\‹öú€€ä
+N¬àYŸ[ùŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[YŸ[ùœ€‹[€èâŒ¬à
+YŸ[ù»◊JKôõ‹ëXX⁄
+HOà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHHKòYŸ[ù⁄Y¬à‹ù^€€ù[ùHKõò[YHKö‹›ò[YHKòYŸ[ù⁄Y¬àYŸ[ùŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»ÿYYŸ[ù»õ‹àY]öX‹»ö[\âÀ\úäN¬àBàBÇàÀ»]öXŸHö[\à›\ù»[\HH‹[]Y⁄[àYŸ[ù\»Ÿ[X›YàYà
+]öXŸTŸ[X›
+H¬à]öXŸTŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[]öXŸ\œ€‹[€èâŒ¬à]öXŸTŸ[X›ô\ÿXõYHùYN¬àBüBÇôù[ò›[€à€ìY]öX‹’[ò[ù⁄[ôŸJ]ù
+H¬à€€ú›[ò[ùYH]ùù\ôŸ]ùò[YN¬àY]öX‹’ìKôö[\úÀù[ò[ùYH[ò[ùY¬àY]öX‹’ìKôö[\úÀòYŸ[ùYH	…Œ¬àY]öX‹’ìKôö[\úÀô]öXŸTŸ\öX[H	…Œ¬ÇàÀ»\]Hö\›X[›]Bà]ùù\ôŸ]ò€\‹”\›ùŸŸ€J	⁄\À]ò[YIÀH][ò[ùY
+N¬ÇàÀ»ô\Ÿ]YŸ[ùŸ]öXŸHö[\ú¬à€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿYŸ[ùŸö[\â N¬à€€ú›]öXŸTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊Ÿ]öXŸWŸö[\â N¬àYà
+YŸ[ùŸ[X›
+H¬àYŸ[ùŸ[X›ùò[YHH	…Œ¬àYŸ[ùŸ[X›ò€\‹”\›úô[[›ôJ	⁄\À]ò[YI N¬àÀ»⁄›»YŸ[ùö[\à⁄[à[ò[ùŸ[X›YYH⁄[àê[[ò[ù»ÇàYŸ[ùŸ[X›ú›[Kô\‹^HH[ò[ùY»	…»à	€õ€ôIŒ¬àBàYà
+]öXŸTŸ[X›
+H¬à]öXŸTŸ[X›ùò[YHH	…Œ¬à]öXŸTŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[]öXŸ\œ€‹[€èâŒ¬à]öXŸTŸ[X›ô\ÿXõYHùYN¬à]öXŸTŸ[X›ò€\‹”\›úô[[›ôJ	⁄\À]ò[YI N¬àÀ»YH]öXŸHö[\à⁄[à[ò[ù⁄[ôŸ\¬à]öXŸTŸ[X›ú›[Kô\‹^HH	€õ€ôIŒ¬àBÇàÀ»ô[ÿYY]öX‹»⁄]ô]»ö[\ÇàÿYY]öX‹ ùYJN¬ÇàÀ»ôK\‹[]HYŸ[ùö[\àõ‹àŸ[X›Y[ò[ùàYà
+[ò[ùY
+H¬à‹[]PYŸ[ùö[\ëõ‹ï[ò[ù
+[ò[ùY
+N¬àBüBÇò\ﬁ[ò»ù[ò›[€à‹[]PYŸ[ùö[\ëõ‹ï[ò[ù
+[ò[ùY
+H¬à€€ú›YŸ[ùŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊ÿYŸ[ùŸö[\â N¬àYà
+XYŸ[ùŸ[X›
+Hô]\õé¬ÇàûH¬à]\õH	Àÿ\K›åKÿYŸ[ùÀ€\›	Œ¬àYà
+[ò[ùY
+H¬à\õ
+œH›[ò[ù⁄YIŸ[ò€ŸUTíP€€\€ô[ù
+[ò[ùY
+_X¬àBà€€ú›ô\‹H]ÿZ]ô]⁄
+\õ
+N¬àYà
+ô\‹õ⁄ H¬à€€ú›YŸ[ù»H]ÿZ]ô\‹öú€€ä
+N¬àYŸ[ùŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[YŸ[ùœ€‹[€èâŒ¬à
+YŸ[ù»◊JKôõ‹ëXX⁄
+HOà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHHKòYŸ[ù⁄Y¬à‹ù^€€ù[ùHKõò[YHKö‹›ò[YHKòYŸ[ù⁄Y¬àYŸ[ùŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬àBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»ô[ÿYYŸ[ù»õ‹à[ò[ù	À\úäN¬àBüBÇôù[ò›[€à€ìY]öX‹–YŸ[ù⁄[ôŸJ]ù
+H¬à€€ú›YŸ[ùYH]ùù\ôŸ]ùò[YN¬àY]öX‹’ìKôö[\úÀòYŸ[ùYHYŸ[ùY¬àY]öX‹’ìKôö[\úÀô]öXŸTŸ\öX[H	…Œ¬ÇàÀ»\]Hö\›X[›]Bà]ùù\ôŸ]ò€\‹”\›ùŸŸ€J	⁄\À]ò[YIÀHXYŸ[ùY
+N¬Çà€€ú›]öXŸTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊Ÿ]öXŸWŸö[\â N¬àYà
+]öXŸTŸ[X›
+H¬à]öXŸTŸ[X›ùò[YHH	…Œ¬à]öXŸTŸ[X›ò€\‹”\›úô[[›ôJ	⁄\À]ò[YI N¬ÇàYà
+YŸ[ùY
+H¬àÀ»⁄›»[ô‹[]H]öXŸHö[\àõ‹àŸ[X›YYŸ[ùà]öXŸTŸ[X›ú›[Kô\‹^HH	…Œ¬à‹[]Q]öXŸQö[\ëõ‹êYŸ[ù
+YŸ[ùY
+N¬àH[ŸH¬àÀ»YH]öXŸHö[\à⁄[àê[YŸ[ù»à\»Ÿ[X›Yà]öXŸTŸ[X›ú›[Kô\‹^HH	€õ€ôIŒ¬à]öXŸTŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[]öXŸ\œ€‹[€èâŒ¬à]öXŸTŸ[X›ô\ÿXõYHùYN¬àBàBÇàÀ»ô[ÿYY]öX‹»⁄]ô]»ö[\ÇàÿYY]öX‹ ùYJN¬üBÇò\ﬁ[ò»ù[ò›[€à‹[]Q]öXŸQö[\ëõ‹êYŸ[ù
+YŸ[ùY
+H¬à€€ú›]öXŸTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊Ÿ]öXŸWŸö[\â N¬àYà
+Y]öXŸTŸ[X›
+Hô]\õé¬Çà]öXŸTŸ[X›ô\ÿXõYHò[ŸN¬à]öXŸTŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèê[]öXŸ\œ€‹[€èâŒ¬ÇàûH¬àÀ»ô]⁄[]öXŸ\»[ôö[\àûHYŸ[ù⁄Y€Y[ù\⁄YBà€€ú›ô\‹H]ÿZ]ô]⁄
+	Àÿ\K›åKŸ]öXŸ\À€\›	 N¬àYà
+ô\‹õ⁄ H¬à€€ú›]HH]ÿZ]ô\‹öú€€ä
+N¬à€€ú›]öXŸ\»H\úò^Kö\–\úò^J]JH»]Hà
+]Kô]öXŸ\»◊JN¬àÀ»ö[\à»€õH]öXŸ\»ô[€ô⁄[ô»»HŸ[X›YYŸ[ùà€€ú›YŸ[ù]öXŸ\»H]öXŸ\Àôö[\äOàòYŸ[ù⁄YOOHYŸ[ùY
+N¬àYŸ[ù]öXŸ\Àôõ‹ëXX⁄
+Oà¬à€€ú›‹Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	€‹[€â N¬à‹ùò[YHHúŸ\öX[¬à‹ù^€€ù[ùHõ[Ÿ[úŸ\öX[¬àYà
+ö\
+H¬à‹ù^€€ù[ù
+œH
+	Ÿö\JX¬àBà]öXŸTŸ[X›ò\[ô⁄[
+‹
+N¬àJN¬ÇàYà
+YŸ[ù]öXŸ\Àõ[ô›OOH
+H¬à]öXŸTŸ[X›ö[õô\íSH	œ‹[€àò[YOHàèìõ»]öXŸ\œ€‹[€èâŒ¬à]öXŸTŸ[X›ô\ÿXõYHùYN¬àBàBàHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	—òZ[Y»ÿY]öXŸ\»õ‹àYŸ[ù	À\úäN¬à]öXŸTŸ[X›ô\ÿXõYHùYN¬àBüBÇôù[ò›[€à€ìY]öX‹—]öXŸP⁄[ôŸJ]ù
+H¬à€€ú›Ÿ\öX[H]ùù\ôŸ]ùò[YN¬àY]öX‹’ìKôö[\úÀô]öXŸTŸ\öX[HŸ\öX[¬ÇàÀ»\]Hö\›X[›]Bà]ùù\ôŸ]ò€\‹”\›ùŸŸ€J	⁄\À]ò[YIÀH\Ÿ\öX[
+N¬ÇàÀ»ô[ÿYY]öX‹»⁄]ô]»ö[\ÇàÿYY]öX‹ ùYJN¬üBÇôù[ò›[€àŸ]Y]öX‹‘ò[ôŸJò[ôŸJH¬àYà
+\ò[ôŸHò[ôŸHOOHY]öX‹’ìKúò[ôŸJHô]\õé¬àY]öX‹’ìKúò[ôŸHHò[ôŸN¬à\]SY]öX‹‘ò[ôŸPù]€ú 
+N¬àÿYY]öX‹ ùYJN¬üBÇôù[ò›[€à\]SY]öX‹‘ò[ôŸPù]€ú 
+H¬à€€ú›€€ùõ€»Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Y]öX‹◊‹ò[ôŸWÿ€€ùõ€… N¬àYà
+X€€ùõ€ Hô]\õé¬à€€ùõ€Àú]Y\ûTŸ[X›‹ê[
+	÷Ÿ]K\ò[ôŸWI Kôõ‹ëXX⁄
+ùàOà¬àYà
+ùãôŸ]]öXù]J	Ÿ]K\ò[ôŸI HOOHY]öX‹’ìKúò[ôŸJH¬àùãò€\‹”\›òY
+	ÿX›]ôI N¬àH[ŸH¬àùãò€\‹”\›úô[[›ôJ	ÿX›]ôI N¬àBàJN¬üBÇôù[ò›[€à\”Y]öX‹’XêX›]ôJ
+H¬à€€ú›XàHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	÷Ÿ]K]XèHõY]öX‹»óI N¬àô]\õàXà	âà]Xãò€\‹”\›ò€€ùZ[ú 	⁄Y[â N¬üBÇã äÇà
+à[ôH]ôHY]öX‹»€ò\⁄›úõ€H‘—Hõ‹àôX[][YH⁄\ù\]\ÀÇà
+à\[ô»Hô]»€ò\⁄›»H[Y\Ÿ\öY\»]H[ôôK\ô[ô\ú»⁄\ùÀÇà
+ã¬ôù[ò›[€à[ôS]ôSY]öX‹‘€ò\⁄›
+€ò\⁄›
+H¬àÀ»€õH\]HYà€àY]öX‹»Xà[ôŸH]ôH^\›[ô»]H»\[ô¬àYà
+Z\”Y]öX‹’XêX›]ôJ
+H\Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ H¬àô]\õé¬àBÇà€€ú›»HŸ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\Œ¬à€€ú›€ò\⁄›»HÀú€ò\⁄›»◊N¬à€€ú›⁄\ùŸ\öY\»HÀò⁄\ù‹Ÿ\öY\»ﬂN¬ÇàÀ»€€ùô\ù€ò\⁄›[Y\›[\»Z[\ŸX€€ô»õ‹à⁄\ù€€\]Xö[]Bà€€ú›[Y\›[\\»Hô]»]J€ò\⁄›ù[Y\›[\
+KôŸ][YJ
+N¬à€€ú›õY]H€ò\⁄›ôõY]ﬂN¬à€€ú›Ÿ\ùô\àH€ò\⁄›úŸ\ùô\àﬂN¬ÇàÀ»\[ô»€ò\⁄›»\úò^Bà€ò\⁄›Àú\⁄
+¬à[Y\›[\à€ò\⁄›ù[Y\›[\àY\éà€ò\⁄›ùY\à	‹ò]…ÀàõY]àõY]àŸ\ùô\éàŸ\ùô\ãàJN¬ÇàÀ»\[ô»⁄\ù‹Ÿ\öY\»\úò^\»õ‹àXX⁄Y]öX¬àÀ»òX⁄Ÿ[ô\Ÿ\»€€\X››üHõ‹õX]€»ŸH\[ô[àHÿ[YHõ‹õX]à€€ú›\[ô⁄[ùH
+Ÿ^Kò[YJHOà¬àYà
+⁄\ùŸ\öY\÷⁄Ÿ^WH	âà\úò^Kö\–\úò^J⁄\ùŸ\öY\÷⁄Ÿ^WJJH¬àÀ»\ŸHHÿ[YHõ‹õX]\»^\›[ô»⁄[ù»
+€€\X››üJBà⁄\ùŸ\öY\÷⁄Ÿ^WKú\⁄
+»à[Y\›[\\Àéàò[YHœ»JN¬àBàN¬ÇàÀ»õY]Y]öX‹¬à\[ô⁄[ù
+	ÿYŸ[ù…ÀõY]ù›[ÿYŸ[ù N¬à\[ô⁄[ù
+	Ÿ]öXŸ\…ÀõY]ù›[Ÿ]öXŸ\ N¬à\[ô⁄[ù
+	Ÿ]öXŸ\◊€€õ[ôIÀõY]ô]öXŸ\◊€€õ[ôJN¬à\[ô⁄[ù
+	Ÿ]öXŸ\◊€Ÿôõ[ôIÀõY]ô]öXŸ\◊€Ÿôõ[ôJN¬à\[ô⁄[ù
+	Ÿ]öXŸ\◊Ÿ\úõ‹âÀõY]ô]öXŸ\◊Ÿ\úõ‹äN¬à\[ô⁄[ù
+	ÿYŸ[ù◊›‹…ÀõY]òYŸ[ù◊›‹ N¬à\[ô⁄[ù
+	ÿYŸ[ù◊⁄	ÀõY]òYŸ[ù◊⁄
+N¬à\[ô⁄[ù
+	ÿYŸ[ù◊€Ÿôõ[ôIÀõY]òYŸ[ù◊€Ÿôõ[ôJN¬à\[ô⁄[ù
+	›€ô\ó⁄Y⁄	ÀõY]ù€ô\ó⁄Y⁄
+N¬à\[ô⁄[ù
+	›€ô\ó€YY][IÀõY]ù€ô\ó€YY][JN¬à\[ô⁄[ù
+	›€ô\ó€›…ÀõY]ù€ô\ó€› N¬à\[ô⁄[ù
+	›€ô\óÿ‹ö]Xÿ[	ÀõY]ù€ô\óÿ‹ö]Xÿ[
+N¬à\[ô⁄[ù
+	›€ô\ó›[ö€õ›€âÀõY]ù€ô\ó›[ö€õ›€äN¬à\[ô⁄[ù
+	››[‹YŸ\…ÀõY]ù›[‹YŸ\ N¬à\[ô⁄[ù
+	ÿ€€‹ó‹YŸ\…ÀõY]ò€€‹ó‹YŸ\ N¬à\[ô⁄[ù
+	€[€õ◊‹YŸ\…ÀõY]õ[€õ◊‹YŸ\ N¬à\[ô⁄[ù
+	‹ÿÿ[óÿ€›[ù	ÀõY]úÿÿ[óÿ€›[ù
+N¬à\[ô⁄[ù
+	›‹◊ÿ€€õôX›[€ú…ÀõY]ù‹◊ÿ€€õôX›[€ú N¬ÇàÀ»Ÿ\ùô\àY]öX‹¬à\[ô⁄[ù
+	Ÿ€‹õ›][ô\…ÀŸ\ùô\ãô€‹õ›][ô\ N¬à\[ô⁄[ù
+	⁄X\ÿ[ÿ…ÀŸ\ùô\ãöX\ÿ[ÿ◊€XäN¬à\[ô⁄[ù
+	Ÿó‹⁄^ôIÀŸ\ùô\ãôó‹⁄^ôWÿû]\ N¬ÇàÀ»ù[ôH€]H⁄[ù»›]⁄YH›\úô[ù[YH⁄[ô›¬à€€ú›ò[ôŸU⁄[ô›»HŸ]Y]öX‹‘ò[ôŸU⁄[ô› Y]öX‹’ìKúò[ôŸJN¬à€€ú››]ŸôàH]Kõõ› 
+HHò[ôŸU⁄[ô›Œ¬ÇàÀ»ù[ôH€ò\⁄›¬à⁄[H
+€ò\⁄›Àõ[ô›à	âàô]»]J€ò\⁄›÷ÃKù[Y\›[\
+KôŸ][YJ
+H›]ŸôäH¬à€ò\⁄›Àú⁄Yù
+
+N¬àBÇàÀ»ù[ôH⁄\ù‹Ÿ\öY\»
+⁄[ù»\ŸH›üHõ‹õX]⁄\ôH\»[Y\›[\[à\ Bàõ‹à
+€€ú›Ÿ^H[à⁄\ùŸ\öY\ H¬à€€ú›\úàH⁄\ùŸ\öY\÷⁄Ÿ^WN¬àYà
+\úò^Kö\–\úò^J\úäJH¬à⁄[H
+\úãõ[ô›à	âà\úñÃKù›]ŸôäH¬à\úãú⁄Yù
+
+N¬àBàBàBÇàÀ»ôK\ô[ô\àH[YK\Ÿ\öY\»⁄\ù»
+õ›Y»]õ⁄Y^Ÿ\‹⁄]ôHôYò]‹ Bàõ›Yô[ô\ì]ôSY]öX‹ 
+N¬üBÇãÀ»õ›H]ôH⁄\ù\]\»»X^€òŸH\àŸX€€ôõ‹à€[€›\ôõ‹õX[òŸBõ]€]ôSY]öX‹‘ô[ô\ï[Y\àHù[¬ôù[ò›[€àõ›Yô[ô\ì]ôSY]öX‹ 
+H¬àYà
+€]ôSY]öX‹‘ô[ô\ï[Y\äHô]\õé¬à€]ôSY]öX‹‘ô[ô\ï[Y\àHŸ][Y[›]
+
+
+HOà¬à€]ôSY]öX‹‘ô[ô\ï[Y\àHù[¬àô[ô\ê€€ú›[XXõ\’[YTŸ\öY\–⁄\ù Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ N¬àô[ô\êYŸ[ùõY]⁄\ù Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ N¬àô[ô\îŸ\ùô\ï[YTŸ\öY\–⁄\ù Ÿ\ùô\ìY]öX‹’ìKù[Y\Ÿ\öY\ N¬àKL
+N¬üBÇôù[ò›[€à\—]öXŸ\’XêX›]ôJ
+H¬à€€ú›XàHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	÷Ÿ]K]XèHô]öXŸ\»óI N¬àô]\õàXà	âà]Xãò€\‹”\›ò€€ùZ[ú 	⁄Y[â N¬üBÇôù[ò›[€à‘Ÿ\öY\‘⁄[ù \úäH¬àYà
+P\úò^Kö\–\úò^J\úäJHô]\õà◊N¬àô]\õà\úãõX\
+Oà¬à€€ú›[Y\›[\HÀù[Y\›[\Àï[Y\›[\¬à€€ú›ò[YHHù[Xô\äÀùò[YHœ»Àïò[YHœ»
+N¬à€€ú›[YS\»H[Y\›[\»ô]»]J[Y\›[\
+KôŸ][YJ
+HàòSé¬àô]\õà
+ù[Xô\ãö\—ö[ö]J[YS\ JH»»[YNà[YS\Àò[YHHàù[¬àJKôö[\äõ€€X[äN¬üBÇôù[ò›[€àÿ[›[]Uõ›Y⁄]
+Ÿ\öY\ H¬àYà
+P\úò^Kö\–\úò^JŸ\öY\ HŸ\öY\Àõ[ô›OOH
+Hô]\õà¬à€€ú››[HŸ\öY\ÀúôYXŸJ
+›[K
+HOà›[H
+»ù[Xô\äÀùò[YHÀïò[YH
+K
+N¬à€€ú››\ú»HŸ]Y]öX‹‘ò[ôŸU⁄[ô› Y]öX‹’ìKúò[ôŸJH»
+å
+àå
+àL
+N¬àô]\õà›\ú»à»›[»›\ú»à¬üBÇãÀ»⁄\ùù[ò›[€ú»
+ò]—õY]⁄\ùò]—õY]⁄\ùX[^\ H\ôHõ›»[à][Àÿ⁄\ùÀöú¬ãÀ»õ‹õX]\ò][€îŸXÀõ‹õX]]T⁄‹ùõ‹õX][YT⁄‹ù\ôHõ›»[à][ÀŸõ‹õX]\úÀöú¬Çôù[ò›[€àô[ô\ìŸ‹ Ÿ‹ H¬àÀ»\úŸH[ôõ‹õX[^ôHŸ»[ô\¬à][ô\»H◊N¬à]\–\[ôHò[ŸN¬àYà
+Ÿ‹»	âàŸ‹ÀõŸ‹»	âà\úò^Kö\–\úò^JŸ‹ÀõŸ‹ JH¬à[ô\»HŸ‹ÀõŸ‹Œ¬à\–\[ôHõ€€X[äŸ‹Àò\[ô
+N¬àH[ŸHYà
+\úò^Kö\–\úò^JŸ‹ JH¬à[ô\»HŸ‹Œ¬àH[ŸHYà
+\[ŸàŸ‹»OOH	‹›ö[ô… H¬à[ô\»HŸ‹Àú‹]
+	◊â Kôö[\äOàùö[J
+JN¬àBÇàÀ»\úŸHŸ»[ô\»[ù»›ùX›\ôY[ùöY\»
+Yàõ›[ôXYH\úŸY
+BàÀ»⁄X⁄»Yàö\ú›][H\»[ôXYHH\úŸY[ùûH
+\»	‹ò]…»õ‹\ùJBàYà
+[ô\Àõ[ô›à	âà\[Ÿà[ô\÷ÃHOOH	€ÿöôX›	»	âà[ô\÷ÃKúò]»OOH[ôYö[ôY
+H¬à›\úô[ùŸ”[ô\»H[ô\Œ»À»[ôXYH\úŸYàH[ŸH¬à›\úô[ùŸ”[ô\»H[ô\ÀõX\
+\úŸSŸ”[ôJN¬àBÇàÀ»ﬁ[ò»⁄]Ÿ‹‘›]HYà[ùöY\»ÿ[YHúõ€HÿYŸ‹¬àYà
+Ÿ‹‘›]Kô[ùöY\Àõ[ô›à
+H¬à›\úô[ùŸ”[ô\»HŸ‹‘›]Kô[ùöY\Œ¬àBÇàÀ»ô[ô\àò\ŸY€à›\úô[ùöY]»[ŸH
+\‹»\–\[ô»⁄⁄\]]À\ÿ‹õ€
+BàYà
+X›]ôSŸ’öY]”[ŸHOOH	›XõI H¬àô[ô\ìŸ‹’XõJ›\úô[ùŸ”[ô\À\–\[ô
+N¬àH[ŸH¬àô[ô\ìŸ‹‘ò] ›\úô[ùŸ”[ô\À\–\[ô
+N¬àBüBÇã äÇà
+à\úŸHH⁄[ô€HŸ»[ôH[ù»›ùX›\ôY€€\€ô[ù¬à
+àõ‹õX]àåãLKLïMNååKLŒå”UëSHY\‹ÿYŸHŸ^O]ò[YHŸ^O]ò[YBà
+ã¬ôù[ò›[€à\úŸSŸ”[ôJ[ôJH¬àYà
+[[ôH\[Ÿà[ôHOOH	‹›ö[ô… H¬àô]\õà»ò]Œà›ö[ô [ôH	… K[Y\›[\àù[]ô[à	…ÀY\‹ÿYŸNà[ôH	…À€€ù^àﬂHN¬àBÇà€€ú›[ùûHH»ò]Œà[ôK[Y\›[\àù[]ô[à	…ÀY\‹ÿYŸNà	…À€€ù^àﬂHN¬ÇàÀ»X]⁄[Y\›[\]›\ùàT”»åHõ‹õX]à€€ú›[Y\›[\X]⁄H[ôKõX]⁄
+◊äÕKWÃüKWÃüUÃüNóÃüNóÃüJŒñ ÀWWÃüNóÃü_äO W ã N¬àYà
+[Y\›[\X]⁄
+H¬àûH¬à[ùûKù[Y\›[\Hô]»]J[Y\›[\X]⁄ÃWJN¬àHÿ]⁄
+JH¬à[ùûKù[Y\›[\Hù[¬àBà[ôHH[ôKú€XŸJ[Y\›[\X]⁄ÃKõ[ô›
+N¬àBÇàÀ»X]⁄]ô[[àúòX⁄Ÿ]Œà—Tîì‘óK’–TìóK“Sëì◊K—PïQ◊K’êP—WBà€€ú›]ô[X]⁄H[ôKõX]⁄
+◊ó   WW ã N¬àYà
+]ô[X]⁄
+H¬à[ùûKõ]ô[H]ô[X]⁄ÃWKù’\\êÿ\ŸJ
+N¬à[ôHH[ôKú€XŸJ]ô[X]⁄ÃKõ[ô›
+N¬àBÇàÀ»^òX›Ÿ^O]ò[YH€€ù^Z\ú»úõ€HH[ôàÀ»€‹ö»òX⁄›ÿ\ô»»ö[ô€€ù^Z\ú¬à€€ú›€€ù^Z\ú»H◊N¬à€€ú››î]\õàH◊    OJñ◊àóJàü  IŒ¬à]ô[XZ[ö[ô»H[ôN¬à]X]⁄¬à⁄[H
+
+X]⁄Hô[XZ[ö[ôÀõX]⁄
+›î]\õäJHOOHù[
+H¬à]ò[YHHX]⁄ÃóN¬àÀ»ô[[›ôH][›\»Yàô\Ÿ[ùàYà
+ò[YKú›\ù’⁄]
+	»â H	âàò[YKô[ô’⁄]
+	»â JH¬àò[YHHò[YKú€XŸJKLJN¬àBà€€ù^Z\úÀù[ú⁄Yù
+»Ÿ^NàX]⁄ÃWKò[YNàò[YHJN¬àô[XZ[ö[ô»Hô[XZ[ö[ôÀú€XŸJX]⁄ö[ô^
+N¬àBÇà[ùûKõY\‹ÿYŸHHô[XZ[ö[ôÀùö[J
+N¬à€€ù^Z\úÀôõ‹ëXX⁄
+Z\àOà¬à[ùûKò€€ù^‹Z\ãöŸ^WHHZ\ãùò[YN¬àJN¬Çàô]\õà[ùûN¬üBÇôù[ò›[€àô[ô\ìŸ‹’XõJ[ùöY\À\–\[ôHò[ŸJH¬à€€ú›õŸHHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ◊›XõWÿõŸI N¬àYà
+]õŸJH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	‹ô[ô\ìŸ‹’XõNàõŸHõ›õ›[ô	 N¬àô]\õé¬àBÇàÀ»\]H›[€›[ùúõ€HŸ\ùô\à›]Bà€€ú›[ùûP€›[ù[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ‹◊Ÿ[ùûWÿ€›[ù	 N¬àYà
+[ùûP€›[ù[
+H¬à[ùûP€›[ù[ù^€€ù[ùHŸ‹‘›]Kù›[
+[ùöY\»»[ùöY\Àõ[ô›à
+N¬àBÇàYà
+Y[ùöY\»[ùöY\Àõ[ô›OOH
+H¬àõŸKö[õô\íSH	œèè€€‹[èHçà€\‹œHõŸÀ]XõKY[\Hèìõ»Ÿ‹»]òZ[XõO›è›èâŒ¬à\]SŸ‹‘⁄›⁄[ô–€›[ù
+
+N¬àô]\õé¬àBÇàÀ»Ÿ\ùô\ã\⁄YHö[\ö[ô»\»[ôXYH\YYù\›ô[ô\à[[ùöY\¬à\]SŸ‹‘⁄›⁄[ô–€›[ù
+[ùöY\Àõ[ô›
+N¬ÇàÀ»ùZ[õ›‹»⁄]ÿY[[‹ôHŸ[ù[ô[]H[ô
+õ‹àÿY[ô»€\àŸ‹ Bà€€ú›õ›‹»H[ùöY\ÀõX\
+[ùûHOà¬à€€ú›[YR[H[ùûKù[Y\›[\à»‹[à€\‹œHõŸÀ][YKY]HèâŸõ‹õX]]T⁄‹ù
+[ùûKù[Y\›[\
+_O‹‹[èâŸõ‹õX][YT⁄‹ù
+[ùûKù[Y\›[\
+_Xàà	œ‹[à€\‹œHõŸÀ][YHè∏†%‹‹[èâŒ¬Çà€€ú›]ô[⁄Ÿ[àHÿYôP€\‹’⁄Ÿ[ä[ùûKõ]ô[…ÿ‹ö]Xÿ[	À	Ÿ\úõ‹âÀ	›ÿ\õâÀ	›ÿ\õö[ô…À	⁄[ôõ…À	ŸXùY…À	›òXŸI◊K	⁄[ôõ… N¬à€€ú›]ô[€\‹»H[ùûKõ]ô[»ŸÀ[]ô[I€]ô[⁄Ÿ[üXà	…Œ¬à€€ú›]ô[[H[ùûKõ]ô[à»‹[à€\‹œHõŸÀ[]ô[	€]ô[€\‹ﬂHèâŸ\ÿÿ\R[
+[ùûKõ]ô[
+_O‹‹[èòàà	…Œ¬Çà€€ú›€€ù^[HÿöôX›öŸ^\ [ùûKò€€ù^
+Kõ[ô›àà»ÿöôX›ô[ùöY\ [ùûKò€€ù^
+KõX\
+
+⁄ÀóJHOÇà‹[à€\‹œHõŸÀX€€ù^]Y»èè‹[à€\‹œHùYÀZŸ^HèâŸ\ÿÿ\R[
+ _O‹‹[èèO‹[à€\‹œHùYÀ]ò[YHèâŸ\ÿÿ\R[
+›ö[ô äJ_O‹‹[èè‹‹[èòà
+Köõ⁄[ä	… Bàà	…Œ¬Çàô]\õàèÇà€\‹œHõŸÀ][YHèâ›[YR[O›Çàâ€]ô[[O›Çà€\‹œHõŸÀ[Y\‹ÿYŸHèâŸ\ÿÿ\R[
+[ùûKõY\‹ÿYŸJ_O›Çà€\‹œHõŸÀX€€ù^èâÿ€€ù^[O›Çà›èò¬àJN¬ÇàÀ»YÿY[[‹ôHŸ[ù[ô[]H[ôYà[‹ôHŸ‹»\ôH]òZ[XõK‹à[ô[ôXÿ]‹ÇàYà
+Ÿ‹‘›]Kö\”[‹ôJH¬àõ›‹Àú\⁄
+àYHõŸ‹◊€ÿY€[‹ôW‹Ÿ[ù[ô[à€\‹œHõŸ‹À[ÿY\Ÿ[ù[ô[èÇà€€‹[èHçà›[OHù^X[Y€éòŸ[ù\é‹Y[ôŒåMú»èÇà]à€\‹œHõÿY[ôÀ\‹[õô\àà›[OHô\‹^Nö[õ[ôKXõÿ⁄Œ€X\ô⁄[ã\öY⁄é»èèŸ]èÇà‹[à€\‹œHõ]]Y]^èìÿY[ô»€\àŸ‹Àããè‹‹[èÇà›Çà›èò
+N¬àH[ŸHYà
+[ùöY\Àõ[ô›à
+H¬àõ›‹Àú\⁄
+à€\‹œHõŸ‹ÀY[ô[X\öŸ\àèÇà€€‹[èHçà›[OHù^X[Y€éòŸ[ù\é‹Y[ôŒåLúÿ€€‹éùò\äK[]]Y
+NŸõ€ù\›[Nö][XŒ»èÇà8†%[ôŸàŸ‹»8†%à›Çà›èò
+N¬àBÇàõŸKö[õô\íSHõ›‹Àöõ⁄[ä	… N¬ÇàÀ»]]À\ÿ‹õ€»õ›€HYàõ›]\ŸY[ôì’\[ô[ô»€\àŸ‹¬àYà
+Z\–\[ô
+H¬à€€ú›]\ŸP⁄X⁄ÿõﬁHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹]\ŸWÿ]]‹ÿ‹õ€	 N¬àYà
+\]\ŸP⁄X⁄ÿõﬁ\]\ŸP⁄X⁄ÿõﬁò⁄X⁄ŸY
+H¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ◊›XõWÿ€€ùZ[ô\â N¬àYà
+€€ùZ[ô\äH¬à€€ùZ[ô\ãúÿ‹õ€‹H€€ùZ[ô\ãúÿ‹õ€ZY⁄¬àBàBàBüBÇôù[ò›[€àô[ô\ìŸ‹‘ò] [ùöY\À\–\[ôHò[ŸJH¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ… N¬àYà
+X€€ùZ[ô\äH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	‹ô[ô\ìŸ‹‘ò]ŒàŸ»[[Y[ùõ›õ›[ô	 N¬àô]\õé¬àBÇàÀ»\]H›[€›[ùúõ€HŸ\ùô\à›]Bà€€ú›[ùûP€›[ù[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ‹◊Ÿ[ùûWÿ€›[ù	 N¬àYà
+[ùûP€›[ù[
+H¬à[ùûP€›[ù[ù^€€ù[ùHŸ‹‘›]Kù›[
+[ùöY\»»[ùöY\Àõ[ô›à
+N¬àBÇàYà
+Y[ùöY\»[ùöY\Àõ[ô›OOH
+H¬à€€ùZ[ô\ãù^€€ù[ùH	”õ»Ÿ‹»]òZ[XõIŒ¬à\]SŸ‹‘⁄›⁄[ô–€›[ù
+
+N¬àô]\õé¬àBÇàÀ»Ÿ\ùô\ã\⁄YHö[\ö[ô»\»[ôXYH\YYà\]SŸ‹‘⁄›⁄[ô–€›[ù
+[ùöY\Àõ[ô›
+N¬ÇàÀ»ùZ[€€ù[ù⁄]ÿY[[‹ôH[ôXÿ]‹à‹à[ôX\öŸ\Çà]€€ù[ùH[ùöY\ÀõX\
+HOàKúò] Köõ⁄[ä	◊â N¬àYà
+Ÿ‹‘›]Kö\”[‹ôJH¬à€€ù[ù
+œH	◊óãKKHÿ‹õ€›€à»ÿY€\àŸ‹»KKIŒ¬àH[ŸHYà
+[ùöY\Àõ[ô›à
+H¬à€€ù[ù
+œH	◊ó∏†%[ôŸàŸ‹»8†%	Œ¬àBà€€ùZ[ô\ãù^€€ù[ùH€€ù[ù¬ÇàÀ»]]À\ÿ‹õ€»õ›€HYàõ›]\ŸY[ôì’\[ô[ô»€\àŸ‹¬àYà
+Z\–\[ô
+H¬à€€ú›]\ŸP⁄X⁄ÿõﬁHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹]\ŸWÿ]]‹ÿ‹õ€	 N¬àYà
+\]\ŸP⁄X⁄ÿõﬁ\]\ŸP⁄X⁄ÿõﬁò⁄X⁄ŸY
+H¬à€€ùZ[ô\ãúÿ‹õ€‹H€€ùZ[ô\ãúÿ‹õ€ZY⁄¬àBàBüBÇôù[ò›[€à\]SŸ‹‘⁄›⁄[ô–€›[ù
+€›[ù
+H¬à€€ú›⁄›⁄[ô–€›[ù[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ‹◊‹⁄›⁄[ô◊ÿ€›[ù	 N¬àYà
+⁄›⁄[ô–€›[ù[
+H¬à⁄›⁄[ô–€›[ù[ù^€€ù[ùH€›[ù¬àBüBÇãÀ»Ÿ]\[ù\úŸX›[€ìÿúŸ\ùô\àõ‹àŸ‹»[ôö[ö]Hÿ‹õ€
+ÿY€\àŸ‹»⁄[àŸ[ù[ô[ôX€€Y\»ö\⁄XõJBôù[ò›[€àŸ]\Ÿ‹“[ôö[ö]Tÿ‹õ€
+
+H¬à€X[ù\Ÿ‹“[ôö[ö]Tÿ‹õ€
+
+N¬Çà€€ú›Ÿ[ù[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ‹◊€ÿY€[‹ôW‹Ÿ[ù[ô[	 N¬àYà
+\Ÿ[ù[ô[[Ÿ‹‘›]Kö\”[‹ôJHô]\õé¬ÇàŸ‹‘›]Kúÿ‹õ€ÿúŸ\ùô\àHô]»[ù\úŸX›[€ìÿúŸ\ùô\ä
+[ùöY\ HOà¬à[ùöY\Àôõ‹ëXX⁄
+[ùûHOà¬àYà
+[ùûKö\“[ù\úŸX›[ô»	âà[Ÿ‹‘›]KõÿY[ô»	âàŸ‹‘›]Kö\”[‹ôJH¬àÀ»[ôõ‹òŸH€€€›€à»ô]ô[ùù[ò]ÿ^Hô\]Y\›¬à€€ú›õ›»H]Kõõ› 
+N¬àYà
+õ›»HŸ‹‘›]Kõ\›ÿY[YHŸ‹‘›]Kò€€€›€ì\ H¬àô]\õé¬àBàŸ‹‘›]Kõ\›ÿY[YHHõ›Œ¬àÀ»ÿY€\àŸ‹¬àÿYŸ‹ »\[ôàùYHJN¬àBàJN¬àK¬àõ€›àÿ›[Y[ùôŸ][[Y[ùûRY
+	€Ÿ◊›XõWÿ€€ùZ[ô\â Kàõ€›X\ô⁄[éà	ÃL	Ààô\⁄€àåBàJN¬ÇàŸ‹‘›]Kúÿ‹õ€ÿúŸ\ùô\ãõÿúŸ\ùôJŸ[ù[ô[
+N¬üBÇôù[ò›[€à€X[ù\Ÿ‹“[ôö[ö]Tÿ‹õ€
+
+H¬àYà
+Ÿ‹‘›]Kúÿ‹õ€ÿúŸ\ùô\äH¬àŸ‹‘›]Kúÿ‹õ€ÿúŸ\ùô\ãô\ÿ€€õôX›
+
+N¬àŸ‹‘›]Kúÿ‹õ€ÿúŸ\ùô\àHù[¬àBüBÇãÀ»õ‹õX]]T⁄‹ù[ôõ‹õX][YT⁄‹ù\ôHõ›»[à][ÀŸõ‹õX]\úÀöú¬Çôù[ò›[€àô[ô\ê]Y]Ÿ‹ [ùöY\À‹[€ú»HﬂJH¬à€€ú›€€ùZ[ô\àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€Ÿ‹◊›XõI N¬àYà
+X€€ùZ[ô\äH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	‹ô[ô\ê]Y]Ÿ‹Œà€€ùZ[ô\àõ›õ›[ô	 N¬àô]\õé¬àBÇà€€ú›\[ôHõ€€X[ä‹[€úÀò\[ô
+N¬ÇàYà
+P\úò^Kö\–\úò^J[ùöY\ H[ùöY\Àõ[ô›OOH
+H¬à€€ú›Y\‹ÿYŸHH‹[€úÀôö[\ú–X›]ôBà»	”õ»]Y][ùöY\»X]⁄H›\úô[ùö[\úÀâ¬àà	”õ»]Y][ùöY\»[à\»⁄[ô›ÀâŒ¬à€€ùZ[ô\ãö[õô\íSH]à€\‹œHõ]]Y]^à›[OHúY[ôŒåLú»èâŸ\ÿÿ\R[
+Y\‹ÿYŸJ_OŸ]èò¬à€X[ù\]Y][ôö[ö]Tÿ‹õ€
+
+N¬àô]\õé¬àBÇàÀ»õŸ‹ô\‹⁄]ôHô[ô\ö[ô»H€õHô[ô\àHYŸH]H[YBàYà
+X\[ô
+H¬à]Y]ô[ô\î›]Kô\‹^YYH¬àÀ»[ö]X[^ôHHXõH›ùX›\ôBà€€ùZ[ô\ãö[õô\íSHàXõH€\‹œHú⁄[\K]XõHèÇàXYÇàèÇàï[Y\›[\›ÇàêX›‹è›ÇàêX›[€è›Çàï\ôŸ]›Çàë]Z[œ›Çà›èÇà›XYÇàõŸOè›õŸOÇà›XõOÇà¬àBÇà€€ú›õŸHH€€ùZ[ô\ãú]Y\ûTŸ[X›‹ä	›õŸI N¬àYà
+]õŸJHô]\õé¬Çà€€ú››\ùYH]Y]ô[ô\î›]Kô\‹^YY¬à€€ú›[ôYHX]õZ[ä›\ùY
+»]Y]ô[ô\î›]KúYŸT⁄^ôK[ùöY\Àõ[ô›
+N¬à€€ú›YŸQ[ùöY\»H[ùöY\Àú€XŸJ›\ùY[ôY
+N¬ÇàÀ»ô[[›ôH^\›[ô»Ÿ[ù[ô[à€€ú›^\›[ô‘Ÿ[ù[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€ÿY€[‹ôW‹Ÿ[ù[ô[	 N¬àYà
+^\›[ô‘Ÿ[ù[ô[
+H^\›[ô‘Ÿ[ù[ô[úô[[›ôJ
+N¬Çà€€ú›õ›‹»HYŸQ[ùöY\ÀõX\
+[ùûHOà¬à€€ú›»H\ÿÿ\R[
+õ‹õX]]U[YJ[ùûKù[Y\›[\
+JN¬à€€ú›ô[H\ÿÿ\R[
+õ‹õX]ô[]]ôU[YJ[ùûKù[Y\›[\
+JN¬à€€ú›X›‹ìò[YHH[ùûKòX›‹ó€ò[YH[ùûKòX›‹ó⁄Y	¯†%	Œ¬à€€ú›X›‹ìY]T\ù»H◊N¬àYà
+[ùûKòX›‹ó›\JH¬àX›‹ìY]T\ùÀú\⁄
+
+[ùûKòX›‹ó›\H	… Kù’\\êÿ\ŸJ
+JN¬àBàYà
+[ùûKòX›‹ó⁄Y
+H¬àX›‹ìY]T\ùÀú\⁄
+[ùûKòX›‹ó⁄Y
+N¬àBà€€ú›X›‹ìY]HHX›‹ìY]T\ùÀõ[ô›»]à€\‹œHò]Y]XX›‹ã[Y]HèâŸ\ÿÿ\R[
+X›‹ìY]T\ùÀöõ⁄[ä	»8†(à	 J_OŸ]èòà	…Œ¬Çà€€ú›Ÿ]ô\ö]HH›ö[ô [ùûKúŸ]ô\ö]H	⁄[ôõ… Kù”›Ÿ\êÿ\ŸJ
+N¬à€€ú›Ÿ]ô\ö]PòYŸHH‹[à€\‹œHòòYŸH	ŸŸ]Ÿ]ô\ö]PòYŸP€\‹ Ÿ]ô\ö]J_HèâŸ\ÿÿ\R[
+Ÿ]ô\ö]Kù’\\êÿ\ŸJ
+J_O‹‹[èò¬Çà€€ú›X›[€ìXô[H\ÿÿ\R[
+[ùûKòX›[€à	¯†%	 N¬Çà€€ú›\ôŸ]ö[X\ûT\ù»H◊N¬àYà
+[ùûKù\ôŸ]›\JH\ôŸ]ö[X\ûT\ùÀú\⁄
+[ùûKù\ôŸ]›\JN¬àYà
+[ùûKù\ôŸ]⁄Y
+H\ôŸ]ö[X\ûT\ùÀú\⁄
+[ùûKù\ôŸ]⁄Y
+N¬à€€ú›\ôŸ]ö[X\ûHH\ôŸ]ö[X\ûT\ùÀõ[ô›»\ÿÿ\R[
+\ôŸ]ö[X\ûT\ùÀöõ⁄[ä	»8†(à	 JHà	¯†%	Œ¬à€€ú›[ò[ùY»H[ùûKù[ò[ù⁄Y»]à€\‹œHò]Y]]\ôŸ][Y]Hèï[ò[ùà	Ÿ\ÿÿ\R[
+[ùûKù[ò[ù⁄Y
+_OŸ]èòà	…Œ¬Çà€€ú›]Z[[ô\»H◊N¬àYà
+[ùûKô]Z[ H¬à]Z[[ô\Àú\⁄
+[ùûKô]Z[ N¬àBàYà
+[ùûKö\ÿYô\‹ H¬à]Z[[ô\Àú\⁄
+Tà	Ÿ[ùûKö\ÿYô\‹ﬂX
+N¬àBàYà
+[ùûKù\Ÿ\óÿYŸ[ù
+H¬à]Z[[ô\Àú\⁄
+\Ÿ\ãPYŸ[ùà	Ÿ[ùûKù\Ÿ\óÿYŸ[ùX
+N¬àBàYà
+[ùûKúô\]Y\›⁄Y
+H¬à]Z[[ô\Àú\⁄
+ô\]Y\›à	Ÿ[ùûKúô\]Y\›⁄YX
+N¬àBà€€ú›Y]Y]U^Hõ‹õX]]Y]Y]Y]J[ùûKõY]Y]JN¬à€€ú›]Z[^H]Z[[ô\Àõ[ô›»\ÿÿ\R[
+]Z[[ô\Àöõ⁄[ä	◊â JHà	¯†%	Œ¬à€€ú›Y]Y]Põÿ⁄»HY]Y]U^»ôH€\‹œHò]Y][Y]Y]HèâŸ\ÿÿ\R[
+Y]Y]U^
+_O‹ôOòà	…Œ¬Çàô]\õààèÇàÇà]à€\‹œHùXõK\ö[X\ûHèâ›ﬂOŸ]èÇà]à€\‹œHõ]]Y]^èâ‹ô[OŸ]èÇà›ÇàÇà]à€\‹œHùXõK\ö[X\ûHèâŸ\ÿÿ\R[
+X›‹ìò[YJ_OŸ]èÇà	ÿX›‹ìY]_Bà›ÇàÇà]à€\‹œHùXõK\ö[X\ûHèâÿX›[€ìXô[OŸ]èÇà]à€\‹œHò]Y]Y]Z[[Y]Hèâ‹Ÿ]ô\ö]PòYŸ_OŸ]èÇà›ÇàÇà]à€\‹œHùXõK\ö[X\ûHèâ›\ôŸ]ö[X\û_OŸ]èÇà	›[ò[ùYﬂBà›ÇàÇà]à€\‹œHò]Y]Y]Z[»èâŸ]Z[^OŸ]èÇà	€Y]Y]Põÿ⁄ﬂBà›Çà›èÇà¬àJKöõ⁄[ä	… N¬ÇàõŸKö[úŸ\ùYòXŸ[ùS
+	ÿôYõ‹ôY[ô	Àõ›‹ N¬à]Y]ô[ô\î›]Kô\‹^YYH[ôY¬ÇàÀ»YŸ[ù[ô[õ›»Yà[‹ôH][\»]òZ[XõBàYà
+[ôY[ùöY\Àõ[ô›
+H¬à€€ú›Ÿ[ù[ô[õ›»Hÿ›[Y[ùò‹ôX]Q[[Y[ù
+	›â N¬àŸ[ù[ô[õ›ÀöYH	ÿ]Y]€ÿY€[‹ôW‹Ÿ[ù[ô[	Œ¬àŸ[ù[ô[õ›Àò€\‹”ò[YHH	ÿ]Y][ÿY\Ÿ[ù[ô[	Œ¬àŸ[ù[ô[õ›Àö[õô\íSH	œ€€‹[èHçHà›[OHù^X[Y€éòŸ[ù\é‹Y[ôŒåMú»èè]à€\‹œHõÿY[ôÀ\‹[õô\àà›[OHô\‹^Nö[õ[ôKXõÿ⁄Œ€X\ô⁄[ã\öY⁄é»èèŸ]èè‹[à€\‹œHõ]]Y]^èìÿY[ô»[‹ôH]Y][ùöY\Àããè‹‹[èè›âŒ¬àõŸKò\[ô⁄[
+Ÿ[ù[ô[õ› N¬àŸ]\]Y][ôö[ö]Tÿ‹õ€
+
+N¬àH[ŸH¬à€X[ù\]Y][ôö[ö]Tÿ‹õ€
+
+N¬àBüBÇãÀ»Ÿ]\[ù\úŸX›[€ìÿúŸ\ùô\àõ‹à]Y]Ÿ‹»[ôö[ö]Hÿ‹õ€ôù[ò›[€àŸ]\]Y][ôö[ö]Tÿ‹õ€
+
+H¬à€X[ù\]Y][ôö[ö]Tÿ‹õ€
+
+N¬Çà€€ú›Ÿ[ù[ô[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ]Y]€ÿY€[‹ôW‹Ÿ[ù[ô[	 N¬àYà
+\Ÿ[ù[ô[
+Hô]\õé¬Çà]Y]ô[ô\î›]KõÿúŸ\ùô\àHô]»[ù\úŸX›[€ìÿúŸ\ùô\ä
+[ùöY\ HOà¬à[ùöY\Àôõ‹ëXX⁄
+[ùûHOà¬àYà
+[ùûKö\“[ù\úŸX›[ô»	âà]Y]ô[ô\î›]Kô\‹^YY]Y]ô[ô\î›]Kôö[\ôY[ùöY\Àõ[ô›
+H¬àÿY[‹ôP]Y]Ÿ‹ 
+N¬àBàJN¬àK¬àõ€›àù[àõ€›X\ô⁄[éà	Ãå	Ààô\⁄€ààJN¬Çà]Y]ô[ô\î›]KõÿúŸ\ùô\ãõÿúŸ\ùôJŸ[ù[ô[
+N¬üBÇãÀ»€X[ù\H]Y]Ÿ‹»[ôö[ö]Hÿ‹õ€ÿúŸ\ùô\Çôù[ò›[€à€X[ù\]Y][ôö[ö]Tÿ‹õ€
+
+H¬àYà
+]Y]ô[ô\î›]KõÿúŸ\ùô\äH¬à]Y]ô[ô\î›]KõÿúŸ\ùô\ãô\ÿ€€õôX›
+
+N¬à]Y]ô[ô\î›]KõÿúŸ\ùô\àHù[¬àBüBÇãÀ»ÿY[‹ôH]Y]Ÿ‹»õ‹à[ôö[ö]Hÿ‹õ€ôù[ò›[€àÿY[‹ôP]Y]Ÿ‹ 
+H¬àô[ô\ê]Y]Ÿ‹ ]Y]ô[ô\î›]Kôö[\ôY[ùöY\À»\[ôàùYKö[\ú–X›]ôNà\–X›]ôP]Y]ö[\ú 
+HJN¬üBÇôù[ò›[€àŸ]Ÿ]ô\ö]PòYŸP€\‹ Ÿ]ô\ö]JH¬à›⁄]⁄
+Ÿ]ô\ö]JH¬àÿ\ŸH	Ÿ\úõ‹âŒÇàô]\õà	ÿòYŸKY\úõ‹âŒ¬àÿ\ŸH	›ÿ\õâŒÇàÿ\ŸH	›ÿ\õö[ô…ŒÇàô]\õà	ÿòYŸK]ÿ\õâŒ¬àYò][Çàô]\õà	ÿòYŸKZ[ôõ…Œ¬àBüBÇôù[ò›[€àõ‹õX]]Y]Y]Y]JY]Y]JH¬àYà
+[Y]Y]H\[ŸàY]Y]HOOH	€ÿöôX›	 H¬àô]\õà	…Œ¬àBàûH¬àô]\õàî””ãú›ö[ô⁄YûJY]Y]Kù[äN¬àHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYùÿ\õä	Ÿõ‹õX]]Y]Y]Y]HòZ[Y	À\úäN¬àô]\õà	…Œ¬àBüBÇãÀ»OOOOOH[Ÿ[[ô\ú»OOOOOBãÀ»YŸ[ù]Z[»[Ÿ[
+›ô\õ^JBôÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ÿ€‹ŸWﬁ	 OÀòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬àÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€›ô\õ^I Kú›[Kô\‹^HH	€õ€ôIŒ¬üJN¬ôÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊ÿ€‹ŸI OÀòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬àÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€›ô\õ^I Kú›[Kô\‹^HH	€õ€ôIŒ¬üJN¬ÇãÀ»€X⁄»›]⁄YH[Ÿ[»€‹ŸBù⁄[ô›ÀòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+]ô[ù
+HOà¬à€€ú›YŸ[ù›ô\õ^HHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYŸ[ùŸ]Z[◊€›ô\õ^I N¬à€€ú›€€ôö\õS[Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ€€ôö\õW€[Ÿ[	 N¬ÇàYà
+]ô[ùù\ôŸ]OOHYŸ[ù›ô\õ^JH¬àYŸ[ù›ô\õ^Kú›[Kô\‹^HH	€õ€ôIŒ¬àBàYà
+]ô[ùù\ôŸ]OOH€€ôö\õS[Ÿ[
+H¬à€€ôö\õS[Ÿ[ú›[Kô\‹^HH	€õ€ôIŒ¬àBüJN¬ÇãÀ»ì’Nà[Yÿ]Y€X⁄»[ô\àõ‹à]KXX›[€àù]€ú»\»[à€€[[€ã›ŸXãÿÿ\ôÀöú¬ãÀ»][ô\àÿ[»⁄[ô›Àó◊‹W‹⁄\ôYäàù[ò›[€ú»⁄X⁄\ôH^‹ùYô[›ÀÇãÀ»»ì’YH\Xÿ]H[ô\à\ôHH]ÿ]\Ÿ\»X›[€ú»»ö\ôH⁄XŸKÇÇãÀ»ŸŸ€Hö\⁄Xö[]HŸàYò[òŸYŸ][ô‹»€€ùõ€¬ôù[ò›[€àŸŸ€PYò[òŸYŸ][ô‹ 
+H¬àûH¬à€€ú›[òXõYHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹Ÿ][ô‹◊ÿYò[òŸY›ŸŸ€I OÀò⁄X⁄ŸYò[ŸN¬àÀ»[[Y[ù»X\öŸY\»Yò[òŸY\Ÿ][ô»⁄›[ôH⁄›€ã⁄Y[Çàÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	ÀòYò[òŸY\Ÿ][ô… Kôõ‹ëXX⁄
+[Oà¬àYà
+[òXõY
+H¬à[ú›[Kô\‹^HH	…Œ¬àH[ŸH¬à[ú›[Kô\‹^HH	€õ€ôIŒ¬àBàJN¬ÇàÀ»^\ôX\»‹à›\àYò[òŸY[ú]»X^H\ŸHHYXÿ]Y€\‹¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	ÀòYò[òŸY\Ÿ][ôÀ]^\ôXI Kôõ‹ëXX⁄
+[Oà¬àYà
+[òXõY
+H[ú›[Kô\‹^HH	…Œ¬à[ŸH[ú›[Kô\‹^HH	€õ€ôIŒ¬àJN¬ÇàÀ»\ú⁄\›ôYô\ô[òŸBàûH»ÿÿ[›‹òYŸKúŸ]][J	‹Ÿ][ô‹◊ÿYò[òŸY	À[òXõY»	›ùYI»à	Ÿò[ŸI N»Hÿ]⁄
+JH»BàHÿ]⁄
+JH¬à⁄[ô›Àó◊‹W‹⁄\ôYô\úõ‹ä	›ŸŸ€PYò[òŸYŸ][ô‹»òZ[Y	ÀJN¬àõ›»N¬àBüBÇãÀ»OOOOOHYYŸ[ù[Ÿ[RHOOOOOBôù[ò›[€à[ö]YYŸ[ùRJ
+H¬àYà
+YYŸ[ùRR[ö]X[^ôY
+Hô]\õé¬àYYŸ[ùRR[ö]X[^ôYHùYN¬àÀ»⁄\ôHXY\àõ⁄[àù]€àYàô\Ÿ[ùà€€ú›õ⁄[êùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	⁄õ⁄[ó›⁄Ÿ[óÿùâ N¬àYà
+õ⁄[êùäHõ⁄[êùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà‹[êYYŸ[ù[Ÿ[
+ﬂJJN¬ÇàÀ»⁄\ôH[Ÿ[⁄õ€YBà€€ú›€‹ŸVHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùÿ€‹ŸWﬁ	 N¬à€€ú›ÿ[òŸ[ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùÿÿ[òŸ[	 N¬à€€ú›ö[X\ûPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù‹ö[X\ûI N¬ÇàYà
+€‹ŸV
+H€‹ŸVòY]ô[ù\›[ô\ä	ÿ€X⁄…À€‹ŸPYYŸ[ù[Ÿ[
+N¬àYà
+ÿ[òŸ[ùäHÿ[òŸ[ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À€‹ŸPYYŸ[ù[Ÿ[
+N¬àYà
+ö[X\ûPùäHö[X\ûPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À[ôPYYŸ[ùö[X\ûJN¬üBÇôù[ò›[€à‹[êYYŸ[ù[Ÿ[
+‹ H¬àÀ»‹Œà»[ò[ùQŒà›ö[ô»Bà⁄[ô›ÀóÿYYŸ[ù›]HH¬à›\àKà[ò[ùQà‹»	âà‹Àù[ò[ùQ»‹Àù[ò[ùQàù[ààåà€ôW›[YNàùYKà⁄Ÿ[éàù[à[ŸNà	›⁄Ÿ[âÀà]õ‹õNà	›⁄[ô›‹…Ààõ‹õX]à	ﬁö\	Àà\ò⁄à	ÿ[Yç	¬àN¬àô[ô\êYYŸ[ù›\
+JN¬à€€ú›[Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€[Ÿ[	 N¬àYà
+[Ÿ[
+H»[Ÿ[ú›[Kô\‹^HH	Ÿõ^	Œ»ÿ›[Y[ùòõŸKú›[Kõ›ô\ôõ›»H	⁄Y[âŒ»BüBÇôù[ò›[€à€‹ŸPYYŸ[ù[Ÿ[
+
+H¬à€€ú›[Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€[Ÿ[	 N¬àYà
+[Ÿ[
+H»[Ÿ[ú›[Kô\‹^HH	€õ€ôIŒ»ÿ›[Y[ùòõŸKú›[Kõ›ô\ôõ›»H	…Œ»BàÀ»€X[à\õÿ][ô»õ‹›€àYà]^\›¬à€€ú›õ‹›€àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€‹[€ú◊Ÿõ‹›€â N¬àYà
+õ‹›€äHõ‹›€ãúô[[›ôJ
+N¬àûH»[]H⁄[ô›ÀóÿYYŸ[ù›]N»Hÿ]⁄
+JH»BüBÇò\ﬁ[ò»ù[ò›[€à[ôPYYŸ[ùö[X\ûJ
+H¬à€€ú››H⁄[ô›ÀóÿYYŸ[ù›]H»›\àHN¬àYà
+›ú›\OOHJH¬àÀ»ôXYõ‹õHò[Y\¬à€€ú›[ò[ùŸ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù›[ò[ù	 N¬à€€ú›[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù›	 N¬à€€ú›€ôU[YQ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€€ôW›[YI N¬à€€ú›[ò[ùQH[ò[ùŸ[»[ò[ùŸ[ùò[YHà
+›ù[ò[ùQù[
+N¬à€€ú›H[»\úŸR[ù
+[ùò[YKL
+Håàå¬à€€ú›€ôW›[YHH€ôU[YQ[»€ôU[YQ[ò⁄X⁄ŸYàùYN¬à€€ú›]õ‹õTŸ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù‹]õ‹õI N¬à€€ú›õ‹õX]Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùŸõ‹õX]	 N¬à€€ú›\ò⁄Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùÿ\ò⁄	 N¬à€€ú›]õ‹õHH]õ‹õTŸ[»]õ‹õTŸ[ùò[YHà
+›ú]õ‹õH	›⁄[ô›‹… N¬à€€ú›õ‹õX]Hõ‹õX]Ÿ[»õ‹õX]Ÿ[ùò[YHà
+›ôõ‹õX]	ﬁö\	 N¬à€€ú›\ò⁄H\ò⁄Ÿ[»\ò⁄Ÿ[ùò[YHà
+›ò\ò⁄	ÿ[Yç	 N¬Çà›ù[ò[ùQH[ò[ùQ¬à›ùH¬à›õ€ôW›[YHH€ôW›[YN¬à›ú]õ‹õHH]õ‹õN¬à›ôõ‹õX]Hõ‹õX]¬à›ò\ò⁄H\ò⁄¬ÇàÀ»ò\⁄X»ò[Y][€ÇàYà
+][ò[ùQ
+H»⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	‘X\ŸHŸ[X›H[ò[ù
+›\›€Y\äH»\‹⁄Y€à\»⁄Ÿ[àÀâÀ	”Z\‹⁄[ô»[ò[ù	ÀùYKò[ŸJN»ô]\õé»BÇàÀ»X⁄YH⁄]\à\Ÿ\àÿ[ù»Hò]»⁄Ÿ[à‹àHŸ[ô\ò]Yõ€››ò\ÿ‹ö\à€€ú›Ÿ[X›YX›[€ë[Hÿ›[Y[ùú]Y\ûTŸ[X›‹ä	⁄[ú]€ò[YOHòYÿYŸ[ùÿX›[€àóNò⁄X⁄ŸY	 N¬à€€ú›X›[€àHŸ[X›YX›[€ë[»Ÿ[X›YX›[€ë[ùò[YHà	›⁄Ÿ[âŒ¬àYà
+X›[€àOOH	›⁄Ÿ[â H¬àÀ»‹ôX]Hõ⁄[à⁄Ÿ[ÇàûH¬à€€ú›^[ÿYH»[ò[ù⁄Yà[ò[ùQ€Z[ù]\Œà€ôW›[YNà€ôW›[YHN¬à€€ú›àH]ÿZ]ô]⁄
+	Àÿ\K›åK⁄õ⁄[ã]⁄Ÿ[âÀ»Y]Ÿà	‘‘’	ÀXY\úŒà»	ÿ€€ù[ù]\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KõŸNàî””ãú›ö[ô⁄YûJ^[ÿY
+HJN¬àYà
+\ãõ⁄ Hõ›»ô]»\úõ‹ä]ÿZ]ãù^
+
+JN¬à€€ú›]HH]ÿZ]ãöú€€ä
+N¬à›ù⁄Ÿ[àH]Kù⁄Ÿ[é¬à›úÿ‹ö\Hù[¬à›õ[ŸHH	›⁄Ÿ[âŒ¬à›ú›\Hé¬à⁄[ô›ÀóÿYYŸ[ù›]HH›¬àô[ô\êYYŸ[ù›\
+äN¬àHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	—òZ[Y»‹ôX]Hõ⁄[à⁄Ÿ[éà	»
+»
+\úà	âà\úãõY\‹ÿYŸH»\úãõY\‹ÿYŸHà\úäK	—\úõ‹âÀùYKò[ŸJN¬àBàH[ŸHYà
+X›[€àOOH	‹ÿ‹ö\	 H¬àÀ»Ÿ[ô\ò]Hõ€››ò\ÿ‹ö\öXHŸ\ùô\àX⁄ÿYŸ\»TBàûH¬à€€ú›^[ÿYH»[ò[ù⁄Yà[ò[ùQ]õ‹õNà]õ‹õK[ú›[\ó›\Nà	‹ÿ‹ö\	À€Z[ù]\ŒàN¬à€€ú›àH]ÿZ]ô]⁄
+	Àÿ\K›åK‹X⁄ÿYŸ\…À»Y]Ÿà	‘‘’	ÀXY\úŒà»	ÿ€€ù[ù]\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KõŸNàî””ãú›ö[ô⁄YûJ^[ÿY
+HJN¬àYà
+\ãõ⁄ H¬àõ›»ô]»\úõ‹ä]ÿZ]ãù^
+
+JN¬àBàÀ»[ôHî””à‹àZ[à^ô\‹€úŸ\¬à€€ú››H
+ãöXY\úÀôŸ]
+	ÿ€€ù[ù]\I H	… Kù”›Ÿ\êÿ\ŸJ
+N¬à]ÿ‹ö\^H	…Œ¬à]ö[[ò[YHH	ÿõ€››ò\ú⁄	Œ¬à]›€õÿYTìHù[¬à]€ôS[ô\àHù[¬àYà
+›ö[ò€Y\ 	ÿ\Xÿ][€ã⁄ú€€â JH¬à€€ú›]HH]ÿZ]ãöú€€ä
+N¬àÿ‹ö\^H]Kúÿ‹ö\	…Œ¬àö[[ò[YHH]Kôö[[ò[YHö[[ò[YN¬à›€õÿYTìH]Kô›€õÿY›\õù[¬à€ôS[ô\àH]Kõ€ôW€[ô\àù[¬àH[ŸH¬àÿ‹ö\^H]ÿZ]ãù^
+
+N¬à€€ú›ŸHãöXY\úÀôŸ]
+	ÿ€€ù[ùY\‹‹⁄][€â N¬àYà
+Ÿ
+H¬à€€ú›HHŸõX]⁄
+Ÿö[[ò[YOHè ◊àé◊J HèÀ N¬àYà
+H	âàVÃWJHö[[ò[YHHVÃWN¬àH[ŸHYà
+]õ‹õHOOH	›⁄[ô›‹… Hö[[ò[YHH	ÿõ€››ò\úÃIŒ¬à[ŸHYà
+]õ‹õHOOH	Ÿ\ù⁄[â Hö[[ò[YHH	ÿõ€››ò\ú⁄	Œ¬àBÇà›úÿ‹ö\Hÿ‹ö\^¬à›úÿ‹ö\ö[[ò[YHHö[[ò[YN¬à›úÿ‹ö\›€õÿYTìH›€õÿYTì¬à›õ€ôS[ô\àH€ôS[ô\é¬à›ù⁄Ÿ[àHù[¬à›õ[ŸHH	‹ÿ‹ö\	Œ¬à›ú›\Hé¬à⁄[ô›ÀóÿYYŸ[ù›]HH›¬àô[ô\êYYŸ[ù›\
+äN¬àHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	—òZ[Y»Ÿ[ô\ò]Hõ€››ò\ÿ‹ö\à	»
+»
+\úà	âà\úãõY\‹ÿYŸH»\úãõY\‹ÿYŸHà\úäK	—\úõ‹âÀùYKò[ŸJN¬àBàH[ŸHYà
+X›[€àOOH	Ÿ[XZ[	 H¬àÀ»Ÿ[ôõ€››ò\ÿ‹ö\öXH[XZ[à€€ú›[XZ[[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùŸ[XZ[	 N¬à€€ú›[XZ[YàH[XZ[[»[XZ[[ùò[YKùö[J
+Hà	…Œ¬àYà
+Y[XZ[YäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	‘X\ŸH[ù\àHôX⁄\Y[ù[XZ[Yô\‹ÀâÀ	”Z\‹⁄[ô»[XZ[	ÀùYKò[ŸJN¬àô]\õé¬àBàÀ»ò\⁄X»[XZ[ò[Y][€ÇàYà
+Y[XZ[Yãö[ò€Y\ 	–	 HY[XZ[Yãö[ò€Y\ 	Àâ JH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	‘X\ŸH[ù\àHò[Y[XZ[Yô\‹ÀâÀ	“[ùò[Y[XZ[	ÀùYKò[ŸJN¬àô]\õé¬àBàûH¬à€€ú›^[ÿYH»[ò[ù⁄Yà[ò[ùQ]õ‹õNà]õ‹õK[XZ[à[XZ[Yã€Z[ù]\ŒàN¬à€€ú›àH]ÿZ]ô]⁄
+	Àÿ\K›åK‹X⁄ÿYŸ\À‹Ÿ[ôY[XZ[	À»Y]Ÿà	‘‘’	ÀXY\úŒà»	ÿ€€ù[ù]\IŒà	ÿ\Xÿ][€ã⁄ú€€â»KõŸNàî””ãú›ö[ô⁄YûJ^[ÿY
+HJN¬àYà
+\ãõ⁄ H¬à€€ú›\úï^H]ÿZ]ãù^
+
+N¬àõ›»ô]»\úõ‹ä\úï^
+N¬àBà€€ú›]HH]ÿZ]ãöú€€ä
+N¬à›ô[XZ[Ÿ[ùHùYN¬à›ô[XZ[»H[XZ[Yé¬à›õ[ŸHH	Ÿ[XZ[	Œ¬à›ú›\Hé¬à⁄[ô›ÀóÿYYŸ[ù›]HH›¬àô[ô\êYYŸ[ù›\
+äN¬àHÿ]⁄
+\úäH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	—òZ[Y»Ÿ[ô\ﬁ[Y[ù[XZ[à	»
+»
+\úà	âà\úãõY\‹ÿYŸH»\úãõY\‹ÿYŸHà\úäK	—\úõ‹âÀùYKò[ŸJN¬àBàH[ŸH¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	’[ú›\‹ùY€òõÿ\ô[ô»‹[€àŸ[X›YâÀ	—\úõ‹âÀùYKò[ŸJN¬àBàH[ŸHYà
+›ú›\OOHäH¬àÀ»€ôBà€‹ŸPYYŸ[ù[Ÿ[
+
+N¬àÀ»‹[€ò[HôYúô\⁄⁄Ÿ[úÀ›[ò[ù»\›àûH»ÿY[ò[ù 
+N»Hÿ]⁄
+JH»BàBüBÇôù[ò›[€àô[ô\êYYŸ[ù›\
+›\
+H¬à€€ú›[ôXÿ]‹àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù‹›\⁄[ôXÿ]‹â N¬à€€ú›€€ù[ùHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùÿ€€ù[ù	 N¬à€€ú›ö[X\ûPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù‹ö[X\ûI N¬àYà
+X€€ù[ù
+Hô]\õé¬àYà
+[ôXÿ]‹äH¬àYà
+›\OOHJH¬à[ôXÿ]‹ãù^€€ù[ùH	‘›\KÃà8†%‹ôX]H€òõÿ\ô[ô»\‹Ÿ]	Œ¬àH[ŸH¬à€€ú›[ŸHH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kõ[ŸJH»⁄[ô›ÀóÿYYŸ[ù›]Kõ[ŸHà	›⁄Ÿ[âŒ¬à]Xô[H	’⁄Ÿ[à
+⁄›€à€òŸJIŒ¬àYà
+[ŸHOOH	‹ÿ‹ö\	 HXô[H	–õ€››ò\ÿ‹ö\	Œ¬à[ŸHYà
+[ŸHOOH	Ÿ[XZ[	 HXô[H	—[XZ[Ÿ[ù	Œ¬à[ôXÿ]‹ãù^€€ù[ùH	‘›\ãÃà8†%	»
+»Xô[¬àBàBÇàYà
+›\OOHJH¬àÀ»[ò[ùŸ[X›H[ôYûH‹[]U[ò[ùõ‹›€àYù\à€€ù[ù\»Ÿ]à€€ú››]HH⁄[ô›ÀóÿYYŸ[ù›]HﬂN¬à€€ú›ò[YHH›]Kù	âà›]Kùà»›]Kùàå¬à€€ú›€ôU[YP⁄X⁄ŸYH›]Kõ€ôW›[YHOOH[ôYö[ôY»ùYHàH\›]Kõ€ôW›[YN¬à€€ú›Yò][]õ‹õHH›]Kú]õ‹õH	›⁄[ô›‹…Œ¬à€€ú›]õ‹õS‹[€ú»H¬à»ò[YNà	€[ù^	ÀXô[à	”[ù^	»Kà»ò[YNà	›⁄[ô›‹…ÀXô[à	’⁄[ô›‹…»Kà»ò[YNà	Ÿ\ù⁄[âÀXô[à	€XX”‘…»BàKõX\
+‹Oà‹[€àò[YOHâŸ\ÿÿ\R[
+‹ùò[YJ_Hà	€‹ùò[YHOOHYò][]õ‹õH»	‹Ÿ[X›Y	»à	…ﬂOâŸ\ÿÿ\R[
+‹õXô[
+_O€‹[€èò
+Köõ⁄[ä	◊â N¬à€€ú›õ‹õX]‹[€ú»H¬à»ò[YNà	ﬁö\	ÀXô[à	÷íT\ò⁄]ôI»Kà»ò[YNà	›\ãôﬁâÀXô[à	’Tãë÷à\ò⁄]ôI»BàKõX\
+‹Oà‹[€àò[YOHâŸ\ÿÿ\R[
+‹ùò[YJ_HèâŸ\ÿÿ\R[
+‹õXô[
+_O€‹[€èò
+Köõ⁄[ä	◊â N¬à€€ú›\ò⁄‹[€ú»H¬à»ò[YNà	ÿ[Yç	ÀXô[à	ﬁóÕç»[Yç	»Kà»ò[YNà	ÿ\õMç	ÀXô[à	–TìMç»\H⁄[X€€â»BàKõX\
+‹Oà‹[€àò[YOHâŸ\ÿÿ\R[
+‹ùò[YJ_HèâŸ\ÿÿ\R[
+‹õXô[
+_O€‹[€èò
+Köõ⁄[ä	◊â N¬Çà€€ù[ùö[õô\íSHà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\é»èÇàXô[›[OHôõ€ù]ŸZY⁄çåèê›\›€Y\à
+[ò[ù
+O€Xô[ÇàŸ[X›YHòYÿYŸ[ù›[ò[ùà›[OHúY[ôŒéÿõ‹ô\ã\òY]\Œçÿõ‹ô\éå\€€Yò\äKXõ‹ô\äN»èÇà‹Ÿ[X›ÇÇàXô[›[OHôõ€ù]ŸZY⁄çåèíõ⁄[à⁄Ÿ[à
+Z[ù]\ O€Xô[Çà[ú]YHòYÿYŸ[ù›à\OHõù[Xô\ààò[YOHâŸ\ÿÿ\R[
+›ö[ô ò[YJJ_HàZ[èHåHà›[OHúY[ôŒéÿõ‹ô\ã\òY]\Œçÿõ‹ô\éå\€€Yò\äKXõ‹ô\äN›⁄YåLå»à]]ÿ€€\]OHõŸôàà]KL\ZY€õ‹ôH]K[Y€õ‹ôOHùùYHàœÇÇàXô[›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\é»èÇà[ú]YHòYÿYŸ[ù€€ôW›[YHà\OHò⁄X⁄ÿõﬁà	€€ôU[YP⁄X⁄ŸY»	ÿ⁄X⁄ŸY	»à	…ﬂHœÇà‹[à›[OHò€€‹éùò\äK[]]Y
+Hèì€ôK][YH
+⁄[ô€K]\ŸJH⁄Ÿ[è‹‹[èÇà€Xô[ÇÇà]à›[OHõX\ô⁄[ã]‹é»èÇà]à›[OHôõ€ù]ŸZY⁄çå€X\ô⁄[ãXõ›€Nçú»èì€òõÿ\ô[ô»Y]ŸŸ]èÇàXô[›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\é»èè[ú]\OHúòY[»àò[YOHòYÿYŸ[ùÿX›[€ààò[YOHù⁄Ÿ[àà	‹›]Kõ[ŸHOOH	›⁄Ÿ[â»\›]Kõ[ŸH»	ÿ⁄X⁄ŸY	»à	…ﬂHœà⁄›»ò]»⁄Ÿ[è€Xô[ÇàXô[›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\é»èè[ú]\OHúòY[»àò[YOHòYÿYŸ[ùÿX›[€ààò[YOHúÿ‹ö\à	‹›]Kõ[ŸHOOH	‹ÿ‹ö\	»»	ÿ⁄X⁄ŸY	»à	…ﬂHœàŸ[ô\ò]Hõ€››ò\ÿ‹ö\€Xô[ÇàXô[›[OHô\‹^Nôõ^ÿ[Y€ãZ][\ŒòŸ[ù\éŸÿ\é»èè[ú]\OHúòY[»àò[YOHòYÿYŸ[ùÿX›[€ààò[YOHô[XZ[à	‹›]Kõ[ŸHOOH	Ÿ[XZ[	»»	ÿ⁄X⁄ŸY	»à	…ﬂHœàŸ[ôöXH[XZ[€Xô[Çà]àYHòYÿYŸ[ù‹]õ‹õW‹õ›»à›[OHõX\ô⁄[ã]‹éŸ\‹^Nõõ€ôN»èÇàXô[›[OHôõ€ù]ŸZY⁄çåèï\ôŸ]]õ‹õO€Xô[ÇàŸ[X›YHòYÿYŸ[ù‹]õ‹õHà›[OHúY[ôŒéÿõ‹ô\ã\òY]\Œçÿõ‹ô\éå\€€Yò\äKXõ‹ô\äN›⁄YåN»èÇà	‹]õ‹õS‹[€úﬂBà‹Ÿ[X›ÇàŸ]èÇà]àYHòYÿYŸ[ùŸ[XZ[‹õ›»à›[OHõX\ô⁄[ã]‹éŸ\‹^Nõõ€ôN»èÇàXô[›[OHôõ€ù]ŸZY⁄çåèîôX⁄\Y[ù[XZ[€Xô[Çà[ú]YHòYÿYŸ[ùŸ[XZ[à\OHô[XZ[àXŸZ€\èHù\Ÿ\ê^[\Kò€€Hà›[OHúY[ôŒéÿõ‹ô\ã\òY]\Œçÿõ‹ô\éå\€€Yò\äKXõ‹ô\äN›⁄Yåé»à]]ÿ€€\]OHõŸôàà]KL\ZY€õ‹ôH]K[Y€õ‹ôOHùùYHàœÇà]à›[OHò€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåLú€X\ô⁄[ã]‹ç»èïHôX⁄\Y[ù⁄[ôXŸZ]ôH[àS[XZ[⁄]H[ú›[][€à€ôK[[ô\à[ôù[ÿ‹ö\èŸ]èÇàŸ]èÇàŸ]èÇÇà]à›[OHò€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåL‹èï⁄Ÿ[ú»[ôÿ‹ö\»[ö\ö]\»èŸ]èÇàŸ]èÇà¬ÇàÀ»‹[]H[ò[ùõ‹›€à⁄]êY[ò[ùà‹[€Çà€€ú›[ò[ùŸ[X›H€€ù[ùú]Y\ûTŸ[X›‹ä	»ÿYÿYŸ[ù›[ò[ù	 N¬àYà
+[ò[ùŸ[X›
+H¬à‹[]U[ò[ùõ‹›€ä[ò[ùŸ[X›¬àXŸZ€\éà	ÀKHŸ[X››\›€Y\àKIÀàŸ[X›YYà›]Kù[ò[ùQ	…Àà⁄›–Y‹[€éàùYBàJN¬àÀ»[€»òX⁄»›]H⁄[ôŸH⁄[à[ò[ù\»Ÿ[X›Y
+ù]õ›õ‹àêY[ò[ùäBà[ò[ùŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬àYà
+[ò[ùŸ[X›ùò[YHOOH	◊◊ÿY€ô]◊›[ò[ù◊… H¬à›]Kù[ò[ùQH[ò[ùŸ[X›ùò[YN¬àBàJN¬àBÇà€€ú›[ú]H€€ù[ùú]Y\ûTŸ[X›‹ä	»ÿYÿYŸ[ù›	 N¬àYà
+[ú]
+H¬à[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à€€ú›\úŸYH\úŸR[ù
+[ú]ùò[YKL
+N¬à›]KùH
+\”òSä\úŸY
+H\úŸYH
+H»åà\úŸY¬à[ú]ùò[YHH›]Kù¬àJN¬àBÇà€€ú›€ôU[YR[ú]H€€ù[ùú]Y\ûTŸ[X›‹ä	»ÿYÿYŸ[ù€€ôW›[YI N¬àYà
+€ôU[YR[ú]
+H¬à€ôU[YR[ú]ò⁄X⁄ŸYH€ôU[YP⁄X⁄ŸY¬à€ôU[YR[ú]òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà»›]Kõ€ôW›[YHH€ôU[YR[ú]ò⁄X⁄ŸY»JN¬àBÇà€€ú›]õ‹õTŸ[X›H€€ù[ùú]Y\ûTŸ[X›‹ä	»ÿYÿYŸ[ù‹]õ‹õI N¬àYà
+]õ‹õTŸ[X›
+H¬à]õ‹õTŸ[X›ùò[YHHYò][]õ‹õN¬à›]Kú]õ‹õHH]õ‹õTŸ[X›ùò[YN¬à]õ‹õTŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à›]Kú]õ‹õHH]õ‹õTŸ[X›ùò[YN¬àJN¬àBÇà€€ú›X›[€îòY[‹»H€€ù[ùú]Y\ûTŸ[X›‹ê[
+	⁄[ú]€ò[YOHòYÿYŸ[ùÿX›[€àóI N¬à€€ú›]õ›»H€€ù[ùú]Y\ûTŸ[X›‹ä	»ÿYÿYŸ[ù‹]õ‹õW‹õ›… N¬à€€ú›[XZ[õ›»H€€ù[ùú]Y\ûTŸ[X›‹ä	»ÿYÿYŸ[ùŸ[XZ[‹õ›… N¬à€€ú›\]Tö[X\ûSXô[H
+
+HOà¬à€€ú›Ÿ[H€€ù[ùú]Y\ûTŸ[X›‹ä	⁄[ú]€ò[YOHòYÿYŸ[ùÿX›[€àóNò⁄X⁄ŸY	 N¬àYà
+\Ÿ[\ö[X\ûPùäHô]\õé¬àYà
+Ÿ[ùò[YHOOH	‹ÿ‹ö\	 Hö[X\ûPùãù^€€ù[ùH	—Ÿ[ô\ò]Hÿ‹ö\	Œ¬à[ŸHYà
+Ÿ[ùò[YHOOH	Ÿ[XZ[	 Hö[X\ûPùãù^€€ù[ùH	‘Ÿ[ô[XZ[	Œ¬à[ŸHö[X\ûPùãù^€€ù[ùH	–‹ôX]H⁄Ÿ[âŒ¬àN¬à€€ú›\]QöY[ö\⁄Xö[]HH
+
+HOà¬à€€ú›Ÿ[H€€ù[ùú]Y\ûTŸ[X›‹ä	⁄[ú]€ò[YOHòYÿYŸ[ùÿX›[€àóNò⁄X⁄ŸY	 N¬à€€ú›[ŸHHŸ[»Ÿ[ùò[YHà	›⁄Ÿ[âŒ¬àYà
+]õ› H]õ›Àú›[Kô\‹^HH
+[ŸHOOH	‹ÿ‹ö\	»[ŸHOOH	Ÿ[XZ[	 H»	…»à	€õ€ôIŒ¬àYà
+[XZ[õ› H[XZ[õ›Àú›[Kô\‹^HH[ŸHOOH	Ÿ[XZ[	»»	…»à	€õ€ôIŒ¬àN¬àX›[€îòY[‹Àôõ‹ëXX⁄
+àOàãòY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à›]Kõ[ŸHHãùò[YN¬à\]Tö[X\ûSXô[
+
+N¬à\]QöY[ö\⁄Xö[]J
+N¬àJJN¬à\]Tö[X\ûSXô[
+
+N¬à\]QöY[ö\⁄Xö[]J
+N¬àH[ŸH¬àÀ»›\éà⁄›»⁄Ÿ[ãÿ‹ö\‹à[XZ[€€ôö\õX][€Çà€€ú›⁄Ÿ[àH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kù⁄Ÿ[äH»⁄[ô›ÀóÿYYŸ[ù›]Kù⁄Ÿ[àà	…Œ¬à€€ú›[ŸHH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kõ[ŸJH»⁄[ô›ÀóÿYYŸ[ù›]Kõ[ŸHà	›⁄Ÿ[âŒ¬à€€ú›ÿ‹ö\H
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kúÿ‹ö\
+H»⁄[ô›ÀóÿYYŸ[ù›]Kúÿ‹ö\àù[¬à€€ú›ö[[ò[YHH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kúÿ‹ö\ö[[ò[YJH»⁄[ô›ÀóÿYYŸ[ù›]Kúÿ‹ö\ö[[ò[YHà	ÿõ€››ò\	Œ¬à€€ú›ÿ‹ö\›€õÿYTìHÿYôQ›€õÿYTì
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kúÿ‹ö\›€õÿYTì
+N¬à€€ú›[XZ[Ÿ[ùH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kô[XZ[Ÿ[ù
+H»⁄[ô›ÀóÿYYŸ[ù›]Kô[XZ[Ÿ[ùàò[ŸN¬à€€ú›[XZ[»H
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kô[XZ[ H»⁄[ô›ÀóÿYYŸ[ù›]Kô[XZ[»à	…Œ¬ÇàYà
+[XZ[Ÿ[ù	âà[ŸHOOH	Ÿ[XZ[	 H¬à€€ù[ùö[õô\íSHà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\åLúÿ[Y€ãZ][\ŒòŸ[ù\é›^X[Y€éòŸ[ù\é‹Y[ôŒåå»èÇà]à›[OHôõ€ù\⁄^ôNç»è∏ß"{Ó#œŸ]èÇà»›[OHõX\ô⁄[éåÿ€€‹éùò\äK]^
+N»èë[XZ[Ÿ[ù›XÿŸ\‹Ÿù[O⁄œÇà›[OHò€€‹éùò\äK[]]Y
+N€X\ô⁄[éå»èêYŸ[ù\ﬁ[Y[ù[ú›ùX›[€ú»]ôHôY[àŸ[ùŒè‹Çà]à›[OHôõ€ùYò[Z[Nõ[€õ‹‹XŸN‹Y[ôŒåLúçÿòX⁄Ÿ‹õ›[ôùò\äK\[ô[
+Nÿõ‹ô\ã\òY]\Œçúÿõ‹ô\éå\€€Yò\äKXõ‹ô\äNŸõ€ù]ŸZY⁄çå»èâŸ\ÿÿ\R[
+[XZ[ _OŸ]èÇà›[OHò€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåL‹€X\ô⁄[éå»èïH[XZ[€€ùZ[ú»H€ôK[[ô\à€€[X[ô[ôù[õ€››ò\ÿ‹ö\õ‹àHŸ[X›Y]õ‹õKàHôX⁄\Y[ùÿ[àõ€›»H[ú›ùX›[€ú»»[ú›[[ôôY⁄\›\àHYŸ[ùè‹ÇàŸ]èÇà¬àH[ŸHYà
+ÿ‹ö\	âà[ŸHOOH	‹ÿ‹ö\	 H¬à€€ú›€ôS[ô\àH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kõ€ôS[ô\äH»⁄[ô›ÀóÿYYŸ[ù›]Kõ€ôS[ô\ààù[¬à€€ù[ùö[õô\íSHà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\åLú»èÇà	€€ôS[ô\à»]à›[OHôõ€ùYò[Z[Nõ[€õ‹‹XŸN‹Y[ôŒåLúÿòX⁄Ÿ‹õ›[ôùò\äK\[ô[
+Nÿõ‹ô\ã\òY]\Œçúÿõ‹ô\éå\\⁄Yò\äKXõ‹ô\äN›€‹ôXúôXZŒòúôXZÀX[»èâŸ\ÿÿ\R[
+€ôS[ô\ä_OŸ]èòà]à›[OHôõ€ùYò[Z[Nõ[€õ‹‹XŸN›⁄]K\‹XŸNúôK]‹ò\‹Y[ôŒåLúÿòX⁄Ÿ‹õ›[ôùò\äK\[ô[
+Nÿõ‹ô\ã\òY]\Œçúÿõ‹ô\éå\\⁄Yò\äKXõ‹ô\äN»èâŸ\ÿÿ\R[
+ÿ‹ö\
+_OŸ]èòBà]à›[OHô\‹^Nôõ^Ÿÿ\éÿ[Y€ãZ][\ŒòŸ[ù\éŸõ^]‹ò\ù‹ò\»èÇàù]€àYHòYÿYŸ[ùÿ€‹Hà€\‹œHõ[Ÿ[Xù]€àà›[OHôõ^åN€Z[ã]⁄YååŸõ€ù]ŸZY⁄çå»èâ€€ôS[ô\à»	–€‹H€ôK[[ô\â»à	–€‹Hÿ‹ö\	ﬂOÿù]€èÇà	€€ôS[ô\à»ù]€àYHòYÿYŸ[ù€[‹ôW€‹[€ú»à€\‹œHõ[Ÿ[Xù]€à[Ÿ[Xù]€ã\ŸX€€ô\ûHà›[OHúY[ôŒéLú»èì[‹ôH‹[€ú»8•Øèÿù]€èòàù]€àYHòYÿYŸ[ùŸ›€õÿYà€\‹œHõ[Ÿ[Xù]€à[Ÿ[Xù]€ã\ŸX€€ô\ûHèë›€õÿYÿ‹ö\ÿù]€èòBàŸ]èÇà]à›[OHò€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåL‹èï\»ÿ‹ö\ÿ\»Ÿ[ô\ò]Yõ‹àHŸ[X›Y]õ‹õKà›€õÿY‹à€‹H][ô^X›]H]€àH\ôŸ]XX⁄[ôH»[ú›[[ôôY⁄\›\àHYŸ[ùèŸ]èÇà	€€ôS[ô\à»]àYHòYÿYŸ[ùŸù[‹ÿ‹ö\à›[OHô\‹^Nõõ€ôN€X\ô⁄[ã]‹éŸõ€ùYò[Z[Nõ[€õ‹‹XŸN›⁄]K\‹XŸNúôK]‹ò\‹Y[ôŒåLúÿòX⁄Ÿ‹õ›[ôùò\äK\[ô[
+Nÿõ‹ô\ã\òY]\Œçúÿõ‹ô\éå\\⁄Yò\äKXõ‹ô\äN»èâŸ\ÿÿ\R[
+ÿ‹ö\
+_OŸ]èòà	…ﬂBàŸ]èÇà¬àÀ»‹ôX]Hõÿ][ô»õ‹›€àõ‹à[‹ôH‹[€ú»
+\[ôY»õŸH»\ÿÿ\H[Ÿ[›ô\ôõ› Bà]^\›[ô—õ‹›€àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€‹[€ú◊Ÿõ‹›€â N¬àYà
+^\›[ô—õ‹›€äH^\›[ô—õ‹›€ãúô[[›ôJ
+N¬àYà
+€ôS[ô\äH¬à€€ú›õ‹›€àHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	Ÿ]â N¬àõ‹›€ãöYH	ÿYÿYŸ[ù€‹[€ú◊Ÿõ‹›€âŒ¬àõ‹›€ãú›[Kò‹‹’^H	Ÿ\‹^Nõõ€ôN‹‹⁄][€éôö^YÿòX⁄Ÿ‹õ›[ôùò\äKXô Nÿõ‹ô\éå\€€Yò\äKXõ‹ô\äNÿõ‹ô\ã\òY]\Œçúÿõﬁ\⁄Y›ŒåLúôÿòJçJNﬁãZ[ô^åL€Z[ã]⁄YåN…Œ¬àõ‹›€ãö[õô\íSHàù]€àYHòYÿYŸ[ùŸ›€õÿYà›[OHô\‹^Nòõÿ⁄Œ›⁄YåL	N›^X[Y€éõYù‹Y[ôŒåLMÿòX⁄Ÿ‹õ›[ôõõ€ôNÿõ‹ô\éõõ€ôNÿ€€‹éùò\äK]^
+Nÿ›\ú€‹éú⁄[ù\éŸõ€ù\⁄^ôNåM»èë›€õÿYÿ‹ö\ÿù]€èÇà	‹ÿ‹ö\›€õÿYTì»HYHòYÿYŸ[ùŸ›€õÿY›\õàôYèHâŸ\ÿÿ\R[
+ÿ‹ö\›€õÿYTì
+_Hà\ôŸ]Hóÿõ[ö»àô[Hõõ€‹[ô\àõ‹ôYô\úô\àà›[OHô\‹^Nòõÿ⁄Œ›⁄YåL	N›^X[Y€éõYù‹Y[ôŒåLMÿòX⁄Ÿ‹õ›[ôõõ€ôNÿõ‹ô\éõõ€ôNÿ€€‹éùò\äK]^
+Nÿ›\ú€‹éú⁄[ù\éŸõ€ù\⁄^ôNåM›^YX€‹ò][€éõõ€ôNÿõ‹ô\ã]‹å\€€Yò\äKXõ‹ô\äN»èì‹[à‹›YTìÿOòà	…ﬂBàù]€àYHòYÿYŸ[ù‹⁄›◊Ÿù[à›[OHô\‹^Nòõÿ⁄Œ›⁄YåL	N›^X[Y€éõYù‹Y[ôŒåLMÿòX⁄Ÿ‹õ›[ôõõ€ôNÿõ‹ô\éõõ€ôNÿ€€‹éùò\äK]^
+Nÿ›\ú€‹éú⁄[ù\éŸõ€ù\⁄^ôNåMÿõ‹ô\ã]‹å\€€Yò\äKXõ‹ô\äN»èî⁄›»ù[ÿ‹ö\ÿù]€èÇà¬àÿ›[Y[ùòõŸKò\[ô⁄[
+õ‹›€äN¬àBà€€ú›€‹PùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùÿ€‹I N¬àYà
+€‹PùäH€‹PùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›^–€‹HH€ôS[ô\à»€ôS[ô\ààÿ‹ö\¬àò]öYÿ]‹ãò€\õÿ\ôÀù‹ö]U^
+^–€‹JKù[ä
+
+HOà»⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+
+€ôS[ô\à»	”€ôK[[ô\â»à	‘ÿ‹ö\	 H
+»	»€‹YY»€\õÿ\ô	À	‹›XÿŸ\‹… N»JKòÿ]⁄
+\úàOà»⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	—òZ[Y»€‹Nà	»
+»
+\úà	âà\úãõY\‹ÿYŸH»\úãõY\‹ÿYŸHà\úäK	—\úõ‹âÀùYKò[ŸJN»JN¬àJN¬àÀ»⁄\ôH\õ‹›€àŸŸ€Hõ‹à[‹ôH‹[€ú¬à€€ú›[‹ôS‹[€ú–ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€[‹ôW€‹[€ú… N¬à€€ú›õ‹›€àHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù€‹[€ú◊Ÿõ‹›€â N¬àYà
+[‹ôS‹[€ú–ùà	âàõ‹›€äH¬à€€ú›‹⁄][€ëõ‹›€àH
+
+HOà¬à€€ú›ôX›H[‹ôS‹[€ú–ùãôŸ]õ›[ô[ô–€Y[ùôX›
+
+N¬àõ‹›€ãú›[Kù‹H
+ôX›òõ›€H
+»
+H
+»	‹	Œ¬àõ‹›€ãú›[KõYùHôX›õYù
+»	‹	Œ¬àN¬à[‹ôS‹[€ú–ùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+JHOà¬àKú›‹õ‹Yÿ][€ä
+N¬àYà
+õ‹›€ãú›[Kô\‹^HOOH	€õ€ôI H¬à‹⁄][€ëõ‹›€ä
+N¬àõ‹›€ãú›[Kô\‹^HH	ÿõÿ⁄…Œ¬àH[ŸH¬àõ‹›€ãú›[Kô\‹^HH	€õ€ôIŒ¬àBàJN¬àÀ»€‹ŸHõ‹›€à⁄[à€X⁄⁄[ô»›]⁄YBàÿ›[Y[ùòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+JHOà¬àYà
+[[‹ôS‹[€ú–ùãò€€ùZ[ú Kù\ôŸ]
+H	âàYõ‹›€ãò€€ùZ[ú Kù\ôŸ]
+JH¬àõ‹›€ãú›[Kô\‹^HH	€õ€ôIŒ¬àBàJN¬àÀ»Y›ô\àYôôX›»õ‹›€à][\¬àõ‹›€ãú]Y\ûTŸ[X›‹ê[
+	ÿù]€ãI Kôõ‹ëXX⁄
+][HOà¬à][KòY]ô[ù\›[ô\ä	€[›\ŸY[ù\âÀ
+
+HOà»][Kú›[KòòX⁄Ÿ‹õ›[ôH	›ò\äK\[ô[
+IŒ»JN¬à][KòY]ô[ù\›[ô\ä	€[›\Ÿ[X]ôIÀ
+
+HOà»][Kú›[KòòX⁄Ÿ‹õ›[ôH	€õ€ôIŒ»JN¬àJN¬àBà€€ú›ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùŸ›€õÿY	 N¬àYà
+ùäHùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›õÿàHô]»õÿä‹ÿ‹ö\K»\Nà	ÿ\Xÿ][€ã€ÿ›]\›ôX[I»JN¬à€€ú›\õHTìò‹ôX]SÿöôX›Tì
+õÿäN¬à€€ú›HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	ÿI N»KöôYàH\õ»Kô›€õÿYHö[[ò[YN»ÿ›[Y[ùòõŸKò\[ô⁄[
+JN»Kò€X⁄ 
+N»Kúô[[›ôJ
+N»Tìúô]õ⁄ŸSÿöôX›Tì
+\õ
+N¬àYà
+õ‹›€äHõ‹›€ãú›[Kô\‹^HH	€õ€ôIŒ¬àJN¬à€€ú›⁄›—ù[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ù‹⁄›◊Ÿù[	 N¬àYà
+⁄›—ù[
+H¬à⁄›—ù[òY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›ù[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùŸù[‹ÿ‹ö\	 N¬àYà
+Yù[
+Hô]\õé¬àYà
+ù[ú›[Kô\‹^HOOH	€õ€ôI H¬àù[ú›[Kô\‹^HH	ÿõÿ⁄…Œ»⁄›—ù[ù^€€ù[ùH	“YHù[ÿ‹ö\	Œ¬àH[ŸH»ù[ú›[Kô\‹^HH	€õ€ôIŒ»⁄›—ù[ù^€€ù[ùH	‘⁄›»ù[ÿ‹ö\	Œ»BàYà
+õ‹›€äHõ‹›€ãú›[Kô\‹^HH	€õ€ôIŒ¬àJN¬àBàH[ŸH¬à€€ù[ùö[õô\íSHà]à›[OHô\‹^Nôõ^Ÿõ^Y\ôX›[€éò€€[[éŸÿ\åLú»èÇà]à›[OHôõ€ùYò[Z[Nõ[€õ‹‹XŸN›⁄]K\‹XŸNúôK]‹ò\‹Y[ôŒåLúÿòX⁄Ÿ‹õ›[ôùò\äK\[ô[
+Nÿõ‹ô\ã\òY]\Œçúÿõ‹ô\éå\\⁄Yò\äKXõ‹ô\äN»èâŸ\ÿÿ\R[
+⁄Ÿ[ä_OŸ]èÇà]à›[OHô\‹^Nôõ^Ÿÿ\é»èÇàù]€àYHòYÿYŸ[ùÿ€‹Hà€\‹œHõ[Ÿ[Xù]€à[Ÿ[Xù]€ã\ŸX€€ô\ûHèê€‹H⁄Ÿ[èÿù]€èÇàù]€àYHòYÿYŸ[ùŸ›€õÿYà€\‹œHõ[Ÿ[Xù]€àèë›€õÿY⁄Ÿ[èÿù]€èÇàŸ]èÇà]à›[OHò€€‹éùò\äK[]]Y
+NŸõ€ù\⁄^ôNåL‹èï\»⁄Ÿ[à\»⁄›€à€õH€òŸKàYù\à[›H€‹ŸH\»[Ÿ[Hò]»⁄Ÿ[àÿ[õõ›ôHô]öY]ôYYÿZ[àúõ€HHŸ\ùô\ãèŸ]èÇàŸ]èÇà¬àÀ»⁄\ôH€‹KŸ›€õÿYõ‹à⁄Ÿ[Çà€€ú›€‹PùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùÿ€‹I N¬àYà
+€‹PùäH€‹PùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À€‹U⁄Ÿ[ï–€\õÿ\ô
+N¬à€€ú›ùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿYÿYŸ[ùŸ›€õÿY	 N¬àYà
+ùäHùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›õÿàHô]»õÿä›⁄Ÿ[óK»\Nà	›^‹Z[â»JN¬à€€ú›\õHTìò‹ôX]SÿöôX›Tì
+õÿäN¬à€€ú›HHÿ›[Y[ùò‹ôX]Q[[Y[ù
+	ÿI N¬àKöôYàH\õ»Kô›€õÿYH	⁄õ⁄[ã]⁄Ÿ[ãù	Œ»ÿ›[Y[ùòõŸKò\[ô⁄[
+JN»Kò€X⁄ 
+N»Kúô[[›ôJ
+N»Tìúô]õ⁄ŸSÿöôX›Tì
+\õ
+N¬àJN¬àBàYà
+ö[X\ûPùäHö[X\ûPùãù^€€ù[ùH	—€ôIŒ¬àBüBÇôù[ò›[€à€‹U⁄Ÿ[ï–€\õÿ\ô
+
+H¬à€€ú›⁄Ÿ[àH
+⁄[ô›ÀóÿYYŸ[ù›]H	âà⁄[ô›ÀóÿYYŸ[ù›]Kù⁄Ÿ[äH»⁄[ô›ÀóÿYYŸ[ù›]Kù⁄Ÿ[àà	…Œ¬àYà
+]⁄Ÿ[äHô]\õé¬àò]öYÿ]‹ãò€\õÿ\ôÀù‹ö]U^
+⁄Ÿ[äKù[ä
+
+HOà¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›’ÿ\›
+	’⁄Ÿ[à€‹YY»€\õÿ\ô	À	‹›XÿŸ\‹… N¬àJKòÿ]⁄
+\úàOà¬à⁄[ô›Àó◊‹W‹⁄\ôYú⁄›–[\ù
+	—òZ[Y»€‹H⁄Ÿ[éà	»
+»
+\úà	âà\úãõY\‹ÿYŸH»\úãõY\‹ÿYŸHà\úäK	—\úõ‹âÀùYKò[ŸJN¬àJN¬üBÇãÀ»\]HH€€\X›[YHö[\à\‹^HXô[úõ€H€Y\à[ô^ôù[ò›[€à\]U[YQö[\ä[ô^
+H¬à€€ú›Xô[»H…Ã[IÀ	ÃõIÀ	Õ[IÀ	ÃLIÀ	ÃM[IÀ	ÃÃIÀ	ÃZ	À	Ãö	À	Ã⁄	À	Õö	À	ÃLö	À	ÃY	À	ÃŸ	À	–[[YI◊N¬à]YH\úŸR[ù
+[ô^L
+N¬àYà
+\”òSäY
+HY
+HYHXô[Àõ[ô›HN¬àYà
+YèHXô[Àõ[ô›
+HYHXô[Àõ[ô›HN¬à€€ú›[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	›[YWŸö[\ó›ò[YI N¬àYà
+[
+H[ù^€€ù[ùHXô[÷⁄YN¬üBÇãÀ»⁄\ôH\ö[ù\à]Z[»[Ÿ[€‹ŸHù]€ú»[ôòX⁄Ÿõ‹äù[ò›[€à⁄\ôTö[ù\ì[Ÿ[
+
+H¬à€€ú›]Z[”›ô\õ^HHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ö[ù\óŸ]Z[◊€›ô\õ^I N¬à€€ú›[Ÿ[€‹ŸPùàHÿ›[Y[ùú]Y\ûTŸ[X›‹ä	»‹ö[ù\óŸ]Z[◊ÿX›[€ú»ù]€â N¬à€€ú›ö[ù\ë]Z[–€‹ŸVHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ö[ù\óŸ]Z[◊ÿ€‹ŸWﬁ	 N¬Çàù[ò›[€à€‹ŸTö[ù\ë]Z[”[Ÿ[
+
+H¬àYà
+]Z[”›ô\õ^JH¬à]Z[”›ô\õ^Kú›[Kô\‹^HH	€õ€ôIŒ¬àÿ›[Y[ùòõŸKú›[Kõ›ô\ôõ›»H	…Œ¬àûH»[]H]Z[”›ô\õ^Kô]\Ÿ]ò›\úô[ùö[ù\í\»Hÿ]⁄
+JH»BàBàBÇàYà
+[Ÿ[€‹ŸPùäH[Ÿ[€‹ŸPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…À€‹ŸTö[ù\ë]Z[”[Ÿ[
+N¬àYà
+ö[ù\ë]Z[–€‹ŸV
+Hö[ù\ë]Z[–€‹ŸVòY]ô[ù\›[ô\ä	ÿ€X⁄…À€‹ŸTö[ù\ë]Z[”[Ÿ[
+N¬àYà
+]Z[”›ô\õ^JH¬à]Z[”›ô\õ^KòY]ô[ù\›[ô\ä	ÿ€X⁄…Àù[ò›[€à
+JH¬àYà
+Kù\ôŸ]OOH]Z[”›ô\õ^JH€‹ŸTö[ù\ë]Z[”[Ÿ[
+
+N¬àJN¬àBüJJ
+N¬ÇãÀ»⁄\ôH\[\ù[ô»[ôô\‹ù»[Ÿ[¬äù[ò›[€à⁄\ôP[\ù[ô”[Ÿ[ 
+H¬àÀ»[\à»€‹ŸH[Ÿ[àù[ò›[€à€‹ŸS[Ÿ[
+[Ÿ[
+H¬àYà
+[Ÿ[
+H[Ÿ[ú›[Kô\‹^HH	€õ€ôIŒ¬àBÇàÀ»[\à»⁄\ôHH[Ÿ[	‹»€‹ŸHù]€ú¬àù[ò›[€à⁄\ôS[Ÿ[€‹ŸJ[Ÿ[Y€‹ŸVYÿ[òŸ[Y
+H¬à€€ú›[Ÿ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+[Ÿ[Y
+N¬à€€ú›€‹ŸVHÿ›[Y[ùôŸ][[Y[ùûRY
+€‹ŸVY
+N¬à€€ú›ÿ[òŸ[Hÿ›[Y[ùôŸ][[Y[ùûRY
+ÿ[òŸ[Y
+N¬ÇàYà
+€‹ŸV
+H€‹ŸVòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà€‹ŸS[Ÿ[
+[Ÿ[
+JN¬àYà
+ÿ[òŸ[
+Hÿ[òŸ[òY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà€‹ŸS[Ÿ[
+[Ÿ[
+JN¬àYà
+[Ÿ[
+H¬à[Ÿ[òY]ô[ù\›[ô\ä	ÿ€X⁄…À
+JHOà¬àYà
+Kù\ôŸ]OOH[Ÿ[
+H€‹ŸS[Ÿ[
+[Ÿ[
+N¬àJN¬àBàBÇàÀ»[\ùù[H[Ÿ[à⁄\ôS[Ÿ[€‹ŸJ	ÿ[\ù‹ù[W€[Ÿ[	À	ÿ[\ù‹ù[W€[Ÿ[ÿ€‹ŸWﬁ	À	ÿ[\ù‹ù[Wÿÿ[òŸ[	 N¬à€€ú›[\ùù[Tÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ[\ù‹ù[W‹ÿ]ôI N¬àYà
+[\ùù[Tÿ]ôPùäH[\ùù[Tÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àÿ]ôP[\ùù[JN¬ÇàÀ»õ›YöXÿ][€à⁄[õô[[Ÿ[à⁄\ôS[Ÿ[€‹ŸJ	€õ›YöXÿ][€óÿ⁄[õô[€[Ÿ[	À	€õ›YöXÿ][€óÿ⁄[õô[€[Ÿ[ÿ€‹ŸWﬁ	À	ÿ⁄[õô[ÿÿ[òŸ[	 N¬à€€ú›⁄[õô[ÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ⁄[õô[‹ÿ]ôI N¬àYà
+⁄[õô[ÿ]ôPùäH⁄[õô[ÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àÿ]ôSõ›YöXÿ][€ê⁄[õô[
+N¬à€€ú›⁄[õô[\TŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	ÿ⁄[õô[›\I N¬àYà
+⁄[õô[\TŸ[X›
+H⁄[õô[\TŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ\]P⁄[õô[€€ôöY‘ŸX›[€äN¬ÇàÀ»⁄\ôH\⁄[õô[\Hÿ\ô»€X⁄»[ô\ú¬àÿ›[Y[ùú]Y\ûTŸ[X›‹ê[
+	Àò⁄[õô[]\KXÿ\ô	 Kôõ‹ëXX⁄
+ÿ\ôOà¬àÿ\ôòY]ô[ù\›[ô\ä	ÿ€X⁄…À
+
+HOà¬à€€ú›\HHÿ\ôô]\Ÿ]ù\N¬àYà
+\H	âà⁄[õô[\TŸ[X›
+H¬à⁄[õô[\TŸ[X›ùò[YHH\N¬à\]P⁄[õô[€€ôöY‘ŸX›[€ä
+N¬àBàJN¬àJN¬ÇàÀ»\ÿÿ[][€à€XﬁH[Ÿ[à⁄\ôS[Ÿ[€‹ŸJ	Ÿ\ÿÿ[][€ó‹€XﬁW€[Ÿ[	À	Ÿ\ÿÿ[][€ó‹€XﬁW€[Ÿ[ÿ€‹ŸWﬁ	À	Ÿ\ÿÿ[][€óÿÿ[òŸ[	 N¬à€€ú›\ÿÿ[][€îÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	Ÿ\ÿÿ[][€ó‹ÿ]ôI N¬àYà
+\ÿÿ[][€îÿ]ôPùäH\ÿÿ[][€îÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àÿ]ôQ\ÿÿ[][€î€XﬁJN¬ÇàÀ»XZ[ù[ò[òŸH⁄[ô›»[Ÿ[à⁄\ôS[Ÿ[€‹ŸJ	€XZ[ù[ò[òŸW›⁄[ô›◊€[Ÿ[	À	€XZ[ù[ò[òŸW›⁄[ô›◊€[Ÿ[ÿ€‹ŸWﬁ	À	€XZ[ù[ò[òŸWÿÿ[òŸ[	 N¬à€€ú›XZ[ù[ò[òŸTÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	€XZ[ù[ò[òŸW‹ÿ]ôI N¬àYà
+XZ[ù[ò[òŸTÿ]ôPùäHXZ[ù[ò[òŸTÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àÿ]ôSXZ[ù[ò[òŸU⁄[ô› N¬ÇàÀ»ÿ⁄Y[Yô\‹ù[Ÿ[à⁄\ôS[Ÿ[€‹ŸJ	‹ÿ⁄Y[Y‹ô\‹ù€[Ÿ[	À	‹ÿ⁄Y[Y‹ô\‹ù€[Ÿ[ÿ€‹ŸWﬁ	À	‹ÿ⁄Y[Wÿÿ[òŸ[	 N¬à€€ú›ÿ⁄Y[Tÿ]ôPùàHÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ÿ⁄Y[W‹ÿ]ôI N¬àYà
+ÿ⁄Y[Tÿ]ôPùäHÿ⁄Y[Tÿ]ôPùãòY]ô[ù\›[ô\ä	ÿ€X⁄…Àÿ]ôTÿ⁄Y[Yô\‹ù
+N¬ÇàÀ»ÿ⁄Y[Húô\]Y[òﬁH⁄[ôŸH[ô\àH⁄›À⁄YH^HöY[¬à€€ú›úô\]Y[òﬁTŸ[X›Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ÿ⁄Y[WŸúô\]Y[òﬁI N¬àYà
+úô\]Y[òﬁTŸ[X›
+H¬àúô\]Y[òﬁTŸ[X›òY]ô[ù\›[ô\ä	ÿ⁄[ôŸIÀ
+
+HOà¬à€€ú›úô\HHúô\]Y[òﬁTŸ[X›ùò[YN¬à€€ú›^QöY[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ÿ⁄Y[WŸ^WŸöY[	 N¬à€€ú›^SŸì[€ùöY[Hÿ›[Y[ùôŸ][[Y[ùûRY
+	‹ÿ⁄Y[WŸ^W€Ÿó€[€ùŸöY[	 N¬ÇàYà
+^QöY[
+H^QöY[ú›[Kô\‹^HHúô\HOOH	›ŸYZ€I»»	ÿõÿ⁄…»à	€õ€ôIŒ¬àYà
+^SŸì[€ùöY[
+H^SŸì[€ùöY[ú›[Kô\‹^HHúô\HOOH	€[€ùI»»	ÿõÿ⁄…»à	€õ€ôIŒ¬àJN¬àBÇàÀ»ô\‹ù›€õÿY[Ÿ[à⁄\ôS[Ÿ[€‹ŸJ	‹ô\‹ùŸ›€õÿY€[Ÿ[	À	‹ô\‹ùŸ›€õÿYÿ€‹ŸWﬁ	À	‹ô\‹ùŸ›€õÿYÿ€‹ŸI N¬üJJ
+N¬

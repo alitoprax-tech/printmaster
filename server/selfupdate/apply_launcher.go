@@ -11,27 +11,29 @@ import (
 	"time"
 
 	"printmaster/common/logger"
+	"printmaster/common/updateauth"
 	"printmaster/server/storage"
 )
 
 // ApplyInstruction represents the payload consumed by the helper to apply an update.
 type ApplyInstruction struct {
-	RunID            int64     `json:"run_id"`
-	StagePath        string    `json:"stage_path"`
-	BackupPath       string    `json:"backup_path"`
-	BinaryPath       string    `json:"binary_path"`
-	TargetVersion    string    `json:"target_version"`
-	CurrentVersion   string    `json:"current_version"`
-	ServiceName      string    `json:"service_name"`
-	Platform         string    `json:"platform"`
-	Arch             string    `json:"arch"`
-	Channel          string    `json:"channel"`
-	Component        string    `json:"component"`
-	DatabaseConfig   string    `json:"database_config"` // JSON-encoded database config
-	StateDir         string    `json:"state_dir"`
-	HelperBinaryPath string    `json:"helper_binary_path"`
-	LogPath          string    `json:"log_path"`
-	CreatedAt        time.Time `json:"created_at"`
+	Manifest         *updateauth.Manifest `json:"signed_manifest"`
+	RunID            int64                `json:"run_id"`
+	StagePath        string               `json:"stage_path"`
+	BackupPath       string               `json:"backup_path"`
+	BinaryPath       string               `json:"binary_path"`
+	TargetVersion    string               `json:"target_version"`
+	CurrentVersion   string               `json:"current_version"`
+	ServiceName      string               `json:"service_name"`
+	Platform         string               `json:"platform"`
+	Arch             string               `json:"arch"`
+	Channel          string               `json:"channel"`
+	Component        string               `json:"component"`
+	DatabaseConfig   string               `json:"database_config"` // JSON-encoded database config
+	StateDir         string               `json:"state_dir"`
+	HelperBinaryPath string               `json:"helper_binary_path"`
+	LogPath          string               `json:"log_path"`
+	CreatedAt        time.Time            `json:"created_at"`
 }
 
 // ApplyLauncher launches the helper that performs the actual restart and rollback workflow.
@@ -66,7 +68,7 @@ func (h *helperLauncher) Launch(run *storage.SelfUpdateRun, inst *ApplyInstructi
 		return nil, fmt.Errorf("backup path missing")
 	}
 	helpersDir := filepath.Join(h.stateDir, helperDirName)
-	if err := os.MkdirAll(helpersDir, 0o755); err != nil {
+	if err := os.MkdirAll(helpersDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create helpers dir: %w", err)
 	}
 	helperName := fmt.Sprintf("run-%d%s", run.ID, filepath.Ext(h.binaryPath))
@@ -75,15 +77,15 @@ func (h *helperLauncher) Launch(run *storage.SelfUpdateRun, inst *ApplyInstructi
 		return nil, fmt.Errorf("copy helper binary: %w", err)
 	}
 	if runtime.GOOS != "windows" {
-		_ = os.Chmod(helperPath, 0o755)
+		_ = os.Chmod(helperPath, 0o700)
 	}
 	logDir := filepath.Join(h.stateDir, logDirName)
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
 	logPath := filepath.Join(logDir, fmt.Sprintf("run-%d.log", run.ID))
 	applyDir := filepath.Join(h.stateDir, applyDirName)
-	if err := os.MkdirAll(applyDir, 0o755); err != nil {
+	if err := os.MkdirAll(applyDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create apply dir: %w", err)
 	}
 	inst.HelperBinaryPath = helperPath

@@ -134,7 +134,10 @@ func (api *API) handleListPolicies(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	if !api.authorize(w, r, authz.ActionTenantsRead, authz.ResourceRef{}) {
+	// The list contains policies for every tenant, including the global policy.
+	// It is therefore a server-wide settings read and must never be granted by
+	// the tenant-scoped tenants.read permission.
+	if !api.authorize(w, r, authz.ActionSettingsFleetGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 	policies, err := api.store.ListFleetUpdatePolicies(r.Context())
@@ -207,7 +210,7 @@ func (api *API) handleTenantPolicyGet(w http.ResponseWriter, r *http.Request, te
 	if !isGlobal {
 		resource = authz.ResourceRef{TenantIDs: []string{tenantID}}
 	} else {
-		action = authz.ActionSettingsFleetRead
+		action = authz.ActionSettingsFleetGlobalRead
 	}
 	if !api.authorize(w, r, action, resource) {
 		return
@@ -230,7 +233,7 @@ func (api *API) handleTenantPolicyPut(w http.ResponseWriter, r *http.Request, te
 	if !isGlobal {
 		resource = authz.ResourceRef{TenantIDs: []string{tenantID}}
 	} else {
-		action = authz.ActionSettingsFleetWrite
+		action = authz.ActionSettingsFleetGlobalWrite
 	}
 	if !api.authorize(w, r, action, resource) {
 		return
@@ -277,7 +280,7 @@ func (api *API) handleTenantPolicyDelete(w http.ResponseWriter, r *http.Request,
 	if !isGlobal {
 		resource = authz.ResourceRef{TenantIDs: []string{tenantID}}
 	} else {
-		action = authz.ActionSettingsFleetWrite
+		action = authz.ActionSettingsFleetGlobalWrite
 	}
 	if !api.authorize(w, r, action, resource) {
 		return

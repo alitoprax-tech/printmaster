@@ -31,9 +31,7 @@ services:
   # PrintMaster auto-detects TimescaleDB and enables these features automatically.
   # Replace credentials and tune performance for production use.
   db:
-    # New deployments use PostgreSQL 18. Do not use this tag for an existing
-    # PostgreSQL 15 data directory; follow docs/deployment/database-upgrade.md.
-    image: timescale/timescaledb:latest-pg18
+    image: timescale/timescaledb:2.17.2-pg15
     # --- Plain PostgreSQL Alternative ---
     # If you prefer standard PostgreSQL without time-series features, use:
     #   image: postgres:18-alpine
@@ -50,15 +48,15 @@ services:
     # Ensure TimescaleDB is preloaded (required for existing databases)
     command: ["postgres", "-c", "shared_preload_libraries=timescaledb"]
     environment:
-      # IMPORTANT: Change these credentials in production
       POSTGRES_USER: printmaster
-      POSTGRES_PASSWORD: changeme
+      POSTGRES_PASSWORD: "${PRINTMASTER_DB_PASSWORD:?Set PRINTMASTER_DB_PASSWORD before starting}"
       POSTGRES_DB: printmaster
     volumes:
-      # PG18 images use /var/lib/postgresql as the data root.
-      - db-data:/var/lib/postgresql
+      - db-data:/var/lib/postgresql/data
+    # Keep the database private; expose it through an authenticated tunnel if
+    # remote administration is required.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U printmaster"]
       interval: 10s
@@ -68,15 +66,15 @@ services:
   # pgAdmin (Optional) - Web UI for database management
   # Comment out this service if you don't need the admin panel.
   pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:8.14
+    profiles: ["admin"]
     restart: unless-stopped
     container_name: printmaster-pgadmin
     environment:
-      # IMPORTANT: Change these credentials in production
-      PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: changeme
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_DEFAULT_EMAIL:?Set PGADMIN_DEFAULT_EMAIL when using the admin profile}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_DEFAULT_PASSWORD:?Set PGADMIN_DEFAULT_PASSWORD when using the admin profile}"
     ports:
-      - "5050:80"
+      - "127.0.0.1:5050:80"
     depends_on:
       - db
 
@@ -87,7 +85,7 @@ services:
       context: .
       dockerfile: server/Dockerfile
       args:
-        VERSION: latest
+        VERSION: "${PRINTMASTER_VERSION:-dev}"
     restart: unless-stopped
     container_name: printmaster-server
     depends_on:
@@ -99,17 +97,21 @@ services:
       DB_PORT: "5432"
       DB_NAME: "printmaster"
       DB_USER: "printmaster"
-      DB_PASS: "changeme"
+      DB_PASS: "${PRINTMASTER_DB_PASSWORD:?Set PRINTMASTER_DB_PASSWORD before starting}"
       DOCKER: "true"
-      # Auto-join secret for agent registration (change to re-enable auto-join)
-      INIT_SECRET: "changeme-for-production"
+      # The host ports remain loopback-only; the service must listen on the
+      # private compose network for the optional agent container.
+      BIND_ADDRESS: "0.0.0.0"
+      # Optional shared auto-join secret. Leave unset in production and use
+      # short-lived, one-time tenant join tokens instead.
+      INIT_SECRET: "${PRINTMASTER_INIT_SECRET:-}"
       # Uncomment and adjust additional server settings as needed:
       # LOG_LEVEL: "info"
       # TLS_CERT: "/var/lib/printmaster/server/cert.pem"
       # TLS_KEY: "/var/lib/printmaster/server/key.pem"
     ports:
-      - "9090:9090"    # HTTP API
-      - "9443:9443"    # HTTPS API
+      - "127.0.0.1:9090:9090"    # HTTP API (reverse proxy backend)
+      - "127.0.0.1:9443:9443"    # HTTPS API
     volumes:
       # Persistent storage for logs, certificates, and data
       - server-data:/var/lib/printmaster/server
@@ -120,28 +122,40 @@ services:
   # Local agent for printer discovery and monitoring. Can be run on separate hosts.
   # Comment out if you only need the server.
   agent:
+    # The optional agent profile is disabled by default. When enabled, the
+    # agent must use an HTTPS server URL; plaintext HTTP is rejected by the
+    # agent onboarding policy even on the private compose network.
+    profiles: ["agent"]
     build:
       context: .
       dockerfile: agent/Dockerfile
       args:
-        VERSION: latest
+        VERSION: "${PRINTMASTER_VERSION:-dev}"
     restart: unless-stopped
     container_name: printmaster-agent
     depends_on:
       - server
     environment:
       # Server registration
-      SERVER_URL: "http://server:9090"
+      SERVER_URL: "${PRINTMASTER_AGENT_SERVER_URL:-https://server:9443}"
+      # Leave empty when the server certificate chains to a public CA. For a
+      # private/self-signed CA, set PRINTMASTER_AGENT_CA_PATH and mount the CA
+      # certificate into the agent container at that path.
+      SERVER_CA_PATH: "${PRINTMASTER_AGENT_CA_PATH:-}"
+      # Optional incoming SNMP trap community; keep empty unless explicitly
+      # enabled and restrict UDP/162 to the printer VLAN.
+      SNMP_TRAP_COMMUNITY: "${PRINTMASTER_SNMP_TRAP_COMMUNITY:-}"
       DOCKER: "true"
-      # Auto-join secret (must match server INIT_SECRET for auto-registration)
-      INIT_SECRET: "changeme-for-production"
+      # Optional auto-join secret (must match the server for auto-registration).
+      # Leave unset when using one-time tenant join tokens.
+      INIT_SECRET: "${PRINTMASTER_INIT_SECRET:-}"
       # Uncomment and adjust additional agent settings as needed:
       # DISCOVERY_RANGE: "192.168.1.0/24"
       # AGENT_NAME: "Site-A-Agent"
       # LOG_LEVEL: "info"
     ports:
-      - "8080:8080"    # Web UI HTTP
-      - "8443:8443"    # Web UI HTTPS
+      - "127.0.0.1:8080:8080"    # Web UI HTTP
+      - "127.0.0.1:8443:8443"    # Web UI HTTPS
     volumes:
       # Persistent storage for discovered devices and metrics
       - agent-data:/var/lib/printmaster/agent

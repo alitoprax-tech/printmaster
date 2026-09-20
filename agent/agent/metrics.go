@@ -89,7 +89,7 @@ func PersistMetrics() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(fn, data, 0o644)
+	return os.WriteFile(fn, data, 0o600)
 }
 
 // GetMetricsSnapshot returns a copy of the current metrics for inspection.

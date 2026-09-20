@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"printmaster/common/requestauth"
 	wscommon "printmaster/common/ws"
 )
 
@@ -57,6 +58,7 @@ type WSClient struct {
 	handshakeTimeout   time.Duration
 	maxReconnectDelay  time.Duration
 	insecureSkipVerify bool
+	tlsConfig          *tls.Config
 
 	// Local handler for direct invocation (avoids localhost HTTP round-trip)
 	localHandler      http.Handler
@@ -67,6 +69,9 @@ type WSClient struct {
 // NewWSClient creates a new WebSocket client
 func NewWSClient(serverURL, token string, insecureSkipVerify bool) *WSClient {
 	ctx, cancel := context.WithCancel(context.Background())
+	if insecureSkipVerify {
+		WarnCtx("Ignoring insecure WebSocket TLS setting; certificate verification is always enforced")
+	}
 
 	return &WSClient{
 		serverURL:         serverURL,
@@ -77,13 +82,15 @@ func NewWSClient(serverURL, token string, insecureSkipVerify bool) *WSClient {
 		cancel:            cancel,
 		localHandlerReady: make(chan struct{}),
 		// No stdlib logger; use agent package logging helpers instead
-		reconnectDelay:     5 * time.Second,
-		pingInterval:       30 * time.Second,
-		writeTimeout:       10 * time.Second,
-		readTimeout:        60 * time.Second,
-		handshakeTimeout:   10 * time.Second,
-		maxReconnectDelay:  5 * time.Minute,
-		insecureSkipVerify: insecureSkipVerify,
+		reconnectDelay:    5 * time.Second,
+		pingInterval:      30 * time.Second,
+		writeTimeout:      10 * time.Second,
+		readTimeout:       60 * time.Second,
+		handshakeTimeout:  10 * time.Second,
+		maxReconnectDelay: 5 * time.Minute,
+		// Keep this field for source compatibility, but never allow callers to
+		// disable certificate verification.
+		insecureSkipVerify: false,
 	}
 }
 
@@ -238,26 +245,30 @@ func (ws *WSClient) connect() error {
 	basePath := strings.TrimSuffix(u.Path, "/")
 	u.Path = basePath + "/api/v1/agents/ws"
 
-	// Add authentication token as query parameter
+	// Keep credentials out of URLs, reverse proxy logs and connection errors.
 	q := u.Query()
-	q.Set("token", ws.token)
+	q.Del("token")
 	u.RawQuery = q.Encode()
 
 	// Log the target URL but mask token for privacy in logs
 	InfoCtx("Connecting to WebSocket", "url", maskTokenForLog(u))
 
-	// Determine whether to skip TLS verification for the WebSocket dialer.
-	// Use the same configured policy passed into the WS client (via ServerClient)
-	skipVerify := ws.insecureSkipVerify
+	// Certificate verification is mandatory. A custom CA may be supplied via
+	// SetTLSConfig when a private PKI is used.
+	tlsConfig := ws.tlsConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 
 	// Connect using shared ws wrapper
-	conn, resp, err := wscommon.Dial(u.String(), nil, &tls.Config{InsecureSkipVerify: skipVerify}, ws.handshakeTimeout)
+	conn, resp, err := wscommon.Dial(u.String(), http.Header{"Authorization": {"Bearer " + ws.token}}, tlsConfig.Clone(), ws.handshakeTimeout)
 	if err != nil {
 		// Try to include HTTP response body and headers from the upgrade attempt for easier debugging
 		if resp != nil {
 			var bodyBytes []byte
 			if resp.Body != nil {
-				bodyBytes, _ = io.ReadAll(resp.Body)
+				defer resp.Body.Close()
+				bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			}
 			// Log status, a short preview of body, and response headers (if any)
 			preview := string(bodyBytes)
@@ -655,8 +666,8 @@ func (ws *WSClient) handleStreamingProxyRequest(requestID, method, path, rawQuer
 		req.Header.Set(k, v)
 	}
 
-	// Mark this as a server-proxied request
-	req.Header.Set("X-PrintMaster-Proxy", "server")
+	// Only this authenticated WebSocket path can establish a proxy principal.
+	req = req.WithContext(requestauth.WithProxyPrincipal(req.Context(), req.Header.Get("X-PrintMaster-User"), req.Header.Get("X-PrintMaster-Role")))
 
 	// Use our streaming ResponseWriter that sends chunks via WebSocket
 	streamWriter := newStreamingResponseWriter(ws, requestID)
@@ -713,9 +724,8 @@ func (ws *WSClient) handleLocalProxyRequest(requestID, method, path, rawQuery st
 		req.Header.Set(k, v)
 	}
 
-	// Mark this as a server-proxied request so agent auth middleware can bypass it
-	// This is safe because this code path is only reached for requests from the trusted server
-	req.Header.Set("X-PrintMaster-Proxy", "server")
+	// HTTP clients cannot supply this typed, in-process identity.
+	req = req.WithContext(requestauth.WithProxyPrincipal(req.Context(), req.Header.Get("X-PrintMaster-User"), req.Header.Get("X-PrintMaster-Role")))
 
 	// Use httptest.ResponseRecorder to capture the response
 	recorder := httptest.NewRecorder()
@@ -725,8 +735,7 @@ func (ws *WSClient) handleLocalProxyRequest(requestID, method, path, rawQuery st
 
 	// Extract response
 	result := recorder.Result()
-	respBody, err := io.ReadAll(result.Body)
-	result.Body.Close()
+	respBody, err := readBoundedProxyBody(result.Body)
 	if err != nil {
 		ws.sendProxyError(requestID, fmt.Sprintf("Failed to read local response: %v", err))
 		return
@@ -752,6 +761,23 @@ func (ws *WSClient) handleLocalProxyRequest(requestID, method, path, rawQuery st
 
 	// Send proxy response back to server
 	ws.sendProxyResponse(requestID, result.StatusCode, respHeaders, respBody)
+}
+
+const maxLocalProxyResponseBodySize = 8 << 20
+
+func readBoundedProxyBody(body io.ReadCloser) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, maxLocalProxyResponseBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxLocalProxyResponseBodySize {
+		return nil, fmt.Errorf("local proxy response body exceeds %d bytes", maxLocalProxyResponseBodySize)
+	}
+	return data, nil
 }
 
 // sendProxyResponse sends a successful proxy response back to the server

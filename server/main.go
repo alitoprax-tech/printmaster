@@ -22,14 +22,13 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // Import for side-effect: registers /debug/pprof handlers
-	"net/smtp"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"printmaster/common/config"
 	"printmaster/common/logger"
+	"printmaster/common/requestauth"
 	commonutil "printmaster/common/util"
 	sharedweb "printmaster/common/web"
 	wscommon "printmaster/common/ws"
@@ -41,6 +40,7 @@ import (
 	releases "printmaster/server/releases"
 	selfupdate "printmaster/server/selfupdate"
 	serversettings "printmaster/server/settings"
+	smtpclient "printmaster/server/smtp"
 	"printmaster/server/storage"
 	tenancy "printmaster/server/tenancy"
 	updatepolicy "printmaster/server/updatepolicy"
@@ -68,12 +68,17 @@ const (
 	httpRecencyThreshold = 90 * time.Second
 
 	// HTTP server timeout settings to prevent slowloris and resource exhaustion attacks
-	httpReadTimeout  = 30 * time.Second
-	httpWriteTimeout = 60 * time.Second
-	httpIdleTimeout  = 120 * time.Second
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 30 * time.Second
+	httpWriteTimeout      = 60 * time.Second
+	httpIdleTimeout       = 120 * time.Second
+	httpMaxHeaderBytes    = 16 << 10
 
 	// Maximum request body size (1MB) to prevent denial-of-service via oversized payloads
-	maxRequestBodySize = 1 << 20 // 1MB
+	maxRequestBodySize           = 1 << 20  // 1MB
+	maxProxyRequestBodySize      = 1 << 20  // 1MB
+	maxProxyResponseBodySize     = 8 << 20  // 8MB encoded/decoded response body
+	maxProxyDecompressedBodySize = 16 << 20 // 16MB after gzip expansion
 )
 
 // Principal represents the authenticated user along with cached authorization helpers.
@@ -369,24 +374,25 @@ func (m *MetricsBroadcaster) BroadcastMetrics(snapshot *storage.ServerMetricsSna
 }
 
 var (
-	serverLogger        *logger.Logger
-	serverStore         storage.Store
-	settingsResolver    *serversettings.Resolver
-	authRateLimiter     *AuthRateLimiter     // Rate limiter for failed auth attempts
-	configLoadErrors    []string             // Track config loading errors for display in UI
-	usingDefaultConfig  bool                 // Flag to indicate if using defaults vs loaded config
-	loadedConfigPath    string               // Path of the config file that was successfully loaded
-	sseHub              *SSEHub              // SSE hub for real-time UI updates
-	wsHub               *wscommon.Hub        // In-process hub for websocket-capable UI clients
-	serverConfig        *Config              // Loaded server configuration (accessible to handlers)
-	serverLogDir        string               // Directory containing server logs for UI fetches
-	configSourceTracker *ConfigSourceTracker // Tracks which keys were set by env vars
-	releaseManager      *releases.Manager
-	intakeWorker        *releases.IntakeWorker // Release intake worker for syncing GitHub releases
-	selfUpdateManager   *selfupdate.Manager    // Self-update manager for server binary updates
-	alertEvaluator      *alertsapi.Evaluator   // Alert evaluation background worker
-	metricsCollector    *metricsapi.Collector  // Server metrics collection background worker
-	credentialsKey      []byte                 // Encryption key for device credentials
+	serverLogger           *logger.Logger
+	serverStore            storage.Store
+	settingsResolver       *serversettings.Resolver
+	authRateLimiter        *AuthRateLimiter     // Rate limiter for failed auth attempts
+	publicTokenRateLimiter *AuthRateLimiter     // Bounded limiter for Argon2-backed public token flows
+	configLoadErrors       []string             // Track config loading errors for display in UI
+	usingDefaultConfig     bool                 // Flag to indicate if using defaults vs loaded config
+	loadedConfigPath       string               // Path of the config file that was successfully loaded
+	sseHub                 *SSEHub              // SSE hub for real-time UI updates
+	wsHub                  *wscommon.Hub        // In-process hub for websocket-capable UI clients
+	serverConfig           *Config              // Loaded server configuration (accessible to handlers)
+	serverLogDir           string               // Directory containing server logs for UI fetches
+	configSourceTracker    *ConfigSourceTracker // Tracks which keys were set by env vars
+	releaseManager         *releases.Manager
+	intakeWorker           *releases.IntakeWorker // Release intake worker for syncing GitHub releases
+	selfUpdateManager      *selfupdate.Manager    // Self-update manager for server binary updates
+	alertEvaluator         *alertsapi.Evaluator   // Alert evaluation background worker
+	metricsCollector       *metricsapi.Collector  // Server metrics collection background worker
+	credentialsKey         []byte                 // Encryption key for device credentials
 )
 
 var processStart = time.Now()
@@ -601,17 +607,18 @@ func runServer(ctx context.Context, configFlag string) {
 
 			// Ensure parent directory exists
 			parent := filepath.Dir(dbPath)
-			if err := os.MkdirAll(parent, 0755); err != nil {
+			if err := os.MkdirAll(parent, 0700); err != nil {
 				logWarn("Could not create DB parent directory; falling back to default", "path", parent, "error", err)
 				// clear to allow fallback logic to run
 				cfg.Database.Path = ""
 			} else {
 				// Try to open or create the DB file to ensure we have write access
-				f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0644)
+				f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0600)
 				if err != nil {
 					logWarn("Cannot write to DB path; falling back to default", "path", dbPath, "error", err)
 					cfg.Database.Path = ""
 				} else {
+					_ = f.Chmod(0600)
 					if err := f.Close(); err != nil {
 						logWarn("Failed to close DB probe file", "path", dbPath, "error", err)
 					}
@@ -650,7 +657,7 @@ func runServer(ctx context.Context, configFlag string) {
 			}
 			if strings.HasPrefix(strings.ToLower(cfg.Database.Path), strings.ToLower(pd)) {
 				parent := filepath.Dir(cfg.Database.Path)
-				if err := os.MkdirAll(parent, 0755); err != nil {
+				if err := os.MkdirAll(parent, 0700); err != nil {
 					logInfo("ProgramData path not writable; switching to per-user data directory", "programdata", pd, "error", err)
 					if userDir, derr := config.GetDataDirectory("server", false); derr == nil {
 						cfg.Database.Path = filepath.Join(userDir, "server.db")
@@ -726,8 +733,10 @@ func runServer(ctx context.Context, configFlag string) {
 	releaseManager, err = releases.NewManager(serverStore, serverLogger, releases.ManagerOptions{})
 	if err != nil {
 		logWarn("Release manifest manager disabled", "error", err)
-	} else if _, err := releaseManager.EnsureActiveKey(ctx); err != nil {
-		logWarn("Failed to ensure signing key", "error", err)
+	} else if !releaseManager.OfflineSigningEnabled() {
+		if _, err := releaseManager.EnsureActiveKey(ctx); err != nil {
+			logWarn("Failed to ensure signing key", "error", err)
+		}
 	}
 
 	if worker, err := releases.NewIntakeWorker(serverStore, serverLogger, releases.Options{
@@ -795,21 +804,22 @@ func runServer(ctx context.Context, configFlag string) {
 		manager.Start(ctx)
 	}
 
-	// Bootstrap initial admin user. Default to ADMIN_USER=admin and ADMIN_PASSWORD=printmaster
+	// Initial admin creation requires an explicitly supplied password.
 	adminUser := os.Getenv("ADMIN_USER")
 	if adminUser == "" {
 		adminUser = "admin"
 	}
 	adminPass := os.Getenv("ADMIN_PASSWORD")
-	if adminPass == "" {
-		adminPass = "printmaster"
-	}
 
 	bctx := context.Background()
 	existingUser, err := serverStore.GetUserByUsername(bctx, adminUser)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		logWarn("Failed to check for existing admin user", "user", adminUser, "error", err)
 	} else if existingUser == nil {
+		if len(adminPass) < 16 || adminPass == "printmaster" {
+			logFatal("Initial administrator requires ADMIN_PASSWORD with at least 16 characters")
+			return
+		}
 		// create admin user (either sql.ErrNoRows or nil user)
 		u := &storage.User{Username: adminUser, Role: storage.RoleAdmin}
 		if err := serverStore.CreateUser(bctx, u, adminPass); err != nil {
@@ -822,6 +832,10 @@ func runServer(ctx context.Context, configFlag string) {
 	// Bootstrap auto-join token if INIT_SECRET is set (for Docker Compose auto-registration)
 	initSecret := os.Getenv("INIT_SECRET")
 	if initSecret != "" {
+		if err := config.ValidateInitSecret(initSecret); err != nil {
+			logFatal("INIT_SECRET rejected", "error", err)
+			return
+		}
 		// Check if this secret was already used
 		secretUsedFile := filepath.Join(dataDir, ".init_secret_used")
 		if _, err := os.Stat(secretUsedFile); os.IsNotExist(err) {
@@ -892,6 +906,9 @@ func runServer(ctx context.Context, configFlag string) {
 	logInfo("SSE hub initialized")
 
 	// Initialize authentication rate limiter if enabled
+	// Public token validation is always bounded because it performs expensive
+	// Argon2 work even when login throttling is disabled for a local deployment.
+	publicTokenRateLimiter = NewAuthRateLimiter(60, time.Minute, time.Minute)
 	if cfg.Security.RateLimitEnabled {
 		maxAttempts := cfg.Security.RateLimitMaxAttempts
 		blockDuration := time.Duration(cfg.Security.RateLimitBlockMinutes) * time.Minute
@@ -1243,10 +1260,10 @@ func handleServiceCommand(cmd string) {
 // startReverseProxyMode starts the server in reverse proxy mode (behind nginx)
 // Supports both HTTP and HTTPS based on configuration
 func startReverseProxyMode(ctx context.Context, tlsConfig *TLSConfig) {
-	// Use configured bind address, default to all interfaces if not set
+	// Use configured bind address, default to loopback if not set
 	bindAddr := tlsConfig.BindAddress
 	if bindAddr == "" {
-		bindAddr = "0.0.0.0"
+		bindAddr = "127.0.0.1"
 	}
 
 	// Add reverse proxy middleware
@@ -1274,13 +1291,15 @@ func startReverseProxyMode(ctx context.Context, tlsConfig *TLSConfig) {
 
 		// Create HTTPS server with timeouts to prevent slowloris attacks
 		httpsServer := &http.Server{
-			Addr:         addr,
-			TLSConfig:    tlsCfg,
-			Handler:      handler,
-			ReadTimeout:  httpReadTimeout,
-			WriteTimeout: httpWriteTimeout,
-			IdleTimeout:  httpIdleTimeout,
-			ErrorLog:     log.New(logBridgeWriter{level: logger.ERROR}, "[HTTPS] ", 0),
+			Addr:              addr,
+			TLSConfig:         tlsCfg,
+			Handler:           handler,
+			ReadHeaderTimeout: httpReadHeaderTimeout,
+			ReadTimeout:       httpReadTimeout,
+			WriteTimeout:      httpWriteTimeout,
+			IdleTimeout:       httpIdleTimeout,
+			MaxHeaderBytes:    httpMaxHeaderBytes,
+			ErrorLog:          log.New(logBridgeWriter{level: logger.ERROR}, "[HTTPS] ", 0),
 			ConnState: func(conn net.Conn, state http.ConnState) {
 				if state == http.StateNew {
 					logDebug("New connection", "remote_addr", conn.RemoteAddr().String())
@@ -1324,12 +1343,14 @@ func startReverseProxyMode(ctx context.Context, tlsConfig *TLSConfig) {
 
 		// Create HTTP server with timeouts to prevent slowloris attacks
 		httpServer := &http.Server{
-			Addr:         addr,
-			Handler:      handler,
-			ReadTimeout:  httpReadTimeout,
-			WriteTimeout: httpWriteTimeout,
-			IdleTimeout:  httpIdleTimeout,
-			ErrorLog:     log.New(logBridgeWriter{level: logger.ERROR}, "[HTTP] ", 0),
+			Addr:              addr,
+			Handler:           handler,
+			ReadHeaderTimeout: httpReadHeaderTimeout,
+			ReadTimeout:       httpReadTimeout,
+			WriteTimeout:      httpWriteTimeout,
+			IdleTimeout:       httpIdleTimeout,
+			MaxHeaderBytes:    httpMaxHeaderBytes,
+			ErrorLog:          log.New(logBridgeWriter{level: logger.ERROR}, "[HTTP] ", 0),
 		}
 
 		// Start server in goroutine
@@ -1365,10 +1386,10 @@ func startStandaloneMode(ctx context.Context, tlsConfig *TLSConfig) {
 		logFatal("Failed to setup TLS", "error", err, "mode", tlsConfig.Mode)
 	}
 
-	// Use configured bind address, default to all interfaces if not set
+	// Use configured bind address, default to loopback if not set
 	bindAddr := tlsConfig.BindAddress
 	if bindAddr == "" {
-		bindAddr = "0.0.0.0"
+		bindAddr = "127.0.0.1"
 	}
 	httpsAddr := fmt.Sprintf("%s:%d", bindAddr, tlsConfig.HTTPSPort)
 
@@ -1408,11 +1429,13 @@ func startStandaloneMode(ctx context.Context, tlsConfig *TLSConfig) {
 
 	// Create HTTPS server with security headers and timeouts to prevent slowloris attacks
 	httpsServer := &http.Server{
-		Handler:      loggingMiddleware(securityHeadersMiddleware(http.DefaultServeMux)),
-		ReadTimeout:  httpReadTimeout,
-		WriteTimeout: httpWriteTimeout,
-		IdleTimeout:  httpIdleTimeout,
-		ErrorLog:     log.New(logBridgeWriter{level: logger.ERROR}, "[HTTPS] ", 0),
+		Handler:           loggingMiddleware(securityHeadersMiddleware(http.DefaultServeMux)),
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		MaxHeaderBytes:    httpMaxHeaderBytes,
+		ErrorLog:          log.New(logBridgeWriter{level: logger.ERROR}, "[HTTPS] ", 0),
 		ConnState: func(conn net.Conn, state http.ConnState) {
 			if state == http.StateNew {
 				logDebug("New connection", "remote_addr", conn.RemoteAddr().String())
@@ -1469,7 +1492,18 @@ func startACMEChallengeServer(tlsConfig *TLSConfig) {
 	logInfo("Starting ACME HTTP-01 challenge server", "port", 80)
 	logInfo("ACME challenge server listening", "addr", ":80")
 
-	if err := http.ListenAndServe(":80", mux); err != nil {
+	// The ACME endpoint is intentionally tiny, but it is still internet-facing
+	// and must be protected from slowloris/header exhaustion attacks.
+	acmeServer := &http.Server{
+		Addr:              ":80",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	if err := acmeServer.ListenAndServe(); err != nil {
 		logError("ACME challenge server failed", "error", err)
 	}
 }
@@ -1477,6 +1511,13 @@ func startACMEChallengeServer(tlsConfig *TLSConfig) {
 // loggingMiddleware logs all incoming HTTP requests
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && r.Body != http.NoBody {
+			// Apply a defense-in-depth cap before dispatching to any route. Route
+			// handlers still use decodeJSONBody/readBoundedProxyBody for stricter
+			// limits, while legacy or extension handlers cannot accidentally read
+			// an unbounded request body.
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+		}
 		clientIP := getRealIP(r)
 
 		// Log the incoming request at trace level (too noisy for debug)
@@ -1557,16 +1598,17 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		token := parts[1]
 		tokenPrefix := token
-		if len(token) > 8 {
-			tokenPrefix = token[:8]
+		if len(tokenPrefix) > 8 {
+			tokenPrefix = tokenPrefix[:8]
 		}
+		tokenLogPrefix := tokenPrefixForLog(token)
 
 		// Check if this IP+token is currently blocked
 		if authRateLimiter != nil {
 			if isBlocked, blockedUntil := authRateLimiter.IsBlocked(clientIP, tokenPrefix); isBlocked {
 				logWarn("Blocked authentication attempt",
 					"ip", clientIP,
-					"token", tokenPrefix+"...",
+					"token", tokenLogPrefix+"...",
 					"blocked_until", blockedUntil.Format(time.RFC3339),
 					"user_agent", r.Header.Get("User-Agent"))
 				http.Error(w, "Too many failed attempts. Try again later.", http.StatusTooManyRequests)
@@ -1590,7 +1632,7 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			if shouldLog {
 				fields := []interface{}{
 					"ip", clientIP,
-					"token", tokenPrefix + "...",
+					"token", tokenLogPrefix + "...",
 					"error", err.Error(),
 					"attempt_count", attemptCount,
 					"user_agent", r.Header.Get("User-Agent"),
@@ -1603,10 +1645,10 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 					// Log to audit trail when blocking occurs
 					logAuditEntry(ctx, &storage.AuditEntry{
 						ActorType: storage.AuditActorAgent,
-						ActorID:   tokenPrefix,
+						ActorID:   tokenLogPrefix,
 						Action:    "auth_blocked",
 						Details: fmt.Sprintf("IP blocked after %d failed attempts with token %s... Error: %s",
-							attemptCount, tokenPrefix, err.Error()),
+							attemptCount, tokenLogPrefix, err.Error()),
 						IPAddress: clientIP,
 						UserAgent: r.Header.Get("User-Agent"),
 						Severity:  storage.AuditSeverityWarn,
@@ -1679,6 +1721,10 @@ func loadUserForSessionToken(token string) (*storage.User, error) {
 // requireWebAuth validates a session token from cookie or Authorization header
 func requireWebAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requestauth.BrowserRequestAllowed(r) {
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
 		token := sessionTokenFromRequest(r)
 		if token == "" {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
@@ -1744,11 +1790,40 @@ func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 // denial-of-service attacks via oversized payloads. Returns an error if the body
 // exceeds maxRequestBodySize (1MB) or if JSON decoding fails.
 func decodeJSONBody(r *http.Request, v interface{}) error {
-	return json.NewDecoder(io.LimitReader(r.Body, maxRequestBodySize)).Decode(v)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxRequestBodySize {
+		return fmt.Errorf("request body exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(v); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("request must contain one JSON value")
+	}
+	return nil
+}
+
+func validatePasswordInput(password string) error {
+	if serverConfig != nil {
+		return serverConfig.Security.ValidatePassword(password)
+	}
+	if len(password) > maxPasswordLength {
+		return fmt.Errorf("password must be at most %d characters", maxPasswordLength)
+	}
+	return nil
 }
 
 // handleAuthLogin handles local username/password login and returns a session token
 func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if !requestauth.BrowserRequestAllowed(r) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1765,14 +1840,28 @@ func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "username and password required", http.StatusBadRequest)
 		return
 	}
-
-	ctx := context.Background()
+	clientIP := getRealIP(r)
+	loginKey := "login:" + strings.ToLower(strings.TrimSpace(req.Username))
+	if authRateLimiter != nil {
+		if blocked, until := authRateLimiter.IsBlocked(clientIP, loginKey); blocked {
+			w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(until).Seconds())+1))
+			http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+			return
+		}
+	}
+	if len(req.Password) > maxPasswordLength {
+		if authRateLimiter != nil {
+			authRateLimiter.RecordFailure(clientIP, loginKey)
+		}
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	ctx := r.Context()
 	user, err := serverStore.AuthenticateUser(ctx, req.Username, req.Password)
 	if err != nil {
 		// rate limit
 		if authRateLimiter != nil {
-			clientIP := getRealIP(r)
-			authRateLimiter.RecordFailure(clientIP, req.Username)
+			authRateLimiter.RecordFailure(clientIP, loginKey)
 		}
 		logAuditEntry(ctx, &storage.AuditEntry{
 			ActorType: storage.AuditActorUser,
@@ -1791,6 +1880,9 @@ func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if authRateLimiter != nil {
+		authRateLimiter.RecordSuccess(clientIP, loginKey)
+	}
 	ses, err := createSessionCookie(w, r, user.ID)
 	if err != nil {
 		serverLogger.Error("Failed to create session cookie after login", "user_id", user.ID, "username", user.Username, "error", err)
@@ -1843,7 +1935,7 @@ func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" && serverConfig != nil && (serverConfig.Server.BehindProxy || serverConfig.Server.CloudflareProxy) && isTrustedProxy(extractIPFromAddr(r.RemoteAddr)) {
 		parts := strings.Split(proto, ",")
 		if len(parts) > 0 {
 			if strings.TrimSpace(strings.ToLower(parts[0])) == "https" {
@@ -1994,11 +2086,9 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Validate password against policy
-		if serverConfig != nil {
-			if err := serverConfig.Security.ValidatePassword(req.Password); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
+		if err := validatePasswordInput(req.Password); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		role := storage.NormalizeRole(req.Role)
 		tenantIDs := storage.SortTenantIDs(req.TenantIDs)
@@ -2158,6 +2248,8 @@ var (
 	agentCallbackTokensMu sync.RWMutex
 )
 
+const maxAgentCallbackTokens = 8192
+
 // generateAgentCallbackToken creates a new short-lived callback token for agent auth.
 func generateAgentCallbackToken(user *storage.User, agentID, callbackURL string) *agentCallbackToken {
 	b := make([]byte, 32)
@@ -2182,6 +2274,24 @@ func generateAgentCallbackToken(user *storage.User, agentID, callbackURL string)
 	}
 
 	agentCallbackTokensMu.Lock()
+	if len(agentCallbackTokens) >= maxAgentCallbackTokens {
+		// Remove expired entries first; if a caller is still flooding the
+		// endpoint, evict the oldest entry to keep the map bounded.
+		var oldest string
+		var oldestAt time.Time
+		for key, existing := range agentCallbackTokens {
+			if existing == nil || now.After(existing.ExpiresAt) {
+				delete(agentCallbackTokens, key)
+				continue
+			}
+			if oldest == "" || existing.CreatedAt.Before(oldestAt) {
+				oldest, oldestAt = key, existing.CreatedAt
+			}
+		}
+		if len(agentCallbackTokens) >= maxAgentCallbackTokens && oldest != "" {
+			delete(agentCallbackTokens, oldest)
+		}
+	}
 	agentCallbackTokens[token] = act
 	agentCallbackTokensMu.Unlock()
 
@@ -2251,6 +2361,9 @@ func cleanupExpiredSessions() {
 // Creates a callback token for redirecting back to an agent with authentication.
 // Requires an authenticated session.
 func handleAgentAuthCallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -2270,6 +2383,19 @@ func handleAgentAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	req.AgentID = strings.TrimSpace(req.AgentID)
+	if req.AgentID == "" {
+		http.Error(w, "agent_id required", http.StatusBadRequest)
+		return
+	}
+	agent, err := serverStore.GetAgent(r.Context(), req.AgentID)
+	if err != nil || agent == nil {
+		http.Error(w, "agent not found", http.StatusNotFound)
+		return
+	}
+	if !authorizeOrReject(w, r, authz.ActionAgentsRead, authz.ResourceRef{TenantIDs: []string{agent.TenantID}}) {
+		return
+	}
 
 	// Validate callback URL is reasonable (must be HTTPS or localhost)
 	callbackURL := strings.TrimSpace(req.CallbackURL)
@@ -2282,10 +2408,35 @@ func handleAgentAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid callback_url", http.StatusBadRequest)
 		return
 	}
-	// Allow localhost (any scheme) or HTTPS
+	if parsed.User != nil || strings.ContainsAny(callbackURL, "\r\n\\") || parsed.Host == "" {
+		http.Error(w, "invalid callback_url", http.StatusBadRequest)
+		return
+	}
+	// Callback tokens are bearer credentials.  Only the agent's dedicated
+	// callback endpoint may receive one; accepting an arbitrary local path
+	// would let an authenticated caller forward the token to another service
+	// listening on localhost.
+	if parsed.Path != "/api/v1/auth/callback" {
+		http.Error(w, "callback_url must target the agent auth callback", http.StatusBadRequest)
+		return
+	}
+	if callbackAgentID := strings.TrimSpace(parsed.Query().Get("agent_id")); callbackAgentID != "" && callbackAgentID != req.AgentID {
+		http.Error(w, "callback agent identity mismatch", http.StatusBadRequest)
+		return
+	}
+	// Allow localhost or the registered agent host over HTTPS. This prevents
+	// an authenticated user from turning the callback endpoint into a generic
+	// bearer-token minting service for an arbitrary external host.
 	host := strings.ToLower(parsed.Hostname())
 	isLocalhost := host == "localhost" || host == "127.0.0.1" || host == "::1"
-	if !isLocalhost && parsed.Scheme != "https" {
+	registeredHosts := map[string]struct{}{strings.ToLower(strings.TrimSpace(agent.IP)): {}, strings.ToLower(strings.TrimSpace(agent.Hostname)): {}}
+	if !isLocalhost {
+		if _, ok := registeredHosts[host]; !ok || !strings.EqualFold(parsed.Scheme, "https") {
+			http.Error(w, "callback_url host is not registered for this agent", http.StatusBadRequest)
+			return
+		}
+	}
+	if isLocalhost && parsed.Scheme != "http" && parsed.Scheme != "https" {
 		http.Error(w, "callback_url must use HTTPS for non-localhost addresses", http.StatusBadRequest)
 		return
 	}
@@ -2333,8 +2484,17 @@ func handleAgentAuthCallback(w http.ResponseWriter, r *http.Request) {
 // handleAgentAuthCallbackValidate handles POST /api/v1/auth/agent-callback/validate
 // Validates a callback token (called by agents). Does not require session auth.
 func handleAgentAuthCallbackValidate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// This endpoint is intentionally public because the agent calls it after a
+	// browser login. Bound unauthenticated traffic before doing map lookups and
+	// audit writes so random-token floods cannot become an unbounded DoS.
+	if !allowPublicTokenFlow(w, r, "agent-callback-validate") {
 		return
 	}
 
@@ -2352,10 +2512,14 @@ func handleAgentAuthCallbackValidate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token required", http.StatusBadRequest)
 		return
 	}
+	if len(token) > 128 || len(strings.TrimSpace(req.AgentID)) > deviceAuthMaxAgentID {
+		http.Error(w, "token or agent identity too long", http.StatusBadRequest)
+		return
+	}
 
 	act, valid := validateAgentCallbackToken(token)
 	if !valid {
-		serverLogger.Warn("Agent callback token validation failed", "token_prefix", token[:min(8, len(token))]+"...")
+		serverLogger.Warn("Agent callback token validation failed", "token_prefix", maskSensitiveToken(token))
 		// Audit log for failed validation
 		ctx := r.Context()
 		logAuditEntry(ctx, &storage.AuditEntry{
@@ -2375,13 +2539,16 @@ func handleAgentAuthCallbackValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional: verify agent ID matches if provided
-	if req.AgentID != "" && act.AgentID != "" && req.AgentID != act.AgentID {
+	// The agent ID is part of the token binding and is mandatory. A mismatch
+	// must fail closed; logging it and continuing would let one agent consume a
+	// token minted for another tenant/agent.
+	if req.AgentID == "" || act.AgentID == "" || req.AgentID != act.AgentID {
 		serverLogger.Warn("Agent callback token agent ID mismatch",
 			"expected", act.AgentID,
 			"got", req.AgentID,
 		)
-		// Still allow it but log the mismatch
+		http.Error(w, "agent identity mismatch", http.StatusForbidden)
+		return
 	}
 
 	serverLogger.Info("Agent callback token validated",
@@ -2554,11 +2721,9 @@ func handleUser(w http.ResponseWriter, r *http.Request) {
 		})
 		if req.Password != "" {
 			// Validate password against policy
-			if serverConfig != nil {
-				if err := serverConfig.Security.ValidatePassword(req.Password); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
+			if err := validatePasswordInput(req.Password); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
 			}
 			if err := serverStore.UpdateUserPassword(ctx, id, req.Password); err != nil {
 				serverLogger.Error("Failed to update user password", "user_id", id, "error", err)
@@ -2736,9 +2901,9 @@ func sendHTMLEmail(to string, subject string, htmlBody string, textBody string) 
 
 	// Sanitize from address to prevent header injection
 	validatedFrom := sanitizeEmailHeader(from)
-
-	addr := fmt.Sprintf("%s:%d", host, port)
-	auth := smtp.PlainAuth("", user, pass, host)
+	if validatedFrom == "" {
+		return fmt.Errorf("SMTP sender is not configured")
+	}
 
 	// Build email message using validated values
 	var msg string
@@ -2778,7 +2943,10 @@ func sendHTMLEmail(to string, subject string, htmlBody string, textBody string) 
 			"\r\n" + textBody
 	}
 
-	return smtp.SendMail(addr, auth, validatedFrom, []string{validatedTo}, []byte(msg))
+	// Resolve the SMTP hostname once and dial the numeric result.  This keeps
+	// the admin-configured SMTP path safe from DNS rebinding while preserving
+	// the hostname for STARTTLS SNI and authentication.
+	return smtpclient.Send(context.Background(), host, port, user, pass, validatedFrom, []string{validatedTo}, []byte(msg), false)
 }
 
 // getEmailTheme returns the configured email theme, defaulting to "auto"
@@ -2794,8 +2962,15 @@ func getEmailTheme() string {
 
 // handlePasswordResetRequest accepts {email} and sends a reset token by email (if configured)
 func handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
+	if !requestauth.BrowserRequestAllowed(r) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !allowPublicTokenFlow(w, r, "password-reset-request") {
 		return
 	}
 	var req struct {
@@ -2852,11 +3027,7 @@ func handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
 		IPAddress: extractClientIP(r),
 		UserAgent: r.Header.Get("User-Agent"),
 	})
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	resetURL := fmt.Sprintf("%s://%s/reset?token=%s", scheme, r.Host, token)
+	resetURL := buildExternalURL(r) + "/reset?token=" + url.QueryEscape(token)
 
 	// Generate themed HTML email
 	theme := emailtpl.NormalizeTheme(getEmailTheme())
@@ -2877,10 +3048,33 @@ func handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"sent": true})
 }
 
+// allowPublicTokenFlow bounds expensive Argon2 verification on unauthenticated
+// invitation and password-reset endpoints. The limiter is deliberately keyed
+// by operation so a token brute-force campaign cannot consume the login budget.
+func allowPublicTokenFlow(w http.ResponseWriter, r *http.Request, operation string) bool {
+	if publicTokenRateLimiter == nil {
+		return true
+	}
+	blocked, _, _ := publicTokenRateLimiter.RecordFailure(getRealIP(r), operation)
+	if blocked {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many token requests", http.StatusTooManyRequests)
+		return false
+	}
+	return true
+}
+
 // handlePasswordResetConfirm accepts {token, password} to reset the password
 func handlePasswordResetConfirm(w http.ResponseWriter, r *http.Request) {
+	if !requestauth.BrowserRequestAllowed(r) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !allowPublicTokenFlow(w, r, "password-reset-confirm") {
 		return
 	}
 	var req struct {
@@ -2895,6 +3089,14 @@ func handlePasswordResetConfirm(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token and password required", http.StatusBadRequest)
 		return
 	}
+	if len(req.Token) > 512 {
+		http.Error(w, "invalid token", http.StatusBadRequest)
+		return
+	}
+	if err := validatePasswordInput(req.Password); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	ctx := context.Background()
 	userID, err := serverStore.ValidatePasswordResetToken(ctx, req.Token)
 	if err != nil {
@@ -2907,6 +3109,19 @@ func handlePasswordResetConfirm(w http.ResponseWriter, r *http.Request) {
 		serverLogger.Error("Failed to reset password", "user_id", userID, "error", err)
 		http.Error(w, "failed to reset password", http.StatusInternalServerError)
 		return
+	}
+	// A password reset invalidates every existing session, including sessions
+	// created by a compromised browser or refresh token.
+	if sessions, err := serverStore.ListSessions(ctx); err == nil {
+		for _, session := range sessions {
+			if session != nil && session.UserID == userID && session.Token != "" {
+				if err := serverStore.DeleteSessionByHash(ctx, session.Token); err != nil {
+					serverLogger.Warn("Failed to revoke session after password reset", "user_id", userID, "error", err)
+				}
+			}
+		}
+	} else {
+		serverLogger.Warn("Failed to enumerate sessions after password reset", "user_id", userID, "error", err)
 	}
 	// Optionally delete any other outstanding tokens for this user
 	_ = serverStore.DeletePasswordResetToken(ctx, req.Token)
@@ -2989,14 +3204,10 @@ func handleUserInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build invitation URL
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	host := r.Host
-	serverURL := fmt.Sprintf("%s://%s", scheme, host)
-	inviteURL := fmt.Sprintf("%s/accept-invite?token=%s", serverURL, token)
+	// Build invitation URL from the configured canonical URL when present; do
+	// not trust an arbitrary Host/X-Forwarded-Proto header for emailed links.
+	serverURL := buildExternalURL(r)
+	inviteURL := fmt.Sprintf("%s/accept-invite?token=%s", serverURL, url.QueryEscape(token))
 
 	// Get tenant name if applicable
 	var tenantName string
@@ -3099,9 +3310,16 @@ func handleInviteValidate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
+	if !allowPublicTokenFlow(w, r, "invite-validate") {
+		return
+	}
 	token := r.URL.Query().Get("token")
 	if token == "" {
 		http.Error(w, "token required", http.StatusBadRequest)
+		return
+	}
+	if len(token) > 512 {
+		http.Error(w, "invalid token", http.StatusBadRequest)
 		return
 	}
 
@@ -3134,8 +3352,15 @@ func handleInviteValidate(w http.ResponseWriter, r *http.Request) {
 // handleInviteAccept accepts an invitation and creates the user account (public endpoint)
 // POST /api/v1/users/invite/accept
 func handleInviteAccept(w http.ResponseWriter, r *http.Request) {
+	if !requestauth.BrowserRequestAllowed(r) {
+		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if !allowPublicTokenFlow(w, r, "invite-accept") {
 		return
 	}
 
@@ -3150,6 +3375,14 @@ func handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Token == "" || req.Username == "" || req.Password == "" {
 		http.Error(w, "token, username, and password are required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Token) > 512 {
+		http.Error(w, "invalid invitation token", http.StatusBadRequest)
+		return
+	}
+	if err := validatePasswordInput(req.Password); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -3196,7 +3429,15 @@ func handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 
 	// Mark invitation as used
 	if err := serverStore.MarkInvitationUsed(ctx, inv.ID); err != nil {
-		logWarn("Failed to mark invitation as used", "error", err, "id", inv.ID)
+		// The claim must succeed before the newly-created account is exposed;
+		// otherwise two concurrent accepts could create multiple accounts from
+		// one invitation. Best effort cleanup preserves the one-time property.
+		if cleanupErr := serverStore.DeleteUser(ctx, user.ID); cleanupErr != nil {
+			logError("Failed to roll back user after invitation claim failure", "user_id", user.ID, "error", cleanupErr)
+		}
+		logWarn("Invitation was already used or expired", "error", err, "id", inv.ID)
+		http.Error(w, "invalid or expired invitation", http.StatusConflict)
+		return
 	}
 
 	// Audit log
@@ -3261,13 +3502,24 @@ func auditActorFromPrincipal(r *http.Request) (storage.AuditActorType, string, s
 }
 
 func maskSensitiveToken(token string) string {
-	if token == "" {
+	if strings.TrimSpace(token) == "" {
 		return ""
 	}
-	if len(token) <= 8 {
-		return token
+	return tokenPrefixForLog(token) + "..."
+}
+
+// tokenPrefixForLog returns a bounded diagnostic value without exposing short
+// bearer/reset tokens in logs. The raw value remains confined to authentication
+// and rate-limit lookups.
+func tokenPrefixForLog(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "[redacted]"
 	}
-	return token[:8] + "..."
+	if len(token) <= 8 {
+		return "[redacted]"
+	}
+	return token[:8]
 }
 
 func logRequestAudit(r *http.Request, entry *storage.AuditEntry) {
@@ -3480,6 +3732,7 @@ func setupRoutes(cfg *Config) {
 	tenancy.SetAuditLogger(logRequestAudit)
 	tenancy.SetEmailSender(sendHTMLEmail)
 	tenancy.SetEmailThemeGetter(getEmailTheme)
+	tenancy.SetExternalURLBuilder(buildExternalURL)
 	tenancy.SetUserFromContextGetter(func(ctx context.Context) *storage.User {
 		if v := ctx.Value(userContextKey); v != nil {
 			if u, ok := v.(*storage.User); ok {
@@ -3495,6 +3748,10 @@ func setupRoutes(cfg *Config) {
 		AuthMiddleware: requireWebAuth,
 		Authorizer: func(r *http.Request, action authz.Action, resource authz.ResourceRef) error {
 			return authorizeRequest(r, action, resource)
+		},
+		IsAdmin: func(r *http.Request) bool {
+			principal := getPrincipal(r)
+			return principal != nil && principal.IsAdmin()
 		},
 		ActorResolver: func(r *http.Request) string {
 			if principal := getPrincipal(r); principal != nil && principal.User != nil {
@@ -3546,7 +3803,6 @@ func setupRoutes(cfg *Config) {
 	// Alerts API routes
 	alertNotifier := alertsapi.NewNotifier(serverStore, alertsapi.NotifierConfig{
 		Logger:     nil, // Uses slog.Default()
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 		MaxRetries: 3,
 		RetryDelay: 5 * time.Second,
 		SMTP: alertsapi.SMTPConfig{
@@ -3562,6 +3818,13 @@ func setupRoutes(cfg *Config) {
 		AuthMiddleware: requireWebAuth,
 		Authorizer: func(r *http.Request, action authz.Action, resource authz.ResourceRef) error {
 			return authorizeRequest(r, action, resource)
+		},
+		TenantScope: func(r *http.Request) ([]string, bool, bool) {
+			principal := getPrincipal(r)
+			if principal == nil {
+				return nil, false, false
+			}
+			return principal.AllowedTenantIDs(), principal.IsAdmin(), true
 		},
 		ActorResolver: func(r *http.Request) string {
 			if principal := getPrincipal(r); principal != nil && principal.User != nil {
@@ -3625,6 +3888,9 @@ func setupRoutes(cfg *Config) {
 	http.HandleFunc("/api/v1/server/settings/sources", requireWebAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		if !authorizeOrReject(w, r, authz.ActionSettingsServerRead, authz.ResourceRef{}) {
 			return
 		}
 		// Build list of locked keys (those set by environment variables)
@@ -3804,8 +4070,13 @@ func runHealthCheck(configFlag string) error {
 func probeHealthEndpoint(endpoint string, insecure bool) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	if insecure {
+		if !isLoopbackHealthEndpoint(endpoint) {
+			return fmt.Errorf("insecure health probes are restricted to loopback")
+		}
 		// Skip TLS verification for self-signed/local certs used by the server.
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec
+		// #nosec G402 -- the endpoint is checked above and is fixed loopback;
+		// self-signed certificates are accepted only for this local probe.
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
@@ -3827,7 +4098,7 @@ func probeHealthEndpoint(endpoint string, insecure bool) error {
 		Status string `json:"status"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 
@@ -3836,6 +4107,15 @@ func probeHealthEndpoint(endpoint string, insecure bool) error {
 	}
 
 	return nil
+}
+
+func isLoopbackHealthEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
 // handleSSE streams server-sent events to UI clients for real-time updates
@@ -3847,7 +4127,6 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -3868,7 +4147,17 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Stream events to client
 	for {
 		select {
-		case event := <-client.events:
+		case event, ok := <-client.events:
+			if !ok {
+				return
+			}
+			principal := currentStreamPrincipal(r)
+			if principal == nil {
+				return
+			}
+			if !eventVisibleToPrincipal(r.Context(), serverStore, principal, event.Data) {
+				continue
+			}
 			// Marshal event data
 			data, err := json.Marshal(event.Data)
 			if err != nil {
@@ -3929,6 +4218,14 @@ func handleUIWebSocket(w http.ResponseWriter, r *http.Request) {
 			case ev, ok := <-ch:
 				if !ok {
 					return
+				}
+				principal := currentStreamPrincipal(r)
+				if principal == nil {
+					conn.Close()
+					return
+				}
+				if !eventVisibleToPrincipal(r.Context(), serverStore, principal, ev.Data) {
+					continue
 				}
 				if b, err := ev.Marshal(); err == nil {
 					if err := conn.WriteRaw(b, 10*time.Second); err != nil {
@@ -4289,6 +4586,11 @@ func handleAgentsList(w http.ResponseWriter, r *http.Request) {
 			for id := range scope {
 				tenantIDs = append(tenantIDs, id)
 			}
+		}
+		if scope != nil && len(tenantIDs) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"agents": []*storage.Agent{}, "total_count": 0, "has_more": false, "limit": limit, "offset": 0})
+			return
 		}
 
 		// Get total count
@@ -4716,6 +5018,10 @@ func handleAgentDetails(w http.ResponseWriter, r *http.Request) {
 
 // handleAgentProxy proxies HTTP requests to the agent's own web UI through WebSocket
 func handleAgentProxy(w http.ResponseWriter, r *http.Request) {
+	if !browserProxyEnabled() {
+		http.Error(w, "browser proxy is disabled until a separate printer origin is configured", http.StatusServiceUnavailable)
+		return
+	}
 	// Extract agent ID from path: /api/v1/proxy/agent/{agentID}/{path...}
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/proxy/agent/")
 	parts := strings.SplitN(path, "/", 2)
@@ -4790,11 +5096,10 @@ func handleAgentProxy(w http.ResponseWriter, r *http.Request) {
 
 // handleDeviceProxy proxies HTTP requests to device web UIs through agent WebSocket
 func handleDeviceProxy(w http.ResponseWriter, r *http.Request) {
-	if correctedPath, ok := recoverDeviceProxyResourcePath(r); ok {
-		http.Redirect(w, r, correctedPath, http.StatusFound)
+	if !browserProxyEnabled() {
+		http.Error(w, "browser proxy is disabled until a separate printer origin is configured", http.StatusServiceUnavailable)
 		return
 	}
-
 	serial, targetPath, err := parseDeviceProxyPath(r.URL.Path, "/api/v1/proxy/device/")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -4849,6 +5154,10 @@ func isProxyResourceDirectory(segment string) bool {
 // handleLegacyDeviceProxy keeps historical /proxy/{serial}/ URLs working by routing
 // them through the same device proxy implementation as the modern API endpoint.
 func handleLegacyDeviceProxy(w http.ResponseWriter, r *http.Request) {
+	if !browserProxyEnabled() {
+		http.Error(w, "browser proxy is disabled until a separate printer origin is configured", http.StatusServiceUnavailable)
+		return
+	}
 	serial, targetPath, err := parseDeviceProxyPath(r.URL.Path, "/proxy/")
 	if err != nil {
 		http.NotFound(w, r)
@@ -4895,13 +5204,11 @@ func handleDeviceCredentials(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check tenant access via the device's agent
-		if device.AgentID != "" {
-			agent, err := serverStore.GetAgent(ctx, device.AgentID)
-			if err == nil && agent != nil && !tenantAllowed(scope, agent.TenantID) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
+		// Ownership must be established, including for legacy/orphaned data.
+		agent, err := serverStore.GetAgent(ctx, device.AgentID)
+		if device.AgentID == "" || err != nil || agent == nil || !tenantAllowed(scope, agent.TenantID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 
 		// Get credentials from server storage
@@ -4928,6 +5235,9 @@ func handleDeviceCredentials(w http.ResponseWriter, r *http.Request) {
 			AuthType  string `json:"auth_type"`
 			AutoLogin bool   `json:"auto_login"`
 		}
+		if !authorizeOrReject(w, r, authz.ActionDeviceCredentialsWrite, authz.ResourceRef{}) {
+			return
+		}
 		if err := decodeJSONBody(r, &req); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
@@ -4946,18 +5256,15 @@ func handleDeviceCredentials(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check tenant access via the device's agent
-		var tenantID string
-		if device.AgentID != "" {
-			agent, err := serverStore.GetAgent(ctx, device.AgentID)
-			if err == nil && agent != nil {
-				if !tenantAllowed(scope, agent.TenantID) {
-					http.Error(w, "forbidden", http.StatusForbidden)
-					return
-				}
-				tenantID = agent.TenantID
-			}
+		agent, err := serverStore.GetAgent(ctx, device.AgentID)
+		if device.AgentID == "" || err != nil || agent == nil || !tenantAllowed(scope, agent.TenantID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
+		if !authorizeOrReject(w, r, authz.ActionDeviceCredentialsWrite, authz.ResourceRef{TenantIDs: []string{agent.TenantID}}) {
+			return
+		}
+		tenantID := agent.TenantID
 
 		// Encrypt password if provided
 		encryptedPassword := ""
@@ -5126,10 +5433,11 @@ func proxyThroughWebSocket(w http.ResponseWriter, r *http.Request, agentID strin
 // proxyThroughWebSocketWithTimeout sends an HTTP request through WebSocket with custom timeout.
 // Use longer timeouts for operations like metrics collection that may take significant time.
 func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, agentID string, targetURL string, timeout time.Duration) {
-	// Remove security headers that would block proxied content from being displayed
-	// This must happen BEFORE any response is written (including errors)
-	w.Header().Del("X-Frame-Options")
-	w.Header().Del("Content-Security-Policy")
+	// A browser proxy must not weaken the management panel's headers.  Device
+	// responses are untrusted input and are additionally sandboxed below.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "no-store")
 
 	// Detect if we're proxying to the agent's device proxy endpoint
 	// In this case, the agent already handles all content rewriting, so we just need
@@ -5147,42 +5455,35 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 	}
 
 	// Generate unique request ID
-	requestID := fmt.Sprintf("%s-%d", agentID, time.Now().UnixNano())
+
 	start := time.Now()
 
 	// Create response channel
 	respChan := make(chan wscommon.Message, 1)
 
 	// Register the channel for this request
-	proxyRequestsLock.Lock()
-	proxyRequests[requestID] = respChan
-	proxyRequestsLock.Unlock()
+	requestID := registerProxyRequest(agentID, respChan)
 
 	// Clean up on exit
 	defer func() {
 		proxyRequestsLock.Lock()
 		delete(proxyRequests, requestID)
 		proxyRequestsLock.Unlock()
-		close(respChan)
 	}()
 
 	// Read request body if present
 	var bodyStr string
 	if r.Body != nil {
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err == nil {
-			bodyStr = base64.StdEncoding.EncodeToString(bodyBytes)
+		bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
+		if err != nil {
+			http.Error(w, "proxy request body too large", http.StatusRequestEntityTooLarge)
+			return
 		}
+		bodyStr = base64.StdEncoding.EncodeToString(bodyBytes)
 	}
 
 	// Extract headers
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-
+	headers := trustedProxyHeaders(r)
 	// Add principal info for the agent to use when returning auth/me responses
 	// This allows the proxied agent UI to know who the server-authenticated user is
 	principal := getPrincipal(r)
@@ -5217,6 +5518,9 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 		statusCode := 200
 		if code, ok := resp.Data["status_code"].(float64); ok {
 			statusCode = int(code)
+			if statusCode < 100 || statusCode > 599 {
+				statusCode = http.StatusBadGateway
+			}
 		}
 
 		logTraceTag("proxy", "Proxy response received",
@@ -5233,14 +5537,9 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 				"duration_ms", duration.Milliseconds())
 		}
 
-		// Set response headers from agent
-		if respHeaders, ok := resp.Data["headers"].(map[string]interface{}); ok {
-			for k, v := range respHeaders {
-				if vStr, ok := v.(string); ok {
-					w.Header().Set(k, vStr)
-				}
-			}
-		}
+		// Copy only rendering metadata. In particular, a printer cannot set or
+		// overwrite management cookies, redirect the panel, or relax its policy.
+		copySafeProxyResponseHeaders(w.Header(), resp.Data["headers"])
 
 		// Add custom header to indicate this is a proxied response
 		w.Header().Set("X-PrintMaster-Proxied", "true")
@@ -5287,18 +5586,25 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 			}
 		}
 
-		// Remove server-level security headers that would block proxied content
-		w.Header().Del("Content-Security-Policy")
-		w.Header().Del("X-Frame-Options")
-
 		// Process response body BEFORE calling WriteHeader (so we can update Content-Length/Content-Encoding)
 		var bodyBytes []byte
 		if bodyB64, ok := resp.Data["body"].(string); ok {
+			if base64.StdEncoding.DecodedLen(len(bodyB64)) > maxProxyResponseBodySize {
+				http.Error(w, "proxy response body too large", http.StatusBadGateway)
+				return
+			}
 			var err error
 			bodyBytes, err = base64.StdEncoding.DecodeString(bodyB64)
 			if err != nil {
-				bodyBytes = nil
+				http.Error(w, "invalid proxy response", http.StatusBadGateway)
+				return
 			}
+		}
+		if strings.Contains(strings.ToLower(contentType), "text/html") {
+			// The current proxy endpoint is on the panel origin. Do not execute
+			// printer-controlled script or submit printer-controlled forms there.
+			w.Header().Set("Content-Security-Policy", "sandbox; default-src 'self' data:; script-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+			w.Header().Set("X-Frame-Options", "DENY")
 		}
 
 		// For agent device proxy responses, the agent already did all the content rewriting
@@ -5310,26 +5616,25 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 
 			// Handle gzip-compressed responses
 			if len(bodyBytes) >= 2 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b {
-				gr, gerr := gzip.NewReader(bytes.NewReader(bodyBytes))
+				decompressed, gerr := decompressProxyGzip(bodyBytes)
 				if gerr == nil {
-					decompressed, rerr := io.ReadAll(gr)
-					_ = gr.Close()
-					if rerr == nil {
-						// Simple string replacement of agent prefix to server prefix
-						transformed := bytes.ReplaceAll(decompressed, []byte(agentPrefix), []byte(serverPrefix))
-						// Recompress
-						var buf bytes.Buffer
-						gw := gzip.NewWriter(&buf)
-						if _, werr := gw.Write(transformed); werr == nil {
-							_ = gw.Close()
-							bodyBytes = buf.Bytes()
-							w.Header().Set("Content-Encoding", "gzip")
-						} else {
-							_ = gw.Close()
-							w.Header().Del("Content-Encoding")
-							bodyBytes = transformed
-						}
+					// Simple string replacement of agent prefix to server prefix
+					transformed := bytes.ReplaceAll(decompressed, []byte(agentPrefix), []byte(serverPrefix))
+					// Recompress
+					var buf bytes.Buffer
+					gw := gzip.NewWriter(&buf)
+					if _, werr := gw.Write(transformed); werr == nil {
+						_ = gw.Close()
+						bodyBytes = buf.Bytes()
+						w.Header().Set("Content-Encoding", "gzip")
+					} else {
+						_ = gw.Close()
+						w.Header().Del("Content-Encoding")
+						bodyBytes = transformed
 					}
+				} else {
+					http.Error(w, "invalid or oversized compressed proxy response", http.StatusBadGateway)
+					return
 				}
 			} else {
 				// Simple string replacement - agent prefix to server prefix
@@ -5369,25 +5674,24 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 
 			// Detect gzip by magic bytes
 			if len(bodyBytes) >= 2 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b {
-				gr, gerr := gzip.NewReader(bytes.NewReader(bodyBytes))
+				decompressed, gerr := decompressProxyGzip(bodyBytes)
 				if gerr == nil {
-					decompressed, rerr := io.ReadAll(gr)
-					_ = gr.Close()
-					if rerr == nil {
-						transformed := injectProxyMetaAndBase(decompressed, proxyBase, agentID, targetURL)
-						// Recompress
-						var buf bytes.Buffer
-						gw := gzip.NewWriter(&buf)
-						if _, werr := gw.Write(transformed); werr == nil {
-							_ = gw.Close()
-							bodyBytes = buf.Bytes()
-							w.Header().Set("Content-Encoding", "gzip")
-						} else {
-							_ = gw.Close()
-							w.Header().Del("Content-Encoding")
-							bodyBytes = transformed
-						}
+					transformed := injectProxyMetaAndBase(decompressed, proxyBase, agentID, targetURL)
+					// Recompress
+					var buf bytes.Buffer
+					gw := gzip.NewWriter(&buf)
+					if _, werr := gw.Write(transformed); werr == nil {
+						_ = gw.Close()
+						bodyBytes = buf.Bytes()
+						w.Header().Set("Content-Encoding", "gzip")
+					} else {
+						_ = gw.Close()
+						w.Header().Del("Content-Encoding")
+						bodyBytes = transformed
 					}
+				} else {
+					http.Error(w, "invalid or oversized compressed proxy response", http.StatusBadGateway)
+					return
 				}
 			} else {
 				bodyBytes = injectProxyMetaAndBase(bodyBytes, proxyBase, agentID, targetURL)
@@ -5402,24 +5706,23 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 			proxyBase := computeProxyBaseFromRequest(r)
 
 			if len(bodyBytes) >= 2 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b {
-				gr, gerr := gzip.NewReader(bytes.NewReader(bodyBytes))
+				decompressed, gerr := decompressProxyGzip(bodyBytes)
 				if gerr == nil {
-					decompressed, rerr := io.ReadAll(gr)
-					_ = gr.Close()
-					if rerr == nil {
-						transformed := rewriteProxyJS(decompressed, proxyBase, targetURL)
-						var buf bytes.Buffer
-						gw := gzip.NewWriter(&buf)
-						if _, werr := gw.Write(transformed); werr == nil {
-							_ = gw.Close()
-							bodyBytes = buf.Bytes()
-							w.Header().Set("Content-Encoding", "gzip")
-						} else {
-							_ = gw.Close()
-							w.Header().Del("Content-Encoding")
-							bodyBytes = transformed
-						}
+					transformed := rewriteProxyJS(decompressed, proxyBase, targetURL)
+					var buf bytes.Buffer
+					gw := gzip.NewWriter(&buf)
+					if _, werr := gw.Write(transformed); werr == nil {
+						_ = gw.Close()
+						bodyBytes = buf.Bytes()
+						w.Header().Set("Content-Encoding", "gzip")
+					} else {
+						_ = gw.Close()
+						w.Header().Del("Content-Encoding")
+						bodyBytes = transformed
 					}
+				} else {
+					http.Error(w, "invalid or oversized compressed proxy response", http.StatusBadGateway)
+					return
 				}
 			} else {
 				bodyBytes = rewriteProxyJS(bodyBytes, proxyBase, targetURL)
@@ -5643,6 +5946,57 @@ func rewriteProxyJS(body []byte, proxyBase string, targetURL string) []byte {
 	return []byte(s)
 }
 
+// authorizeDeviceProxyOwner establishes the device's owning agent and applies
+// both tenant scoping and the operation-specific RBAC check before any request
+// is forwarded over the agent WebSocket.  Proxy endpoints are reachable from
+// the browser-authenticated surface, so checking only that a session exists is
+// insufficient for multi-tenant deployments.
+func authorizeDeviceProxyOwner(w http.ResponseWriter, r *http.Request, device *storage.Device, action authz.Action) (*storage.Agent, bool) {
+	if device == nil || strings.TrimSpace(device.AgentID) == "" {
+		http.Error(w, "Device has no associated agent", http.StatusBadRequest)
+		return nil, false
+	}
+	principal := getPrincipal(r)
+	if principal == nil {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return nil, false
+	}
+	scope, ok := tenantScope(principal)
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
+	ctx := r.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	agent, err := serverStore.GetAgent(ctx, device.AgentID)
+	if err != nil || agent == nil {
+		http.Error(w, "Agent not found", http.StatusNotFound)
+		return nil, false
+	}
+	if !tenantAllowed(scope, agent.TenantID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return nil, false
+	}
+	if !authorizeOrReject(w, r, action, authz.ResourceRef{TenantIDs: []string{agent.TenantID}}) {
+		return nil, false
+	}
+	return agent, true
+}
+
+func proxyDeviceIPMatches(device *storage.Device, requested string) bool {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || device == nil || strings.TrimSpace(device.IP) == "" {
+		return true
+	}
+	left, right := net.ParseIP(requested), net.ParseIP(strings.TrimSpace(device.IP))
+	if left != nil && right != nil {
+		return left.Equal(right)
+	}
+	return strings.EqualFold(requested, strings.TrimSpace(device.IP))
+}
+
 // handleDevicePreviewProxy proxies /devices/preview requests to the device's agent
 // This allows the server UI to use the same "Refresh Details" button as the agent UI
 func handleDevicePreviewProxy(w http.ResponseWriter, r *http.Request) {
@@ -5656,9 +6010,9 @@ func handleDevicePreviewProxy(w http.ResponseWriter, r *http.Request) {
 		Serial string `json:"serial"`
 		IP     string `json:"ip"`
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		writeProxyBodyError(w, err)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -5673,9 +6027,11 @@ func handleDevicePreviewProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
-
-	if device.AgentID == "" {
-		http.Error(w, "Device has no associated agent", http.StatusBadRequest)
+	if !proxyDeviceIPMatches(device, req.IP) {
+		http.Error(w, "requested IP does not match device", http.StatusBadRequest)
+		return
+	}
+	if _, ok := authorizeDeviceProxyOwner(w, r, device, authz.ActionDevicesRead); !ok {
 		return
 	}
 
@@ -5708,9 +6064,9 @@ func handleDeviceUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Serial string `json:"serial"`
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		writeProxyBodyError(w, err)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -5730,9 +6086,7 @@ func handleDeviceUpdateProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
-
-	if device.AgentID == "" {
-		http.Error(w, "Device has no associated agent", http.StatusBadRequest)
+	if _, ok := authorizeDeviceProxyOwner(w, r, device, authz.ActionDevicesWrite); !ok {
 		return
 	}
 
@@ -5764,9 +6118,9 @@ func handleDeviceMetricsCollectProxy(w http.ResponseWriter, r *http.Request) {
 		Serial string `json:"serial"`
 		IP     string `json:"ip"`
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		writeProxyBodyError(w, err)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -5781,9 +6135,11 @@ func handleDeviceMetricsCollectProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
-
-	if device.AgentID == "" {
-		http.Error(w, "Device has no associated agent", http.StatusBadRequest)
+	if !proxyDeviceIPMatches(device, req.IP) {
+		http.Error(w, "requested IP does not match device", http.StatusBadRequest)
+		return
+	}
+	if _, ok := authorizeDeviceProxyOwner(w, r, device, authz.ActionDevicesRead); !ok {
 		return
 	}
 
@@ -5826,10 +6182,10 @@ func handleDeviceReportProxy(w http.ResponseWriter, r *http.Request) {
 		DeviceIP     string `json:"device_ip"`
 		DeviceSerial string `json:"device_serial"`
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
 	if err != nil {
 		logError("Device report: failed to read body", "error", err)
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		writeProxyBodyError(w, err)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -5866,10 +6222,12 @@ func handleDeviceReportProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
-
-	if device.AgentID == "" {
-		logWarn("Device report: device has no agent", "serial", device.Serial)
-		http.Error(w, "Device has no associated agent", http.StatusBadRequest)
+	if !proxyDeviceIPMatches(device, req.DeviceIP) {
+		logWarn("Device report: requested IP does not match device", "serial", device.Serial, "ip", req.DeviceIP)
+		http.Error(w, "requested IP does not match device", http.StatusBadRequest)
+		return
+	}
+	if _, ok := authorizeDeviceProxyOwner(w, r, device, authz.ActionDevicesRead); !ok {
 		return
 	}
 
@@ -5894,40 +6252,32 @@ func handleDeviceReportProxy(w http.ResponseWriter, r *http.Request) {
 // proxyReportWithServerLogs proxies a report request to the agent and injects server logs
 func proxyReportWithServerLogs(w http.ResponseWriter, r *http.Request, agentID string, targetURL string) {
 	timeout := 60 * time.Second // Reports can take a while with full SNMP walks
-	requestID := fmt.Sprintf("%s-%d", agentID, time.Now().UnixNano())
 
 	// Create response channel
 	respChan := make(chan wscommon.Message, 1)
 
 	// Register the channel for this request
-	proxyRequestsLock.Lock()
-	proxyRequests[requestID] = respChan
-	proxyRequestsLock.Unlock()
+	requestID := registerProxyRequest(agentID, respChan)
 
 	defer func() {
 		proxyRequestsLock.Lock()
 		delete(proxyRequests, requestID)
 		proxyRequestsLock.Unlock()
-		close(respChan)
 	}()
 
 	// Read request body
 	var bodyStr string
 	if r.Body != nil {
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err == nil {
-			bodyStr = base64.StdEncoding.EncodeToString(bodyBytes)
+		bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
+		if err != nil {
+			writeProxyBodyError(w, err)
+			return
 		}
+		bodyStr = base64.StdEncoding.EncodeToString(bodyBytes)
 	}
 
 	// Extract headers
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-
+	headers := trustedProxyHeaders(r)
 	// Send proxy request to agent
 	if err := sendProxyRequest(agentID, requestID, targetURL, r.Method, headers, bodyStr); err != nil {
 		logError("Failed to send report proxy request", "agent_id", agentID, "error", err)
@@ -5947,6 +6297,10 @@ func proxyReportWithServerLogs(w http.ResponseWriter, r *http.Request, agentID s
 		// Decode the body from base64
 		var bodyBytes []byte
 		if bodyB64, ok := resp.Data["body"].(string); ok {
+			if base64.StdEncoding.DecodedLen(len(bodyB64)) > maxProxyResponseBodySize {
+				http.Error(w, "proxy response body too large", http.StatusBadGateway)
+				return
+			}
 			var err error
 			bodyBytes, err = base64.StdEncoding.DecodeString(bodyB64)
 			if err != nil {
@@ -5959,14 +6313,15 @@ func proxyReportWithServerLogs(w http.ResponseWriter, r *http.Request, agentID s
 		// If it's a JSON response, inject server logs
 		var responseData map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &responseData); err == nil {
-			// Get server logs (last 200 lines)
-			serverLogs := tailServerLogFile(200)
-
-			// Check if this is a fallback response with embedded report
-			if reportData, ok := responseData["report"].(map[string]interface{}); ok {
-				reportData["server_logs"] = serverLogs
-				responseData["report"] = reportData
-				logInfo("Injected server logs into fallback report", "log_count", len(serverLogs))
+			// Server logs can contain cross-tenant metadata and credentials. Only
+			// global administrators may receive the optional diagnostic field.
+			if principal := getPrincipal(r); principal != nil && principal.IsAdmin() {
+				serverLogs := tailServerLogFile(200)
+				if reportData, ok := responseData["report"].(map[string]interface{}); ok {
+					reportData["server_logs"] = serverLogs
+					responseData["report"] = reportData
+					logInfo("Injected server logs into fallback report", "log_count", len(serverLogs))
+				}
 			}
 
 			// Re-encode the modified response
@@ -5976,14 +6331,9 @@ func proxyReportWithServerLogs(w http.ResponseWriter, r *http.Request, agentID s
 			}
 		}
 
-		// Set response headers from agent
-		if respHeaders, ok := resp.Data["headers"].(map[string]interface{}); ok {
-			for k, v := range respHeaders {
-				if vStr, ok := v.(string); ok {
-					w.Header().Set(k, vStr)
-				}
-			}
-		}
+		// Copy only safe rendering headers; an agent must not be able to set
+		// management cookies, redirects, or security policy headers on the panel.
+		copySafeProxyResponseHeaders(w.Header(), resp.Data["headers"])
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(statusCode)
 		w.Write(bodyBytes)
@@ -6009,10 +6359,10 @@ func handleDeviceReportStreamProxy(w http.ResponseWriter, r *http.Request) {
 		DeviceIP     string `json:"device_ip"`
 		DeviceSerial string `json:"device_serial"`
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBoundedProxyBody(r.Body, maxProxyRequestBodySize)
 	if err != nil {
 		logError("Report stream: failed to read body", "error", err)
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		writeProxyBodyError(w, err)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -6048,10 +6398,12 @@ func handleDeviceReportStreamProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
-
-	if device.AgentID == "" {
-		logWarn("Report stream: device has no agent", "serial", device.Serial)
-		http.Error(w, "Device has no associated agent", http.StatusBadRequest)
+	if !proxyDeviceIPMatches(device, req.DeviceIP) {
+		logWarn("Report stream: requested IP does not match device", "serial", device.Serial, "ip", req.DeviceIP)
+		http.Error(w, "requested IP does not match device", http.StatusBadRequest)
+		return
+	}
+	if _, ok := authorizeDeviceProxyOwner(w, r, device, authz.ActionDevicesRead); !ok {
 		return
 	}
 
@@ -6077,9 +6429,6 @@ func handleDeviceReportStreamProxy(w http.ResponseWriter, r *http.Request) {
 // and forwards SSE events in real-time as they arrive via WebSocket.
 func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentID string, targetURL string, bodyBytes []byte) {
 	timeout := 120 * time.Second // Longer timeout for full SNMP walks
-	requestID := fmt.Sprintf("%s-%d", agentID, time.Now().UnixNano())
-
-	logDebug("Starting true-streaming report proxy", "request_id", requestID, "agent_id", agentID)
 
 	// Set up SSE headers immediately
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -6098,9 +6447,7 @@ func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentI
 	respChan := make(chan wscommon.Message, 100)
 
 	// Register the channel for this request
-	proxyRequestsLock.Lock()
-	proxyRequests[requestID] = respChan
-	proxyRequestsLock.Unlock()
+	requestID := registerProxyRequest(agentID, respChan)
 
 	defer func() {
 		proxyRequestsLock.Lock()
@@ -6112,13 +6459,7 @@ func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentI
 	bodyStr := base64.StdEncoding.EncodeToString(bodyBytes)
 
 	// Extract headers
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-
+	headers := trustedProxyHeaders(r)
 	// Send streaming proxy request to agent
 	conn, exists := getAgentWSConnection(agentID)
 	if !exists {
@@ -6158,7 +6499,9 @@ func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentI
 
 	logDebug("Streaming proxy request sent, forwarding chunks", "request_id", requestID)
 
-	// Forward streaming chunks from agent to client
+	// Forward streaming chunks from agent to client with an aggregate response
+	// limit so a connected agent cannot exhaust server memory or bandwidth.
+	var streamedBytes int64
 	timeoutTimer := time.NewTimer(timeout)
 	defer timeoutTimer.Stop()
 
@@ -6184,11 +6527,18 @@ func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentI
 
 				// Forward chunk data directly to client
 				if chunkB64, ok := resp.Data["chunk"].(string); ok {
+					decodedLen := base64.StdEncoding.DecodedLen(len(chunkB64))
+					if decodedLen > maxProxyResponseBodySize || streamedBytes+int64(decodedLen) > maxProxyResponseBodySize {
+						fmt.Fprintf(w, "event: error\ndata: {\"error\":\"Response too large\",\"fallback\":true}\n\n")
+						flusher.Flush()
+						return
+					}
 					chunkData, err := base64.StdEncoding.DecodeString(chunkB64)
 					if err != nil {
 						logWarn("Report stream: failed to decode chunk", "error", err)
 						continue
 					}
+					streamedBytes += int64(len(chunkData))
 					w.Write(chunkData)
 					flusher.Flush()
 				}
@@ -6206,20 +6556,30 @@ func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentI
 				statusCode := 200
 				if code, ok := resp.Data["status_code"].(float64); ok {
 					statusCode = int(code)
+					if statusCode < 100 || statusCode > 599 {
+						statusCode = http.StatusBadGateway
+					}
 				}
 
 				if bodyB64, ok := resp.Data["body"].(string); ok {
+					if base64.StdEncoding.DecodedLen(len(bodyB64)) > maxProxyResponseBodySize {
+						fmt.Fprintf(w, "event: error\ndata: {\"error\":\"Response too large\",\"fallback\":true}\n\n")
+						flusher.Flush()
+						return
+					}
 					bodyData, err := base64.StdEncoding.DecodeString(bodyB64)
 					if err == nil {
 						// Try to inject server logs
 						var responseData map[string]interface{}
 						if json.Unmarshal(bodyData, &responseData) == nil {
-							if reportData, ok := responseData["report"].(map[string]interface{}); ok {
-								serverLogs := tailServerLogFile(200)
-								reportData["server_logs"] = serverLogs
-								responseData["report"] = reportData
-								if modified, err := json.Marshal(responseData); err == nil {
-									bodyData = modified
+							if principal := getPrincipal(r); principal != nil && principal.IsAdmin() {
+								if reportData, ok := responseData["report"].(map[string]interface{}); ok {
+									serverLogs := tailServerLogFile(200)
+									reportData["server_logs"] = serverLogs
+									responseData["report"] = reportData
+									if modified, err := json.Marshal(responseData); err == nil {
+										bodyData = modified
+									}
 								}
 							}
 						}
@@ -6255,6 +6615,16 @@ func handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST or DELETE only", http.StatusMethodNotAllowed)
 		return
 	}
+	principal := getPrincipal(r)
+	if principal == nil {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	scope, scopeOK := tenantScope(principal)
+	if !scopeOK && !principal.IsAdmin() {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 
 	var req struct {
 		Serial          string `json:"serial"`
@@ -6263,12 +6633,7 @@ func handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 		DeleteFromAgent bool   `json:"delete_from_agent"` // Also delete from agent's database
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -6288,9 +6653,40 @@ func handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 	if err == nil && device != nil {
 		deviceExistsOnServer = true
 		agentID = device.AgentID
+		if req.AgentID != "" && req.AgentID != agentID {
+			http.Error(w, "agent does not own device", http.StatusForbidden)
+			return
+		}
 	} else {
 		// Device not in server DB - use agent_id from request if provided
 		agentID = req.AgentID
+	}
+
+	// A device mutation is tenant-scoped.  Resolve the owning agent before any
+	// server or remote deletion so a caller cannot delete another tenant's
+	// device by supplying only a serial/agent ID.
+	var owner *storage.Agent
+	if agentID != "" {
+		owner, err = serverStore.GetAgent(ctx, agentID)
+		if err != nil || owner == nil {
+			http.Error(w, "agent not found", http.StatusNotFound)
+			return
+		}
+		if !tenantAllowed(scope, owner.TenantID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !authorizeOrReject(w, r, authz.ActionDevicesDelete, authz.ResourceRef{TenantIDs: []string{owner.TenantID}}) {
+			return
+		}
+	} else if !principal.IsAdmin() || !authorizeOrReject(w, r, authz.ActionDevicesDelete, authz.ResourceRef{}) {
+		// Orphaned devices have no trustworthy tenant owner.  Only an admin may
+		// remove them after the explicit global permission check.
+		if principal.IsAdmin() {
+			return
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
 	}
 
 	deletedFromAgent := false
@@ -6329,9 +6725,20 @@ func handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 	// Delete from server database (if it exists there)
 	deletedFromServer := false
 	if deviceExistsOnServer {
-		if err := serverStore.DeleteDevice(ctx, req.Serial, req.DeleteMetrics); err != nil {
-			logError("Failed to delete device from server", "serial", req.Serial, "error", err)
-			http.Error(w, "Failed to delete device: "+err.Error(), http.StatusInternalServerError)
+		var deleteErr error
+		if agentID != "" {
+			// Keep the ownership predicate in the DELETE itself. The device may be
+			// reassigned between the lookup above and this operation; a stale
+			// lookup must never let a tenant delete the new owner's device.
+			deleteErr = serverStore.DeleteDeviceForAgent(ctx, req.Serial, agentID, req.DeleteMetrics)
+		} else {
+			// Legacy/orphaned rows have no agent owner and are already restricted to
+			// administrators by the checks above.
+			deleteErr = serverStore.DeleteDevice(ctx, req.Serial, req.DeleteMetrics)
+		}
+		if deleteErr != nil {
+			logError("Failed to delete device from server", "serial", req.Serial, "error", deleteErr)
+			http.Error(w, "Failed to delete device: "+deleteErr.Error(), http.StatusInternalServerError)
 			return
 		}
 		deletedFromServer = true
@@ -6404,14 +6811,18 @@ func handleDevicesBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logInfo("Devices batch received", "agent_id", req.AgentID, "count", len(req.Devices))
+	agent, ok := authenticatedBatchAgent(w, r, req.AgentID)
+	if !ok {
+		return
+	}
 
 	// Store each device
-	ctx := context.Background()
+	ctx := r.Context()
 	stored := 0
 	for _, deviceMap := range req.Devices {
 		// Convert map to Device struct (simplified - in production, use proper unmarshaling)
 		device := &storage.Device{}
-		device.AgentID = req.AgentID
+		device.AgentID = agent.AgentID
 		device.LastSeen = req.Timestamp
 		device.FirstSeen = req.Timestamp
 		device.CreatedAt = req.Timestamp
@@ -6493,9 +6904,6 @@ func handleDevicesBatch(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Get authenticated agent from context
-	agent := r.Context().Value(agentContextKey).(*storage.Agent)
-
 	logInfo("Devices stored", "agent_id", agent.AgentID, "stored", stored, "total", len(req.Devices))
 
 	// Log audit entry for device upload
@@ -6563,6 +6971,22 @@ func handleDevicesList(w http.ResponseWriter, r *http.Request) {
 				allowedAgentIDs = append(allowedAgentIDs, a.AgentID)
 			}
 		}
+	}
+	// An empty allow-list means the principal owns no tenants.  Passing an
+	// empty slice to the legacy storage methods means "all agents/devices";
+	// fail closed before reaching those methods.
+	if scope != nil && len(allowedAgentIDs) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		if limitStr != "" {
+			limit, _ := strconv.Atoi(limitStr)
+			if limit <= 0 || limit > 200 {
+				limit = 50
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"devices": []*storage.DeviceWithMetrics{}, "total_count": 0, "has_more": false, "limit": limit, "offset": 0})
+		} else {
+			json.NewEncoder(w).Encode([]*storage.DeviceWithMetrics{})
+		}
+		return
 	}
 
 	// If pagination is requested, use paginated endpoint
@@ -7297,6 +7721,15 @@ func handleMetricsAggregated(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.Background()
 	tenantIDs := principal.AllowedTenantIDs()
+	if !principal.IsAdmin() && len(tenantIDs) == 0 {
+		// An empty tenant scope must never be passed to storage as "no
+		// filter".  Return an empty aggregate for a valid but unassigned user.
+		now := time.Now().UTC()
+		empty := &storage.AggregatedMetrics{GeneratedAt: now, RangeStart: since.UTC(), RangeEnd: now}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(empty)
+		return
+	}
 
 	// If a specific tenant is requested and user has access, use that instead
 	if filterTenantID != "" {
@@ -7314,60 +7747,76 @@ func handleMetricsAggregated(w http.ResponseWriter, r *http.Request) {
 			}
 			if allowed {
 				tenantIDs = []string{filterTenantID}
+			} else {
+				// Do not silently broaden a filtered request when the requested
+				// tenant is outside the caller's scope. Failing closed also keeps
+				// callers from mistaking an unfiltered aggregate for the result
+				// of their requested tenant filter.
+				http.Error(w, "tenant not found", http.StatusNotFound)
+				return
 			}
-			// If not allowed, keep original tenantIDs (will return empty or their data)
 		}
 	}
+	// Resolve agent/device filters to their owning tenant before querying the
+	// aggregate. This prevents a multi-tenant principal from using a filter
+	// that is silently ignored and receiving an unscoped fleet snapshot.
+	if filterAgentID != "" {
+		agent, err := serverStore.GetAgent(ctx, filterAgentID)
+		if err != nil || agent == nil || (!principal.IsAdmin() && !principal.CanAccessTenant(agent.TenantID)) {
+			http.Error(w, "agent not found", http.StatusNotFound)
+			return
+		}
+		tenantIDs = []string{agent.TenantID}
+	}
+	if filterDeviceSerial != "" {
+		device, err := serverStore.GetDevice(ctx, filterDeviceSerial)
+		if err != nil || device == nil || device.AgentID == "" {
+			http.Error(w, "device not found", http.StatusNotFound)
+			return
+		}
+		agent, err := serverStore.GetAgent(ctx, device.AgentID)
+		if err != nil || agent == nil || (!principal.IsAdmin() && !principal.CanAccessTenant(agent.TenantID)) {
+			http.Error(w, "device not found", http.StatusNotFound)
+			return
+		}
+		tenantIDs = []string{agent.TenantID}
+	}
 
-	agg, err := serverStore.GetAggregatedMetrics(ctx, since, tenantIDs)
+	var (
+		agg *storage.AggregatedMetrics
+		err error
+	)
+	if filterAgentID != "" || filterDeviceSerial != "" {
+		filteredStore, ok := serverStore.(interface {
+			GetAggregatedMetricsFiltered(context.Context, time.Time, []string, string, string) (*storage.AggregatedMetrics, error)
+		})
+		if !ok {
+			http.Error(w, "filtered metrics are unavailable", http.StatusNotImplemented)
+			return
+		}
+		agg, err = filteredStore.GetAggregatedMetricsFiltered(ctx, since, tenantIDs, filterAgentID, filterDeviceSerial)
+	} else {
+		agg, err = serverStore.GetAggregatedMetrics(ctx, since, tenantIDs)
+	}
 	if err != nil {
 		logError("Failed to get aggregated metrics", "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	// Apply agent filter if specified
-	if filterAgentID != "" {
-		agg = filterAggregatedMetricsByAgent(agg, filterAgentID)
-	}
-
-	// Apply device filter if specified
-	if filterDeviceSerial != "" {
-		agg = filterAggregatedMetricsByDevice(agg, filterDeviceSerial)
-	}
-
-	attachServerStats(ctx, agg)
+	attachServerStats(ctx, agg, principal.IsAdmin())
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(agg)
 }
 
-// filterAggregatedMetricsByAgent filters aggregated metrics to only include data for a specific agent.
-// This is used for single-agent views on the metrics dashboard.
-func filterAggregatedMetricsByAgent(agg *storage.AggregatedMetrics, agentID string) *storage.AggregatedMetrics {
-	if agg == nil || agentID == "" {
-		return agg
-	}
-	// For now, we return the full aggregation since device-level filtering would require
-	// the aggregation query to be modified. The client-side filtering handles display.
-	// TODO: Implement proper server-side filtering by modifying GetAggregatedMetrics to accept agent filter
-	return agg
-}
-
-// filterAggregatedMetricsByDevice filters aggregated metrics to only include data for a specific device.
-// This is used for single-device views on the metrics dashboard.
-func filterAggregatedMetricsByDevice(agg *storage.AggregatedMetrics, serial string) *storage.AggregatedMetrics {
-	if agg == nil || serial == "" {
-		return agg
-	}
-	// For now, we return the full aggregation since device-level filtering would require
-	// the aggregation query to be modified. The client-side filtering handles display.
-	// TODO: Implement proper server-side filtering by modifying GetAggregatedMetrics to accept device filter
-	return agg
-}
-
-func attachServerStats(ctx context.Context, agg *storage.AggregatedMetrics) {
+func attachServerStats(ctx context.Context, agg *storage.AggregatedMetrics, includeGlobal bool) {
 	if agg == nil {
+		return
+	}
+	if !includeGlobal {
+		// Runtime/database counters are server-wide and cannot be made tenant
+		// scoped from this aggregate. Do not disclose them to tenant users.
 		return
 	}
 	stats := storage.ServerStats{
@@ -7414,7 +7863,7 @@ func handleServerMetricsTimeSeries(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	if !authorizeOrReject(w, r, authz.ActionMetricsSummaryRead, authz.ResourceRef{}) {
+	if !authorizeOrReject(w, r, authz.ActionMetricsServerGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -7454,6 +7903,9 @@ func handleServerMetricsTimeSeries(w http.ResponseWriter, r *http.Request) {
 
 	if maxStr := r.URL.Query().Get("max_points"); maxStr != "" {
 		if max, err := strconv.Atoi(maxStr); err == nil && max > 0 {
+			if max > 10000 {
+				max = 10000
+			}
 			query.MaxPoints = max
 		}
 	}
@@ -7476,7 +7928,7 @@ func handleServerMetricsLatest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	if !authorizeOrReject(w, r, authz.ActionMetricsSummaryRead, authz.ResourceRef{}) {
+	if !authorizeOrReject(w, r, authz.ActionMetricsServerGlobalRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -7610,8 +8062,13 @@ func handleMetricsHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Raw mode disables downsampling
+	// Raw mode may request higher fidelity, but it still respects the hard
+	// server-side cap below so a single request cannot allocate unbounded
+	// response memory.
 	rawMode := r.URL.Query().Get("raw") == "true"
+	if rawMode {
+		maxPoints = 10000
+	}
 
 	// Determine since time
 	var since time.Time
@@ -7672,8 +8129,8 @@ func handleMetricsHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Downsample if needed and not in raw mode
-	if !rawMode && len(history) > maxPoints {
+	// Downsample if needed. Raw mode only bypasses the small UI default.
+	if len(history) > maxPoints {
 		history = downsampleMetrics(history, maxPoints)
 	}
 
@@ -7763,13 +8220,17 @@ func handleMetricsBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logInfo("Metrics batch received", "agent_id", req.AgentID, "count", len(req.Metrics))
+	agent, ok := authenticatedBatchAgent(w, r, req.AgentID)
+	if !ok {
+		return
+	}
 
 	// Store each metric snapshot
-	ctx := context.Background()
+	ctx := r.Context()
 	stored := 0
 	for _, metricMap := range req.Metrics {
 		metric := &storage.MetricsSnapshot{}
-		metric.AgentID = req.AgentID
+		metric.AgentID = agent.AgentID
 		metric.Timestamp = req.Timestamp
 
 		// Extract fields
@@ -7802,9 +8263,6 @@ func handleMetricsBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		stored++
 	}
-
-	// Get authenticated agent from context
-	agent := r.Context().Value(agentContextKey).(*storage.Agent)
 
 	logInfo("Metrics stored", "agent_id", agent.AgentID, "stored", stored, "total", len(req.Metrics))
 
@@ -7951,7 +8409,7 @@ func handleSelfUpdateRuns(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	if !authorizeOrReject(w, r, authz.ActionLogsRead, authz.ResourceRef{}) {
+	if !authorizeOrReject(w, r, authz.ActionSettingsServerRead, authz.ResourceRef{}) {
 		return
 	}
 	limit := 50
@@ -8062,7 +8520,7 @@ func handleLogsClear(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	if !authorizeOrReject(w, r, authz.ActionLogsRead, authz.ResourceRef{}) {
+	if !authorizeOrReject(w, r, authz.ActionLogsWrite, authz.ResourceRef{}) {
 		return
 	}
 
@@ -8079,8 +8537,9 @@ func handleLogsClear(w http.ResponseWriter, r *http.Request) {
 			logWarn("Failed to rotate log file", "err", err)
 		}
 		// Create new empty log file
-		if f, err := os.Create(logPath); err == nil {
-			f.Close()
+		if f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600); err == nil {
+			_ = os.Chmod(logPath, 0600)
+			_ = f.Close()
 		}
 	}
 
@@ -8478,6 +8937,9 @@ type serverSettingsUpdateResult struct {
 func handleOnboardingStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	if !authorizeOrReject(w, r, authz.ActionSettingsServerRead, authz.ResourceRef{}) {
 		return
 	}
 
@@ -9245,6 +9707,12 @@ func handleAgentUpdateManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
+	agentCtx := r.Context().Value(agentContextKey)
+	agent, ok := agentCtx.(*storage.Agent)
+	if !ok || agent == nil || strings.TrimSpace(agent.AgentID) == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
 
 	var req struct {
 		AgentID   string `json:"agent_id"`
@@ -9257,10 +9725,22 @@ func handleAgentUpdateManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	if strings.TrimSpace(req.AgentID) != "" && strings.TrimSpace(req.AgentID) != agent.AgentID {
+		http.Error(w, "agent identity mismatch", http.StatusForbidden)
+		return
+	}
+	// This endpoint is intentionally scoped to the authenticated agent update
+	// component.  A bearer token must not be usable as a general release browser.
+	req.AgentID = agent.AgentID
 
 	if req.Component == "" {
 		req.Component = "agent"
 	}
+	if !strings.EqualFold(strings.TrimSpace(req.Component), "agent") {
+		http.Error(w, "only agent updates are available on this endpoint", http.StatusForbidden)
+		return
+	}
+	req.Component = "agent"
 	if req.Channel == "" {
 		req.Channel = "stable"
 	}
@@ -9298,6 +9778,13 @@ func handleAgentUpdateManifest(w http.ResponseWriter, r *http.Request) {
 		manifest.DownloadURL = fmt.Sprintf("/api/v1/agents/update/download/%s/%s/%s-%s",
 			manifest.Component, manifest.Version, manifest.Platform, manifest.Arch)
 	}
+	if manifest == nil {
+		// A release manager must return a manifest on success. Keep this
+		// endpoint fail-closed if a future implementation violates that
+		// contract instead of dereferencing a nil pointer below.
+		http.Error(w, "update manifest unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	logDebug("Returning update manifest",
 		"agent_id", req.AgentID,
@@ -9320,18 +9807,31 @@ func handleAgentUpdateDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET required", http.StatusMethodNotAllowed)
 		return
 	}
+	agentCtx := r.Context().Value(agentContextKey)
+	if agent, ok := agentCtx.(*storage.Agent); !ok || agent == nil || strings.TrimSpace(agent.AgentID) == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
 
 	// Parse URL: /api/v1/agents/update/download/{component}/{version}/{platform}-{arch}
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/agents/update/download/")
 	parts := strings.Split(path, "/")
-	if len(parts) < 3 {
+	if len(parts) != 3 {
 		http.Error(w, "invalid download path", http.StatusBadRequest)
 		return
 	}
 
-	component := parts[0]
+	component := strings.ToLower(strings.TrimSpace(parts[0]))
+	if component != "agent" {
+		http.Error(w, "only agent updates are available on this endpoint", http.StatusForbidden)
+		return
+	}
 	version := parts[1]
 	platformArch := parts[2]
+	if version == "" || platformArch == "" || strings.ContainsAny(version, "\\\x00\r\n") || strings.ContainsAny(platformArch, "\\\x00\r\n") {
+		http.Error(w, "invalid download path", http.StatusBadRequest)
+		return
+	}
 
 	// Split platform-arch
 	dashIdx := strings.LastIndex(platformArch, "-")
@@ -9389,6 +9889,12 @@ func handleAgentUpdateTelemetry(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
+	agentCtx := r.Context().Value(agentContextKey)
+	agent, ok := agentCtx.(*storage.Agent)
+	if !ok || agent == nil || strings.TrimSpace(agent.AgentID) == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
 
 	var req struct {
 		AgentID        string                 `json:"agent_id"`
@@ -9405,6 +9911,11 @@ func handleAgentUpdateTelemetry(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	if strings.TrimSpace(req.AgentID) != "" && strings.TrimSpace(req.AgentID) != agent.AgentID {
+		http.Error(w, "agent identity mismatch", http.StatusForbidden)
+		return
+	}
+	req.AgentID = agent.AgentID
 
 	// Log telemetry for monitoring/alerting
 	logInfo("Agent update telemetry",
@@ -9432,6 +9943,9 @@ var releaseSyncInProgress bool
 func handleReleasesSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !authorizeOrReject(w, r, authz.ActionReleasesWrite, authz.ResourceRef{}) {
 		return
 	}
 	if intakeWorker == nil {
@@ -9515,12 +10029,18 @@ func handleReleasesArtifacts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !authorizeOrReject(w, r, authz.ActionReleasesRead, authz.ResourceRef{}) {
+		return
+	}
 
 	component := r.URL.Query().Get("component")
 	limitStr := r.URL.Query().Get("limit")
 	limit := 50
 	if limitStr != "" {
 		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			if n > 200 {
+				n = 200
+			}
 			limit = n
 		}
 	}
@@ -9580,6 +10100,9 @@ func handleReleasesArtifacts(w http.ResponseWriter, r *http.Request) {
 func handleLatestAgentVersion(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !authorizeOrReject(w, r, authz.ActionReleasesRead, authz.ResourceRef{}) {
 		return
 	}
 

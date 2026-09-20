@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +14,14 @@ import (
 	"printmaster/server/storage"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// Heartbeats are agent-authenticated but still untrusted input. Keep
+	// metadata bounded before writing it to the database or reflecting it to UI
+	// event streams.
+	maxWSHeartbeatFieldBytes = 512
+	maxWSDeviceCount         = 1_000_000
 )
 
 var (
@@ -27,7 +36,7 @@ var (
 	wsDisconnectEventsPerAgent = make(map[string]int64)
 
 	// Track pending proxy requests awaiting responses from agents
-	proxyRequests     = make(map[string]chan wscommon.Message) // key: requestID
+	proxyRequests     = make(map[string]pendingProxy) // key: random request ID
 	proxyRequestsLock sync.RWMutex
 )
 
@@ -38,33 +47,35 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 	// Extract client IP address (respects X-Forwarded-For when behind proxy)
 	clientIP := getRealIP(r)
 
-	// Extract and validate authentication token from query parameter
-	token := r.URL.Query().Get("token")
+	// Native agents authenticate with a bearer header. URL tokens are rejected.
+	authorization := strings.Fields(r.Header.Get("Authorization"))
+	token := ""
+	if len(authorization) == 2 && strings.EqualFold(authorization[0], "Bearer") {
+		token = authorization[1]
+	}
 	if token == "" {
 		http.Error(w, "Missing authentication token", http.StatusUnauthorized)
 		return
 	}
 
 	tokenPrefix := token
-	if len(token) > 8 {
-		tokenPrefix = token[:8]
+	if len(tokenPrefix) > 8 {
+		tokenPrefix = tokenPrefix[:8]
 	}
+	tokenLogPrefix := tokenPrefixForLog(token)
 
 	// Always log incoming WS attempt (helps diagnose why agents don't complete handshake)
 	logInfo("Incoming WebSocket connection attempt",
 		"ip", clientIP,
-		"token", tokenPrefix+"...",
+		"token", tokenLogPrefix+"...",
 		"user_agent", r.Header.Get("User-Agent"))
-	logDebug("Incoming WebSocket raw headers",
-		"remote_addr", r.RemoteAddr,
-		"headers", r.Header)
 
 	// Check if this IP+token is currently blocked
 	if authRateLimiter != nil {
 		if isBlocked, blockedUntil := authRateLimiter.IsBlocked(clientIP, tokenPrefix); isBlocked {
 			logWarn("Blocked WebSocket connection attempt",
 				"ip", clientIP,
-				"token", tokenPrefix+"...",
+				"token", tokenLogPrefix+"...",
 				"blocked_until", blockedUntil.Format(time.RFC3339),
 				"user_agent", r.Header.Get("User-Agent"))
 			logDebug("Blocked WebSocket details", "remote_addr", r.RemoteAddr)
@@ -74,7 +85,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 	}
 
 	// Authenticate agent
-	logDebug("Authenticating WebSocket token", "token_prefix", tokenPrefix+"...", "ip", clientIP)
+	logDebug("Authenticating WebSocket token", "token_prefix", tokenLogPrefix+"...", "ip", clientIP)
 	agent, err := serverStore.GetAgentByToken(r.Context(), token)
 	if err != nil {
 		// Record failed attempt and check if we should log
@@ -89,7 +100,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		if shouldLog {
 			fields := []interface{}{
 				"ip", clientIP,
-				"token", tokenPrefix + "...",
+				"token", tokenLogPrefix + "...",
 				"error", err.Error(),
 				"attempt_count", attemptCount,
 				"protocol", "websocket",
@@ -103,10 +114,10 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 				// Log to audit trail when blocking occurs
 				logAuditEntry(r.Context(), &storage.AuditEntry{
 					ActorType: storage.AuditActorAgent,
-					ActorID:   tokenPrefix,
+					ActorID:   tokenLogPrefix,
 					Action:    "auth_blocked_websocket",
 					Details: fmt.Sprintf("IP blocked after %d failed WebSocket auth attempts with token %s... Error: %s",
-						attemptCount, tokenPrefix, err.Error()),
+						attemptCount, tokenLogPrefix, err.Error()),
 					IPAddress: clientIP,
 					UserAgent: r.Header.Get("User-Agent"),
 					Severity:  storage.AuditSeverityWarn,
@@ -144,17 +155,17 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 			if isBlocked {
 				logError("WebSocket auth returned nil agent - IP blocked",
 					"ip", clientIP,
-					"token", tokenPrefix+"...",
+					"token", tokenLogPrefix+"...",
 					"attempt_count", attemptCount,
 					"status", "BLOCKED")
 
 				// Log to audit trail when blocking occurs
 				logAuditEntry(r.Context(), &storage.AuditEntry{
 					ActorType: storage.AuditActorAgent,
-					ActorID:   tokenPrefix,
+					ActorID:   tokenLogPrefix,
 					Action:    "auth_blocked_websocket",
 					Details: fmt.Sprintf("IP blocked after %d failed WebSocket auth attempts with token %s... (nil agent)",
-						attemptCount, tokenPrefix),
+						attemptCount, tokenLogPrefix),
 					IPAddress: clientIP,
 					UserAgent: r.Header.Get("User-Agent"),
 					Severity:  storage.AuditSeverityWarn,
@@ -166,7 +177,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 			} else {
 				logWarn("WebSocket auth returned nil agent",
 					"ip", clientIP,
-					"token", tokenPrefix+"...",
+					"token", tokenLogPrefix+"...",
 					"attempt_count", attemptCount)
 			}
 		}
@@ -347,11 +358,11 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		case wscommon.MessageTypeHeartbeat:
 			handleWSHeartbeat(conn, agent, msg, serverStore)
 		case wscommon.MessageTypeProxyResponse:
-			handleWSProxyResponse(msg)
+			handleWSProxyResponse(agent.AgentID, conn, msg)
 		case wscommon.MessageTypeProxyStreamChunk:
-			handleWSProxyStreamChunk(msg)
+			handleWSProxyStreamChunk(agent.AgentID, conn, msg)
 		case wscommon.MessageTypeProxyStreamEnd:
-			handleWSProxyStreamEnd(msg)
+			handleWSProxyStreamEnd(agent.AgentID, conn, msg)
 		case wscommon.MessageTypeUpdateProgress:
 			handleWSUpdateProgress(agent, msg)
 		case wscommon.MessageTypeJobProgress:
@@ -370,7 +381,9 @@ func handleWSHeartbeat(conn *wscommon.Conn, agent *storage.Agent, msg wscommon.M
 	// Extract optional device count from heartbeat data
 	deviceCount := 0
 	if dc, ok := msg.Data["device_count"].(float64); ok {
-		deviceCount = int(dc)
+		if !math.IsNaN(dc) && !math.IsInf(dc, 0) && dc >= 0 && dc <= maxWSDeviceCount {
+			deviceCount = int(dc)
+		}
 	}
 
 	status := wsStringField(msg.Data, "status")
@@ -440,12 +453,20 @@ func wsStringField(data map[string]interface{}, key string) string {
 	}
 	switch v := val.(type) {
 	case string:
-		return strings.TrimSpace(v)
+		return boundedWSString(v)
 	case fmt.Stringer:
-		return strings.TrimSpace(v.String())
+		return boundedWSString(v.String())
 	default:
-		return strings.TrimSpace(fmt.Sprintf("%v", v))
+		return boundedWSString(fmt.Sprintf("%v", v))
 	}
+}
+
+func boundedWSString(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= maxWSHeartbeatFieldBytes {
+		return value
+	}
+	return strings.ToValidUTF8(value[:maxWSHeartbeatFieldBytes], "")
 }
 
 // sendWSError sends an error message to the WebSocket client
@@ -507,7 +528,7 @@ func cleanupAgentDiagnostics(agentID string) {
 }
 
 // handleWSProxyResponse handles HTTP proxy responses from agents
-func handleWSProxyResponse(msg wscommon.Message) {
+func handleWSProxyResponse(agentID string, conn *wscommon.Conn, msg wscommon.Message) {
 	requestID, ok := msg.Data["request_id"].(string)
 	if !ok {
 		logWarn("Proxy response missing request_id")
@@ -517,12 +538,7 @@ func handleWSProxyResponse(msg wscommon.Message) {
 	logTrace("Received WS proxy response", "request_id", requestID)
 
 	// Find the waiting channel for this request
-	proxyRequestsLock.Lock()
-	respChan, exists := proxyRequests[requestID]
-	if exists {
-		delete(proxyRequests, requestID)
-	}
-	proxyRequestsLock.Unlock()
+	respChan, exists := takeProxyChannel(agentID, conn, requestID, true)
 
 	if !exists {
 		logWarn("Received proxy response for unknown request ID", "request_id", requestID)
@@ -539,7 +555,7 @@ func handleWSProxyResponse(msg wscommon.Message) {
 }
 
 // handleWSProxyStreamChunk handles streaming proxy response chunks from agents
-func handleWSProxyStreamChunk(msg wscommon.Message) {
+func handleWSProxyStreamChunk(agentID string, conn *wscommon.Conn, msg wscommon.Message) {
 	requestID, ok := msg.Data["request_id"].(string)
 	if !ok {
 		logWarn("Stream chunk missing request_id")
@@ -547,9 +563,7 @@ func handleWSProxyStreamChunk(msg wscommon.Message) {
 	}
 
 	// Find the waiting channel for this request (don't delete - more chunks coming)
-	proxyRequestsLock.RLock()
-	respChan, exists := proxyRequests[requestID]
-	proxyRequestsLock.RUnlock()
+	respChan, exists := takeProxyChannel(agentID, conn, requestID, false)
 
 	if !exists {
 		// This can happen if the connection was closed - not necessarily an error
@@ -568,7 +582,7 @@ func handleWSProxyStreamChunk(msg wscommon.Message) {
 }
 
 // handleWSProxyStreamEnd handles end of streaming proxy response
-func handleWSProxyStreamEnd(msg wscommon.Message) {
+func handleWSProxyStreamEnd(agentID string, conn *wscommon.Conn, msg wscommon.Message) {
 	requestID, ok := msg.Data["request_id"].(string)
 	if !ok {
 		logWarn("Stream end missing request_id")
@@ -578,12 +592,7 @@ func handleWSProxyStreamEnd(msg wscommon.Message) {
 	logDebug("Received stream end", "request_id", requestID)
 
 	// Find and remove the waiting channel
-	proxyRequestsLock.Lock()
-	respChan, exists := proxyRequests[requestID]
-	if exists {
-		delete(proxyRequests, requestID)
-	}
-	proxyRequestsLock.Unlock()
+	respChan, exists := takeProxyChannel(agentID, conn, requestID, true)
 
 	if !exists {
 		return
@@ -713,8 +722,11 @@ func handleWSDeviceDeleted(agent *storage.Agent, msg wscommon.Message, store sto
 		"serial", serial)
 
 	// Delete from server storage (without metrics - agent already deleted locally)
+	// The serial is untrusted agent-provided data. Bind the delete to the
+	// authenticated WebSocket agent so one compromised agent cannot remove a
+	// device belonging to another tenant/agent.
 	ctx := context.Background()
-	err := store.DeleteDevice(ctx, serial, false)
+	err := store.DeleteDeviceForAgent(ctx, serial, agent.AgentID, false)
 	if err != nil {
 		// Log but don't fail - device may not exist on server yet
 		logWarn("Failed to delete device from server during agent sync",

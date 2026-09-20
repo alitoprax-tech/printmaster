@@ -406,8 +406,12 @@ func TestUpdateScheduleAfterRun(t *testing.T) {
 	}
 
 	// Update after successful run
+	successRun := &ReportRun{ReportID: report.ID, Status: ReportRunStatusPending, Format: ReportFormatJSON, StartedAt: time.Now()}
+	if err := s.CreateReportRun(ctx, successRun); err != nil {
+		t.Fatal(err)
+	}
 	nextRun := time.Now().Add(24 * time.Hour)
-	err = s.UpdateScheduleAfterRun(ctx, schedule.ID, run.ID, nextRun, false)
+	err = s.UpdateScheduleAfterRun(ctx, schedule.ID, successRun.ID, nextRun, false)
 	if err != nil {
 		t.Fatalf("UpdateScheduleAfterRun (success): %v", err)
 	}
@@ -418,7 +422,11 @@ func TestUpdateScheduleAfterRun(t *testing.T) {
 	}
 
 	// Update after failed run
-	err = s.UpdateScheduleAfterRun(ctx, schedule.ID, run.ID, nextRun, true)
+	failedRun := &ReportRun{ReportID: report.ID, Status: ReportRunStatusPending, Format: ReportFormatJSON, StartedAt: time.Now()}
+	if err := s.CreateReportRun(ctx, failedRun); err != nil {
+		t.Fatal(err)
+	}
+	err = s.UpdateScheduleAfterRun(ctx, schedule.ID, failedRun.ID, nextRun, true)
 	if err != nil {
 		t.Fatalf("UpdateScheduleAfterRun (failure): %v", err)
 	}

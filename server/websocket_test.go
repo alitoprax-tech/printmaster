@@ -50,10 +50,11 @@ func TestWebSocketConnection(t *testing.T) {
 	defer server.Close()
 
 	// Convert http:// to ws://
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + agent.Token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	authHeader := http.Header{"Authorization": {"Bearer " + agent.Token}}
 
 	// Connect via WebSocket
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, authHeader)
 	if err != nil {
 		t.Fatalf("Failed to connect via WebSocket: %v", err)
 	}
@@ -97,10 +98,11 @@ func TestWebSocketHeartbeat(t *testing.T) {
 	defer server.Close()
 
 	// Convert http:// to ws://
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + agent.Token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	authHeader := http.Header{"Authorization": {"Bearer " + agent.Token}}
 
 	// Connect via WebSocket
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, authHeader)
 	if err != nil {
 		t.Fatalf("Failed to connect via WebSocket: %v", err)
 	}
@@ -180,8 +182,9 @@ func TestWebSocketHeartbeatMetadata(t *testing.T) {
 	}))
 	defer server.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + agent.Token
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	authHeader := http.Header{"Authorization": {"Bearer " + agent.Token}}
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, authHeader)
 	if err != nil {
 		t.Fatalf("Failed to connect via WebSocket: %v", err)
 	}
@@ -294,6 +297,58 @@ func TestWebSocketMissingToken(t *testing.T) {
 	t.Log("WebSocket missing token handled correctly")
 }
 
+func TestWebSocketDeviceDeleteIsBoundToAuthenticatedAgent(t *testing.T) {
+	t.Parallel()
+	store, err := storage.NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for _, agentID := range []string{"ws-delete-a", "ws-delete-b"} {
+		if err := store.RegisterAgent(ctx, &storage.Agent{AgentID: agentID, Token: agentID + "-token"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertDevice(ctx, &storage.Device{Serial: "ws-device-a", AgentID: "ws-delete-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(ctx, &storage.Device{Serial: "ws-device-b", AgentID: "ws-delete-b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	handleWSDeviceDeleted(&storage.Agent{AgentID: "ws-delete-a"}, wscommon.Message{
+		Data: map[string]interface{}{"serial": "ws-device-b"},
+	}, store)
+	if _, err := store.GetDevice(ctx, "ws-device-b"); err != nil {
+		t.Fatalf("cross-agent device was deleted: %v", err)
+	}
+
+	handleWSDeviceDeleted(&storage.Agent{AgentID: "ws-delete-a"}, wscommon.Message{
+		Data: map[string]interface{}{"serial": "ws-device-a"},
+	}, store)
+	if _, err := store.GetDevice(ctx, "ws-device-a"); err == nil {
+		t.Fatal("authenticated agent could not delete its own device")
+	}
+}
+
+func TestWebSocketHeartbeatMetadataIsBounded(t *testing.T) {
+	longValue := strings.Repeat("x", maxWSHeartbeatFieldBytes+100)
+	if got := wsStringField(map[string]interface{}{"hostname": longValue}, "hostname"); len(got) > maxWSHeartbeatFieldBytes {
+		t.Fatalf("heartbeat metadata length = %d, want <= %d", len(got), maxWSHeartbeatFieldBytes)
+	}
+	if got := wsStringField(map[string]interface{}{"hostname": "\u00e7" + longValue}, "hostname"); !strings.HasPrefix(got, "\u00e7") {
+		t.Fatalf("bounded UTF-8 metadata lost its prefix: %q", got[:minInt(len(got), 8)])
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // TestWebSocketReconnection tests handling of agent reconnection
 func TestWebSocketReconnection(t *testing.T) {
 	t.Parallel()
@@ -329,16 +384,17 @@ func TestWebSocketReconnection(t *testing.T) {
 	defer server.Close()
 
 	// Convert http:// to ws://
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "?token=" + agent.Token
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	authHeader := http.Header{"Authorization": {"Bearer " + agent.Token}}
 
 	// First connection
-	ws1, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	ws1, _, err := websocket.DefaultDialer.Dial(wsURL, authHeader)
 	if err != nil {
 		t.Fatalf("Failed first connection: %v", err)
 	}
 
 	// Second connection (should close first one)
-	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, authHeader)
 	if err != nil {
 		t.Fatalf("Failed second connection: %v", err)
 	}

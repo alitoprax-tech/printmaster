@@ -4,15 +4,53 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
+
+const (
+	minInitSecretBytes = 32
+	// Keep accidental or maliciously oversized bearer secrets from making
+	// Argon2 verification consume disproportionate CPU/memory. Normal generated
+	// secrets are far below this limit.
+	maxInitSecretBytes = 4096
+)
+
+// ValidateInitSecret validates the shared bootstrap secret used for automatic
+// agent enrollment.  The value becomes a long-lived bearer credential, so a
+// short or malformed value must never be accepted by a running component.
+// Storage helpers intentionally remain format-agnostic for migrations and
+// unit tests; startup and enrollment paths call this function before use.
+func ValidateInitSecret(secret string) error {
+	if secret == "" {
+		return nil
+	}
+	if !utf8.ValidString(secret) {
+		return fmt.Errorf("INIT_SECRET must be valid UTF-8")
+	}
+	if len([]byte(secret)) < minInitSecretBytes {
+		return fmt.Errorf("INIT_SECRET must contain at least %d bytes", minInitSecretBytes)
+	}
+	if len([]byte(secret)) > maxInitSecretBytes {
+		return fmt.Errorf("INIT_SECRET must contain at most %d bytes", maxInitSecretBytes)
+	}
+	for _, r := range secret {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("INIT_SECRET must not contain whitespace or control characters")
+		}
+	}
+	return nil
+}
 
 // FindConfigFile searches for a config file in multiple platform-appropriate locations
 // Returns the path and data if found, or an error if not found in any location
@@ -74,7 +112,9 @@ func GetDataDirectory(component string, isService bool) (string, error) {
 	var dataDir string
 
 	// Docker takes precedence - use mounted volume path
-	if os.Getenv("DOCKER") != "" {
+	if override := os.Getenv("PRINTMASTER_DATA_DIR"); override != "" {
+		dataDir = filepath.Join(override, component)
+	} else if os.Getenv("DOCKER") != "" {
 		dataDir = filepath.Join("/var/lib/printmaster", component)
 	} else if isService {
 		// Service mode - use system-wide directory with component subdirectory
@@ -104,7 +144,7 @@ func GetDataDirectory(component string, isService bool) (string, error) {
 	}
 
 	// Create directory if it doesn't exist
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create data directory: %w", err)
 	}
 
@@ -116,7 +156,9 @@ func GetLogDirectory(component string, isService bool) (string, error) {
 	var logDir string
 
 	// Docker takes precedence - use mounted volume path
-	if os.Getenv("DOCKER") != "" {
+	if override := os.Getenv("PRINTMASTER_LOG_DIR"); override != "" {
+		logDir = filepath.Join(override, component)
+	} else if os.Getenv("DOCKER") != "" {
 		logDir = filepath.Join("/var/log/printmaster", component)
 	} else if isService {
 		// Service mode - use system log directory with component subdirectory
@@ -134,7 +176,7 @@ func GetLogDirectory(component string, isService bool) (string, error) {
 	}
 
 	// Create directory if it doesn't exist
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create log directory: %w", err)
 	}
 
@@ -151,11 +193,11 @@ func WriteDefaultTOML(configPath string, config interface{}) error {
 
 	// Ensure directory exists
 	dir := filepath.Dir(configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	file, err := os.Create(configPath)
+	file, err := os.OpenFile(configPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create config file: %w", err)
 	}
@@ -174,7 +216,7 @@ func WriteDefaultTOML(configPath string, config interface{}) error {
 func WriteTOML(configPath string, config interface{}) error {
 	// Ensure directory exists
 	dir := filepath.Dir(configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
@@ -186,12 +228,15 @@ func WriteTOML(configPath string, config interface{}) error {
 
 	// Write atomically: write to temp file then rename
 	tmp := configPath + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(tmp, buf.Bytes(), 0600); err != nil {
 		return fmt.Errorf("failed to write temp config file: %w", err)
 	}
 	if err := os.Rename(tmp, configPath); err != nil {
 		return fmt.Errorf("failed to rename temp config file: %w", err)
 	}
+	// os.WriteFile honours the requested mode for new files; chmod also
+	// tightens permissions when an existing temporary file was reused.
+	_ = os.Chmod(configPath, 0600)
 	return nil
 }
 
@@ -243,7 +288,7 @@ type DatabaseConfig struct {
 	// Path is the SQLite database file path (only used for sqlite driver)
 	Path string `toml:"path"`
 	// DSN is a full connection string that overrides individual connection fields
-	// Example for postgres: "postgres://user:pass@localhost:5432/dbname?sslmode=disable"
+	// Example for postgres: "postgres://user:pass@localhost:5432/dbname?sslmode=verify-full"
 	DSN string `toml:"dsn"`
 	// Host is the database server hostname (for postgres/mysql)
 	Host string `toml:"host"`
@@ -308,9 +353,10 @@ func (c *DatabaseConfig) BuildDSN() string {
 		if user == "" {
 			user = "printmaster"
 		}
-		dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-			user, c.Password, host, port, dbName, sslMode)
-		return dsn
+		dsn := url.URL{Scheme: "postgres", User: url.UserPassword(user, c.Password),
+			Host: net.JoinHostPort(host, strconv.Itoa(port)), Path: "/" + dbName,
+			RawQuery: url.Values{"sslmode": {sslMode}}.Encode()}
+		return dsn.String()
 
 	case "mysql", "mariadb":
 		// Build MySQL/MariaDB connection string (DSN format: user:pass@tcp(host:port)/dbname)

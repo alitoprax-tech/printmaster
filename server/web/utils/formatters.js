@@ -69,13 +69,10 @@ function formatRelativeTime(value) {
  * @returns {string} Formatted number or "—" if invalid
  */
 function formatNumber(value) {
-    if (typeof value === 'number' && isFinite(value)) {
-        return value.toLocaleString();
-    }
-    if (typeof value === 'string' && value.trim() !== '') {
-        return value;
-    }
-    return '—';
+    const number = typeof value === 'number'
+        ? value
+        : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+    return Number.isFinite(number) ? number.toLocaleString() : '—';
 }
 
 /**

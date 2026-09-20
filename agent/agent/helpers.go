@@ -31,7 +31,7 @@ func AppendScanEvent(msg string) {
 	fpath := filepath.Join(logDir, "scan_events.log")
 	line := time.Now().Format(time.RFC3339) + " " + msg + "\n"
 	// best-effort append
-	f, err := os.OpenFile(fpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(fpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err == nil {
 		_, _ = f.WriteString(line)
 		_ = f.Close()
