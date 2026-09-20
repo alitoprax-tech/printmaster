@@ -306,7 +306,13 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 	if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
 		return fmt.Errorf("load pending Agent identity: %w", pendingErr)
 	} else if pending != nil {
-		if activated, activateErr := w.activatePendingMTLS(ctx, pending); !activated {
+		attemptID := ""
+		if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+			return fmt.Errorf("load pre-enrollment attempt: %w", attemptErr)
+		} else if attempt != nil {
+			attemptID = attempt.EnrollmentAttemptID
+		}
+		if activated, activateErr := w.activatePendingMTLS(ctx, pending, attemptID); !activated {
 			return fmt.Errorf("pending mTLS activation requires retry: %w", activateErr)
 		}
 		return nil
@@ -577,13 +583,6 @@ func (w *UploadWorker) activatePendingMTLS(ctx context.Context, pending *agent.C
 	attemptID := ""
 	if len(enrollmentAttemptID) > 0 {
 		attemptID = strings.TrimSpace(enrollmentAttemptID[0])
-	}
-	if attemptID == "" {
-		if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
-			return false, fmt.Errorf("load completed enrollment attempt: %w", attemptErr)
-		} else if attempt != nil {
-			attemptID = attempt.EnrollmentAttemptID
-		}
 	}
 	if attemptID != "" {
 		if err := agent.CompleteEnrollmentAttempt(w.dataDir, attemptID); err != nil {
