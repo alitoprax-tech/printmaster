@@ -7,10 +7,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"fmt"
+	"errors"
 	"math/big"
 	"os"
-	"strings"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -45,33 +45,123 @@ func testIdentityMaterial(t *testing.T, commonName string) ([]byte, []byte) {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 }
 
-func TestSaveClientIdentityRollsBackOnReplacementFailure(t *testing.T) {
+func TestIdentityGenerationCrashCheckpoints(t *testing.T) {
+	checkpoints := []string{
+		checkpointAfterKeyWrite,
+		checkpointAfterKeyFsync,
+		checkpointAfterCertWrite,
+		checkpointAfterCertFsync,
+		checkpointAfterMetaWrite,
+		checkpointAfterMetaFsync,
+		checkpointBeforeGenerationDirFsync,
+		checkpointAfterGenerationDirFsync,
+		checkpointBeforePointerSwitch,
+		checkpointAfterPointerSwitch,
+		checkpointBeforeOldCleanup,
+		checkpointAfterOldCleanup,
+	}
+	expires := time.Now().Add(24 * time.Hour)
+	for _, checkpoint := range checkpoints {
+		t.Run(checkpoint, func(t *testing.T) {
+			dataDir := t.TempDir()
+			oldCert, oldKey := testIdentityMaterial(t, "old")
+			newCert, newKey := testIdentityMaterial(t, "new")
+			if err := SaveClientIdentity(dataDir, "old-credential", expires, oldCert, oldKey); err != nil {
+				t.Fatalf("save baseline identity: %v", err)
+			}
+			setIdentityCheckpointHook(func(name string) error {
+				if name == checkpoint {
+					return errors.New("simulated process crash")
+				}
+				return nil
+			})
+			_ = SaveClientIdentity(dataDir, "new-credential", expires, newCert, newKey)
+			setIdentityCheckpointHook(nil)
+
+			loaded, err := LoadClientIdentity(dataDir)
+			if err != nil {
+				t.Fatalf("restart load after %s: %v", checkpoint, err)
+			}
+			if loaded == nil || (loaded.CredentialID != "old-credential" && loaded.CredentialID != "new-credential") {
+				t.Fatalf("restart lost both complete identities after %s: %#v", checkpoint, loaded)
+			}
+		})
+	}
+}
+
+func TestPendingIdentityCrashCheckpoints(t *testing.T) {
+	checkpoints := []string{
+		checkpointAfterKeyWrite,
+		checkpointAfterKeyFsync,
+		checkpointAfterCertWrite,
+		checkpointAfterCertFsync,
+		checkpointAfterMetaWrite,
+		checkpointAfterMetaFsync,
+		checkpointBeforeGenerationDirFsync,
+		checkpointAfterGenerationDirFsync,
+		checkpointBeforePointerSwitch,
+		checkpointAfterPointerSwitch,
+		checkpointBeforeOldCleanup,
+		checkpointAfterOldCleanup,
+	}
+	expires := time.Now().Add(24 * time.Hour)
+	for _, checkpoint := range checkpoints {
+		t.Run(checkpoint, func(t *testing.T) {
+			dataDir := t.TempDir()
+			certPEM, keyPEM := testIdentityMaterial(t, "pending")
+			identity, err := BuildClientIdentity("pending-credential", expires, certPEM, keyPEM)
+			if err != nil {
+				t.Fatalf("build pending identity: %v", err)
+			}
+			identity.TenantID = "tenant-1"
+			setIdentityCheckpointHook(func(name string) error {
+				if name == checkpoint {
+					return errors.New("simulated process crash")
+				}
+				return nil
+			})
+			_ = SavePendingClientIdentity(dataDir, identity, certPEM, keyPEM)
+			setIdentityCheckpointHook(nil)
+
+			loaded, err := LoadPendingClientIdentity(dataDir)
+			if err != nil {
+				t.Fatalf("restart pending load after %s: %v", checkpoint, err)
+			}
+			if loaded == nil || loaded.CredentialID != "pending-credential" || loaded.TenantID != "tenant-1" {
+				t.Fatalf("pending identity lost after %s: %#v", checkpoint, loaded)
+			}
+		})
+	}
+}
+
+func TestIdentityPointerCorruptionFallsBackToCompleteGeneration(t *testing.T) {
 	dataDir := t.TempDir()
 	oldCert, oldKey := testIdentityMaterial(t, "old")
 	newCert, newKey := testIdentityMaterial(t, "new")
 	expires := time.Now().Add(24 * time.Hour)
 	if err := SaveClientIdentity(dataDir, "old-credential", expires, oldCert, oldKey); err != nil {
-		t.Fatalf("save initial identity: %v", err)
+		t.Fatalf("save old identity: %v", err)
 	}
-
-	originalRename := renameIdentityFile
-	renameIdentityFile = func(oldPath, newPath string) error {
-		if strings.HasSuffix(newPath, clientIdentityCertFile+clientIdentityBackupSuffix) {
-			return fmt.Errorf("injected certificate backup failure")
-		}
-		return os.Rename(oldPath, newPath)
+	if err := SaveClientIdentity(dataDir, "new-credential", expires, newCert, newKey); err != nil {
+		t.Fatalf("save new identity: %v", err)
 	}
-	defer func() { renameIdentityFile = originalRename }()
-
-	if err := SaveClientIdentity(dataDir, "new-credential", expires, newCert, newKey); err == nil {
-		t.Fatal("expected replacement failure")
+	root := identityStoreRoot(dataDir, false)
+	if err := os.WriteFile(filepath.Join(root, identityCurrentFile), []byte("../../outside\n"), 0600); err != nil {
+		t.Fatalf("corrupt current pointer: %v", err)
 	}
 	loaded, err := LoadClientIdentity(dataDir)
 	if err != nil {
-		t.Fatalf("load identity after failed replacement: %v", err)
+		t.Fatalf("load after corrupt pointer: %v", err)
 	}
-	if loaded == nil || loaded.CredentialID != "old-credential" {
-		t.Fatalf("failed replacement lost active identity: %#v", loaded)
+	if loaded == nil || (loaded.CredentialID != "old-credential" && loaded.CredentialID != "new-credential") {
+		t.Fatalf("corrupt pointer discarded all complete generations: %#v", loaded)
+	}
+	if err := os.WriteFile(filepath.Join(root, identityCurrentFile), []byte("gen-9999999999999999-deadbeef\n"), 0600); err != nil {
+		t.Fatalf("point at incomplete generation: %v", err)
+	}
+	loaded, err = LoadClientIdentity(dataDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("load after incomplete pointer: identity=%#v err=%v", loaded, err)
 	}
 }
 
@@ -106,5 +196,29 @@ func TestPendingClientIdentityPromotesAfterActivation(t *testing.T) {
 	}
 	if pending, err := LoadPendingClientIdentity(dataDir); err != nil || pending != nil {
 		t.Fatalf("pending identity was not cleared: identity=%#v err=%v", pending, err)
+	}
+}
+
+func TestIdentityDirectorySyncFailureIsReturnedAndPreviousIdentitySurvives(t *testing.T) {
+	dataDir := t.TempDir()
+	oldCert, oldKey := testIdentityMaterial(t, "old")
+	newCert, newKey := testIdentityMaterial(t, "new")
+	expires := time.Now().Add(24 * time.Hour)
+	if err := SaveClientIdentity(dataDir, "old-credential", expires, oldCert, oldKey); err != nil {
+		t.Fatalf("save baseline identity: %v", err)
+	}
+	originalSync := syncIdentityDirectory
+	syncIdentityDirectory = func(string) error { return errors.New("simulated directory sync failure") }
+	err := SaveClientIdentity(dataDir, "new-credential", expires, newCert, newKey)
+	syncIdentityDirectory = originalSync
+	if err == nil {
+		t.Fatal("expected directory sync failure to be returned")
+	}
+	loaded, loadErr := LoadClientIdentity(dataDir)
+	if loadErr != nil || loaded == nil {
+		t.Fatalf("previous complete identity was not recoverable: identity=%#v err=%v", loaded, loadErr)
+	}
+	if loaded.CredentialID != "old-credential" && loaded.CredentialID != "new-credential" {
+		t.Fatalf("unexpected identity after sync failure: %#v", loaded)
 	}
 }
