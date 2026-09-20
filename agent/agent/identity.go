@@ -78,6 +78,12 @@ type PendingIdentity struct {
 	// is opaque and is sent to the server, while the private key remains local.
 	EnrollmentAttemptID string
 	AgentID             string
+	// KeyBackend and KeyReference describe where the private key is held.
+	// They are persisted as metadata only; a Windows CNG/TPM key never has
+	// private key bytes on disk.
+	KeyBackend   string
+	KeyReference string
+	signer       crypto.Signer
 }
 
 // ClientIdentity is the persisted certificate metadata and parsed certificate
@@ -99,6 +105,8 @@ type identityMetadata struct {
 	CredentialID string    `json:"credential_id"`
 	TenantID     string    `json:"tenant_id,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`
+	KeyBackend   string    `json:"key_backend,omitempty"`
+	KeyReference string    `json:"key_reference,omitempty"`
 }
 
 // identityJournal is a durable replay record. It is deliberately separate
@@ -114,9 +122,11 @@ type identityJournal struct {
 }
 
 type enrollmentAttemptMetadata struct {
-	AttemptID string    `json:"enrollment_attempt_id"`
-	AgentID   string    `json:"agent_id"`
-	CreatedAt time.Time `json:"created_at"`
+	AttemptID    string    `json:"enrollment_attempt_id"`
+	AgentID      string    `json:"agent_id"`
+	CreatedAt    time.Time `json:"created_at"`
+	KeyBackend   string    `json:"key_backend,omitempty"`
+	KeyReference string    `json:"key_reference,omitempty"`
 }
 
 type enrollmentAttemptJournal struct {
@@ -131,6 +141,9 @@ type storedIdentity struct {
 	identity       *ClientIdentity
 	certificatePEM []byte
 	privateKeyPEM  []byte
+	keyBackend     string
+	keyReference   string
+	signer         crypto.Signer
 	generation     string
 }
 
@@ -170,10 +183,24 @@ func hitIdentityCheckpoint(name string) error {
 }
 
 func BuildClientIdentity(credentialID string, expiresAt time.Time, certificatePEM, privateKeyPEM []byte) (*ClientIdentity, error) {
+	return buildClientIdentityWithSigner(credentialID, expiresAt, certificatePEM, privateKeyPEM, nil)
+}
+
+// BuildClientIdentityFromPending builds an identity using the key backend that
+// created the CSR. On Windows this may be a non-exportable CNG/TPM signer;
+// callers must not assume PrivateKeyPEM is populated.
+func BuildClientIdentityFromPending(credentialID string, expiresAt time.Time, certificatePEM []byte, pending *PendingIdentity) (*ClientIdentity, error) {
+	if pending == nil {
+		return nil, fmt.Errorf("pending identity required")
+	}
+	return buildClientIdentityWithSigner(credentialID, expiresAt, certificatePEM, pending.PrivateKeyPEM, pending.signer)
+}
+
+func buildClientIdentityWithSigner(credentialID string, expiresAt time.Time, certificatePEM, privateKeyPEM []byte, signer crypto.Signer) (*ClientIdentity, error) {
 	if strings.TrimSpace(credentialID) == "" {
 		return nil, fmt.Errorf("credential id required")
 	}
-	cert, err := tls.X509KeyPair(certificatePEM, privateKeyPEM)
+	cert, err := tlsCertificateWithSigner(certificatePEM, privateKeyPEM, signer)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +211,35 @@ func BuildClientIdentity(credentialID string, expiresAt time.Time, certificatePE
 // must persist the returned private key together with the issued certificate
 // before changing the active client identity.
 func GenerateClientCSR(agentID string) (*PendingIdentity, error) {
+	return generateSoftwareClientCSR(agentID)
+}
+
+// GenerateClientCSRAt creates a CSR using the platform key backend. It is
+// used for migration and renewal, where the resulting private key must remain
+// protected just like a fresh enrollment key.
+func GenerateClientCSRAt(dataDir, agentID string) (*PendingIdentity, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, fmt.Errorf("data directory required")
+	}
+	keyID, err := newEnrollmentAttemptID()
+	if err != nil {
+		return nil, fmt.Errorf("generate protected key id: %w", err)
+	}
+	return generateProtectedClientCSR(dataDir, agentID, keyID)
+}
+
+// MigrateLegacyKeyStorage upgrades a legacy PEM identity/enrollment store to
+// the platform protected backend. Non-Windows platforms retain their existing
+// PEM behavior; Windows performs the migration before the service uses the
+// identity and fails closed if protection or durability cannot be confirmed.
+func MigrateLegacyKeyStorage(dataDir string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("data directory required")
+	}
+	return migrateLegacyKeyStoragePlatform(dataDir)
+}
+
+func generateSoftwareClientCSR(agentID string) (*PendingIdentity, error) {
 	if strings.TrimSpace(agentID) == "" {
 		return nil, fmt.Errorf("agent id required")
 	}
@@ -203,6 +259,8 @@ func GenerateClientCSR(agentID string) (*PendingIdentity, error) {
 		PrivateKeyPEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
 		CSRPEM:        pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}),
 		AgentID:       agentID,
+		KeyBackend:    keyBackendSoftware,
+		signer:        key,
 	}, nil
 }
 
@@ -214,13 +272,13 @@ func CreateEnrollmentAttempt(dataDir, agentID string) (*PendingIdentity, error) 
 	if strings.TrimSpace(dataDir) == "" || strings.TrimSpace(agentID) == "" {
 		return nil, fmt.Errorf("data directory and agent id required")
 	}
-	pending, err := GenerateClientCSR(agentID)
-	if err != nil {
-		return nil, err
-	}
 	attemptID, err := newEnrollmentAttemptID()
 	if err != nil {
 		return nil, fmt.Errorf("generate enrollment attempt id: %w", err)
+	}
+	pending, err := generateProtectedClientCSR(dataDir, agentID, attemptID)
+	if err != nil {
+		return nil, err
 	}
 	pending.EnrollmentAttemptID = attemptID
 	if err := saveEnrollmentAttempt(dataDir, pending); err != nil {
@@ -299,7 +357,7 @@ func SaveClientIdentity(dataDir, credentialID string, expiresAt time.Time, certi
 	if strings.TrimSpace(dataDir) == "" || strings.TrimSpace(credentialID) == "" || len(certificatePEM) == 0 || len(privateKeyPEM) == 0 {
 		return fmt.Errorf("complete Agent identity required")
 	}
-	if _, err := tls.X509KeyPair(certificatePEM, privateKeyPEM); err != nil {
+	if _, err := tlsCertificateWithSigner(certificatePEM, privateKeyPEM, nil); err != nil {
 		return fmt.Errorf("certificate/private key mismatch: %w", err)
 	}
 	return saveIdentityGeneration(identityStoreRoot(dataDir, false), identityMetadata{
@@ -318,7 +376,7 @@ func SavePendingClientIdentity(dataDir string, identity *ClientIdentity, certifi
 	if strings.TrimSpace(identity.CredentialID) == "" || len(certificatePEM) == 0 || len(privateKeyPEM) == 0 {
 		return fmt.Errorf("complete pending Agent identity required")
 	}
-	if _, err := tls.X509KeyPair(certificatePEM, privateKeyPEM); err != nil {
+	if _, err := tlsCertificateWithSigner(certificatePEM, privateKeyPEM, nil); err != nil {
 		return fmt.Errorf("certificate/private key mismatch: %w", err)
 	}
 	return saveIdentityGeneration(identityStoreRoot(dataDir, true), identityMetadata{
@@ -326,6 +384,28 @@ func SavePendingClientIdentity(dataDir string, identity *ClientIdentity, certifi
 		TenantID:     identity.TenantID,
 		ExpiresAt:    identity.ExpiresAt.UTC(),
 	}, certificatePEM, privateKeyPEM)
+}
+
+// SavePendingClientIdentityFromPending persists a certificate with the exact
+// key backend that generated its CSR. This keeps TPM/CNG identities as key
+// references and keeps DPAPI ciphertext off the plaintext identity path.
+func SavePendingClientIdentityFromPending(dataDir string, identity *ClientIdentity, certificatePEM []byte, pending *PendingIdentity) error {
+	if identity == nil || pending == nil {
+		return fmt.Errorf("pending identity required")
+	}
+	if strings.TrimSpace(identity.CredentialID) == "" || len(certificatePEM) == 0 {
+		return fmt.Errorf("complete pending Agent identity required")
+	}
+	if _, err := tlsCertificateWithSigner(certificatePEM, pending.PrivateKeyPEM, pending.signer); err != nil {
+		return fmt.Errorf("certificate/private key mismatch: %w", err)
+	}
+	return saveIdentityGenerationWithKey(identityStoreRoot(dataDir, true), identityMetadata{
+		CredentialID: identity.CredentialID,
+		TenantID:     identity.TenantID,
+		ExpiresAt:    identity.ExpiresAt.UTC(),
+		KeyBackend:   pending.KeyBackend,
+		KeyReference: pending.KeyReference,
+	}, certificatePEM, pending.PrivateKeyPEM)
 }
 
 // PromotePendingClientIdentity commits the pending generation as a new active
@@ -342,10 +422,12 @@ func PromotePendingClientIdentity(dataDir string) error {
 		}
 		return fmt.Errorf("pending Agent identity not found")
 	}
-	if err := saveIdentityGeneration(identityStoreRoot(dataDir, false), identityMetadata{
+	if err := saveIdentityGenerationWithKey(identityStoreRoot(dataDir, false), identityMetadata{
 		CredentialID: pending.identity.CredentialID,
 		TenantID:     pending.identity.TenantID,
 		ExpiresAt:    pending.identity.ExpiresAt.UTC(),
+		KeyBackend:   pending.keyBackend,
+		KeyReference: pending.keyReference,
 	}, pending.certificatePEM, pending.privateKeyPEM); err != nil {
 		return err
 	}
@@ -459,8 +541,13 @@ func enrollmentStoreRoot(dataDir string) string {
 }
 
 func saveEnrollmentAttempt(dataDir string, attempt *PendingIdentity) error {
-	if attempt == nil || strings.TrimSpace(attempt.EnrollmentAttemptID) == "" || strings.TrimSpace(attempt.AgentID) == "" || len(attempt.CSRPEM) == 0 || len(attempt.PrivateKeyPEM) == 0 {
+	if attempt == nil || strings.TrimSpace(attempt.EnrollmentAttemptID) == "" || strings.TrimSpace(attempt.AgentID) == "" || len(attempt.CSRPEM) == 0 {
 		return fmt.Errorf("complete pre-enrollment attempt required")
+	}
+	// A TPM/CNG-backed attempt deliberately has no private-key bytes. Its
+	// durable key reference is sufficient to reopen the non-exportable signer.
+	if len(attempt.PrivateKeyPEM) == 0 && (!isCNGKeyBackend(attempt.KeyBackend) || strings.TrimSpace(attempt.KeyReference) == "") {
+		return fmt.Errorf("pre-enrollment private key reference missing")
 	}
 	if err := validateEnrollmentAttempt(attempt); err != nil {
 		return err
@@ -472,7 +559,12 @@ func saveEnrollmentAttempt(dataDir string, attempt *PendingIdentity) error {
 	if err := recoverEnrollmentTransactions(root); err != nil {
 		return fmt.Errorf("recover enrollment transaction: %w", err)
 	}
-	metadata := enrollmentAttemptMetadata{AttemptID: attempt.EnrollmentAttemptID, AgentID: attempt.AgentID, CreatedAt: time.Now().UTC()}
+	storedKey, keyRef, err := prepareStoredKey(root, attempt.PrivateKeyPEM, keyReference{Backend: attempt.KeyBackend, Reference: attempt.KeyReference})
+	if err != nil {
+		return err
+	}
+	attempt.KeyBackend, attempt.KeyReference = keyRef.Backend, keyRef.Reference
+	metadata := enrollmentAttemptMetadata{AttemptID: attempt.EnrollmentAttemptID, AgentID: attempt.AgentID, CreatedAt: time.Now().UTC(), KeyBackend: keyRef.Backend, KeyReference: keyRef.Reference}
 	metaJSON, err := json.Marshal(metadata)
 	if err != nil {
 		return err
@@ -481,7 +573,7 @@ func saveEnrollmentAttempt(dataDir string, attempt *PendingIdentity) error {
 	if err != nil {
 		return err
 	}
-	journalJSON, err := json.Marshal(enrollmentAttemptJournal{Version: 1, Generation: generation, Metadata: metadata, CSRPEM: attempt.CSRPEM, PrivateKeyPEM: attempt.PrivateKeyPEM})
+	journalJSON, err := json.Marshal(enrollmentAttemptJournal{Version: 1, Generation: generation, Metadata: metadata, CSRPEM: attempt.CSRPEM, PrivateKeyPEM: storedKey})
 	if err != nil {
 		return err
 	}
@@ -502,7 +594,7 @@ func saveEnrollmentAttempt(dataDir string, attempt *PendingIdentity) error {
 			_ = os.RemoveAll(tempDir)
 		}
 	}()
-	if err := writeEnrollmentGenerationFiles(tempDir, metaJSON, attempt.CSRPEM, attempt.PrivateKeyPEM, true); err != nil {
+	if err := writeEnrollmentGenerationFiles(tempDir, metaJSON, attempt.CSRPEM, storedKey, true); err != nil {
 		return err
 	}
 	finalDir := filepath.Join(root, generation)
@@ -526,14 +618,6 @@ func validateEnrollmentAttempt(attempt *PendingIdentity) error {
 	if !isOpaqueEnrollmentAttemptID(attempt.EnrollmentAttemptID) {
 		return fmt.Errorf("invalid enrollment attempt id")
 	}
-	keyBlock, _ := pem.Decode(attempt.PrivateKeyPEM)
-	if keyBlock == nil {
-		return fmt.Errorf("pre-enrollment private key missing")
-	}
-	key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
-	if err != nil {
-		return fmt.Errorf("parse pre-enrollment private key: %w", err)
-	}
 	csrBlock, _ := pem.Decode(attempt.CSRPEM)
 	if csrBlock == nil || csrBlock.Type != "CERTIFICATE REQUEST" {
 		return fmt.Errorf("pre-enrollment CSR missing")
@@ -545,8 +629,23 @@ func validateEnrollmentAttempt(attempt *PendingIdentity) error {
 	if err := csr.CheckSignature(); err != nil {
 		return fmt.Errorf("pre-enrollment CSR signature invalid: %w", err)
 	}
-	privateSigner, ok := key.(crypto.Signer)
-	if !ok || !publicKeysEqual(privateSigner.Public(), csr.PublicKey) {
+	privateSigner := attempt.signer
+	if privateSigner == nil {
+		keyBlock, _ := pem.Decode(attempt.PrivateKeyPEM)
+		if keyBlock == nil {
+			return fmt.Errorf("pre-enrollment private key missing")
+		}
+		key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return fmt.Errorf("parse pre-enrollment private key: %w", err)
+		}
+		var ok bool
+		privateSigner, ok = key.(crypto.Signer)
+		if !ok {
+			return fmt.Errorf("pre-enrollment private key is not a signer")
+		}
+	}
+	if !publicKeysEqual(privateSigner.Public(), csr.PublicKey) {
 		return fmt.Errorf("pre-enrollment CSR does not match private key")
 	}
 	return nil
@@ -738,7 +837,11 @@ func readEnrollmentGeneration(root, generation string) (*PendingIdentity, error)
 	if err := json.Unmarshal(metaJSON, &metadata); err != nil {
 		return nil, err
 	}
-	attempt := &PendingIdentity{PrivateKeyPEM: privateKeyPEM, CSRPEM: csrPEM, EnrollmentAttemptID: metadata.AttemptID, AgentID: metadata.AgentID}
+	privateKeyPEM, signer, err := restoreStoredKey(path, privateKeyPEM, keyReference{Backend: metadata.KeyBackend, Reference: metadata.KeyReference})
+	if err != nil {
+		return nil, err
+	}
+	attempt := &PendingIdentity{PrivateKeyPEM: privateKeyPEM, CSRPEM: csrPEM, EnrollmentAttemptID: metadata.AttemptID, AgentID: metadata.AgentID, KeyBackend: metadata.KeyBackend, KeyReference: metadata.KeyReference, signer: signer}
 	if err := validateEnrollmentAttempt(attempt); err != nil {
 		return nil, err
 	}
@@ -784,21 +887,30 @@ func recoverEnrollmentTransactions(root string) error {
 }
 
 func recoverEnrollmentJournal(root, journalPath string, journal enrollmentAttemptJournal) error {
-	attempt := &PendingIdentity{PrivateKeyPEM: journal.PrivateKeyPEM, CSRPEM: journal.CSRPEM, EnrollmentAttemptID: journal.Metadata.AttemptID, AgentID: journal.Metadata.AgentID}
+	privateKeyPEM, signer, err := restoreStoredKey(root, journal.PrivateKeyPEM, keyReference{Backend: journal.Metadata.KeyBackend, Reference: journal.Metadata.KeyReference})
+	if err != nil {
+		return err
+	}
+	storedKey, keyRef, err := prepareStoredKey(root, privateKeyPEM, keyReference{Backend: journal.Metadata.KeyBackend, Reference: journal.Metadata.KeyReference})
+	if err != nil {
+		return fmt.Errorf("protect recovered enrollment key: %w", err)
+	}
+	journal.Metadata.KeyBackend, journal.Metadata.KeyReference = keyRef.Backend, keyRef.Reference
+	attempt := &PendingIdentity{PrivateKeyPEM: privateKeyPEM, CSRPEM: journal.CSRPEM, EnrollmentAttemptID: journal.Metadata.AttemptID, AgentID: journal.Metadata.AgentID, KeyBackend: journal.Metadata.KeyBackend, KeyReference: journal.Metadata.KeyReference, signer: signer}
 	if err := validateEnrollmentAttempt(attempt); err != nil {
 		return err
 	}
 	if _, err := readEnrollmentGeneration(root, journal.Generation); err != nil {
-		metaJSON, marshalErr := json.Marshal(journal.Metadata)
-		if marshalErr != nil {
-			return marshalErr
-		}
 		tempDir, err := os.MkdirTemp(root, ".enrollment-generation-recover-")
 		if err != nil {
 			return err
 		}
 		defer os.RemoveAll(tempDir)
-		if err := writeEnrollmentGenerationFiles(tempDir, metaJSON, journal.CSRPEM, journal.PrivateKeyPEM, false); err != nil {
+		metaJSON, marshalErr := json.Marshal(journal.Metadata)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if err := writeEnrollmentGenerationFiles(tempDir, metaJSON, journal.CSRPEM, storedKey, false); err != nil {
 			return err
 		}
 		finalDir := filepath.Join(root, journal.Generation)
@@ -1015,26 +1127,37 @@ func readGeneration(root, generation string) (*storedIdentity, error) {
 			return nil, fmt.Errorf("identity generation contains a non-regular file")
 		}
 	}
-	identity, cert, key, err := readIdentityFiles(paths)
+	identity, cert, key, keyBackend, keyReference, signer, err := readStoredIdentityFiles(path, paths)
 	if err != nil {
 		return nil, err
 	}
 	if identity == nil {
 		return nil, fmt.Errorf("identity generation incomplete")
 	}
-	return &storedIdentity{identity: identity, certificatePEM: cert, privateKeyPEM: key, generation: generation}, nil
+	return &storedIdentity{identity: identity, certificatePEM: cert, privateKeyPEM: key, keyBackend: keyBackend, keyReference: keyReference, signer: signer, generation: generation}, nil
 }
 
 func saveIdentityGeneration(root string, metadata identityMetadata, certificatePEM, privateKeyPEM []byte) error {
+	return saveIdentityGenerationWithKey(root, metadata, certificatePEM, privateKeyPEM)
+}
+
+func saveIdentityGenerationWithKey(root string, metadata identityMetadata, certificatePEM, privateKeyPEM []byte) error {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
 	}
 	if err := recoverIdentityTransactions(root); err != nil {
 		return fmt.Errorf("recover identity transaction: %w", err)
 	}
-	if _, err := tls.X509KeyPair(certificatePEM, privateKeyPEM); err != nil {
-		return fmt.Errorf("certificate/private key mismatch: %w", err)
+	if !(isCNGKeyBackend(metadata.KeyBackend) && len(privateKeyPEM) == 0) {
+		if _, err := tlsCertificateWithSigner(certificatePEM, privateKeyPEM, nil); err != nil {
+			return fmt.Errorf("certificate/private key mismatch: %w", err)
+		}
 	}
+	storedKey, keyRef, err := prepareStoredKey(root, privateKeyPEM, keyReference{Backend: metadata.KeyBackend, Reference: metadata.KeyReference})
+	if err != nil {
+		return err
+	}
+	metadata.KeyBackend, metadata.KeyReference = keyRef.Backend, keyRef.Reference
 	metaPEM, err := json.Marshal(metadata)
 	if err != nil {
 		return err
@@ -1043,7 +1166,7 @@ func saveIdentityGeneration(root string, metadata identityMetadata, certificateP
 	if err != nil {
 		return err
 	}
-	journal := identityJournal{Version: 1, Generation: generation, Metadata: metadata, CertificatePEM: certificatePEM, PrivateKeyPEM: privateKeyPEM}
+	journal := identityJournal{Version: 1, Generation: generation, Metadata: metadata, CertificatePEM: certificatePEM, PrivateKeyPEM: storedKey}
 	journalPEM, err := json.Marshal(journal)
 	if err != nil {
 		return err
@@ -1066,7 +1189,7 @@ func saveIdentityGeneration(root string, metadata identityMetadata, certificateP
 			_ = os.RemoveAll(tempDir)
 		}
 	}()
-	if err := writeGenerationFiles(tempDir, metaPEM, certificatePEM, privateKeyPEM, true); err != nil {
+	if err := writeGenerationFiles(tempDir, metaPEM, certificatePEM, storedKey, true); err != nil {
 		return err
 	}
 	finalDir := filepath.Join(root, generation)
@@ -1218,19 +1341,28 @@ func recoverIdentityTransactions(root string) error {
 
 func recoverIdentityJournal(root, journalPath string, journal identityJournal) error {
 	if _, err := readGeneration(root, journal.Generation); err != nil {
+		storedKey, signer, keyErr := restoreStoredKey(root, journal.PrivateKeyPEM, keyReference{Backend: journal.Metadata.KeyBackend, Reference: journal.Metadata.KeyReference})
+		if keyErr != nil {
+			return fmt.Errorf("invalid identity transaction key: %w", keyErr)
+		}
+		storedKey, keyRef, keyErr := prepareStoredKey(root, storedKey, keyReference{Backend: journal.Metadata.KeyBackend, Reference: journal.Metadata.KeyReference})
+		if keyErr != nil {
+			return fmt.Errorf("protect recovered identity key: %w", keyErr)
+		}
+		journal.Metadata.KeyBackend, journal.Metadata.KeyReference = keyRef.Backend, keyRef.Reference
+		if _, keyErr := tlsCertificateWithSigner(journal.CertificatePEM, storedKey, signer); keyErr != nil {
+			return fmt.Errorf("invalid identity transaction certificate/key: %w", keyErr)
+		}
 		metaPEM, marshalErr := json.Marshal(journal.Metadata)
 		if marshalErr != nil {
 			return marshalErr
-		}
-		if _, keyErr := tls.X509KeyPair(journal.CertificatePEM, journal.PrivateKeyPEM); keyErr != nil {
-			return fmt.Errorf("invalid identity transaction certificate/key: %w", keyErr)
 		}
 		tempDir, err := os.MkdirTemp(root, ".generation-recover-")
 		if err != nil {
 			return err
 		}
 		defer os.RemoveAll(tempDir)
-		if err := writeGenerationFiles(tempDir, metaPEM, journal.CertificatePEM, journal.PrivateKeyPEM, false); err != nil {
+		if err := writeGenerationFiles(tempDir, metaPEM, journal.CertificatePEM, storedKey, false); err != nil {
 			return err
 		}
 		finalDir := filepath.Join(root, journal.Generation)
@@ -1329,6 +1461,40 @@ func readIdentityFiles(paths identityFileSet) (*ClientIdentity, []byte, []byte, 
 		return nil, nil, nil, fmt.Errorf("Agent identity metadata incomplete")
 	}
 	return &ClientIdentity{CredentialID: meta.CredentialID, TenantID: meta.TenantID, ExpiresAt: meta.ExpiresAt, Certificate: cert}, certPEM, keyPEM, nil
+}
+
+func readStoredIdentityFiles(root string, paths identityFileSet) (*ClientIdentity, []byte, []byte, string, string, crypto.Signer, error) {
+	keyStored, keyErr := os.ReadFile(paths.key)
+	certPEM, certErr := os.ReadFile(paths.cert)
+	metaPEM, metaErr := os.ReadFile(paths.meta)
+	if keyErr != nil || certErr != nil || metaErr != nil {
+		if os.IsNotExist(keyErr) && os.IsNotExist(certErr) && os.IsNotExist(metaErr) {
+			return nil, nil, nil, "", "", nil, nil
+		}
+		if keyErr != nil {
+			return nil, nil, nil, "", "", nil, keyErr
+		}
+		if certErr != nil {
+			return nil, nil, nil, "", "", nil, certErr
+		}
+		return nil, nil, nil, "", "", nil, metaErr
+	}
+	var meta identityMetadata
+	if err := json.Unmarshal(metaPEM, &meta); err != nil {
+		return nil, nil, nil, "", "", nil, fmt.Errorf("parse Agent identity metadata: %w", err)
+	}
+	privateKeyPEM, signer, err := restoreStoredKey(root, keyStored, keyReference{Backend: meta.KeyBackend, Reference: meta.KeyReference})
+	if err != nil {
+		return nil, nil, nil, "", "", nil, err
+	}
+	cert, err := tlsCertificateWithSigner(certPEM, privateKeyPEM, signer)
+	if err != nil {
+		return nil, nil, nil, "", "", nil, fmt.Errorf("load Agent identity: %w", err)
+	}
+	if meta.CredentialID == "" || meta.ExpiresAt.IsZero() {
+		return nil, nil, nil, "", "", nil, fmt.Errorf("Agent identity metadata incomplete")
+	}
+	return &ClientIdentity{CredentialID: meta.CredentialID, TenantID: meta.TenantID, ExpiresAt: meta.ExpiresAt, Certificate: cert}, certPEM, privateKeyPEM, meta.KeyBackend, meta.KeyReference, signer, nil
 }
 
 func identityPaths(dataDir, suffix string) identityFileSet {

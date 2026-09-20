@@ -1,6 +1,10 @@
 # PrintMaster Agent Configuration Example
 # Copy this file to config.toml and customize for your environment
 
+# Windows service installs protect mTLS identity, enrollment, pending, and
+# renewal keys with TPM/CNG when available or service-scoped DPAPI fallback.
+# Do not add private-key PEM material to this file.
+
 # Asset ID regex pattern (customize for your asset tag format)
 asset_id_regex = "\\b\\d{5}\\b"
 

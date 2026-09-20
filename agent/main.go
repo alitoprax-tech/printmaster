@@ -2165,6 +2165,7 @@ func startServerUploadWorker(
 	ctx context.Context,
 	agentCfg *AgentConfig,
 	dataDir string,
+	isService bool,
 	deviceStore storage.DeviceStore,
 	settings *SettingsManager,
 	workerLogger Logger,
@@ -2174,6 +2175,11 @@ func startServerUploadWorker(
 	}
 	if strings.TrimSpace(agentCfg.Server.URL) == "" {
 		return nil, fmt.Errorf("server URL not configured")
+	}
+	if runtime.GOOS == "windows" && isService {
+		if err := ensureWindowsAgentDataDirectory(filepath.Dir(dataDir)); err != nil {
+			return nil, fmt.Errorf("Windows Agent data directory validation failed: %w", err)
+		}
 	}
 	validatedServerURL, err := validateOnboardingServerURL(agentCfg.Server.URL)
 	if err != nil {
@@ -2405,12 +2411,12 @@ func performServerJoin(
 	if !mtlsEnrolled {
 		if pending, csrErr := agent.LoadOrCreateEnrollmentAttempt(dataDir, agentID); csrErr == nil {
 			if registration, mtlsErr := client.RegisterWithMTLS(reqCtx, joinToken, string(pending.CSRPEM), Version, pending.EnrollmentAttemptID); mtlsErr == nil {
-				identity, buildErr := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+				identity, buildErr := agent.BuildClientIdentityFromPending(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending)
 				if buildErr != nil {
 					return nil, newJoinError(http.StatusBadGateway, buildErr)
 				}
 				identity.TenantID = registration.TenantID
-				if saveErr := agent.SavePendingClientIdentity(dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); saveErr != nil {
+				if saveErr := agent.SavePendingClientIdentityFromPending(dataDir, identity, registration.ClientCertificate, pending); saveErr != nil {
 					return nil, newJoinError(http.StatusInternalServerError, saveErr)
 				}
 				if setErr := client.SetClientIdentity(identity); setErr != nil {
@@ -2509,7 +2515,7 @@ func performServerJoin(
 		maybeStartAutoUpdateWorker(appCtx, agentCfg, dataDir, isSvc, logger)
 	} else {
 		go func() {
-			worker, err := startServerUploadWorker(appCtx, agentCfg, dataDir, deviceStore, settings, logger)
+			worker, err := startServerUploadWorker(appCtx, agentCfg, dataDir, isSvc, deviceStore, settings, logger)
 			if err != nil {
 				if logger != nil {
 					logger.Error("Failed to start upload worker after join", "error", err)
@@ -2747,6 +2753,18 @@ func handleServiceCommand(cmd string) {
 				os.Exit(1)
 			}
 		}
+		if runtime.GOOS == "windows" {
+			if err := configureInstalledWindowsService(svcConfig.Name); err != nil {
+				commonutil.ShowError(fmt.Sprintf("Failed to apply Windows service security: %v", err))
+				commonutil.ShowCompletionScreen(false, "Installation Failed")
+				os.Exit(1)
+			}
+			if err := hardenWindowsAgentDataDirectory(filepath.Join(os.Getenv("ProgramData"), "PrintMaster")); err != nil {
+				commonutil.ShowError(fmt.Sprintf("Failed to protect Agent data directory: %v", err))
+				commonutil.ShowCompletionScreen(false, "Installation Failed")
+				os.Exit(1)
+			}
+		}
 		commonutil.ShowSuccess("Service installed")
 
 		commonutil.ShowCompletionScreen(true, "Service Installed!")
@@ -2966,6 +2984,18 @@ func handleServiceCommand(cmd string) {
 			commonutil.ShowCompletionScreen(false, "Update Failed")
 			os.Exit(1)
 		}
+		if runtime.GOOS == "windows" {
+			if err := configureInstalledWindowsService(svcConfig.Name); err != nil {
+				commonutil.ShowError(fmt.Sprintf("Failed to apply Windows service security: %v", err))
+				commonutil.ShowCompletionScreen(false, "Update Failed")
+				os.Exit(1)
+			}
+			if err := hardenWindowsAgentDataDirectory(filepath.Join(os.Getenv("ProgramData"), "PrintMaster")); err != nil {
+				commonutil.ShowError(fmt.Sprintf("Failed to protect Agent data directory: %v", err))
+				commonutil.ShowCompletionScreen(false, "Update Failed")
+				os.Exit(1)
+			}
+		}
 		commonutil.ShowSuccess("Service installed")
 
 		// Start service
@@ -3144,6 +3174,21 @@ func runInteractive(ctx context.Context, configFlag string) {
 	var agentConfig *AgentConfig
 
 	isService := !service.Interactive()
+	if runtime.GOOS == "windows" && isService {
+		serviceDataDir, err := config.GetDataDirectory("agent", true)
+		if err != nil {
+			appLogger.Error("Windows Agent data directory could not be initialized", "error", err)
+			return
+		}
+		if err := ensureWindowsAgentDataDirectory(filepath.Dir(serviceDataDir)); err != nil {
+			appLogger.Error("Windows Agent data directory security validation failed", "error", err)
+			return
+		}
+		if err := agent.MigrateLegacyKeyStorage(serviceDataDir); err != nil {
+			appLogger.Error("Windows Agent key migration failed", "error", err)
+			return
+		}
+	}
 	var configPaths []string
 
 	if isService {
@@ -4556,7 +4601,7 @@ func runInteractive(ctx context.Context, configFlag string) {
 		}
 
 		go func() {
-			worker, err := startServerUploadWorker(ctx, agentConfig, dataDir, deviceStore, settingsManager, appLogger)
+			worker, err := startServerUploadWorker(ctx, agentConfig, dataDir, isService, deviceStore, settingsManager, appLogger)
 			if err != nil {
 				appLogger.Error("Failed to start upload worker", "error", err)
 				return

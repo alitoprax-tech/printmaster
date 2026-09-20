@@ -493,12 +493,12 @@ func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string
 	if err != nil {
 		return "", err
 	}
-	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	identity, err := agent.BuildClientIdentityFromPending(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending)
 	if err != nil {
 		return "", err
 	}
 	identity.TenantID = registration.TenantID
-	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+	if err := agent.SavePendingClientIdentityFromPending(w.dataDir, identity, registration.ClientCertificate, pending); err != nil {
 		return "", err
 	}
 	if activated, err := w.activatePendingMTLS(ctx, identity, pending.EnrollmentAttemptID); !activated {
@@ -508,7 +508,7 @@ func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string
 }
 
 func (w *UploadWorker) migrateMTLS(ctx context.Context) (bool, error) {
-	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	pending, err := agent.GenerateClientCSRAt(w.dataDir, w.client.AgentID)
 	if err != nil {
 		return false, err
 	}
@@ -516,12 +516,12 @@ func (w *UploadWorker) migrateMTLS(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	identity, err := agent.BuildClientIdentityFromPending(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending)
 	if err != nil {
 		return false, err
 	}
 	identity.TenantID = registration.TenantID
-	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+	if err := agent.SavePendingClientIdentityFromPending(w.dataDir, identity, registration.ClientCertificate, pending); err != nil {
 		return false, err
 	}
 	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
@@ -531,7 +531,7 @@ func (w *UploadWorker) migrateMTLS(ctx context.Context) (bool, error) {
 }
 
 func (w *UploadWorker) renewMTLS(ctx context.Context) error {
-	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	pending, err := agent.GenerateClientCSRAt(w.dataDir, w.client.AgentID)
 	if err != nil {
 		return err
 	}
@@ -539,12 +539,12 @@ func (w *UploadWorker) renewMTLS(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	identity, err := agent.BuildClientIdentityFromPending(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending)
 	if err != nil {
 		return err
 	}
 	identity.TenantID = registration.TenantID
-	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+	if err := agent.SavePendingClientIdentityFromPending(w.dataDir, identity, registration.ClientCertificate, pending); err != nil {
 		return err
 	}
 	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
