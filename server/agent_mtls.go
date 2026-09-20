@@ -381,29 +381,33 @@ func handleAgentMTLSRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Token           string `json:"token"`
-		AgentID         string `json:"agent_id"`
-		Name            string `json:"name,omitempty"`
-		AgentVersion    string `json:"agent_version,omitempty"`
-		ProtocolVersion string `json:"protocol_version,omitempty"`
-		Hostname        string `json:"hostname,omitempty"`
-		IP              string `json:"ip,omitempty"`
-		Platform        string `json:"platform,omitempty"`
-		OSVersion       string `json:"os_version,omitempty"`
-		GoVersion       string `json:"go_version,omitempty"`
-		Architecture    string `json:"architecture,omitempty"`
-		NumCPU          int    `json:"num_cpu,omitempty"`
-		TotalMemoryMB   int64  `json:"total_memory_mb,omitempty"`
-		BuildType       string `json:"build_type,omitempty"`
-		GitCommit       string `json:"git_commit,omitempty"`
-		CSR             string `json:"csr"`
+		Token               string `json:"token"`
+		AgentID             string `json:"agent_id"`
+		Name                string `json:"name,omitempty"`
+		AgentVersion        string `json:"agent_version,omitempty"`
+		ProtocolVersion     string `json:"protocol_version,omitempty"`
+		Hostname            string `json:"hostname,omitempty"`
+		IP                  string `json:"ip,omitempty"`
+		Platform            string `json:"platform,omitempty"`
+		OSVersion           string `json:"os_version,omitempty"`
+		GoVersion           string `json:"go_version,omitempty"`
+		Architecture        string `json:"architecture,omitempty"`
+		NumCPU              int    `json:"num_cpu,omitempty"`
+		TotalMemoryMB       int64  `json:"total_memory_mb,omitempty"`
+		BuildType           string `json:"build_type,omitempty"`
+		GitCommit           string `json:"git_commit,omitempty"`
+		CSR                 string `json:"csr"`
+		EnrollmentAttemptID string `json:"enrollment_attempt_id"`
+		// TenantID is accepted only as a consistency check for retries. The
+		// authoritative tenant always comes from the join token/database.
+		TenantID string `json:"tenant_id,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&in); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(in.Token) == "" || strings.TrimSpace(in.AgentID) == "" || strings.TrimSpace(in.CSR) == "" {
-		http.Error(w, "token, agent_id and csr required", http.StatusBadRequest)
+	if strings.TrimSpace(in.Token) == "" || strings.TrimSpace(in.AgentID) == "" || strings.TrimSpace(in.CSR) == "" || strings.TrimSpace(in.EnrollmentAttemptID) == "" {
+		http.Error(w, "token, agent_id, csr and enrollment_attempt_id required", http.StatusBadRequest)
 		return
 	}
 	credentialStore, ok := serverStore.(storage.AgentCredentialStore)
@@ -411,6 +415,13 @@ func handleAgentMTLSRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "mTLS storage unavailable", http.StatusNotImplemented)
 		return
 	}
+	publicKeySHA256, err := csrPublicKeySHA256([]byte(in.CSR))
+	if err != nil {
+		http.Error(w, "invalid CSR: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	csrDigest := sha256.Sum256([]byte(in.CSR))
+	csrSHA256 := hex.EncodeToString(csrDigest[:])
 	credentialID, err := newAgentCredentialID()
 	if err != nil {
 		http.Error(w, "credential generation failed", http.StatusInternalServerError)
@@ -418,21 +429,38 @@ func handleAgentMTLSRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	agent := &storage.Agent{AgentID: strings.TrimSpace(in.AgentID), Name: in.Name, Hostname: in.Hostname, IP: in.IP, Platform: in.Platform, Version: in.AgentVersion, ProtocolVersion: in.ProtocolVersion, RegisteredAt: now, LastSeen: now, Status: "active", OSVersion: in.OSVersion, GoVersion: in.GoVersion, Architecture: in.Architecture, NumCPU: in.NumCPU, TotalMemoryMB: in.TotalMemoryMB, BuildType: in.BuildType, GitCommit: in.GitCommit}
-	var issuedCertificate []byte
-	join, credential, err := credentialStore.EnrollAgentWithCredential(r.Context(), in.Token, agent, func(join *storage.JoinToken, registered *storage.Agent) (*storage.AgentCredential, error) {
-		cred, certificatePEM, err := agentMTLSManager.issue(registered.AgentID, join.TenantID, credentialID, []byte(in.CSR))
-		issuedCertificate = certificatePEM
-		return cred, err
+	_, credential, issuedCertificate, err := credentialStore.EnrollAgentWithCredentialAttempt(r.Context(), in.Token, agent, strings.TrimSpace(in.EnrollmentAttemptID), csrSHA256, publicKeySHA256, strings.TrimSpace(in.TenantID), func(join *storage.JoinToken, registered *storage.Agent) (*storage.AgentCredential, []byte, error) {
+		return agentMTLSManager.issue(registered.AgentID, join.TenantID, credentialID, []byte(in.CSR))
 	})
 	if err != nil {
 		http.Error(w, "enrollment failed: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
-	if len(issuedCertificate) == 0 || credential == nil || join == nil {
+	if len(issuedCertificate) == 0 || credential == nil {
 		http.Error(w, "certificate response unavailable", http.StatusInternalServerError)
 		return
 	}
 	writeAgentCertificateResponse(w, credential, issuedCertificate)
+}
+
+func csrPublicKeySHA256(csrPEM []byte) (string, error) {
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return "", fmt.Errorf("certificate request PEM required")
+	}
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return "", err
+	}
+	der, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(der)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // handleAgentIdentityMigrate upgrades an existing bearer identity while the

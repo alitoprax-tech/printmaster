@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -29,27 +30,43 @@ const (
 	clientIdentityPendingSuffix = ".pending"
 	clientIdentityBackupSuffix  = ".bak"
 
-	identityRootDirectory    = "identity"
-	identityActiveDirectory  = "active"
-	identityPendingDirectory = "pending"
-	identityCurrentFile      = "current"
-	identityGenerationPrefix = "gen-"
-	identityTombstone        = "none"
-	identityJournalPrefix    = ".txn-"
-	identityJournalSuffix    = ".json"
+	identityRootDirectory       = "identity"
+	identityActiveDirectory     = "active"
+	identityPendingDirectory    = "pending"
+	identityCurrentFile         = "current"
+	identityGenerationPrefix    = "gen-"
+	identityTombstone           = "none"
+	identityJournalPrefix       = ".txn-"
+	identityJournalSuffix       = ".json"
+	identityEnrollmentDirectory = "enrollment"
+	enrollmentAttemptKeyFile    = "key"
+	enrollmentAttemptCSRFile    = "csr"
+	enrollmentAttemptMetaFile   = "meta.json"
 
-	checkpointAfterKeyWrite            = "after-key-write"
-	checkpointAfterKeyFsync            = "after-key-fsync"
-	checkpointAfterCertWrite           = "after-cert-write"
-	checkpointAfterCertFsync           = "after-cert-fsync"
-	checkpointAfterMetaWrite           = "after-meta-write"
-	checkpointAfterMetaFsync           = "after-meta-fsync"
-	checkpointBeforeGenerationDirFsync = "before-generation-dir-fsync"
-	checkpointAfterGenerationDirFsync  = "after-generation-dir-fsync"
-	checkpointBeforePointerSwitch      = "before-pointer-switch"
-	checkpointAfterPointerSwitch       = "after-pointer-switch"
-	checkpointBeforeOldCleanup         = "before-old-cleanup"
-	checkpointAfterOldCleanup          = "after-old-cleanup"
+	checkpointAfterKeyWrite                      = "after-key-write"
+	checkpointAfterKeyFsync                      = "after-key-fsync"
+	checkpointAfterCertWrite                     = "after-cert-write"
+	checkpointAfterCertFsync                     = "after-cert-fsync"
+	checkpointAfterMetaWrite                     = "after-meta-write"
+	checkpointAfterMetaFsync                     = "after-meta-fsync"
+	checkpointBeforeGenerationDirFsync           = "before-generation-dir-fsync"
+	checkpointAfterGenerationDirFsync            = "after-generation-dir-fsync"
+	checkpointBeforePointerSwitch                = "before-pointer-switch"
+	checkpointAfterPointerSwitch                 = "after-pointer-switch"
+	checkpointBeforeOldCleanup                   = "before-old-cleanup"
+	checkpointAfterOldCleanup                    = "after-old-cleanup"
+	checkpointEnrollmentAfterKeyWrite            = "enrollment-after-key-write"
+	checkpointEnrollmentAfterKeyFsync            = "enrollment-after-key-fsync"
+	checkpointEnrollmentAfterCSRWrite            = "enrollment-after-csr-write"
+	checkpointEnrollmentAfterCSRFsync            = "enrollment-after-csr-fsync"
+	checkpointEnrollmentAfterMetaWrite           = "enrollment-after-meta-write"
+	checkpointEnrollmentAfterMetaFsync           = "enrollment-after-meta-fsync"
+	checkpointEnrollmentBeforeGenerationDirFsync = "enrollment-before-generation-dir-fsync"
+	checkpointEnrollmentAfterGenerationDirFsync  = "enrollment-after-generation-dir-fsync"
+	checkpointEnrollmentBeforePointerSwitch      = "enrollment-before-pointer-switch"
+	checkpointEnrollmentAfterPointerSwitch       = "enrollment-after-pointer-switch"
+	checkpointEnrollmentBeforeOldCleanup         = "enrollment-before-old-cleanup"
+	checkpointEnrollmentAfterOldCleanup          = "enrollment-after-old-cleanup"
 )
 
 // PendingIdentity keeps a newly generated private key local while the CSR is
@@ -57,6 +74,10 @@ const (
 type PendingIdentity struct {
 	PrivateKeyPEM []byte
 	CSRPEM        []byte
+	// EnrollmentAttemptID identifies the durable first-enrollment attempt. It
+	// is opaque and is sent to the server, while the private key remains local.
+	EnrollmentAttemptID string
+	AgentID             string
 }
 
 // ClientIdentity is the persisted certificate metadata and parsed certificate
@@ -92,6 +113,20 @@ type identityJournal struct {
 	PrivateKeyPEM  []byte           `json:"private_key_pem"`
 }
 
+type enrollmentAttemptMetadata struct {
+	AttemptID string    `json:"enrollment_attempt_id"`
+	AgentID   string    `json:"agent_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type enrollmentAttemptJournal struct {
+	Version       int                       `json:"version"`
+	Generation    string                    `json:"generation"`
+	Metadata      enrollmentAttemptMetadata `json:"metadata"`
+	CSRPEM        []byte                    `json:"csr_pem"`
+	PrivateKeyPEM []byte                    `json:"private_key_pem"`
+}
+
 type storedIdentity struct {
 	identity       *ClientIdentity
 	certificatePEM []byte
@@ -115,6 +150,7 @@ var (
 
 	identityCheckpointMu   sync.RWMutex
 	identityCheckpointHook func(string) error
+	enrollmentAttemptMu    sync.Mutex
 )
 
 func setIdentityCheckpointHook(hook func(string) error) {
@@ -166,7 +202,94 @@ func GenerateClientCSR(agentID string) (*PendingIdentity, error) {
 	return &PendingIdentity{
 		PrivateKeyPEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
 		CSRPEM:        pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}),
+		AgentID:       agentID,
 	}, nil
+}
+
+// CreateEnrollmentAttempt creates and durably records the key and CSR before
+// any network enrollment request is sent. The opaque attempt ID lets the
+// server replay the same public enrollment result after a response-loss crash.
+// The private key is written only to the Agent's local crash-safe store.
+func CreateEnrollmentAttempt(dataDir, agentID string) (*PendingIdentity, error) {
+	if strings.TrimSpace(dataDir) == "" || strings.TrimSpace(agentID) == "" {
+		return nil, fmt.Errorf("data directory and agent id required")
+	}
+	pending, err := GenerateClientCSR(agentID)
+	if err != nil {
+		return nil, err
+	}
+	attemptID, err := newEnrollmentAttemptID()
+	if err != nil {
+		return nil, fmt.Errorf("generate enrollment attempt id: %w", err)
+	}
+	pending.EnrollmentAttemptID = attemptID
+	if err := saveEnrollmentAttempt(dataDir, pending); err != nil {
+		return nil, fmt.Errorf("persist pre-enrollment attempt: %w", err)
+	}
+	return pending, nil
+}
+
+// LoadEnrollmentAttempt recovers the newest complete pre-enrollment attempt.
+// Incomplete generations and corrupt pointers are ignored/recovered using the
+// same journal and immutable-generation rules as active identities.
+func LoadEnrollmentAttempt(dataDir, agentID string) (*PendingIdentity, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, nil
+	}
+	attempt, state, err := loadEnrollmentAttemptStore(enrollmentStoreRoot(dataDir))
+	if err != nil {
+		return nil, err
+	}
+	if attempt == nil || state == identityStoreTombstone {
+		return nil, nil
+	}
+	if strings.TrimSpace(agentID) != "" && attempt.AgentID != strings.TrimSpace(agentID) {
+		return nil, fmt.Errorf("pre-enrollment attempt belongs to a different Agent")
+	}
+	return attempt, nil
+}
+
+// LoadOrCreateEnrollmentAttempt reuses a durable attempt after a process
+// restart; it creates a new one only when no attempt is recoverable.
+func LoadOrCreateEnrollmentAttempt(dataDir, agentID string) (*PendingIdentity, error) {
+	enrollmentAttemptMu.Lock()
+	defer enrollmentAttemptMu.Unlock()
+	attempt, err := LoadEnrollmentAttempt(dataDir, agentID)
+	if err != nil {
+		return nil, err
+	}
+	if attempt != nil {
+		return attempt, nil
+	}
+	return CreateEnrollmentAttempt(dataDir, agentID)
+}
+
+// CompleteEnrollmentAttempt tombstones the attempt selector after the issued
+// identity has been activated. Immutable generations remain for forensics and
+// recovery, but they can no longer be selected on startup.
+func CompleteEnrollmentAttempt(dataDir, attemptID string) error {
+	if strings.TrimSpace(dataDir) == "" || strings.TrimSpace(attemptID) == "" {
+		return fmt.Errorf("data directory and enrollment attempt id required")
+	}
+	attempt, err := LoadEnrollmentAttempt(dataDir, "")
+	if err != nil {
+		return err
+	}
+	if attempt == nil {
+		return nil
+	}
+	if attempt.EnrollmentAttemptID != strings.TrimSpace(attemptID) {
+		return fmt.Errorf("enrollment attempt id does not match persisted attempt")
+	}
+	return writeEnrollmentPointer(enrollmentStoreRoot(dataDir), identityTombstone)
+}
+
+func newEnrollmentAttemptID() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // SaveClientIdentity commits a new immutable active generation. The current
@@ -329,6 +452,396 @@ func identityStoreRoot(dataDir string, pending bool) string {
 		name = identityPendingDirectory
 	}
 	return filepath.Join(dataDir, identityRootDirectory, name)
+}
+
+func enrollmentStoreRoot(dataDir string) string {
+	return filepath.Join(dataDir, identityRootDirectory, identityEnrollmentDirectory)
+}
+
+func saveEnrollmentAttempt(dataDir string, attempt *PendingIdentity) error {
+	if attempt == nil || strings.TrimSpace(attempt.EnrollmentAttemptID) == "" || strings.TrimSpace(attempt.AgentID) == "" || len(attempt.CSRPEM) == 0 || len(attempt.PrivateKeyPEM) == 0 {
+		return fmt.Errorf("complete pre-enrollment attempt required")
+	}
+	if err := validateEnrollmentAttempt(attempt); err != nil {
+		return err
+	}
+	root := enrollmentStoreRoot(dataDir)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return err
+	}
+	if err := recoverEnrollmentTransactions(root); err != nil {
+		return fmt.Errorf("recover enrollment transaction: %w", err)
+	}
+	metadata := enrollmentAttemptMetadata{AttemptID: attempt.EnrollmentAttemptID, AgentID: attempt.AgentID, CreatedAt: time.Now().UTC()}
+	metaJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	generation, err := newGenerationName()
+	if err != nil {
+		return err
+	}
+	journalJSON, err := json.Marshal(enrollmentAttemptJournal{Version: 1, Generation: generation, Metadata: metadata, CSRPEM: attempt.CSRPEM, PrivateKeyPEM: attempt.PrivateKeyPEM})
+	if err != nil {
+		return err
+	}
+	journalPath := filepath.Join(root, identityJournalPrefix+generation+identityJournalSuffix)
+	if err := writeDurableIdentityFile(journalPath, journalJSON, "", ""); err != nil {
+		return err
+	}
+	if err := syncIdentityDirectoryChecked(root, "", ""); err != nil {
+		return fmt.Errorf("sync enrollment journal directory: %w", err)
+	}
+	tempDir, err := os.MkdirTemp(root, ".enrollment-generation-write-")
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(tempDir)
+		}
+	}()
+	if err := writeEnrollmentGenerationFiles(tempDir, metaJSON, attempt.CSRPEM, attempt.PrivateKeyPEM, true); err != nil {
+		return err
+	}
+	finalDir := filepath.Join(root, generation)
+	if err := os.Rename(tempDir, finalDir); err != nil {
+		return err
+	}
+	if err := syncIdentityDirectoryChecked(root, "", ""); err != nil {
+		return fmt.Errorf("sync enrollment generation parent directory: %w", err)
+	}
+	if err := writeEnrollmentPointer(root, generation); err != nil {
+		return err
+	}
+	committed = true
+	if err := cleanupEnrollmentJournal(root, journalPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateEnrollmentAttempt(attempt *PendingIdentity) error {
+	if !isOpaqueEnrollmentAttemptID(attempt.EnrollmentAttemptID) {
+		return fmt.Errorf("invalid enrollment attempt id")
+	}
+	keyBlock, _ := pem.Decode(attempt.PrivateKeyPEM)
+	if keyBlock == nil {
+		return fmt.Errorf("pre-enrollment private key missing")
+	}
+	key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse pre-enrollment private key: %w", err)
+	}
+	csrBlock, _ := pem.Decode(attempt.CSRPEM)
+	if csrBlock == nil || csrBlock.Type != "CERTIFICATE REQUEST" {
+		return fmt.Errorf("pre-enrollment CSR missing")
+	}
+	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse pre-enrollment CSR: %w", err)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return fmt.Errorf("pre-enrollment CSR signature invalid: %w", err)
+	}
+	privateSigner, ok := key.(crypto.Signer)
+	if !ok || !publicKeysEqual(privateSigner.Public(), csr.PublicKey) {
+		return fmt.Errorf("pre-enrollment CSR does not match private key")
+	}
+	return nil
+}
+
+func publicKeysEqual(left, right crypto.PublicKey) bool {
+	leftDER, leftErr := x509.MarshalPKIXPublicKey(left)
+	rightDER, rightErr := x509.MarshalPKIXPublicKey(right)
+	return leftErr == nil && rightErr == nil && string(leftDER) == string(rightDER)
+}
+
+func isOpaqueEnrollmentAttemptID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func writeEnrollmentGenerationFiles(dir string, metaJSON, csrPEM, privateKeyPEM []byte, checkpoints bool) error {
+	write := func(path string, data []byte, afterWrite, afterFsync string) error {
+		if checkpoints {
+			return writeDurableIdentityFile(path, data, afterWrite, afterFsync)
+		}
+		return writeDurableIdentityFile(path, data, "", "")
+	}
+	if err := write(filepath.Join(dir, enrollmentAttemptKeyFile), privateKeyPEM, checkpointEnrollmentAfterKeyWrite, checkpointEnrollmentAfterKeyFsync); err != nil {
+		return err
+	}
+	if err := write(filepath.Join(dir, enrollmentAttemptCSRFile), csrPEM, checkpointEnrollmentAfterCSRWrite, checkpointEnrollmentAfterCSRFsync); err != nil {
+		return err
+	}
+	if err := write(filepath.Join(dir, enrollmentAttemptMetaFile), metaJSON, checkpointEnrollmentAfterMetaWrite, checkpointEnrollmentAfterMetaFsync); err != nil {
+		return err
+	}
+	return syncIdentityDirectoryChecked(dir, checkpointEnrollmentBeforeGenerationDirFsync, checkpointEnrollmentAfterGenerationDirFsync)
+}
+
+func writeEnrollmentPointer(root, generation string) error {
+	if generation != identityTombstone && !isGenerationName(generation) {
+		return fmt.Errorf("invalid enrollment pointer generation")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(root, ".enrollment-current-write-")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := temp.Chmod(0600); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.WriteString(generation + "\n"); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := hitIdentityCheckpoint(checkpointEnrollmentBeforePointerSwitch); err != nil {
+		return err
+	}
+	if err := atomicReplaceIdentityFilePlatform(tempPath, filepath.Join(root, identityCurrentFile)); err != nil {
+		return fmt.Errorf("switch enrollment pointer: %w", err)
+	}
+	if err := hitIdentityCheckpoint(checkpointEnrollmentAfterPointerSwitch); err != nil {
+		return err
+	}
+	return syncIdentityDirectoryChecked(root, "", "")
+}
+
+func loadEnrollmentAttemptStore(root string) (*PendingIdentity, identityStoreState, error) {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, identityStoreAbsent, nil
+	}
+	if err != nil {
+		return nil, identityStoreAvailable, err
+	}
+	if err := recoverEnrollmentTransactions(root); err != nil {
+		recoveryErr := err
+		attempt, state, _ := selectEnrollmentGeneration(root, entries)
+		if attempt != nil || state == identityStoreTombstone {
+			return attempt, state, nil
+		}
+		return nil, state, recoveryErr
+	}
+	entries, err = os.ReadDir(root)
+	if err != nil {
+		return nil, identityStoreAvailable, err
+	}
+	return selectEnrollmentGeneration(root, entries)
+}
+
+func selectEnrollmentGeneration(root string, entries []os.DirEntry) (*PendingIdentity, identityStoreState, error) {
+	state := identityStoreAbsent
+	for _, entry := range entries {
+		if entry.Name() == identityCurrentFile || strings.HasPrefix(entry.Name(), identityGenerationPrefix) || strings.HasPrefix(entry.Name(), identityJournalPrefix) {
+			state = identityStoreAvailable
+			break
+		}
+	}
+	if current, err := os.ReadFile(filepath.Join(root, identityCurrentFile)); err == nil {
+		name := strings.TrimSpace(string(current))
+		if name == identityTombstone {
+			return nil, identityStoreTombstone, nil
+		}
+		if isGenerationName(name) {
+			if attempt, readErr := readEnrollmentGeneration(root, name); readErr == nil {
+				return attempt, identityStoreAvailable, nil
+			}
+			state = identityStoreAvailable
+		}
+	} else if !os.IsNotExist(err) {
+		state = identityStoreAvailable
+	}
+	if state == identityStoreAbsent {
+		return nil, state, nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, identityStoreAvailable, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !isGenerationName(entry.Name()) {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	for _, name := range names {
+		if attempt, readErr := readEnrollmentGeneration(root, name); readErr == nil {
+			return attempt, identityStoreAvailable, nil
+		}
+	}
+	return nil, identityStoreAvailable, nil
+}
+
+func readEnrollmentGeneration(root, generation string) (*PendingIdentity, error) {
+	if !isGenerationName(generation) {
+		return nil, fmt.Errorf("invalid enrollment generation name")
+	}
+	path := filepath.Join(root, generation)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("enrollment generation is not a directory")
+	}
+	for _, name := range []string{enrollmentAttemptKeyFile, enrollmentAttemptCSRFile, enrollmentAttemptMetaFile} {
+		fileInfo, statErr := os.Lstat(filepath.Join(path, name))
+		if statErr != nil {
+			return nil, statErr
+		}
+		if fileInfo.Mode()&os.ModeSymlink != 0 || !fileInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("enrollment generation contains a non-regular file")
+		}
+	}
+	privateKeyPEM, err := os.ReadFile(filepath.Join(path, enrollmentAttemptKeyFile))
+	if err != nil {
+		return nil, err
+	}
+	csrPEM, err := os.ReadFile(filepath.Join(path, enrollmentAttemptCSRFile))
+	if err != nil {
+		return nil, err
+	}
+	metaJSON, err := os.ReadFile(filepath.Join(path, enrollmentAttemptMetaFile))
+	if err != nil {
+		return nil, err
+	}
+	var metadata enrollmentAttemptMetadata
+	if err := json.Unmarshal(metaJSON, &metadata); err != nil {
+		return nil, err
+	}
+	attempt := &PendingIdentity{PrivateKeyPEM: privateKeyPEM, CSRPEM: csrPEM, EnrollmentAttemptID: metadata.AttemptID, AgentID: metadata.AgentID}
+	if err := validateEnrollmentAttempt(attempt); err != nil {
+		return nil, err
+	}
+	return attempt, nil
+}
+
+func recoverEnrollmentTransactions(root string) error {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), identityJournalPrefix) || !strings.HasSuffix(entry.Name(), identityJournalSuffix) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			if firstErr == nil {
+				firstErr = readErr
+			}
+			continue
+		}
+		var journal enrollmentAttemptJournal
+		if err := json.Unmarshal(data, &journal); err != nil || journal.Version != 1 || !isGenerationName(journal.Generation) {
+			if firstErr == nil {
+				if err == nil {
+					err = fmt.Errorf("invalid enrollment transaction")
+				}
+				firstErr = err
+			}
+			continue
+		}
+		if err := recoverEnrollmentJournal(root, path, journal); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func recoverEnrollmentJournal(root, journalPath string, journal enrollmentAttemptJournal) error {
+	attempt := &PendingIdentity{PrivateKeyPEM: journal.PrivateKeyPEM, CSRPEM: journal.CSRPEM, EnrollmentAttemptID: journal.Metadata.AttemptID, AgentID: journal.Metadata.AgentID}
+	if err := validateEnrollmentAttempt(attempt); err != nil {
+		return err
+	}
+	if _, err := readEnrollmentGeneration(root, journal.Generation); err != nil {
+		metaJSON, marshalErr := json.Marshal(journal.Metadata)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		tempDir, err := os.MkdirTemp(root, ".enrollment-generation-recover-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(tempDir)
+		if err := writeEnrollmentGenerationFiles(tempDir, metaJSON, journal.CSRPEM, journal.PrivateKeyPEM, false); err != nil {
+			return err
+		}
+		finalDir := filepath.Join(root, journal.Generation)
+		if _, statErr := os.Stat(finalDir); statErr == nil {
+			if removeErr := os.RemoveAll(finalDir); removeErr != nil {
+				return removeErr
+			}
+		} else if !os.IsNotExist(statErr) {
+			return statErr
+		}
+		if err := os.Rename(tempDir, finalDir); err != nil {
+			return err
+		}
+		if err := syncIdentityDirectory(root); err != nil {
+			return fmt.Errorf("sync recovered enrollment generation parent directory: %w", err)
+		}
+	}
+	current, currentErr := os.ReadFile(filepath.Join(root, identityCurrentFile))
+	currentName := strings.TrimSpace(string(current))
+	currentComplete := false
+	if currentErr == nil && isGenerationName(currentName) {
+		_, currentReadErr := readEnrollmentGeneration(root, currentName)
+		currentComplete = currentReadErr == nil
+	}
+	if currentName != identityTombstone && !currentComplete {
+		if err := writeEnrollmentPointer(root, journal.Generation); err != nil {
+			return err
+		}
+	}
+	return cleanupEnrollmentJournal(root, journalPath)
+}
+
+func cleanupEnrollmentJournal(root, journalPath string) error {
+	if err := hitIdentityCheckpoint(checkpointEnrollmentBeforeOldCleanup); err != nil {
+		return err
+	}
+	if err := os.Remove(journalPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := syncIdentityDirectoryChecked(root, "", ""); err != nil {
+		return fmt.Errorf("sync enrollment cleanup: %w", err)
+	}
+	return hitIdentityCheckpoint(checkpointEnrollmentAfterOldCleanup)
 }
 
 func loadStoredIdentity(dataDir string, pending bool) (*storedIdentity, identityStoreState, error) {

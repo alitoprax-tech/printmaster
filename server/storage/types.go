@@ -188,11 +188,32 @@ type AgentCredential struct {
 // agent.AgentID; the storage layer overwrites those fields defensively.
 type AgentCredentialIssuer func(join *JoinToken, agent *Agent) (*AgentCredential, error)
 
+// AgentEnrollmentIssuer is the certificate-producing variant used by fresh
+// mTLS enrollment. The returned certificate is public material and is stored
+// with the durable enrollment attempt so a response-loss retry can return the
+// same result. Private keys are never part of this callback or the database.
+type AgentEnrollmentIssuer func(join *JoinToken, agent *Agent) (*AgentCredential, []byte, error)
+
+// AgentEnrollmentAttempt records the server-side replay binding for one
+// durable first-enrollment attempt. CertificatePEM is public; no private key
+// field is intentionally present.
+type AgentEnrollmentAttempt struct {
+	AttemptID       string
+	AgentID         string
+	TenantID        string
+	CSRSHA256       string
+	PublicKeySHA256 string
+	CredentialID    string
+	CertificatePEM  []byte
+	CreatedAt       time.Time
+}
+
 // AgentCredentialStore is implemented by persistent stores that support P0-01.
 // It is kept separate from Store so test doubles and legacy integrations do not
 // have to implement mTLS methods before opting into the new mode.
 type AgentCredentialStore interface {
 	EnrollAgentWithCredential(ctx context.Context, token string, agent *Agent, issuer AgentCredentialIssuer) (*JoinToken, *AgentCredential, error)
+	EnrollAgentWithCredentialAttempt(ctx context.Context, token string, agent *Agent, attemptID, csrSHA256, publicKeySHA256, requestedTenantID string, issuer AgentEnrollmentIssuer) (*JoinToken, *AgentCredential, []byte, error)
 	CreateAgentCredential(ctx context.Context, credential *AgentCredential) error
 	GetAgentCredential(ctx context.Context, credentialID string) (*AgentCredential, error)
 	RevokeAgentCredential(ctx context.Context, credentialID, reason string) error

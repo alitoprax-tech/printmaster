@@ -90,6 +90,79 @@ func TestIdentityGenerationCrashCheckpoints(t *testing.T) {
 	}
 }
 
+func TestPreEnrollmentAttemptCrashRecovery(t *testing.T) {
+	checkpoints := []string{
+		checkpointEnrollmentAfterKeyWrite,
+		checkpointEnrollmentAfterKeyFsync,
+		checkpointEnrollmentAfterCSRWrite,
+		checkpointEnrollmentAfterCSRFsync,
+		checkpointEnrollmentAfterMetaWrite,
+		checkpointEnrollmentAfterMetaFsync,
+		checkpointEnrollmentBeforeGenerationDirFsync,
+		checkpointEnrollmentAfterGenerationDirFsync,
+		checkpointEnrollmentBeforePointerSwitch,
+		checkpointEnrollmentAfterPointerSwitch,
+		checkpointEnrollmentBeforeOldCleanup,
+		checkpointEnrollmentAfterOldCleanup,
+	}
+	for _, checkpoint := range checkpoints {
+		t.Run(checkpoint, func(t *testing.T) {
+			dataDir := t.TempDir()
+			setIdentityCheckpointHook(func(name string) error {
+				if name == checkpoint {
+					return errors.New("simulated process crash")
+				}
+				return nil
+			})
+			_, _ = CreateEnrollmentAttempt(dataDir, "agent-pre-enroll")
+			setIdentityCheckpointHook(nil)
+			loaded, err := LoadEnrollmentAttempt(dataDir, "agent-pre-enroll")
+			if err != nil {
+				t.Fatalf("restart load after %s: %v", checkpoint, err)
+			}
+			if loaded == nil || loaded.EnrollmentAttemptID == "" || len(loaded.PrivateKeyPEM) == 0 || len(loaded.CSRPEM) == 0 {
+				t.Fatalf("pre-enrollment attempt lost after %s: %#v", checkpoint, loaded)
+			}
+		})
+	}
+}
+
+func TestPreEnrollmentAttemptCompleteTombstone(t *testing.T) {
+	dataDir := t.TempDir()
+	attempt, err := CreateEnrollmentAttempt(dataDir, "agent-complete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CompleteEnrollmentAttempt(dataDir, attempt.EnrollmentAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadEnrollmentAttempt(dataDir, "agent-complete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != nil {
+		t.Fatalf("completed pre-enrollment attempt remained selectable: %#v", loaded)
+	}
+}
+
+func TestPreEnrollmentAttemptCorruptPointerFallsBackToCompleteGeneration(t *testing.T) {
+	dataDir := t.TempDir()
+	attempt, err := CreateEnrollmentAttempt(dataDir, "agent-pointer-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(enrollmentStoreRoot(dataDir), identityCurrentFile), []byte("corrupt\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadEnrollmentAttempt(dataDir, "agent-pointer-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || loaded.EnrollmentAttemptID != attempt.EnrollmentAttemptID {
+		t.Fatalf("corrupt pointer did not recover complete attempt: %#v", loaded)
+	}
+}
+
 func TestPendingIdentityCrashCheckpoints(t *testing.T) {
 	checkpoints := []string{
 		checkpointAfterKeyWrite,

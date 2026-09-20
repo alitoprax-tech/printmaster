@@ -202,6 +202,23 @@ func (s *PostgresStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON agent_credentials(agent_id);
 	CREATE INDEX IF NOT EXISTS idx_agent_credentials_active ON agent_credentials(agent_id, revoked_at, expires_at);
 
+	-- Durable first-enrollment replay bindings. Certificate material is public;
+	-- private keys are never stored in this table.
+	CREATE TABLE IF NOT EXISTS agent_enrollment_attempts (
+		attempt_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		csr_sha256 TEXT NOT NULL,
+		public_key_sha256 TEXT NOT NULL,
+		credential_id TEXT NOT NULL UNIQUE,
+		certificate_pem TEXT NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL,
+		CONSTRAINT fk_enrollment_attempt_agent FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE,
+		CONSTRAINT fk_enrollment_attempt_credential FOREIGN KEY(credential_id) REFERENCES agent_credentials(credential_id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_agent ON agent_enrollment_attempts(agent_id);
+	CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_tenant ON agent_enrollment_attempts(tenant_id);
+
 	-- Devices discovered by agents
 	CREATE TABLE IF NOT EXISTS devices (
 		serial TEXT PRIMARY KEY,
@@ -971,6 +988,28 @@ func (s *PostgresStore) initSchema() error {
 	}
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_credentials_active ON agent_credentials(agent_id, revoked_at, expires_at)`); err != nil {
 		return fmt.Errorf("failed to create agent credentials active index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS agent_enrollment_attempts (
+		attempt_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		public_key_sha256 TEXT NOT NULL,
+		credential_id TEXT NOT NULL UNIQUE,
+		certificate_pem TEXT NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL,
+		CONSTRAINT fk_enrollment_attempt_agent FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE,
+		CONSTRAINT fk_enrollment_attempt_credential FOREIGN KEY(credential_id) REFERENCES agent_credentials(credential_id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("failed to create agent enrollment attempts table: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE agent_enrollment_attempts ADD COLUMN IF NOT EXISTS csr_sha256 TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("failed to add enrollment CSR binding: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_agent ON agent_enrollment_attempts(agent_id)`); err != nil {
+		return fmt.Errorf("failed to create agent enrollment attempts agent index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_tenant ON agent_enrollment_attempts(tenant_id)`); err != nil {
+		return fmt.Errorf("failed to create agent enrollment attempts tenant index: %w", err)
 	}
 	if err := s.migrateLegacyAgentTokens(); err != nil {
 		return err

@@ -1,8967 +1,920 @@
-// Printer/Copier Fleet Management Agent in Go
-// Cross-platform agent for SNMP printer discovery and reporting
-package main
-
-import (
-	"archive/zip"
-	"bytes"
-	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"embed"
-	"encoding/base64"
-	"encoding/json"
-	"encoding/pem"
-	"errors"
-	"flag"
-	"fmt"
-	"html"
-	"html/template"
-	"io"
-	"math/big"
-	"net"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os"
-	"os/exec"
-	"path"
-	"path/filepath"
-	"printmaster/agent/agent"
-	"printmaster/agent/autoupdate"
-	"printmaster/agent/featureflags"
-	"printmaster/agent/proxy"
-	"printmaster/agent/scanner"
-	"printmaster/agent/storage"
-	"printmaster/common/config"
-	"printmaster/common/logger"
-	"printmaster/common/report"
-	"printmaster/common/requestauth"
-	pmsettings "printmaster/common/settings"
-	commonutil "printmaster/common/util"
-	sharedweb "printmaster/common/web"
-	wscommon "printmaster/common/ws"
-	"runtime"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/gosnmp/gosnmp"
-	"github.com/kardianos/service"
-)
-
-// Version information (set at build time via -ldflags)
-var (
-	Version   = "dev"     // Semantic version (e.g., "1.0.0")
-	BuildTime = "unknown" // Build timestamp
-	GitCommit = "unknown" // Git commit hash
-	BuildType = "dev"     // "dev" or "release"
-)
-
-//go:embed web
-var webFS embed.FS
-
-// loggingResponseWriter captures status code and byte count for diagnostics
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	status int
-	bytes  int
-}
-
-func writeAgentJSONError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func (lrw *loggingResponseWriter) WriteHeader(code int) {
-	lrw.status = code
-	lrw.ResponseWriter.WriteHeader(code)
-}
-
-func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
-	n, err := lrw.ResponseWriter.Write(b)
-	lrw.bytes += n
-	return n, err
-}
-
-// Flush proxies Flush to the underlying writer when supported
-func (lrw *loggingResponseWriter) Flush() {
-	if f, ok := lrw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// ReadFrom ensures io.Copy can use an optimized path while still counting bytes
-func (lrw *loggingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
-	// Use io.Copy which will call lrw.Write, preserving the byte counter
-	return io.Copy(lrw, r)
-}
-
-// basicAuth returns base64 of user:pass per RFC7617
-func basicAuth(userpass string) string {
-	return base64.StdEncoding.EncodeToString([]byte(userpass))
-}
-
-// rewriteExistingBaseTag finds a device-supplied <base href="..."> tag and
-// rewrites it to stay under proxyPrefix. Some vendor UIs (e.g. Kyocera
-// Command Center RX) ship their own <base href="/"> so relative asset
-// requests always resolve from the device's web root; left untouched, those
-// requests escape the proxy prefix and hit the server's own top-level routes
-// (404s / X-Frame-Options-blocked root page) instead of the printer. Returns
-// the rewritten content and whether a tag was found and modified.
-func rewriteExistingBaseTag(content, proxyPrefix, targetHost string) (string, bool) {
-	contentLower := strings.ToLower(content)
-	baseIdx := strings.Index(contentLower, "<base")
-	if baseIdx == -1 {
-		return content, false
-	}
-	tagEnd := strings.Index(content[baseIdx:], ">")
-	if tagEnd == -1 {
-		return content, false
-	}
-	tagEnd += baseIdx + 1 // position just after '>'
-	tag := content[baseIdx:tagEnd]
-	tagLower := strings.ToLower(tag)
-
-	quote := byte('"')
-	hrefIdx := strings.Index(tagLower, `href="`)
-	if hrefIdx == -1 {
-		hrefIdx = strings.Index(tagLower, `href='`)
-		quote = '\''
-	}
-	if hrefIdx == -1 {
-		return content, false
-	}
-	valueStart := hrefIdx + len(`href="`)
-	valueEnd := strings.IndexByte(tag[valueStart:], quote)
-	if valueEnd == -1 {
-		return content, false
-	}
-	valueEnd += valueStart
-	href := tag[valueStart:valueEnd]
-
-	// Strip scheme+host if the href is a full same-host URL
-	hrefPath := href
-	if u, err := url.Parse(href); err == nil && u.Host != "" {
-		if !strings.EqualFold(u.Host, targetHost) {
-			return content, false // different host, leave alone
-		}
-		hrefPath = u.Path
-		if hrefPath == "" {
-			hrefPath = "/"
-		}
-	}
-
-	if !strings.HasPrefix(hrefPath, "/") || strings.HasPrefix(hrefPath, proxyPrefix) {
-		return content, false // relative or already rewritten
-	}
-
-	newHref := proxyPrefix + hrefPath
-	newTag := tag[:valueStart] + newHref + tag[valueEnd:]
-	return content[:baseIdx] + newTag + content[tagEnd:], true
-}
-
-func isKyoceraModelScript(targetPath string) bool {
-	path := strings.ToLower(targetPath)
-	return strings.HasPrefix(path, "/js/jssrc/model/") && strings.HasSuffix(path, ".model.htm")
-}
-
-// Global session cache for form-based logins
-var proxySessionCache = proxy.NewSessionCache()
-
-var agentSessions = newAgentSessionManager()
-var agentAuth *agentAuthManager
-
-// globalLocalPrinterStore holds reference to the local printer store for runtime settings changes
-var globalLocalPrinterStore storage.LocalPrinterStore
-
-// AgentPrincipal represents an authenticated UI context (placeholder for future auth)
-type AgentPrincipal struct {
-	Username  string   `json:"username"`
-	Role      string   `json:"role"`
-	Source    string   `json:"source"`
-	TenantIDs []string `json:"tenant_ids,omitempty"`
-}
-
-type contextKey string
-
-const (
-	isHTTPSContextKey        contextKey = "isHTTPS"
-	agentPrincipalContextKey contextKey = "agentPrincipal"
-)
-
-const (
-	agentSessionCookieName        = "pm_agent_session"
-	defaultAgentSessionTTL        = 24 * time.Hour
-	serverAuthTimeout             = 15 * time.Second
-	maxAgentRequestBodySize       = 2 << 20 // 2 MiB; report/proxy handlers apply tighter limits
-	maxAgentProxyResponseBodySize = 8 << 20 // Bound printer content before it reaches the server WebSocket
-)
-
-// boundedProxyBody prevents a printer (or a USB device) from exhausting the
-// agent while a browser proxy response is being forwarded to the server.
-type boundedProxyBody struct {
-	io.ReadCloser
-	remaining int64
-}
-
-func (b *boundedProxyBody) Read(p []byte) (int, error) {
-	if b == nil || b.ReadCloser == nil {
-		return 0, io.EOF
-	}
-	if b.remaining <= 0 {
-		return 0, io.EOF
-	}
-	if int64(len(p)) > b.remaining {
-		p = p[:b.remaining]
-	}
-	n, err := b.ReadCloser.Read(p)
-	b.remaining -= int64(n)
-	return n, err
-}
-
-func readBoundedProxyResponse(body io.ReadCloser) ([]byte, error) {
-	if body == nil {
-		return nil, nil
-	}
-	defer body.Close()
-	data, err := io.ReadAll(io.LimitReader(body, maxAgentProxyResponseBodySize+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxAgentProxyResponseBodySize {
-		return nil, fmt.Errorf("proxy response body exceeds %d bytes", maxAgentProxyResponseBodySize)
-	}
-	return data, nil
-}
-
-type agentSession struct {
-	ID          string
-	Principal   *AgentPrincipal
-	ServerToken string
-	ExpiresAt   time.Time
-}
-
-type agentSessionManager struct {
-	mu       sync.RWMutex
-	sessions map[string]*agentSession
-}
-
-func newAgentSessionManager() *agentSessionManager {
-	return &agentSessionManager{sessions: make(map[string]*agentSession)}
-}
-
-func (m *agentSessionManager) Create(principal *AgentPrincipal, serverToken string, expiresAt time.Time) string {
-	if principal == nil {
-		return ""
-	}
-	if expiresAt.IsZero() {
-		expiresAt = time.Now().Add(24 * time.Hour)
-	}
-	token := randomSessionToken()
-	// Never fall back to a timestamp (or any other predictable value) when the
-	// system CSPRNG is unavailable. A missing session is safer than issuing a
-	// guessable bearer credential.
-	if token == "" {
-		return ""
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cleanupLocked()
-	m.sessions[token] = &agentSession{
-		ID:          token,
-		Principal:   principal,
-		ServerToken: serverToken,
-		ExpiresAt:   expiresAt,
-	}
-	return token
-}
-
-func (m *agentSessionManager) Get(token string) (*agentSession, bool) {
-	if token == "" {
-		return nil, false
-	}
-	m.mu.RLock()
-	sess, ok := m.sessions[token]
-	m.mu.RUnlock()
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(sess.ExpiresAt) {
-		m.Delete(token)
-		return nil, false
-	}
-	return sess, true
-}
-
-func (m *agentSessionManager) Delete(token string) {
-	if token == "" {
-		return
-	}
-	m.mu.Lock()
-	delete(m.sessions, token)
-	m.mu.Unlock()
-}
-
-func (m *agentSessionManager) cleanupLocked() {
-	now := time.Now()
-	for key, sess := range m.sessions {
-		if now.After(sess.ExpiresAt) {
-			delete(m.sessions, key)
-		}
-	}
-}
-
-func randomSessionToken() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-var (
-	errInvalidCredentials = errors.New("invalid credentials")
-)
-
-type agentAuthManager struct {
-	mode             string
-	allowLocalAdmin  bool
-	serverURL        string
-	agentID          string
-	serverCAPath     string
-	serverSkipVerify bool
-	sessions         *agentSessionManager
-	publicExact      map[string]struct{}
-	publicPrefixes   []string
-}
-
-type agentAuthOptions struct {
-	Mode            string `json:"mode"`
-	AllowLocalAdmin bool   `json:"allow_local_admin"`
-	ServerURL       string `json:"server_url,omitempty"`
-	ServerAuthURL   string `json:"server_auth_url,omitempty"` // URL to redirect for server auth
-	AgentID         string `json:"agent_id,omitempty"`
-	LoginSupported  bool   `json:"login_supported"`
-}
-
-func newAgentAuthManager(cfg *AgentConfig, sessions *agentSessionManager) *agentAuthManager {
-	mode := "local"
-	allowLocal := false
-	serverURL := ""
-	agentID := ""
-	serverCA := ""
-	serverSkip := false
-	if cfg != nil {
-		if cfg.Web.Auth.Mode != "" {
-			mode = strings.ToLower(strings.TrimSpace(cfg.Web.Auth.Mode))
-		}
-		// TCP loopback proves only that a process is local; it does not prove
-		// which Windows user owns that process. The legacy setting is ignored.
-		allowLocal = false
-		serverURL = strings.TrimSpace(cfg.Server.URL)
-		if serverURL != "" {
-			validated, err := validateOnboardingServerURL(serverURL)
-			if err != nil {
-				// Keep an invalid hand-edited URL from becoming a redirect or
-				// credential destination. The upload worker reports the same
-				// configuration error at startup.
-				if appLogger != nil {
-					appLogger.Error("Invalid configured server URL; server integration disabled", "error", err.Error())
-				}
-				serverURL = ""
-			} else {
-				serverURL = validated
-			}
-		}
-		serverCA = strings.TrimSpace(cfg.Server.CAPath)
-		serverSkip = cfg.Server.InsecureSkipVerify
-		agentID = strings.TrimSpace(cfg.Server.AgentID)
-
-		// Auto-enable server mode if server URL is configured and mode not explicitly set
-		if serverURL != "" && cfg.Web.Auth.Mode == "" {
-			mode = "server"
-		}
-	}
-	if mode == "disabled" {
-		// The historic unauthenticated mode granted every caller admin access.
-		// Preserve startup compatibility without preserving that privilege.
-		mode = "local"
-	}
-	return &agentAuthManager{
-		mode:             mode,
-		allowLocalAdmin:  allowLocal,
-		serverURL:        serverURL,
-		agentID:          agentID,
-		serverCAPath:     serverCA,
-		serverSkipVerify: serverSkip,
-		sessions:         sessions,
-		publicExact: map[string]struct{}{
-			"/login":                {},
-			"/favicon.ico":          {},
-			"/health":               {},
-			"/api/version":          {},
-			"/api/v1/auth/options":  {},
-			"/api/v1/auth/login":    {},
-			"/api/v1/auth/logout":   {},
-			"/api/v1/auth/me":       {},
-			"/api/v1/auth/callback": {}, // Server auth callback
-		},
-		publicPrefixes: []string{
-			"/static/",
-		},
-	}
-}
-
-func (a *agentAuthManager) optionsPayload() agentAuthOptions {
-	if a == nil {
-		return agentAuthOptions{Mode: "local", AllowLocalAdmin: false, LoginSupported: false}
-	}
-	serverURL := strings.TrimSpace(a.serverURL)
-	hasServer := serverURL != ""
-	loginSupported := hasServer && a.mode == "server"
-	opts := agentAuthOptions{
-		Mode:            a.mode,
-		AllowLocalAdmin: a.allowLocalAdmin,
-		AgentID:         a.agentID,
-		LoginSupported:  loginSupported,
-	}
-	if hasServer {
-		opts.ServerURL = serverURL
-		// Always provide the server auth URL when server is configured
-		// This enables redirect-based auth even when direct login isn't supported
-		opts.ServerAuthURL = strings.TrimRight(serverURL, "/") + "/login"
-	}
-	return opts
-}
-
-func (a *agentAuthManager) Wrap(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler := next
-		if handler == nil {
-			handler = http.DefaultServeMux
-		}
-		if r.Body != nil {
-			// Bound every request before a route-specific decoder runs. This also
-			// covers legacy handlers that still use json.Decoder directly.
-			r.Body = http.MaxBytesReader(w, r.Body, maxAgentRequestBodySize)
-		}
-		_, trustedProxy := requestauth.ProxyPrincipalFromContext(r.Context())
-		if !trustedProxy && r.URL.Path != "/api/v1/auth/callback" && !requestauth.BrowserRequestAllowed(r) {
-			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
-			return
-		}
-		if a == nil || a.shouldBypass(r) {
-			handler.ServeHTTP(w, r)
-			return
-		}
-		principal, ok := a.authenticate(r)
-		if !ok {
-			a.respondUnauthorized(w, r)
-			return
-		}
-		if !agentRoleAllows(principal, r) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		ctx := context.WithValue(r.Context(), agentPrincipalContextKey, principal)
-		handler.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-func (a *agentAuthManager) shouldBypass(r *http.Request) bool {
-	if a == nil {
-		return true
-	}
-	path := r.URL.Path
-	if _, ok := a.publicExact[path]; ok {
-		return true
-	}
-	for _, prefix := range a.publicPrefixes {
-		if strings.HasPrefix(path, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *agentAuthManager) PrincipalForRequest(r *http.Request) (*AgentPrincipal, bool) {
-	return a.authenticate(r)
-}
-
-func (a *agentAuthManager) authenticate(r *http.Request) (*AgentPrincipal, bool) {
-	if p, ok := requestauth.ProxyPrincipalFromContext(r.Context()); ok {
-		return &AgentPrincipal{Username: p.Username, Role: p.Role, Source: "server-proxy"}, true
-	}
-	if a == nil {
-		return nil, false
-	}
-	if sess := a.sessionFromRequest(r); sess != nil {
-		return sess.Principal, true
-	}
-	switch a.mode {
-	case "local":
-		return nil, false
-	case "server":
-		return nil, false
-	default:
-		return nil, false
-	}
-}
-
-func (a *agentAuthManager) respondUnauthorized(w http.ResponseWriter, r *http.Request) {
-	if a != nil && a.mode == "server" && strings.TrimSpace(a.serverURL) != "" && acceptsHTML(r) {
-		http.Redirect(w, r, a.serverLoginURL(r), http.StatusFound)
-		return
-	}
-	if acceptsHTML(r) {
-		redirectTo := "/login"
-		if r.URL != nil && r.URL.Path != "/login" {
-			redirectTo = redirectTo + "?return_to=" + url.QueryEscape(r.URL.RequestURI())
-		}
-		http.Redirect(w, r, redirectTo, http.StatusFound)
-		return
-	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
-}
-
-func (a *agentAuthManager) sessionFromRequest(r *http.Request) *agentSession {
-	if a == nil || a.sessions == nil {
-		return nil
-	}
-	cookie, err := r.Cookie(agentSessionCookieName)
-	if err != nil {
-		return nil
-	}
-	sess, ok := a.sessions.Get(cookie.Value)
-	if !ok {
-		return nil
-	}
-	return sess
-}
-
-func requestIsLoopback(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	checkHost := func(value string) bool {
-		if value == "" {
-			return false
-		}
-		host := value
-		if strings.Contains(host, ":") {
-			if parsedHost, _, err := net.SplitHostPort(value); err == nil {
-				host = parsedHost
-			}
-		}
-		ip := net.ParseIP(strings.TrimSpace(host))
-		return ip != nil && ip.IsLoopback()
-	}
-	return checkHost(r.RemoteAddr)
-}
-
-func requestIsHTTPS(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	if r.TLS != nil {
-		return true
-	}
-	if v := r.Context().Value(isHTTPSContextKey); v != nil {
-		if flag, ok := v.(bool); ok && flag {
-			return true
-		}
-	}
-	proto := strings.TrimSpace(strings.ToLower(r.Header.Get("X-Forwarded-Proto")))
-	return proto == "https"
-}
-
-// isSafeReturnPath validates that a "return_to" redirect target is a local,
-// same-origin path (prevents open-redirect attacks). It rejects absolute
-// URLs, protocol-relative URLs (//host or /\host), and control characters
-// (tab/CR/LF/etc.) that some browsers strip or normalize before navigating,
-// which could otherwise be used to smuggle "//host" past a naive prefix check
-// (e.g. "/\t/evil.com" is stripped to "//evil.com" by some browsers).
-func isSafeReturnPath(p string) bool {
-	if p == "" || !strings.HasPrefix(p, "/") {
-		return false
-	}
-	if strings.HasPrefix(p, "//") || strings.HasPrefix(p, "/\\") {
-		return false
-	}
-	if strings.Contains(p, "://") {
-		return false
-	}
-	for _, r := range p {
-		if r <= 0x1f || r == 0x7f {
-			return false
-		}
-	}
-	return true
-}
-
-// handleHealth responds with a simple JSON payload indicating the agent is alive.
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "healthy",
-		"timestamp": time.Now().UTC(),
-	})
-}
-
-type agentHealthAttempt struct {
-	url      string
-	insecure bool
-}
-
-// runAgentHealthCheck probes the local /health endpoint using configured ports.
-// Returns nil when healthy; otherwise an error summarizing failures.
-func runAgentHealthCheck(configFlag string) error {
-	cfg := DefaultAgentConfig()
-
-	if resolved := config.ResolveConfigPath("AGENT", configFlag); resolved != "" {
-		if _, err := os.Stat(resolved); err == nil {
-			if loaded, loadErr := LoadAgentConfig(resolved); loadErr == nil {
-				cfg = loaded
-			}
-		}
-	}
-
-	attempts := make([]agentHealthAttempt, 0, 2)
-	if cfg.Web.HTTPPort > 0 {
-		attempts = append(attempts, agentHealthAttempt{url: fmt.Sprintf("http://127.0.0.1:%d/health", cfg.Web.HTTPPort)})
-	}
-	if cfg.Web.HTTPSPort > 0 {
-		attempts = append(attempts, agentHealthAttempt{url: fmt.Sprintf("https://127.0.0.1:%d/health", cfg.Web.HTTPSPort), insecure: true})
-	}
-
-	if len(attempts) == 0 {
-		attempts = append(attempts, agentHealthAttempt{url: "http://127.0.0.1:8080/health"})
-	}
-
-	var errs []string
-	for _, attempt := range attempts {
-		if err := probeAgentHealth(attempt.url, attempt.insecure); err != nil {
-			errMsg := fmt.Sprintf("%s: %v", attempt.url, err)
-			errs = append(errs, errMsg)
-			continue
-		}
-		return nil
-	}
-
-	if len(errs) == 0 {
-		return fmt.Errorf("no health endpoints to probe")
-	}
-
-	return fmt.Errorf("%s", strings.Join(errs, "; "))
-}
-
-func probeAgentHealth(endpoint string, insecure bool) error {
-	client := &http.Client{Timeout: 5 * time.Second}
-	if insecure {
-		if !isLoopbackHealthEndpoint(endpoint) {
-			return fmt.Errorf("insecure health probes are restricted to loopback")
-		}
-		// #nosec G402 -- the endpoint is checked above and is fixed loopback;
-		// the agent may use a self-signed certificate for this local probe only.
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
-
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
-	var payload struct {
-		Status string `json:"status"`
-	}
-
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-
-	if strings.ToLower(strings.TrimSpace(payload.Status)) != "healthy" {
-		return fmt.Errorf("status=%s", payload.Status)
-	}
-
-	return nil
-}
-
-func isLoopbackHealthEndpoint(endpoint string) bool {
-	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return false
-	}
-	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
-	return host == "127.0.0.1" || host == "::1" || host == "localhost"
-}
-
-func acceptsHTML(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	header := r.Header.Get("Accept")
-	if strings.Contains(header, "text/html") {
-		return true
-	}
-	return r.URL != nil && r.URL.Path == "/"
-}
-
-func (a *agentAuthManager) issueSessionCookie(w http.ResponseWriter, r *http.Request, principal *AgentPrincipal, serverToken string, expiresAt time.Time) (string, error) {
-	if a == nil || a.sessions == nil || principal == nil {
-		return "", errors.New("authentication disabled")
-	}
-	if expiresAt.IsZero() || expiresAt.Before(time.Now()) {
-		expiresAt = time.Now().Add(defaultAgentSessionTTL)
-	}
-	sessionID := a.sessions.Create(principal, serverToken, expiresAt)
-	if sessionID == "" {
-		return "", errors.New("failed to generate secure session token")
-	}
-	cookie := &http.Cookie{
-		Name:     agentSessionCookieName,
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-		Expires:  expiresAt,
-	}
-	if expiresAt.After(time.Now()) {
-		cookie.MaxAge = int(time.Until(expiresAt).Seconds())
-	}
-	http.SetCookie(w, cookie)
-	return sessionID, nil
-}
-
-func (a *agentAuthManager) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     agentSessionCookieName,
-		Value:    "",
-		Path:     "/",
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-	})
-}
-
-func (a *agentAuthManager) handleAuthMe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if principal, ok := a.authenticate(r); ok && principal != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(principal)
-		return
-	}
-	http.Error(w, "unauthenticated", http.StatusUnauthorized)
-}
-
-func (a *agentAuthManager) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if a == nil {
-		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	username := strings.TrimSpace(req.Username)
-	password := req.Password
-	if username == "" || password == "" {
-		http.Error(w, "username and password required", http.StatusBadRequest)
-		return
-	}
-	switch a.mode {
-	case "server":
-		principal, serverToken, expiresAt, err := a.serverLogin(r.Context(), username, password)
-		if err != nil {
-			if errors.Is(err, errInvalidCredentials) {
-				http.Error(w, "invalid credentials", http.StatusUnauthorized)
-				return
-			}
-			if appLogger != nil {
-				appLogger.Warn("Server login via agent failed", "error", err.Error())
-			}
-			http.Error(w, "login failed", http.StatusBadGateway)
-			return
-		}
-		if _, err := a.issueSessionCookie(w, r, principal, serverToken, expiresAt); err != nil {
-			http.Error(w, "failed to create session", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"user":    principal,
-		})
-		return
-	case "disabled":
-		http.Error(w, "authentication disabled", http.StatusForbidden)
-		return
-	default:
-		http.Error(w, "login mode not supported", http.StatusNotImplemented)
-		return
-	}
-}
-
-func (a *agentAuthManager) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if a == nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]bool{"success": true})
-		return
-	}
-	var serverToken string
-	cookie, err := r.Cookie(agentSessionCookieName)
-	if err == nil && cookie.Value != "" {
-		if sess, ok := a.sessions.Get(cookie.Value); ok {
-			serverToken = sess.ServerToken
-		}
-		a.sessions.Delete(cookie.Value)
-	}
-	a.clearSessionCookie(w, r)
-	if serverToken != "" && a.mode == "server" {
-		if err := a.serverLogout(r.Context(), serverToken); err != nil && appLogger != nil {
-			appLogger.Warn("Failed to log out from server", "error", err.Error())
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
-}
-
-// handleAuthCallback handles GET /api/v1/auth/callback
-// This is called when the server redirects back to the agent after authentication.
-// The server includes a short-lived callback token that we validate to create a local session.
-func (a *agentAuthManager) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	if a == nil {
-		http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Get the callback token from query params
-	token := strings.TrimSpace(r.URL.Query().Get("token"))
-	returnTo := strings.TrimSpace(r.URL.Query().Get("return_to"))
-	if returnTo == "" || !isSafeReturnPath(returnTo) {
-		returnTo = "/"
-	}
-
-	if token == "" {
-		if appLogger != nil {
-			appLogger.Warn("Auth callback missing token")
-		}
-		// Redirect to login with error
-		http.Redirect(w, r, "/login?error=missing_token&return_to="+url.QueryEscape(returnTo), http.StatusFound)
-		return
-	}
-
-	// Validate the token with the server
-	principal, serverToken, expiresAt, err := a.validateServerCallbackToken(r.Context(), token)
-	if err != nil {
-		if appLogger != nil {
-			appLogger.Warn("Auth callback token validation failed", "error", err.Error())
-		}
-		http.Redirect(w, r, "/login?error=invalid_token&return_to="+url.QueryEscape(returnTo), http.StatusFound)
-		return
-	}
-
-	// Create a local session
-	if _, err := a.issueSessionCookie(w, r, principal, serverToken, expiresAt); err != nil {
-		if appLogger != nil {
-			appLogger.Error("Failed to create session after callback", "error", err.Error())
-		}
-		http.Error(w, "failed to create session", http.StatusInternalServerError)
-		return
-	}
-
-	if appLogger != nil {
-		appLogger.Info("Auth callback successful", "username", principal.Username, "return_to", returnTo)
-	}
-
-	// Redirect to the original destination
-	http.Redirect(w, r, returnTo, http.StatusFound)
-}
-
-// validateServerCallbackToken validates a callback token with the server and returns user info.
-func (a *agentAuthManager) validateServerCallbackToken(ctx context.Context, token string) (*AgentPrincipal, string, time.Time, error) {
-	if a == nil || strings.TrimSpace(a.serverURL) == "" {
-		return nil, "", time.Time{}, fmt.Errorf("server validation unavailable")
-	}
-	if strings.TrimSpace(a.agentID) == "" {
-		return nil, "", time.Time{}, fmt.Errorf("agent identity unavailable")
-	}
-
-	if appLogger != nil {
-		appLogger.Debug("Validating callback token with server", "server_url", a.serverURL)
-	}
-
-	client, err := a.newServerHTTPClient()
-	if err != nil {
-		if appLogger != nil {
-			appLogger.Debug("Failed to create HTTP client for token validation", "error", err.Error())
-		}
-		return nil, "", time.Time{}, err
-	}
-
-	payload := map[string]string{"token": token, "agent_id": a.agentID}
-	buf := &bytes.Buffer{}
-	if err := json.NewEncoder(buf).Encode(payload); err != nil {
-		return nil, "", time.Time{}, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverAPIURL("/api/v1/auth/agent-callback/validate"), bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("PrintMaster-Agent/%s", Version))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		if appLogger != nil {
-			appLogger.Debug("Server returned non-OK status for token validation", "status", resp.StatusCode)
-		}
-		return nil, "", time.Time{}, fmt.Errorf("token validation failed: status %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Valid     bool     `json:"valid"`
-		UserID    int64    `json:"user_id"`
-		Username  string   `json:"username"`
-		Role      string   `json:"role"`
-		TenantID  string   `json:"tenant_id"`
-		TenantIDs []string `json:"tenant_ids"`
-		ExpiresAt string   `json:"expires_at"`
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, "", time.Time{}, err
-	}
-
-	if !result.Valid {
-		if appLogger != nil {
-			appLogger.Debug("Server reported token as invalid")
-		}
-		return nil, "", time.Time{}, fmt.Errorf("token invalid")
-	}
-
-	expiresAt, _ := time.Parse(time.RFC3339, result.ExpiresAt)
-	if expiresAt.IsZero() {
-		expiresAt = time.Now().Add(60 * time.Minute) // Default to 1 hour
-	}
-
-	principal := &AgentPrincipal{
-		Username: result.Username,
-		Role:     result.Role,
-		Source:   "server-callback",
-	}
-
-	if appLogger != nil {
-		appLogger.Debug("Token validation successful", "username", result.Username, "role", result.Role, "expires_at", expiresAt.Format(time.RFC3339))
-	}
-
-	// Return the token itself as the "server token" for logout purposes
-	// In a full implementation, you might want to create a proper server session
-	return principal, token, expiresAt, nil
-}
-
-func (a *agentAuthManager) serverLogin(ctx context.Context, username, password string) (*AgentPrincipal, string, time.Time, error) {
-	if a == nil || strings.TrimSpace(a.serverURL) == "" {
-		return nil, "", time.Time{}, fmt.Errorf("server login unavailable")
-	}
-	client, err := a.newServerHTTPClient()
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	payload := map[string]string{"username": username, "password": password}
-	buf := &bytes.Buffer{}
-	if err := json.NewEncoder(buf).Encode(payload); err != nil {
-		return nil, "", time.Time{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverAPIURL("/api/v1/auth/login"), bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("PrintMaster-Agent/%s", Version))
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, "", time.Time{}, errInvalidCredentials
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", time.Time{}, fmt.Errorf("server login failed: status %d", resp.StatusCode)
-	}
-	var loginResp struct {
-		Token     string `json:"token"`
-		ExpiresAt string `json:"expires_at"`
-	}
-	if err := json.Unmarshal(data, &loginResp); err != nil {
-		return nil, "", time.Time{}, err
-	}
-	if loginResp.Token == "" {
-		return nil, "", time.Time{}, fmt.Errorf("server login failed: missing token")
-	}
-	expiresAt := time.Now().Add(defaultAgentSessionTTL)
-	if loginResp.ExpiresAt != "" {
-		if parsed, err := time.Parse(time.RFC3339, loginResp.ExpiresAt); err == nil {
-			expiresAt = parsed
-		}
-	}
-	principal, err := a.fetchServerPrincipal(ctx, client, loginResp.Token)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	return principal, loginResp.Token, expiresAt, nil
-}
-
-func (a *agentAuthManager) serverLogout(ctx context.Context, serverToken string) error {
-	if a == nil || serverToken == "" {
-		return nil
-	}
-	client, err := a.newServerHTTPClient()
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverAPIURL("/api/v1/auth/logout"), nil)
-	if err != nil {
-		return err
-	}
-	req.AddCookie(&http.Cookie{Name: "pm_session", Value: serverToken})
-	req.Header.Set("User-Agent", fmt.Sprintf("PrintMaster-Agent/%s", Version))
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("server logout failed: status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func (a *agentAuthManager) fetchServerPrincipal(ctx context.Context, client *http.Client, serverToken string) (*AgentPrincipal, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.serverAPIURL("/api/v1/auth/me"), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.AddCookie(&http.Cookie{Name: "pm_session", Value: serverToken})
-	req.Header.Set("User-Agent", fmt.Sprintf("PrintMaster-Agent/%s", Version))
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("auth verification failed: status %d", resp.StatusCode)
-	}
-	var payload struct {
-		Username  string   `json:"username"`
-		Role      string   `json:"role"`
-		TenantID  string   `json:"tenant_id"`
-		TenantIDs []string `json:"tenant_ids"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		return nil, err
-	}
-	ids := payload.TenantIDs
-	if len(ids) == 0 && payload.TenantID != "" {
-		ids = []string{payload.TenantID}
-	}
-	return &AgentPrincipal{
-		Username:  payload.Username,
-		Role:      payload.Role,
-		Source:    "server",
-		TenantIDs: ids,
-	}, nil
-}
-
-func (a *agentAuthManager) newServerHTTPClient() (*http.Client, error) {
-	if a == nil {
-		return nil, fmt.Errorf("authentication manager unavailable")
-	}
-	if _, err := validateOnboardingServerURL(a.serverURL); err != nil {
-		return nil, fmt.Errorf("invalid server URL: %w", err)
-	}
-	if a.serverSkipVerify {
-		return nil, fmt.Errorf("insecure server TLS verification is not permitted")
-	}
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if a.serverCAPath != "" {
-		pemData, err := os.ReadFile(a.serverCAPath)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pemData) {
-			return nil, fmt.Errorf("failed to parse server CA certificate")
-		}
-		tlsConfig.RootCAs = pool
-	}
-	transport := &http.Transport{TLSClientConfig: tlsConfig}
-	return &http.Client{Timeout: serverAuthTimeout, Transport: transport}, nil
-}
-
-func (a *agentAuthManager) serverAPIURL(p string) string {
-	base := strings.TrimRight(a.serverURL, "/")
-	if base == "" {
-		return p
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	return base + p
-}
-
-func (a *agentAuthManager) serverLoginURL(r *http.Request) string {
-	if a == nil || strings.TrimSpace(a.serverURL) == "" {
-		return "/login"
-	}
-	serverURL, err := validateOnboardingServerURL(a.serverURL)
-	if err != nil {
-		return "/login?error=invalid_server_url"
-	}
-	// Determine what URL the user originally wanted
-	returnTo := "/"
-	if r != nil && r.URL != nil {
-		if uri := r.URL.RequestURI(); uri != "" {
-			returnTo = uri
-		}
-	}
-
-	// Build the agent callback URL that the server will redirect to after auth
-	// We need to determine the agent's external URL
-	agentCallbackURL := buildAgentCallbackURL(r, returnTo)
-
-	// Use 'redirect' parameter for external redirects (server login page convention)
-	return serverURL + "/login?redirect=" + url.QueryEscape(agentCallbackURL)
-}
-
-// buildAgentCallbackURL constructs the callback URL that the server should redirect to after auth
-func buildAgentCallbackURL(r *http.Request, returnTo string) string {
-	// Try to determine the agent's base URL from the request
-	scheme := "http"
-	if r != nil && r.TLS != nil {
-		scheme = "https"
-	}
-	// Check for X-Forwarded-Proto header
-	if r != nil {
-		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-			// Trust only the first standard forwarding value and keep the
-			// generated callback URL within HTTP(S). The server performs a
-			// second host/agent binding check before minting a bearer token.
-			proto = strings.ToLower(strings.TrimSpace(strings.Split(proto, ",")[0]))
-			if proto == "http" || proto == "https" {
-				scheme = proto
-			}
-		}
-	}
-
-	host := "localhost:8080" // default fallback
-	if r != nil && r.Host != "" {
-		host = r.Host
-	}
-
-	// Build the callback URL
-	callbackURL := fmt.Sprintf("%s://%s/api/v1/auth/callback?return_to=%s", scheme, host, url.QueryEscape(returnTo))
-	return callbackURL
-}
-
-type staticResourceCache struct {
-	sync.RWMutex
-	items map[string]cachedResource
-}
-
-type cachedResource struct {
-	data        []byte
-	contentType string
-	headers     http.Header
-	expiry      time.Time
-}
-
-func newStaticResourceCache() *staticResourceCache {
-	return &staticResourceCache{items: make(map[string]cachedResource)}
-}
-
-func (c *staticResourceCache) Get(key string) ([]byte, string, http.Header, bool) {
-	c.RLock()
-	defer c.RUnlock()
-	item, ok := c.items[key]
-	if !ok || time.Now().After(item.expiry) {
-		return nil, "", nil, false
-	}
-	return item.data, item.contentType, item.headers, true
-}
-
-func (c *staticResourceCache) Set(key string, data []byte, contentType string, headers http.Header, ttl time.Duration) {
-	c.Lock()
-	defer c.Unlock()
-	c.items[key] = cachedResource{
-		data:        data,
-		contentType: contentType,
-		headers:     headers,
-		expiry:      time.Now().Add(ttl),
-	}
-}
-
-var (
-	staticCache    = newStaticResourceCache()
-	uploadWorkerMu sync.RWMutex
-	uploadWorker   *UploadWorker
-	// localProxyHandler is the root HTTP handler for direct proxy invocation
-	// This is set when the web server starts and used by WebSocket proxy requests
-	localProxyHandler   http.Handler
-	localProxyHandlerMu sync.RWMutex
-	// deviceStore is shared across the agent for persistence access
-	deviceStore storage.DeviceStore
-	// agentConfigStore stores user-configurable settings/ranges
-	agentConfigStore storage.AgentConfigStore
-	settingsManager  *SettingsManager
-	// applyDiscoveryEffectsFunc allows deferred wiring of discovery settings hooks
-	applyDiscoveryEffectsFunc func(map[string]interface{})
-	// configEpsonRemoteModeEnabled tracks global feature flag state
-	configEpsonRemoteModeEnabled bool
-	// Global structured logger instance
-	appLogger *logger.Logger
-	// autoUpdateManagerMu protects access to autoUpdateManager
-	autoUpdateManagerMu sync.RWMutex
-	// autoUpdateManager handles agent self-update operations
-	autoUpdateManager *autoupdate.Manager
-	// scannerConfig centralizes runtime-adjustable scanner parameters
-	scannerConfig struct {
-		sync.RWMutex
-		SNMPTimeoutMs       int
-		SNMPRetries         int
-		DiscoverConcurrency int
-	}
-)
-
-// setLocalProxyHandler sets the global HTTP handler for direct proxy invocation.
-// Called when the web server starts.
-func setLocalProxyHandler(h http.Handler) {
-	localProxyHandlerMu.Lock()
-	localProxyHandler = h
-	localProxyHandlerMu.Unlock()
-
-	// Also set it on the upload worker if it exists
-	uploadWorkerMu.RLock()
-	w := uploadWorker
-	uploadWorkerMu.RUnlock()
-	if w != nil {
-		w.SetLocalHandler(h)
-	}
-}
-
-// getLocalProxyHandler returns the global HTTP handler for direct proxy invocation.
-func getLocalProxyHandler() http.Handler {
-	localProxyHandlerMu.RLock()
-	defer localProxyHandlerMu.RUnlock()
-	return localProxyHandler
-}
-
-// notifyServerDeviceDeleted sends a device_deleted notification to the server via WebSocket.
-// This is called after a device is deleted locally so the server can also remove it.
-// Runs as best-effort - does not block or fail if the server is unreachable.
-func notifyServerDeviceDeleted(serial string) {
-	uploadWorkerMu.RLock()
-	worker := uploadWorker
-	uploadWorkerMu.RUnlock()
-
-	if worker == nil {
-		return
-	}
-
-	wsClient := worker.WSClient()
-	if wsClient == nil || !wsClient.IsConnected() {
-		return
-	}
-
-	msg := wscommon.Message{
-		Type: wscommon.MessageTypeDeviceDeleted,
-		Data: map[string]interface{}{
-			"serial": serial,
-		},
-		Timestamp: time.Now(),
-	}
-
-	if err := wsClient.SendMessage(msg); err != nil {
-		// Log but don't fail - notification is best-effort
-		appLogger.Debug("Failed to notify server about device deletion", "serial", serial, "error", err)
-	} else {
-		appLogger.Info("Notified server about device deletion", "serial", serial)
-	}
-}
-
-func runGarbageCollection(ctx context.Context, store storage.DeviceStore, config *agent.RetentionConfig) {
-	ticker := time.NewTicker(24 * time.Hour) // Run daily
-	defer ticker.Stop()
-
-	// Check if context is already cancelled before running
-	select {
-	case <-ctx.Done():
-		return
-	default:
-		// Run immediately on startup
-		doGarbageCollection(store, config)
-	}
-
-	for {
-		select {
-		case <-ticker.C:
-			doGarbageCollection(store, config)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// doGarbageCollection performs the actual cleanup work
-func doGarbageCollection(store storage.DeviceStore, config *agent.RetentionConfig) {
-	ctx := context.Background()
-
-	// Calculate cutoff timestamps
-	scanHistoryCutoff := time.Now().AddDate(0, 0, -config.ScanHistoryDays).Unix()
-	hiddenDevicesCutoff := time.Now().AddDate(0, 0, -config.HiddenDevicesDays).Unix()
-
-	// Delete old scan history
-	if scansDeleted, err := store.DeleteOldScans(ctx, scanHistoryCutoff); err != nil {
-		appLogger.Error("Garbage collection: Failed to delete old scans", "error", err, "cutoff_days", config.ScanHistoryDays)
-	} else if scansDeleted > 0 {
-		appLogger.Info("Garbage collection: Deleted old scan history", "count", scansDeleted, "age_days", config.ScanHistoryDays)
-	}
-
-	// Delete old hidden devices
-	if devicesDeleted, err := store.DeleteOldHiddenDevices(ctx, hiddenDevicesCutoff); err != nil {
-		appLogger.Error("Garbage collection: Failed to delete old hidden devices", "error", err, "cutoff_days", config.HiddenDevicesDays)
-	} else if devicesDeleted > 0 {
-		appLogger.Info("Garbage collection: Deleted old hidden devices", "count", devicesDeleted, "age_days", config.HiddenDevicesDays)
-	}
-}
-
-// runMetricsDownsampler runs periodic downsampling of metrics data
-// This implements Netdata-style tiered storage: raw â†’ hourly â†’ daily â†’ monthly
-func runMetricsDownsampler(ctx context.Context, store storage.DeviceStore) {
-	// Run every 6 hours (4 times per day)
-	ticker := time.NewTicker(6 * time.Hour)
-	defer ticker.Stop()
-
-	// Run immediately on startup (with a small delay to let the app initialize)
-	select {
-	case <-time.After(30 * time.Second):
-		doMetricsDownsampling(store)
-	case <-ctx.Done():
-		return
-	}
-
-	for {
-		select {
-		case <-ticker.C:
-			doMetricsDownsampling(store)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// doMetricsDownsampling performs the actual downsampling work
-func doMetricsDownsampling(store storage.DeviceStore) {
-	ctx := context.Background()
-
-	appLogger.Info("Metrics downsampling: Starting tiered aggregation")
-
-	// Perform full downsampling: rawâ†’hourly, hourlyâ†’daily, dailyâ†’monthly, cleanup
-	if err := store.PerformFullDownsampling(ctx); err != nil {
-		appLogger.Error("Metrics downsampling: Failed", "error", err)
-	} else {
-		appLogger.Info("Metrics downsampling: Completed successfully")
-	}
-}
-
-// downsampleAgentMetrics reduces the number of data points while preserving first, last,
-// and representative samples throughout the range. Uses LTTB-inspired algorithm
-// for visually significant point selection.
-func downsampleAgentMetrics(data []*storage.MetricsSnapshot, targetPoints int) []*storage.MetricsSnapshot {
-	n := len(data)
-	if n <= targetPoints || targetPoints < 3 {
-		return data
-	}
-
-	// Always keep first and last points
-	result := make([]*storage.MetricsSnapshot, 0, targetPoints)
-	result = append(result, data[0])
-
-	// Calculate bucket size for middle points
-	bucketSize := float64(n-2) / float64(targetPoints-2)
-
-	// Select representative points from each bucket
-	// Simple approach: pick the point with the most change (to preserve peaks/valleys)
-	for i := 0; i < targetPoints-2; i++ {
-		bucketStart := int(float64(i)*bucketSize) + 1
-		bucketEnd := int(float64(i+1)*bucketSize) + 1
-		if bucketEnd > n-1 {
-			bucketEnd = n - 1
-		}
-		if bucketStart >= bucketEnd {
-			continue
-		}
-
-		// Find the point with max delta from linear interpolation (preserves peaks)
-		bestIdx := bucketStart
-		maxDelta := 0.0
-		prevValue := float64(data[bucketStart-1].PageCount)
-		nextValue := float64(data[bucketEnd].PageCount)
-
-		for j := bucketStart; j < bucketEnd; j++ {
-			// Expected value via linear interpolation
-			t := float64(j-bucketStart+1) / float64(bucketEnd-bucketStart+1)
-			expected := prevValue + t*(nextValue-prevValue)
-			actual := float64(data[j].PageCount)
-			delta := expected - actual
-			if delta < 0 {
-				delta = -delta
-			}
-			if delta > maxDelta {
-				maxDelta = delta
-				bestIdx = j
-			}
-		}
-
-		result = append(result, data[bestIdx])
-	}
-
-	result = append(result, data[n-1])
-	return result
-}
-
-// ensureTLSCertificates generates or loads TLS certificates for HTTPS
-// If customCertPath and customKeyPath are provided, uses those instead
-func ensureTLSCertificates(customCertPath, customKeyPath string) (certFile, keyFile string, err error) {
-	// If custom cert paths provided, validate and use them
-	if customCertPath != "" && customKeyPath != "" {
-		if _, err := os.Stat(customCertPath); err == nil {
-			if _, err := os.Stat(customKeyPath); err == nil {
-				appLogger.Info("Using custom TLS certificates", "cert", customCertPath, "key", customKeyPath)
-				return customCertPath, customKeyPath, nil
-			}
-		}
-		appLogger.Warn("Custom TLS certificate paths invalid, falling back to auto-generated", "cert", customCertPath, "key", customKeyPath)
-	}
-
-	// Get data directory
-	dataDir, err := storage.GetDataDir("PrintMaster")
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get data directory: %w", err)
-	}
-
-	certFile = filepath.Join(dataDir, "server.crt")
-	keyFile = filepath.Join(dataDir, "server.key")
-
-	// Check if certificates already exist
-	if _, err := os.Stat(certFile); err == nil {
-		if _, err := os.Stat(keyFile); err == nil {
-			// Both files exist. Tighten permissions on files created by the
-			// agent itself in case an older release left them world-readable.
-			if err := hardenTLSFilePermissions(certFile, keyFile); err != nil {
-				return "", "", err
-			}
-			return certFile, keyFile, nil
-		}
-	}
-
-	// Generate new self-signed certificate
-	appLogger.Info("Generating self-signed TLS certificate")
-
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate private key: %w", err)
-	}
-
-	// Create certificate template
-	notBefore := time.Now()
-	notAfter := notBefore.Add(365 * 24 * time.Hour * 10) // 10 years
-
-	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate serial number: %w", err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{"PrintMaster"},
-			CommonName:   "PrintMaster Agent",
-		},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-	}
-
-	// Create self-signed certificate
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create certificate: %w", err)
-	}
-
-	// Write certificate file
-	certOut, err := os.OpenFile(certFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create cert file: %w", err)
-	}
-	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
-		certOut.Close()
-		return "", "", fmt.Errorf("failed to write cert: %w", err)
-	}
-	certOut.Close()
-
-	// Write private key file
-	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create key file: %w", err)
-	}
-	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		keyOut.Close()
-		return "", "", fmt.Errorf("failed to marshal private key: %w", err)
-	}
-	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
-		keyOut.Close()
-		return "", "", fmt.Errorf("failed to write key: %w", err)
-	}
-	keyOut.Close()
-	if err := hardenTLSFilePermissions(certFile, keyFile); err != nil {
-		return "", "", err
-	}
-
-	appLogger.Info("Generated self-signed TLS certificate", "cert", certFile, "key", keyFile)
-	return certFile, keyFile, nil
-}
-
-// hardenTLSFilePermissions applies least-privilege permissions to the
-// agent-generated certificate pair. The certificate is public material; the
-// private key must remain readable only by the account running the agent.
-func hardenTLSFilePermissions(certFile, keyFile string) error {
-	if strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" {
-		return fmt.Errorf("TLS certificate paths are required")
-	}
-	if err := os.Chmod(certFile, 0644); err != nil {
-		return fmt.Errorf("failed to set TLS certificate permissions: %w", err)
-	}
-	if err := os.Chmod(keyFile, 0600); err != nil {
-		return fmt.Errorf("failed to set TLS private key permissions: %w", err)
-	}
-	return nil
-}
-
-// deviceStorageAdapter implements agent.DeviceStorage interface
-type deviceStorageAdapter struct {
-	store storage.DeviceStore
-}
-
-func (a *deviceStorageAdapter) StoreDiscoveredDevice(ctx context.Context, pi agent.PrinterInfo) error {
-	// Convert PrinterInfo to Device
-	device := storage.PrinterInfoToDevice(pi, false)
-	device.Visible = true
-
-	snapshot := storage.PrinterInfoToScanSnapshot(pi)
-	metrics := storage.PrinterInfoToMetricsSnapshot(pi)
-	if err := a.store.StoreDiscoveryAtomic(ctx, device, snapshot, metrics); err != nil {
-		return fmt.Errorf("failed to persist discovery atomically: %w", err)
-	}
-
-	// Broadcast device update via SSE
-	if sseHub != nil {
-		isNew := device.FirstSeen.Equal(device.LastSeen) || time.Since(device.FirstSeen) < time.Second
-		eventType := "device_updated"
-		if isNew {
-			eventType = "device_discovered"
-		}
-		sseHub.Broadcast(SSEEvent{
-			Type: eventType,
-			Data: map[string]interface{}{
-				"serial": device.Serial,
-				"ip":     device.IP,
-				"make":   device.Manufacturer,
-				"model":  device.Model,
-			},
-		})
-	}
-
-	return nil
-}
-
-// SSE (Server-Sent Events) Hub for real-time UI updates
-type SSEEvent struct {
-	Type string                 `json:"type"`
-	Data map[string]interface{} `json:"data"`
-}
-
-type SSEClient struct {
-	id     string
-	events chan SSEEvent
-}
-
-type SSEHub struct {
-	clients    map[string]*SSEClient
-	broadcast  chan SSEEvent
-	register   chan *SSEClient
-	unregister chan *SSEClient
-	shutdown   chan struct{}
-	mu         sync.RWMutex
-}
-
-func NewSSEHub() *SSEHub {
-	hub := &SSEHub{
-		clients:    make(map[string]*SSEClient),
-		broadcast:  make(chan SSEEvent, 100),
-		register:   make(chan *SSEClient),
-		unregister: make(chan *SSEClient),
-		shutdown:   make(chan struct{}),
-	}
-	go hub.run()
-	return hub
-}
-
-func (h *SSEHub) run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.mu.Lock()
-			h.clients[client.id] = client
-			h.mu.Unlock()
-		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client.id]; ok {
-				delete(h.clients, client.id)
-				close(client.events)
-			}
-			h.mu.Unlock()
-		case event := <-h.broadcast:
-			h.mu.RLock()
-			for _, client := range h.clients {
-				select {
-				case client.events <- event:
-				default:
-					// Client's buffer is full, skip
-				}
-			}
-			h.mu.RUnlock()
-		case <-h.shutdown:
-			// Close all client connections
-			h.mu.Lock()
-			for _, client := range h.clients {
-				close(client.events)
-			}
-			h.clients = make(map[string]*SSEClient)
-			h.mu.Unlock()
-			return
-		}
-	}
-}
-
-func (h *SSEHub) Stop() {
-	close(h.shutdown)
-}
-
-func (h *SSEHub) Broadcast(event SSEEvent) {
-	select {
-	case h.broadcast <- event:
-	default:
-		// Broadcast buffer full, skip event
-	}
-}
-
-func (h *SSEHub) NewClient() *SSEClient {
-	client := &SSEClient{
-		id:     fmt.Sprintf("client_%d", time.Now().UnixNano()),
-		events: make(chan SSEEvent, 10),
-	}
-	h.register <- client
-	return client
-}
-
-func (h *SSEHub) RemoveClient(client *SSEClient) {
-	h.unregister <- client
-}
-
-var sseHub *SSEHub
-
-func mapIntoStruct(src map[string]interface{}, dst interface{}) {
-	if src == nil || dst == nil {
-		return
-	}
-	data, err := json.Marshal(src)
-	if err != nil {
-		return
-	}
-	_ = json.Unmarshal(data, dst)
-}
-
-func structToMap(src interface{}) map[string]interface{} {
-	if src == nil {
-		return map[string]interface{}{}
-	}
-	data, err := json.Marshal(src)
-	if err != nil {
-		return map[string]interface{}{}
-	}
-	var out map[string]interface{}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return map[string]interface{}{}
-	}
-	return out
-}
-
-func applyFeaturesSettingsEffects(feat *pmsettings.FeaturesSettings) {
-	if feat == nil {
-		return
-	}
-	configEnabled := configEpsonRemoteModeEnabled
-	effective := feat.EpsonRemoteModeEnabled || configEnabled
-	previous := featureflags.EpsonRemoteModeEnabled()
-	featureflags.SetEpsonRemoteMode(effective)
-	if configEnabled {
-		feat.EpsonRemoteModeEnabled = effective
-	}
-	if appLogger != nil && effective != previous {
-		appLogger.Info("Epson remote mode updated", "enabled", effective, "config_override", configEnabled)
-	}
-}
-
-func applySpoolerSettings(spooler *pmsettings.SpoolerSettings) {
-	if spooler == nil {
-		return
-	}
-	// Stop the current worker if running
-	StopSpoolerWorker()
-
-	if !spooler.Enabled {
-		if appLogger != nil {
-			appLogger.Info("Spooler tracking disabled")
-		}
-		return
-	}
-
-	// Start with new config if enabled and we have a store
-	if globalLocalPrinterStore == nil {
-		if appLogger != nil {
-			appLogger.Warn("Cannot start spooler worker: no local printer store available")
-		}
-		return
-	}
-
-	pollInterval := time.Duration(spooler.PollIntervalSeconds) * time.Second
-	if pollInterval < 5*time.Second {
-		pollInterval = 5 * time.Second
-	}
-	if pollInterval > 5*time.Minute {
-		pollInterval = 5 * time.Minute
-	}
-
-	config := SpoolerWorkerConfig{
-		PollInterval:           pollInterval,
-		IncludeNetworkPrinters: spooler.IncludeNetworkPrinters,
-		IncludeVirtualPrinters: spooler.IncludeVirtualPrinters,
-		AutoTrackUSB:           true,
-		AutoTrackLocal:         false,
-	}
-
-	if err := StartSpoolerWorker(globalLocalPrinterStore, config, appLogger); err != nil {
-		if appLogger != nil {
-			appLogger.Warn("Failed to start spooler worker with new settings", "error", err)
-		}
-	} else if appLogger != nil {
-		appLogger.Info("Spooler worker restarted with new settings",
-			"poll_interval", pollInterval,
-			"include_network", spooler.IncludeNetworkPrinters,
-			"include_virtual", spooler.IncludeVirtualPrinters)
-	}
-}
-
-func applyEffectiveSettingsSnapshot(cfg pmsettings.Settings) {
-	if applyDiscoveryEffectsFunc != nil {
-		discMap := structToMap(cfg.Discovery)
-		delete(discMap, "ranges_text")
-		delete(discMap, "detected_subnet")
-		applyDiscoveryEffectsFunc(discMap)
-	}
-	applyFeaturesSettingsEffects(&cfg.Features)
-}
-
-func loadUnifiedSettings(store storage.AgentConfigStore) pmsettings.Settings {
-	base := pmsettings.DefaultSettings()
-	managed := false
-	if settingsManager != nil {
-		base, managed = settingsManager.baseSettings()
-	}
-	if store == nil {
-		pmsettings.Sanitize(&base)
-		return base
-	}
-	if !managed {
-		var disc map[string]interface{}
-		if err := store.GetConfigValue("discovery_settings", &disc); err == nil && disc != nil {
-			mapIntoStruct(disc, &base.Discovery)
-		}
-	}
-	if txt, err := store.GetRanges(); err == nil {
-		base.Discovery.RangesText = txt
-	}
-	if ipnets, err := agent.GetLocalSubnets(); err == nil && len(ipnets) > 0 {
-		base.Discovery.DetectedSubnet = ipnets[0].String()
-	}
-	// Load unified settings structure
-	var unified map[string]interface{}
-	if err := store.GetConfigValue("settings", &unified); err == nil && unified != nil {
-		// SNMP settings (fleet-managed, don't allow local override when managed)
-		if snmpRaw, ok := unified["snmp"].(map[string]interface{}); ok && !managed {
-			mapIntoStruct(snmpRaw, &base.SNMP)
-		}
-		// Features settings (fleet-managed, don't allow local override when managed)
-		if featRaw, ok := unified["features"].(map[string]interface{}); ok && !managed {
-			mapIntoStruct(featRaw, &base.Features)
-		}
-		// Logging settings (agent-local, always allow local override)
-		if logRaw, ok := unified["logging"].(map[string]interface{}); ok {
-			mapIntoStruct(logRaw, &base.Logging)
-		}
-		// Web settings (agent-local, always allow local override)
-		if webRaw, ok := unified["web"].(map[string]interface{}); ok {
-			mapIntoStruct(webRaw, &base.Web)
-		}
-	}
-	pmsettings.Sanitize(&base)
-	applyFeaturesSettingsEffects(&base.Features)
-	return base
-}
-
-// applyServerConfigFromStore merges persisted server connection settings from the
-// agent config database into the in-memory configuration so that UI-driven join
-// flows can enable uploads without editing config.toml manually.
-// Note: Environment variables take precedence over stored config values.
-func applyServerConfigFromStore(agentCfg *AgentConfig, store storage.AgentConfigStore, log *logger.Logger) {
-	if agentCfg == nil || store == nil {
-		return
-	}
-
-	var persisted ServerConnectionConfig
-	if err := store.GetConfigValue("server", &persisted); err != nil {
-		if log != nil {
-			log.Warn("Failed to load server settings from config store", "error", err)
-		}
-		return
-	}
-
-	if strings.TrimSpace(persisted.URL) == "" {
-		return
-	}
-
-	// Only apply stored URL if no environment variable is set
-	// This allows SERVER_URL env var to override stored config (Docker Compose scenario)
-	envURL := os.Getenv("SERVER_URL")
-	if envURL == "" {
-		agentCfg.Server.URL = strings.TrimSpace(persisted.URL)
-	} else if log != nil {
-		log.Debug("SERVER_URL environment variable set; ignoring stored URL",
-			"env_url", envURL,
-			"stored_url", persisted.URL)
-	}
-	if persisted.Name != "" {
-		agentCfg.Server.Name = persisted.Name
-	}
-	agentCfg.Server.CAPath = persisted.CAPath
-	// Only apply InsecureSkipVerify from store if env var not set
-	if os.Getenv("SERVER_INSECURE_SKIP_VERIFY") == "" {
-		agentCfg.Server.InsecureSkipVerify = persisted.InsecureSkipVerify
-	}
-	if persisted.UploadInterval > 0 {
-		agentCfg.Server.UploadInterval = persisted.UploadInterval
-	}
-	if persisted.HeartbeatInterval > 0 {
-		agentCfg.Server.HeartbeatInterval = persisted.HeartbeatInterval
-	}
-	if persisted.AgentID != "" {
-		agentCfg.Server.AgentID = persisted.AgentID
-	}
-	if persisted.Token != "" {
-		agentCfg.Server.Token = persisted.Token
-	}
-	if persisted.Enabled {
-		agentCfg.Server.Enabled = true
-	} else if agentCfg.Server.URL != "" {
-		// Default to enabled when a URL is present but legacy data omitted the flag
-		agentCfg.Server.Enabled = true
-	}
-
-	if log != nil {
-		log.Info("Loaded server configuration from agent database",
-			"url", agentCfg.Server.URL,
-			"enabled", agentCfg.Server.Enabled,
-			"insecure_skip_verify", agentCfg.Server.InsecureSkipVerify)
-	}
-}
-
-type serverConnectionStatus struct {
-	Enabled            bool       `json:"enabled"`
-	URL                string     `json:"url"`
-	Name               string     `json:"name"`
-	AgentID            string     `json:"agent_id"`
-	InsecureSkipVerify bool       `json:"insecure_skip_verify"`
-	CAPath             string     `json:"ca_path"`
-	UploadInterval     int        `json:"upload_interval"`
-	HeartbeatInterval  int        `json:"heartbeat_interval"`
-	Connected          bool       `json:"connected"`
-	ConnectionMode     string     `json:"connection_mode"`
-	LastHeartbeat      *time.Time `json:"last_heartbeat,omitempty"`
-	LastDeviceUpload   *time.Time `json:"last_device_upload,omitempty"`
-	LastMetricsUpload  *time.Time `json:"last_metrics_upload,omitempty"`
-	HasAgentToken      bool       `json:"has_agent_token"`
-	HasJoinToken       bool       `json:"has_join_token"`
-	WebSocketEnabled   bool       `json:"websocket_enabled"`
-	WebSocketConnected bool       `json:"websocket_connected"`
-}
-
-var (
-	serverStatusMu          sync.Mutex
-	serverStatusFingerprint string
-)
-
-func snapshotServerConnectionStatus(agentCfg *AgentConfig, dataDir string) serverConnectionStatus {
-	status := serverConnectionStatus{}
-	if agentCfg != nil {
-		status.Enabled = agentCfg.Server.Enabled
-		status.URL = agentCfg.Server.URL
-		status.Name = agentCfg.Server.Name
-		status.AgentID = agentCfg.Server.AgentID
-		status.InsecureSkipVerify = agentCfg.Server.InsecureSkipVerify
-		status.CAPath = agentCfg.Server.CAPath
-		status.UploadInterval = agentCfg.Server.UploadInterval
-		status.HeartbeatInterval = agentCfg.Server.HeartbeatInterval
-	}
-
-	uploadWorkerMu.RLock()
-	worker := uploadWorker
-	uploadWorkerMu.RUnlock()
-	if worker != nil {
-		wStatus := worker.Status()
-		status.Connected = status.Enabled && wStatus.Running
-		status.LastHeartbeat = timePtr(wStatus.LastHeartbeat)
-		status.LastDeviceUpload = timePtr(wStatus.LastDeviceUpload)
-		status.LastMetricsUpload = timePtr(wStatus.LastMetricsUpload)
-		status.WebSocketEnabled = wStatus.WebSocketEnabled
-		status.WebSocketConnected = wStatus.WebSocketConnected
-	} else {
-		status.Connected = false
-	}
-	mode := "disconnected"
-	if status.Enabled && status.URL != "" {
-		if status.Connected {
-			mode = "connected"
-			if status.WebSocketEnabled && status.WebSocketConnected {
-				mode = "live"
-			}
-		}
-	}
-	status.ConnectionMode = mode
-
-	if dataDir != "" {
-		status.HasAgentToken = LoadServerToken(dataDir) != ""
-		status.HasJoinToken = LoadServerJoinToken(dataDir) != ""
-	}
-
-	return status
-}
-
-func serverStatusHash(status serverConnectionStatus) string {
-	data, err := json.Marshal(status)
-	if err != nil {
-		return fmt.Sprintf("fallback:%v:%v", status.Enabled, time.Now().UnixNano())
-	}
-	return string(data)
-}
-
-func setServerStatusFingerprint(status serverConnectionStatus) {
-	serverStatusMu.Lock()
-	defer serverStatusMu.Unlock()
-	serverStatusFingerprint = serverStatusHash(status)
-}
-
-func markServerStatusFingerprint(status serverConnectionStatus) bool {
-	hash := serverStatusHash(status)
-	serverStatusMu.Lock()
-	defer serverStatusMu.Unlock()
-	if hash == serverStatusFingerprint {
-		return false
-	}
-	serverStatusFingerprint = hash
-	return true
-}
-
-func broadcastServerStatusSnapshot(status serverConnectionStatus, reason string) {
-	if sseHub == nil {
-		return
-	}
-	payload := map[string]interface{}{
-		"status": status,
-	}
-	if reason != "" {
-		payload["reason"] = reason
-	}
-	sseHub.Broadcast(SSEEvent{Type: "server_status", Data: payload})
-}
-
-func broadcastServerStatus(agentCfg *AgentConfig, dataDir string, reason string, force bool) {
-	if sseHub == nil {
-		return
-	}
-	status := snapshotServerConnectionStatus(agentCfg, dataDir)
-	if force {
-		setServerStatusFingerprint(status)
-		broadcastServerStatusSnapshot(status, reason)
-		return
-	}
-	if markServerStatusFingerprint(status) {
-		broadcastServerStatusSnapshot(status, reason)
-	}
-}
-
-func startServerStatusMonitor(ctx context.Context, agentCfg *AgentConfig, dataDir string, interval time.Duration) {
-	if agentCfg == nil || dataDir == "" {
-		return
-	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				broadcastServerStatus(agentCfg, dataDir, "", false)
-			}
-		}
-	}()
-}
-
-func timePtr(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	value := t
-	return &value
-}
-
-func disconnectFromServer(agentCfg *AgentConfig, dataDir string) error {
-	if appLogger != nil {
-		appLogger.Info("Disconnecting agent from server")
-	}
-	uploadWorkerMu.Lock()
-	if uploadWorker != nil {
-		uploadWorker.Stop()
-		uploadWorker = nil
-	}
-	uploadWorkerMu.Unlock()
-
-	if strings.TrimSpace(dataDir) != "" {
-		if err := DeleteServerToken(dataDir); err != nil {
-			return fmt.Errorf("failed to remove server token: %w", err)
-		}
-		if err := SaveServerJoinToken(dataDir, ""); err != nil {
-			return fmt.Errorf("failed to clear join token: %w", err)
-		}
-	}
-
-	if agentCfg != nil {
-		agentCfg.Server.Enabled = false
-		agentCfg.Server.URL = ""
-		agentCfg.Server.Name = ""
-		agentCfg.Server.CAPath = ""
-		agentCfg.Server.InsecureSkipVerify = false
-		agentCfg.Server.Token = ""
-	}
-
-	if agentConfigStore != nil {
-		persisted := ServerConnectionConfig{}
-		if agentCfg != nil {
-			persisted.AgentID = agentCfg.Server.AgentID
-		}
-		if err := agentConfigStore.SetConfigValue("server", persisted); err != nil {
-			return fmt.Errorf("failed to persist server disconnect: %w", err)
-		}
-	}
-
-	// Clear server-managed settings snapshot so settings become editable again
-	if settingsManager != nil {
-		if err := settingsManager.ClearManagedSnapshot(); err != nil {
-			if appLogger != nil {
-				appLogger.Warn("Failed to clear server-managed settings", "error", err)
-			}
-		} else if appLogger != nil {
-			appLogger.Info("Cleared server-managed settings, local editing now unlocked")
-		}
-	}
-
-	broadcastServerStatus(agentCfg, dataDir, "disconnected", true)
-	return nil
-}
-
-// startServerUploadWorker encapsulates upload worker bootstrap (agent
-// registration, token persistence, WebSocket setup) so it can be invoked at
-// startup and again after a join event without duplicating logic.
-func startServerUploadWorker(
-	ctx context.Context,
-	agentCfg *AgentConfig,
-	dataDir string,
-	deviceStore storage.DeviceStore,
-	settings *SettingsManager,
-	workerLogger Logger,
-) (*UploadWorker, error) {
-	if agentCfg == nil {
-		return nil, fmt.Errorf("agent configuration unavailable")
-	}
-	if strings.TrimSpace(agentCfg.Server.URL) == "" {
-		return nil, fmt.Errorf("server URL not configured")
-	}
-	validatedServerURL, err := validateOnboardingServerURL(agentCfg.Server.URL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid server URL: %w", err)
-	}
-	// Keep every subsequent HTTP and WebSocket client on the canonical,
-	// validated origin. In particular, do not allow a hand-edited config to
-	// send the agent token to a remote plaintext HTTP endpoint.
-	agentCfg.Server.URL = validatedServerURL
-
-	agentID := agentCfg.Server.AgentID
-	if agentID == "" {
-		var err error
-		agentID, err = LoadOrGenerateAgentID(dataDir)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load or generate agent ID: %w", err)
-		}
-		agentCfg.Server.AgentID = agentID
-		workerLogger.Info("Generated new agent ID", "agent_id", agentID)
-	}
-
-	agentName := agentCfg.Server.Name
-	if agentName == "" {
-		if hostname, err := os.Hostname(); err == nil {
-			agentName = hostname
-		}
-	}
-
-	workerLogger.Info("Server integration enabled",
-		"url", agentCfg.Server.URL,
-		"agent_id", agentID,
-		"agent_name", agentName,
-		"ca_path", agentCfg.Server.CAPath,
-		"upload_interval", agentCfg.Server.UploadInterval,
-		"heartbeat_interval", agentCfg.Server.HeartbeatInterval)
-
-	token := LoadServerToken(dataDir)
-	if token == "" {
-		workerLogger.Debug("No saved server token found")
-	}
-
-	serverClient := agent.NewServerClientWithName(
-		agentCfg.Server.URL,
-		agentID,
-		agentName,
-		token,
-		agentCfg.Server.CAPath,
-		agentCfg.Server.InsecureSkipVerify,
-	)
-	if identity, identityErr := agent.LoadClientIdentity(dataDir); identityErr != nil {
-		workerLogger.Warn("Stored Agent mTLS identity could not be loaded", "error", identityErr)
-	} else if identity != nil {
-		if err := serverClient.SetClientIdentity(identity); err != nil {
-			workerLogger.Warn("Stored Agent mTLS identity could not be installed", "error", err)
-		} else {
-			workerLogger.Info("Loaded Agent mTLS identity", "credential_id", identity.CredentialID, "expires_at", identity.ExpiresAt)
-		}
-	}
-
-	workerConfig := UploadWorkerConfig{
-		HeartbeatInterval: time.Duration(agentCfg.Server.HeartbeatInterval) * time.Second,
-		UploadInterval:    time.Duration(agentCfg.Server.UploadInterval) * time.Second,
-		RetryAttempts:     3,
-		RetryBackoff:      2 * time.Second,
-		UseWebSocket:      true,
-	}
-	if workerConfig.HeartbeatInterval <= 0 {
-		workerConfig.HeartbeatInterval = 60 * time.Second
-	}
-	if workerConfig.UploadInterval <= 0 {
-		workerConfig.UploadInterval = 5 * time.Minute
-	}
-
-	uploadWorker := NewUploadWorker(serverClient, deviceStore, workerLogger, settings, workerConfig, dataDir)
-
-	// Set local handler if web server has already started
-	if h := getLocalProxyHandler(); h != nil {
-		uploadWorker.SetLocalHandler(h)
-	}
-
-	// Build version info for heartbeats
-	versionInfo := &agent.AgentVersionInfo{
-		Version:         Version,
-		ProtocolVersion: "1",
-		BuildType:       BuildType,
-		GitCommit:       GitCommit,
-	}
-
-	if err := uploadWorker.StartWithVersionInfo(ctx, Version, versionInfo); err != nil {
-		return nil, err
-	}
-
-	if newToken := serverClient.GetToken(); newToken != "" && newToken != token {
-		if err := SaveServerToken(dataDir, newToken); err != nil {
-			workerLogger.Error("Failed to save server token", "error", err)
-		} else {
-			workerLogger.Info("Server token saved")
-		}
-	}
-
-	broadcastServerStatus(agentCfg, dataDir, "upload_worker_started", true)
-	return uploadWorker, nil
-}
-
-type serverJoinParams struct {
-	ServerURL string
-	Token     string
-	CAPath    string
-	Insecure  bool
-	AgentName string
-}
-
-type serverJoinResult struct {
-	TenantID   string
-	AgentToken string
-	AgentName  string
-	AgentID    string
-}
-
-type joinError struct {
-	status int
-	err    error
-}
-
-func (e *joinError) Error() string {
-	if e == nil || e.err == nil {
-		return ""
-	}
-	return e.err.Error()
-}
-
-func (e *joinError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.err
-}
-
-func newJoinError(status int, err error) error {
-	if err == nil {
-		err = fmt.Errorf("unknown join error")
-	}
-	return &joinError{status: status, err: err}
-}
-
-func joinErrorStatus(err error) int {
-	var je *joinError
-	if errors.As(err, &je) {
-		return je.status
-	}
-	return http.StatusInternalServerError
-}
-
-func resolveAgentDisplayName(agentCfg *AgentConfig, candidate string) string {
-	if name := strings.TrimSpace(candidate); name != "" {
-		return name
-	}
-	if agentCfg != nil {
-		if cfgName := strings.TrimSpace(agentCfg.Server.Name); cfgName != "" {
-			return cfgName
-		}
-	}
-	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
-		return strings.TrimSpace(host)
-	}
-	return "PrintMaster Agent"
-}
-
-func performServerJoin(
-	reqCtx context.Context,
-	appCtx context.Context,
-	params serverJoinParams,
-	agentCfg *AgentConfig,
-	cfgStore storage.AgentConfigStore,
-	deviceStore storage.DeviceStore,
-	settings *SettingsManager,
-	logger *logger.Logger,
-	isSvc bool,
-) (*serverJoinResult, error) {
-	serverURL, err := validateOnboardingServerURL(params.ServerURL)
-	if err != nil {
-		return nil, newJoinError(http.StatusBadRequest, err)
-	}
-	if params.Insecure {
-		return nil, newJoinError(http.StatusBadRequest, fmt.Errorf("insecure TLS verification is not permitted"))
-	}
-	joinToken := strings.TrimSpace(params.Token)
-	if joinToken == "" {
-		return nil, newJoinError(http.StatusBadRequest, fmt.Errorf("token required"))
-	}
-	dataDir, err := config.GetDataDirectory("agent", isSvc)
-	if err != nil {
-		return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to determine data directory: %w", err))
-	}
-	agentID, err := LoadOrGenerateAgentID(dataDir)
-	if err != nil {
-		return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to load or generate agent id: %w", err))
-	}
-	caPath := strings.TrimSpace(params.CAPath)
-	agentName := resolveAgentDisplayName(agentCfg, params.AgentName)
-	client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, params.Insecure)
-	var agentToken, tenantID string
-	var mtlsEnrolled bool
-	// A previous onboarding attempt may have consumed the one-time join token
-	// and persisted a certificate before the activation response was lost.
-	// Retry that activation before attempting another enrollment.
-	if pendingIdentity, pendingErr := agent.LoadPendingClientIdentity(dataDir); pendingErr != nil {
-		return nil, newJoinError(http.StatusInternalServerError, pendingErr)
-	} else if pendingIdentity != nil {
-		if setErr := client.SetClientIdentity(pendingIdentity); setErr != nil {
-			return nil, newJoinError(http.StatusInternalServerError, setErr)
-		}
-		if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
-			client.ClearClientIdentity()
-			return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("pending mTLS activation: %w", activateErr))
-		}
-		if promoteErr := agent.PromotePendingClientIdentity(dataDir); promoteErr != nil {
-			return nil, newJoinError(http.StatusInternalServerError, promoteErr)
-		}
-		tenantID, mtlsEnrolled = pendingIdentity.TenantID, true
-	}
-	if !mtlsEnrolled {
-		if pending, csrErr := agent.GenerateClientCSR(agentID); csrErr == nil {
-			if registration, mtlsErr := client.RegisterWithMTLS(reqCtx, joinToken, string(pending.CSRPEM), Version); mtlsErr == nil {
-				identity, buildErr := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
-				if buildErr != nil {
-					return nil, newJoinError(http.StatusBadGateway, buildErr)
-				}
-				identity.TenantID = registration.TenantID
-				if saveErr := agent.SavePendingClientIdentity(dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); saveErr != nil {
-					return nil, newJoinError(http.StatusInternalServerError, saveErr)
-				}
-				if setErr := client.SetClientIdentity(identity); setErr != nil {
-					return nil, newJoinError(http.StatusInternalServerError, setErr)
-				}
-				if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
-					client.ClearClientIdentity()
-					return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("mTLS activation: %w", activateErr))
-				}
-				if promoteErr := agent.PromotePendingClientIdentity(dataDir); promoteErr != nil {
-					return nil, newJoinError(http.StatusInternalServerError, promoteErr)
-				}
-				tenantID, mtlsEnrolled = registration.TenantID, true
-			}
-		}
-	}
-	if !mtlsEnrolled {
-		agentToken, tenantID, err = client.RegisterWithToken(reqCtx, joinToken, Version)
-		if err != nil {
-			return nil, newJoinError(http.StatusBadGateway, err)
-		}
-	}
-	if agentCfg != nil {
-		agentCfg.Server.Enabled = true
-		agentCfg.Server.URL = serverURL
-		agentCfg.Server.Name = agentName
-		agentCfg.Server.CAPath = caPath
-		agentCfg.Server.InsecureSkipVerify = params.Insecure
-		agentCfg.Server.AgentID = agentID
-	}
-	if cfgStore != nil {
-		uploadInterval := 0
-		heartbeatInterval := 0
-		if agentCfg != nil {
-			uploadInterval = agentCfg.Server.UploadInterval
-			heartbeatInterval = agentCfg.Server.HeartbeatInterval
-		}
-		persisted := ServerConnectionConfig{
-			Enabled:            true,
-			URL:                serverURL,
-			Name:               agentName,
-			CAPath:             caPath,
-			InsecureSkipVerify: params.Insecure,
-			UploadInterval:     uploadInterval,
-			HeartbeatInterval:  heartbeatInterval,
-			AgentID:            agentID,
-		}
-		if err := cfgStore.SetConfigValue("server", persisted); err != nil {
-			if logger != nil {
-				logger.Warn("Failed to persist server settings", "error", err)
-			}
-		}
-	}
-	if mtlsEnrolled {
-		if err := DeleteServerToken(dataDir); err != nil {
-			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to clear legacy server token: %w", err))
-		}
-		if err := SaveServerJoinToken(dataDir, ""); err != nil {
-			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to clear join token: %w", err))
-		}
-	} else {
-		if err := SaveServerToken(dataDir, agentToken); err != nil {
-			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to save server token: %w", err))
-		}
-		if err := SaveServerJoinToken(dataDir, joinToken); err != nil {
-			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to save join token: %w", err))
-		}
-	}
-	uploadWorkerMu.RLock()
-	existingWorker := uploadWorker
-	uploadWorkerMu.RUnlock()
-	if existingWorker != nil && existingWorker.client != nil {
-		existingWorker.client.SetToken(agentToken)
-		existingWorker.client.BaseURL = serverURL
-		if mtlsEnrolled {
-			if identity, identityErr := agent.LoadClientIdentity(dataDir); identityErr == nil && identity != nil {
-				if setErr := existingWorker.client.SetClientIdentity(identity); setErr == nil {
-					existingWorker.wsClientMu.RLock()
-					wsClient := existingWorker.wsClient
-					existingWorker.wsClientMu.RUnlock()
-					if wsClient != nil {
-						wsClient.SetTLSConfig(existingWorker.client.TLSConfig())
-					}
-				}
-			}
-		}
-		maybeStartAutoUpdateWorker(appCtx, agentCfg, dataDir, isSvc, logger)
-	} else {
-		go func() {
-			worker, err := startServerUploadWorker(appCtx, agentCfg, dataDir, deviceStore, settings, logger)
-			if err != nil {
-				if logger != nil {
-					logger.Error("Failed to start upload worker after join", "error", err)
-				}
-				return
-			}
-			uploadWorkerMu.Lock()
-			uploadWorker = worker
-			uploadWorkerMu.Unlock()
-
-			// Check if local proxy handler was set while we were starting up
-			if h := getLocalProxyHandler(); h != nil {
-				worker.SetLocalHandler(h)
-			}
-
-			maybeStartAutoUpdateWorker(appCtx, agentCfg, dataDir, isSvc, logger)
-		}()
-	}
-	broadcastServerStatus(agentCfg, dataDir, "joined", true)
-	return &serverJoinResult{
-		TenantID:   tenantID,
-		AgentToken: agentToken,
-		AgentName:  agentName,
-		AgentID:    agentID,
-	}, nil
-}
-
-func maybeStartAutoUpdateWorker(appCtx context.Context, agentCfg *AgentConfig, dataDir string, isService bool, log *logger.Logger) {
-	autoUpdateManagerMu.RLock()
-	alreadyRunning := autoUpdateManager != nil
-	autoUpdateManagerMu.RUnlock()
-	if alreadyRunning {
-		return
-	}
-	go initAutoUpdateWorker(appCtx, agentCfg, dataDir, isService, log)
-}
-
-// tryLearnOIDForValue performs an SNMP walk to find an OID that returns the specified value
-// Returns the OID if found, empty string otherwise
-func tryLearnOIDForValue(ctx context.Context, ip string, vendorHint string, fieldName string, targetValue interface{}) string {
-	if ip == "" {
-		return ""
-	}
-
-	// Convert target value to string for comparison
-	targetStr := fmt.Sprintf("%v", targetValue)
-	if targetStr == "" {
-		return ""
-	}
-
-	// Perform a targeted SNMP walk on common MIB roots
-	appLogger.Info("Attempting to learn OID for locked field", "ip", ip, "field", fieldName, "target_value", targetStr)
-
-	result, err := scanner.QueryDevice(ctx, ip, scanner.QueryFull, vendorHint, 10)
-	if err != nil {
-		appLogger.Warn("Failed to query device for OID learning", "ip", ip, "error", err)
-		return ""
-	}
-
-	if result == nil || len(result.PDUs) == 0 {
-		return ""
-	}
-
-	// Search through PDUs for matching value
-	for _, pdu := range result.PDUs {
-		var pduValueStr string
-
-		// Convert PDU value to string based on type
-		switch pdu.Type {
-		case gosnmp.OctetString:
-			if bytes, ok := pdu.Value.([]byte); ok {
-				pduValueStr = string(bytes)
-			} else {
-				pduValueStr = fmt.Sprintf("%v", pdu.Value)
-			}
-		case gosnmp.Integer, gosnmp.Counter32, gosnmp.Gauge32, gosnmp.Counter64:
-			pduValueStr = fmt.Sprintf("%v", pdu.Value)
-		default:
-			pduValueStr = fmt.Sprintf("%v", pdu.Value)
-		}
-
-		// Check for exact match or numeric match
-		if pduValueStr == targetStr {
-			appLogger.Info("Found matching OID for field", "ip", ip, "field", fieldName, "oid", pdu.Name, "value", pduValueStr)
-			return pdu.Name
-		}
-
-		// For numeric fields, try parsing and comparing as integers
-		if strings.Contains(strings.ToLower(fieldName), "page") || strings.Contains(strings.ToLower(fieldName), "count") {
-			targetInt, targetErr := strconv.ParseInt(targetStr, 10, 64)
-			pduInt, pduErr := strconv.ParseInt(pduValueStr, 10, 64)
-			if targetErr == nil && pduErr == nil && targetInt == pduInt {
-				appLogger.Info("Found matching OID for numeric field", "ip", ip, "field", fieldName, "oid", pdu.Name, "value", pduInt)
-				return pdu.Name
-			}
-		}
-	}
-
-	appLogger.Info("No matching OID found for field", "ip", ip, "field", fieldName, "target_value", targetStr, "pdus_checked", len(result.PDUs))
-	return ""
-}
-
-func main() {
-	// Parse command-line flags for service management
-	configPath := flag.String("config", "config.toml", "Configuration file path")
-	generateConfig := flag.Bool("generate-config", false, "Generate default config file and exit")
-	serviceCmd := flag.String("service", "", "Service control: install, uninstall, start, stop, run")
-	showVersion := flag.Bool("version", false, "Show version information and exit")
-	quiet := flag.Bool("quiet", false, "Suppress informational output (errors/warnings still shown)")
-	flag.BoolVar(quiet, "q", false, "Shorthand for --quiet")
-	silent := flag.Bool("silent", false, "Suppress ALL output (complete silence)")
-	flag.BoolVar(silent, "s", false, "Shorthand for --silent")
-	healthCheck := flag.Bool("health", false, "Perform local health check against /health and exit")
-	flag.Parse()
-
-	// Set quiet/silent mode globally for util functions
-	if *silent {
-		commonutil.SetSilentMode(true)
-	} else {
-		commonutil.SetQuietMode(*quiet)
-	}
-
-	// Show version if requested
-	if *showVersion {
-		fmt.Printf("PrintMaster Agent %s\n", Version)
-		fmt.Printf("Build Time: %s\n", BuildTime)
-		fmt.Printf("Git Commit: %s\n", GitCommit)
-		fmt.Printf("Build Type: %s\n", BuildType)
-		fmt.Printf("Go Version: %s\n", runtime.Version())
-		fmt.Printf("OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-		return
-	}
-
-	// Generate default config if requested
-	if *generateConfig {
-		if err := WriteDefaultAgentConfig(*configPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to generate config: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Generated default configuration at %s\n", *configPath)
-		return
-	}
-
-	// Lightweight health probe for Docker/monitoring: call local /health and exit.
-	if *healthCheck {
-		if err := runAgentHealthCheck(*configPath); err != nil {
-			fmt.Fprintf(os.Stderr, "health check failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("healthy")
-		return
-	}
-
-	// Handle service commands
-	if *serviceCmd != "" {
-		handleServiceCommand(*serviceCmd)
-		return
-	}
-
-	// Check if running as service and start appropriately
-	if !service.Interactive() {
-		// Running as service, use service wrapper
-		runAsService()
-		return
-	}
-
-	// Running interactively, start normally (no context means run forever)
-	runInteractive(context.Background(), *configPath)
-}
-
-// handleServiceCommand processes service install/uninstall/start/stop commands
-func handleServiceCommand(cmd string) {
-	svcConfig := getServiceConfig()
-	prg := &program{}
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create service: %v\n", err)
-		os.Exit(1)
-	}
-
-	switch cmd {
-	case "install":
-		// Show banner
-		commonutil.ShowBanner(Version, GitCommit, BuildTime, "Fleet Management Agent")
-
-		// Check if service already exists and handle gracefully
-		status, _ := s.Status()
-		if status != service.StatusUnknown {
-			commonutil.ShowWarning("Service already exists, removing first...")
-
-			// Stop if running
-			if status == service.StatusRunning {
-				commonutil.ShowInfo("Stopping existing service...")
-				_ = s.Stop()
-				time.Sleep(2 * time.Second)
-				commonutil.ShowSuccess("Service stopped")
-			}
-
-			// Uninstall existing
-			commonutil.ShowInfo("Removing existing service...")
-			if err := s.Uninstall(); err != nil {
-				// Ignore "marked for deletion" errors - we can still install over it
-				if !strings.Contains(err.Error(), "marked for deletion") {
-					commonutil.ShowError(fmt.Sprintf("Failed to remove existing service: %v", err))
-					commonutil.ShowCompletionScreen(false, "Installation Failed")
-					os.Exit(1)
-				}
-				commonutil.ShowWarning("Service marked for deletion, will install anyway")
-			} else {
-				commonutil.ShowSuccess("Existing service removed")
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		// Create service directories first
-		commonutil.ShowInfo("Setting up directories...")
-		time.Sleep(300 * time.Millisecond)
-		if err := setupServiceDirectories(); err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to setup service directories: %v", err))
-			commonutil.ShowCompletionScreen(false, "Installation Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Directories ready")
-
-		commonutil.ShowInfo("Installing service...")
-		time.Sleep(500 * time.Millisecond)
-		err = s.Install()
-		if err != nil {
-			// If service already exists, that's actually okay for install
-			if strings.Contains(err.Error(), "already exists") {
-				commonutil.ShowWarning("Service already exists (this is normal)")
-			} else {
-				commonutil.ShowError(fmt.Sprintf("Failed to install service: %v", err))
-				commonutil.ShowCompletionScreen(false, "Installation Failed")
-				os.Exit(1)
-			}
-		}
-		commonutil.ShowSuccess("Service installed")
-
-		commonutil.ShowCompletionScreen(true, "Service Installed!")
-		fmt.Println()
-		commonutil.ShowInfo("Use '--service start' to start the service")
-
-	case "uninstall":
-		err = s.Uninstall()
-		if err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to uninstall service: %v", err))
-			os.Exit(1)
-		}
-		commonutil.ShowInfo("PrintMaster Agent service uninstalled successfully")
-
-	case "start":
-		// Show banner
-		commonutil.ShowBanner(Version, GitCommit, BuildTime, "Fleet Management Agent")
-
-		commonutil.ShowInfo("Starting service...")
-		err = s.Start()
-		if err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to start service: %v", err))
-			commonutil.ShowCompletionScreen(false, "Start Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Service started")
-
-		commonutil.ShowCompletionScreen(true, "Service Started!")
-
-	case "stop":
-		// Show banner
-		commonutil.ShowBanner(Version, GitCommit, BuildTime, "Fleet Management Agent")
-
-		commonutil.ShowInfo("Stopping service...")
-		done := make(chan bool)
-		go commonutil.AnimateProgress(0, "Stopping service (may take up to 30 seconds)", done)
-		err = s.Stop()
-		done <- true
-
-		if err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to stop service: %v", err))
-			commonutil.ShowCompletionScreen(false, "Stop Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Service stopped")
-
-		commonutil.ShowCompletionScreen(true, "Service Stopped!")
-
-	case "status":
-		// Show banner
-		commonutil.ShowBanner(Version, GitCommit, BuildTime, "Fleet Management Agent")
-
-		// Get service status
-		status, statusErr := s.Status()
-
-		fmt.Println()
-		commonutil.ShowInfo("Service Status Information")
-		fmt.Println()
-
-		// Service state
-		var statusText, statusColor string
-		switch status { //nolint:exhaustive
-		case service.StatusRunning:
-			statusText = "RUNNING"
-			statusColor = commonutil.ColorGreen
-		case service.StatusStopped:
-			statusText = "STOPPED"
-			statusColor = commonutil.ColorYellow
-		case service.StatusUnknown:
-			statusText = "NOT INSTALLED"
-			statusColor = commonutil.ColorRed
-		default:
-			statusText = "UNKNOWN"
-			statusColor = commonutil.ColorDim
-		}
-
-		if statusErr != nil {
-			fmt.Printf("  %sService State:%s %s%s%s (%v)\n",
-				commonutil.ColorDim, commonutil.ColorReset,
-				statusColor, statusText, commonutil.ColorReset,
-				statusErr)
-		} else {
-			fmt.Printf("  %sService State:%s %s%s%s\n",
-				commonutil.ColorDim, commonutil.ColorReset,
-				statusColor, commonutil.ColorBold+statusText, commonutil.ColorReset)
-		}
-
-		// Service configuration
-		cfg := getServiceConfig()
-		fmt.Printf("  %sService Name:%s  %s\n", commonutil.ColorDim, commonutil.ColorReset, cfg.Name)
-		fmt.Printf("  %sDisplay Name:%s  %s\n", commonutil.ColorDim, commonutil.ColorReset, cfg.DisplayName)
-		fmt.Printf("  %sDescription:%s   %s\n", commonutil.ColorDim, commonutil.ColorReset, cfg.Description)
-		fmt.Printf("  %sData Directory:%s %s\n", commonutil.ColorDim, commonutil.ColorReset, cfg.WorkingDirectory)
-
-		// Try to get more details on Windows
-		if runtime.GOOS == "windows" && status == service.StatusRunning {
-			fmt.Println()
-			commonutil.ShowInfo("Checking service details...")
-
-			// Use sc.exe to query service for more info
-			cmd := exec.Command("sc", "query", cfg.Name)
-			output, err := cmd.Output()
-			if err == nil {
-				lines := strings.Split(string(output), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if strings.Contains(line, "PID") {
-						fmt.Printf("  %s%s%s\n", commonutil.ColorDim, line, commonutil.ColorReset)
-					}
-				}
-			}
-
-			// Try to get uptime via wmic
-			cmd = exec.Command("wmic", "service", "where", fmt.Sprintf("name='%s'", cfg.Name), "get", "ProcessId,Started", "/value")
-			output, err = cmd.Output()
-			if err == nil {
-				fmt.Printf("  %s%s%s\n", commonutil.ColorDim, strings.TrimSpace(string(output)), commonutil.ColorReset)
-			}
-		}
-
-		fmt.Println()
-
-		// Show helpful next steps based on status
-		switch status {
-		case service.StatusRunning:
-			commonutil.ShowInfo("Service is running normally")
-			fmt.Println()
-			fmt.Printf("  %sWeb UI:%s http://localhost:8080 or https://localhost:8443\n", commonutil.ColorDim, commonutil.ColorReset)
-		case service.StatusStopped:
-			commonutil.ShowWarning("Service is installed but not running - Use '--service start' to start the service")
-		default:
-			commonutil.ShowWarning("Service is not installed - Use '--service install' to install the service")
-		}
-
-		fmt.Println()
-		commonutil.PromptToContinue()
-
-	case "restart":
-		// Show banner
-		commonutil.ShowBanner(Version, GitCommit, BuildTime, "Fleet Management Agent")
-
-		commonutil.ShowInfo("Stopping service...")
-		if err := s.Stop(); err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to stop service: %v", err))
-			commonutil.ShowCompletionScreen(false, "Restart Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Service stopped")
-
-		time.Sleep(1 * time.Second)
-
-		commonutil.ShowInfo("Starting service...")
-		if err := s.Start(); err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to start service: %v", err))
-			commonutil.ShowCompletionScreen(false, "Restart Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Service started")
-
-		commonutil.ShowCompletionScreen(true, "Service Restarted!")
-
-	case "update":
-		// Show banner
-		commonutil.ShowBanner(Version, GitCommit, BuildTime, "Fleet Management Agent")
-
-		// Stop service if running
-		commonutil.ShowInfo("Stopping service...")
-		done := make(chan bool)
-		go commonutil.AnimateProgress(0, "Stopping service (may take up to 30 seconds)", done)
-
-		stopErr := s.Stop()
-		if stopErr != nil {
-			done <- true
-			commonutil.ShowWarning("Service not running or already stopped")
-		} else {
-			// Wait for service to fully stop (max 30 seconds)
-			for i := 0; i < 30; i++ {
-				time.Sleep(1 * time.Second)
-
-				// Check service status (Windows-specific check)
-				if runtime.GOOS == "windows" {
-					status, _ := s.Status()
-					if status == service.StatusStopped {
-						break
-					}
-				}
-			}
-			done <- true
-			commonutil.ShowSuccess("Service stopped")
-		}
-
-		// Uninstall existing service
-		commonutil.ShowInfo("Uninstalling old service...")
-		time.Sleep(500 * time.Millisecond)
-		if err := s.Uninstall(); err != nil {
-			commonutil.ShowWarning("Service not installed or already removed")
-		} else {
-			commonutil.ShowSuccess("Service uninstalled")
-		}
-
-		// Setup directories
-		commonutil.ShowInfo("Setting up directories...")
-		time.Sleep(300 * time.Millisecond)
-		if err := setupServiceDirectories(); err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to setup service directories: %v", err))
-			commonutil.ShowCompletionScreen(false, "Update Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Directories ready")
-
-		// Reinstall service
-		commonutil.ShowInfo("Installing updated service...")
-		time.Sleep(500 * time.Millisecond)
-		err = s.Install()
-		if err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to install service: %v", err))
-			commonutil.ShowCompletionScreen(false, "Update Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Service installed")
-
-		// Start service
-		commonutil.ShowInfo("Starting service...")
-		time.Sleep(500 * time.Millisecond)
-		err = s.Start()
-		if err != nil {
-			commonutil.ShowError(fmt.Sprintf("Failed to start service: %v", err))
-			commonutil.ShowCompletionScreen(false, "Update Failed")
-			os.Exit(1)
-		}
-		commonutil.ShowSuccess("Service started")
-
-		// Show completion screen
-		commonutil.ShowCompletionScreen(true, "Service Updated Successfully!")
-
-	case "run":
-		// Run as service (called by service manager)
-		err = s.Run()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Service run failed: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "help", "":
-		// Show help for service commands
-		fmt.Println("PrintMaster Agent - Service Management")
-		fmt.Println()
-		fmt.Println("Usage:")
-		fmt.Println("  printmaster-agent --service <command>")
-		fmt.Println()
-		fmt.Println("Commands:")
-		fmt.Println("  install    Install PrintMaster Agent as a system service")
-		fmt.Println("  uninstall  Remove the PrintMaster Agent service")
-		fmt.Println("  start      Start the PrintMaster Agent service")
-		fmt.Println("  stop       Stop the PrintMaster Agent service")
-		fmt.Println("  restart    Restart the PrintMaster Agent service")
-		fmt.Println("  status     Show service status and information")
-		fmt.Println("  update     Full reinstall cycle (stop, remove, install, start)")
-		fmt.Println("  run        Run as service (used by service manager)")
-		fmt.Println("  help       Show this help message")
-		fmt.Println()
-		fmt.Println("Service Details:")
-		fmt.Println("  Name:         PrintMasterAgent")
-		fmt.Println("  Display Name: PrintMaster Agent")
-		fmt.Println("  Description:  Printer and copier fleet management agent")
-		fmt.Println()
-		fmt.Println("Platform-Specific Paths:")
-		switch runtime.GOOS {
-		case "windows":
-			fmt.Println("  Data Directory: C:\\ProgramData\\PrintMaster\\")
-			fmt.Println("  Log Directory:  C:\\ProgramData\\PrintMaster\\logs\\")
-		case "darwin":
-			fmt.Println("  Data Directory: /Library/Application Support/PrintMaster/")
-			fmt.Println("  Log Directory:  /var/log/printmaster/")
-		default: // Linux
-			fmt.Println("  Data Directory: /var/lib/printmaster/")
-			fmt.Println("  Log Directory:  /var/log/printmaster/")
-			fmt.Println("  Config:         /etc/printmaster/")
-		}
-		fmt.Println()
-		fmt.Println("Examples:")
-		if runtime.GOOS == "windows" {
-			fmt.Println("  # Install and start (requires Administrator)")
-			fmt.Println("  .\\printmaster-agent.exe --service install")
-			fmt.Println("  .\\printmaster-agent.exe --service start")
-			fmt.Println()
-			fmt.Println("  # Update running service")
-			fmt.Println("  .\\printmaster-agent.exe --service update")
-			fmt.Println()
-			fmt.Println("  # Check service status")
-			fmt.Println("  Get-Service PrintMasterAgent")
-		} else {
-			fmt.Println("  # Install and start (requires root)")
-			fmt.Println("  sudo ./printmaster-agent --service install")
-			fmt.Println("  sudo systemctl start PrintMasterAgent")
-		}
-		fmt.Println()
-
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown service command: %s\n", cmd)
-		fmt.Println()
-		fmt.Println("Valid commands: install, uninstall, start, stop, restart, status, update, run, help")
-		fmt.Println("Run 'printmaster-agent --service help' for more information")
-		os.Exit(1)
-	}
-}
-
-// runAsService starts the agent under service manager control
-func runAsService() {
-	svcConfig := getServiceConfig()
-	prg := &program{}
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		os.Exit(1)
-	}
-
-	err = s.Run()
-	if err != nil {
-		os.Exit(1)
-	}
-}
-
-// runInteractive starts the agent in foreground mode (normal operation)
-func runInteractive(ctx context.Context, configFlag string) {
-	// Initialize SSE hub for real-time UI updates
-	sseHub = NewSSEHub()
-
-	// Initialize structured logger (DEBUG level for proxy diagnostics, 1000 entries in buffer)
-	// Determine log directory based on whether we're running as a service
-	var logDir string
-	if !service.Interactive() {
-		// Running as service - use platform-specific system directory
-		logPath := getServiceLogPath()
-		logDir = filepath.Dir(logPath)
-	} else {
-		logDir = "logs"
-	}
-	if override := os.Getenv("PRINTMASTER_LOG_DIR"); override != "" {
-		logDir = filepath.Join(override, "agent")
-	}
-
-	if err := os.MkdirAll(logDir, 0700); err == nil {
-		appLogger = logger.New(logger.DEBUG, logDir, 1000)
-		// Expose logger globally for scanner/vendor packages
-		logger.SetGlobal(appLogger)
-		appLogger.SetRotationPolicy(logger.RotationPolicy{
-			Enabled:    true,
-			MaxSizeMB:  10,
-			MaxAgeDays: 7,
-			MaxFiles:   5,
-		})
-		// Disable console output when running as service to avoid flooding syslog/journal.
-		// The agent already writes to its own rotated log files in logDir.
-		if !service.Interactive() {
-			appLogger.SetConsoleOutput(false)
-		}
-		// Set up SSE broadcasting for log entries
-		appLogger.SetOnLogCallback(func(entry logger.LogEntry) {
-			if sseHub != nil {
-				// Broadcast log entry via SSE
-				sseHub.Broadcast(SSEEvent{
-					Type: "log_entry",
-					Data: map[string]interface{}{
-						"timestamp": entry.Timestamp.Format(time.RFC3339),
-						"level":     logger.LevelToString(entry.Level),
-						"message":   entry.Message,
-						"context":   entry.Context,
-					},
-				})
-			}
-		})
-		defer appLogger.Close()
-	} else {
-		// Fallback: if log directory creation fails, use a logger with empty directory
-		appLogger = logger.New(logger.DEBUG, "", 1000)
-		logger.SetGlobal(appLogger)
-	}
-
-	if appLogger != nil {
-		appLogger.Info("Printer Fleet Agent starting",
-			"startup_scan", "disabled",
-			"version", Version,
-			"build_time", BuildTime,
-			"git_commit", GitCommit,
-			"build_type", BuildType)
-	}
-
-	// Provide the app logger to the agent package so internal logs are structured
-	agent.SetLogger(appLogger)
-
-	// Load TOML configuration
-	// Try to find config.toml in multiple locations
-	// Service mode: ProgramData/agent > ProgramData (legacy)
-	// Interactive mode: executable dir > current dir
-	var agentConfig *AgentConfig
-
-	isService := !service.Interactive()
-	var configPaths []string
-
-	if isService {
-		// Running as service - check ProgramData locations only
-		programData := os.Getenv("ProgramData")
-		if programData == "" {
-			programData = "C:\\ProgramData"
-		}
-		configPaths = []string{
-			filepath.Join(programData, "PrintMaster", "agent", "config.toml"),
-			filepath.Join(programData, "PrintMaster", "config.toml"), // Legacy location
-		}
-	} else {
-		// Running interactively - check local locations only
-		configPaths = []string{
-			filepath.Join(filepath.Dir(os.Args[0]), "config.toml"),
-			"config.toml",
-		}
-	}
-
-	// Resolve config path using shared helper which checks AGENT_CONFIG/AGENT_CONFIG_PATH,
-	// generic CONFIG/CONFIG_PATH, then the provided flag value.
-	configLoaded := false
-	resolved := config.ResolveConfigPath("AGENT", configFlag)
-	if resolved != "" {
-		if _, statErr := os.Stat(resolved); statErr == nil {
-			if cfg, err := LoadAgentConfig(resolved); err == nil {
-				agentConfig = cfg
-				appLogger.Info("Loaded configuration", "path", resolved)
-				configLoaded = true
-			} else {
-				appLogger.Warn("Config path set but failed to parse", "path", resolved, "error", err)
-			}
-		} else {
-			appLogger.Warn("Config path set but file not found", "path", resolved)
-		}
-	}
-
-	// If not loaded via env/flag, fall back to default search paths
-	for _, cfgPath := range configPaths {
-		if configLoaded {
-			break
-		}
-		if cfg, err := LoadAgentConfig(cfgPath); err == nil {
-			agentConfig = cfg
-			appLogger.Info("Loaded configuration", "path", cfgPath)
-			configLoaded = true
-			break
-		}
-	}
-
-	if !configLoaded {
-		appLogger.Warn("No config.toml found, using defaults")
-		agentConfig = DefaultAgentConfig()
-		ApplyEnvironmentOverrides(agentConfig) // Apply env overrides even when no config file
-	}
-	configEpsonRemoteModeEnabled = agentConfig != nil && agentConfig.EpsonRemoteModeEnabled
-	featureflags.SetEpsonRemoteMode(configEpsonRemoteModeEnabled)
-	// Always apply environment overrides for database path (supports AGENT_DB_PATH and DB_PATH)
-	// even when using default configuration (no config file present).
-	config.ApplyDatabaseEnvOverrides(&agentConfig.Database, "AGENT")
-	if agentConfig.Database.Path != "" {
-		// If env var points to a directory, append default filename (devices.db)
-		dbPath := agentConfig.Database.Path
-		if strings.HasSuffix(dbPath, string(os.PathSeparator)) || strings.HasSuffix(dbPath, "/") {
-			dbPath = filepath.Join(dbPath, "devices.db")
-		} else {
-			if fi, err := os.Stat(dbPath); err == nil && fi.IsDir() {
-				dbPath = filepath.Join(dbPath, "devices.db")
-			}
-		}
-
-		parent := filepath.Dir(dbPath)
-		if err := os.MkdirAll(parent, 0700); err != nil {
-			appLogger.Warn("Could not create DB parent directory, falling back", "parent", parent, "error", err)
-			agentConfig.Database.Path = ""
-		} else {
-			// Probe write access
-			f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE, 0600)
-			if err != nil {
-				appLogger.Warn("Cannot write to DB path, falling back", "path", dbPath, "error", err)
-				agentConfig.Database.Path = ""
-			} else {
-				if err := f.Close(); err != nil {
-					appLogger.Warn("Failed to close DB probe file", "path", dbPath, "error", err)
-				}
-				agentConfig.Database.Path = dbPath
-				appLogger.Info("Database path overridden by environment", "path", agentConfig.Database.Path)
-			}
-		}
-	}
-
-	// Apply logging level from config
-	if level := logger.LevelFromString(agentConfig.Logging.Level); level >= 0 {
-		appLogger.SetLevel(level)
-		appLogger.Info("Log level set from config", "level", agentConfig.Logging.Level)
-	}
-
-	// Initialize device storage
-	// Use config-specified path or detect proper data directory for service
-	var dbPath string
-	var err error
-	if agentConfig != nil && agentConfig.Database.Path != "" {
-		dbPath = agentConfig.Database.Path
-		appLogger.Info("Using configured database path", "path", dbPath)
-	} else {
-		// Detect if running as service and use appropriate directory
-		dataDir, dirErr := config.GetDataDirectory("agent", isService)
-		if dirErr != nil {
-			appLogger.Warn("Could not get data directory, using in-memory storage", "error", dirErr)
-			dbPath = ":memory:"
-		} else {
-			dbPath = filepath.Join(dataDir, "devices.db")
-			appLogger.Info("Using device database", "path", dbPath)
-		}
-	}
-
-	// Set logger for storage package
-	storage.SetLogger(appLogger)
-
-	// Initialize agent config storage first (needed for rotation tracking)
-	agentDBPath := filepath.Join(filepath.Dir(dbPath), "agent.db")
-	if dbPath == ":memory:" {
-		agentDBPath = ":memory:"
-	}
-	agentConfigStore, err = storage.NewAgentConfigStore(agentDBPath)
-	if err != nil {
-		appLogger.Error("Failed to initialize agent config storage", "error", err, "path", agentDBPath)
-		os.Exit(1)
-	}
-	defer agentConfigStore.Close()
-	appLogger.Info("Agent config database initialized", "path", agentDBPath)
-	settingsManager = NewSettingsManager(agentConfigStore)
-	applyServerConfigFromStore(agentConfig, agentConfigStore, appLogger)
-	// The agent config store may contain the URL, agent ID, and token produced
-	// by the device-auth onboarding flow. Build the auth manager only after
-	// merging that state so callback binding and server-mode login use the same
-	// identity as the upload worker.
-	agentAuth = newAgentAuthManager(agentConfig, agentSessions)
-
-	// Migration: consolidate legacy dev_settings / developer_settings / security_settings into unified "settings" key
-	// Also migrates from old Developer/Security structure to new SNMP/Features/Logging/Web structure.
-	// This is idempotent and creates a timestamped backup of legacy data before deleting it.
-	func() {
-		if agentConfigStore == nil {
-			return
-		}
-		var settings map[string]interface{}
-		_ = agentConfigStore.GetConfigValue("settings", &settings)
-		if settings == nil {
-			settings = map[string]interface{}{}
-		}
-
-		migrated := false
-		timestamp := time.Now().Format(time.RFC3339)
-
-		// Migrate legacy "developer" section to new structure
-		if devRaw, ok := settings["developer"].(map[string]interface{}); ok {
-			bkKey := "backup.developer." + timestamp
-			_ = agentConfigStore.SetConfigValue(bkKey, devRaw)
-
-			// Extract SNMP settings
-			snmp := map[string]interface{}{}
-			if v, ok := devRaw["snmp_community"]; ok {
-				snmp["community"] = v
-			}
-			if v, ok := devRaw["snmp_timeout_ms"]; ok {
-				snmp["timeout_ms"] = v
-			}
-			if v, ok := devRaw["snmp_retries"]; ok {
-				snmp["retries"] = v
-			}
-			if len(snmp) > 0 {
-				settings["snmp"] = snmp
-			}
-
-			// Extract Features settings
-			features := map[string]interface{}{}
-			if v, ok := devRaw["epson_remote_mode_enabled"]; ok {
-				features["epson_remote_mode_enabled"] = v
-			}
-			if v, ok := devRaw["asset_id_regex"]; ok {
-				features["asset_id_regex"] = v
-			}
-			if len(features) > 0 {
-				settings["features"] = features
-			}
-
-			// Extract Logging settings
-			logging := map[string]interface{}{}
-			if v, ok := devRaw["log_level"]; ok {
-				logging["level"] = v
-			}
-			if v, ok := devRaw["dump_parse_debug"]; ok {
-				logging["dump_parse_debug"] = v
-			}
-			if len(logging) > 0 {
-				settings["logging"] = logging
-			}
-
-			// Move discover_concurrency to discovery
-			if v, ok := devRaw["discover_concurrency"]; ok {
-				var disc map[string]interface{}
-				_ = agentConfigStore.GetConfigValue("discovery_settings", &disc)
-				if disc == nil {
-					disc = map[string]interface{}{}
-				}
-				disc["concurrency"] = v
-				_ = agentConfigStore.SetConfigValue("discovery_settings", disc)
-			}
-
-			delete(settings, "developer")
-			migrated = true
-			appLogger.Info("Migrated legacy developer settings to new structure", "backup_key", bkKey)
-		}
-
-		// Migrate legacy security_settings to web section
-		var security map[string]interface{}
-		if err := agentConfigStore.GetConfigValue("security_settings", &security); err == nil && security != nil {
-			bkKey := "backup.security_settings." + timestamp
-			_ = agentConfigStore.SetConfigValue(bkKey, security)
-
-			web := map[string]interface{}{}
-			if v, ok := security["enable_http"]; ok {
-				web["enable_http"] = v
-			}
-			if v, ok := security["enable_https"]; ok {
-				web["enable_https"] = v
-			}
-			if v, ok := security["http_port"]; ok {
-				web["http_port"] = v
-			}
-			if v, ok := security["https_port"]; ok {
-				web["https_port"] = v
-			}
-			if v, ok := security["redirect_http_to_https"]; ok {
-				web["redirect_http_to_https"] = v
-			}
-			if v, ok := security["custom_cert_path"]; ok {
-				web["custom_cert_path"] = v
-			}
-			if v, ok := security["custom_key_path"]; ok {
-				web["custom_key_path"] = v
-			}
-			if len(web) > 0 {
-				settings["web"] = web
-			}
-
-			// Move credentials_enabled to features
-			if v, ok := security["credentials_enabled"]; ok {
-				feat, _ := settings["features"].(map[string]interface{})
-				if feat == nil {
-					feat = map[string]interface{}{}
-				}
-				feat["credentials_enabled"] = v
-				settings["features"] = feat
-			}
-
-			_ = agentConfigStore.DeleteConfigValue("security_settings")
-			migrated = true
-			appLogger.Info("Migrated legacy security_settings to web/features", "backup_key", bkKey)
-		}
-
-		// Migrate legacy dev_settings if present
-		var legacy map[string]interface{}
-		if err := agentConfigStore.GetConfigValue("dev_settings", &legacy); err == nil && legacy != nil {
-			bkKey := "backup.dev_settings." + timestamp
-			_ = agentConfigStore.SetConfigValue(bkKey, legacy)
-			_ = agentConfigStore.DeleteConfigValue("dev_settings")
-			migrated = true
-			appLogger.Info("Cleaned up legacy dev_settings", "backup_key", bkKey)
-		}
-
-		// Migrate legacy developer_settings if present
-		if err := agentConfigStore.GetConfigValue("developer_settings", &legacy); err == nil && legacy != nil {
-			bkKey := "backup.developer_settings." + timestamp
-			_ = agentConfigStore.SetConfigValue(bkKey, legacy)
-			_ = agentConfigStore.DeleteConfigValue("developer_settings")
-			migrated = true
-			appLogger.Info("Cleaned up legacy developer_settings", "backup_key", bkKey)
-		}
-
-		if migrated {
-			_ = agentConfigStore.SetConfigValue("settings", settings)
-		}
-	}()
-
-	// Prime runtime settings so feature flags reflect stored values before services start.
-	loadUnifiedSettings(agentConfigStore)
-
-	// Clean up old database backups (keep 10 most recent)
-	if err := storage.CleanupOldBackups(dbPath, 10); err != nil {
-		appLogger.Warn("Failed to cleanup old database backups", "error", err)
-	}
-
-	// Initialize device storage with config store for rotation tracking
-	deviceStore, err = storage.NewSQLiteStoreWithConfig(dbPath, agentConfigStore)
-	if err != nil {
-		appLogger.Error("Failed to initialize device storage", "error", err, "path", dbPath)
-		os.Exit(1)
-	}
-	defer deviceStore.Close()
-
-	// Load and restore trace tags from config
-	var savedTraceTags map[string]bool
-	if err := agentConfigStore.GetConfigValue("trace_tags", &savedTraceTags); err == nil && len(savedTraceTags) > 0 {
-		appLogger.SetTraceTags(savedTraceTags)
-		appLogger.Info("Restored trace tags from config", "count", len(savedTraceTags))
-	}
-
-	// Secret key for encrypting local credentials
-	dataDir := filepath.Dir(dbPath)
-	broadcastServerStatus(agentConfig, dataDir, "initial", true)
-	startServerStatusMonitor(ctx, agentConfig, dataDir, 5*time.Second)
-	secretPath := filepath.Join(dataDir, "agent_secret.key")
-	secretKey, skErr := commonutil.LoadOrCreateKey(secretPath)
-	if skErr != nil {
-		appLogger.Warn("Could not prepare local secret key", "error", skErr, "path", secretPath)
-	} else {
-		appLogger.Debug("Secret key loaded", "path", secretPath)
-	}
-
-	// Helpers for WebUI credential storage
-	type credRecord struct {
-		Username  string `json:"username"`
-		Password  string `json:"password_enc"` // encrypted base64 (local) or plaintext (from server)
-		AuthType  string `json:"auth_type"`    // "basic" | "form"
-		AutoLogin bool   `json:"auto_login"`
-	}
-
-	// getCreds fetches device credentials. When connected to a server, credentials are
-	// fetched from the server (stateless agent model). When standalone, local storage is used.
-	getCreds := func(serial string) (*credRecord, error) {
-		// Try server first if connected (agents should be stateless when server-controlled)
-		uploadWorkerMu.RLock()
-		worker := uploadWorker
-		uploadWorkerMu.RUnlock()
-
-		if worker != nil {
-			if client := worker.Client(); client != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if serverCreds, err := client.GetDeviceCredentials(ctx, serial); err == nil {
-					appLogger.Debug("Got credentials from server", "serial", serial, "has_password", serverCreds.Password != "")
-					return &credRecord{
-						Username:  serverCreds.Username,
-						Password:  serverCreds.Password, // plaintext from server (already decrypted)
-						AuthType:  serverCreds.AuthType,
-						AutoLogin: serverCreds.AutoLogin,
-					}, nil
-				}
-				// Server fetch failed - fall through to local storage for standalone compatibility
-				appLogger.Debug("Server credentials fetch failed, trying local", "serial", serial)
-			}
-		}
-
-		// Fallback to local storage (standalone mode)
-		if agentConfigStore == nil {
-			return nil, fmt.Errorf("no config store")
-		}
-		var all map[string]credRecord
-		if err := agentConfigStore.GetConfigValue("webui_credentials", &all); err != nil {
-			all = map[string]credRecord{}
-		}
-		c, ok := all[serial]
-		if !ok {
-			return nil, fmt.Errorf("not found")
-		}
-		// Decrypt local password
-		if c.Password != "" && len(secretKey) == 32 {
-			if decrypted, err := commonutil.DecryptFromB64(secretKey, c.Password); err == nil {
-				c.Password = decrypted
-			}
-		}
-		return &c, nil
-	}
-
-	saveCreds := func(serial string, c credRecord) error {
-		if agentConfigStore == nil {
-			return fmt.Errorf("no config store")
-		}
-		var all map[string]credRecord
-		if err := agentConfigStore.GetConfigValue("webui_credentials", &all); err != nil || all == nil {
-			all = map[string]credRecord{}
-		}
-		all[serial] = c
-		return agentConfigStore.SetConfigValue("webui_credentials", all)
-	}
-
-	// Create storage adapter that implements agent.DeviceStorage interface
-	storageAdapter := &deviceStorageAdapter{store: deviceStore}
-	agent.SetDeviceStorage(storageAdapter)
-	appLogger.Info("Device storage connected", "mode", "auto_persist")
-	startIdentityRefreshForVersionChange(ctx, agentConfigStore, deviceStore, appLogger)
-
-	// Start garbage collection goroutine
-	retentionConfig := agent.GetRetentionConfig()
-	go runGarbageCollection(ctx, deviceStore, retentionConfig)
-
-	// Start metrics downsampler goroutine (runs every 6 hours)
-	go runMetricsDownsampler(ctx, deviceStore)
-
-	// Auto-discovery management (periodic scanning + optional live discovery methods)
-	// Controlled by discovery setting: auto_discover_enabled (bool) - master switch
-	// Individual live discovery methods can be enabled/disabled independently
-	var (
-		autoDiscoverMu       sync.Mutex
-		autoDiscoverCancel   context.CancelFunc
-		autoDiscoverRunning  bool
-		autoDiscoverInterval = 15 * time.Minute // Configurable via settings
-
-		liveMDNSMu      sync.Mutex
-		liveMDNSCancel  context.CancelFunc
-		liveMDNSRunning bool
-		liveMDNSSeen    = map[string]time.Time{}
-
-		liveWSDiscoveryMu      sync.Mutex
-		liveWSDiscoveryCancel  context.CancelFunc
-		liveWSDiscoveryRunning bool
-		liveWSDiscoverySeen    = map[string]time.Time{}
-
-		liveSSDPMu      sync.Mutex
-		liveSSDPCancel  context.CancelFunc
-		liveSSDPRunning bool
-		liveSSDPSeen    = map[string]time.Time{}
-
-		metricsRescanMu       sync.Mutex
-		metricsRescanCancel   context.CancelFunc
-		metricsRescanRunning  bool
-		metricsRescanInterval = 60 * time.Minute // Configurable via settings
-
-		snmpTrapMu      sync.Mutex
-		snmpTrapCancel  context.CancelFunc
-		snmpTrapRunning bool
-		snmpTrapSeen    = map[string]time.Time{}
-
-		llmnrMu      sync.Mutex
-		llmnrCancel  context.CancelFunc
-		llmnrRunning bool
-		llmnrSeen    = map[string]time.Time{}
-	)
-
-	// Periodic discovery worker
-	startAutoDiscover := func() {
-		autoDiscoverMu.Lock()
-		defer autoDiscoverMu.Unlock()
-		if autoDiscoverRunning {
-			return
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		autoDiscoverCancel = cancel
-		autoDiscoverRunning = true
-		appLogger.Info("Auto Discover: starting periodic scanner", "interval", autoDiscoverInterval.String())
-
-		go func() {
-			ticker := time.NewTicker(autoDiscoverInterval)
-			defer ticker.Stop()
-
-			// Run immediately on start
-			runPeriodicScan := func() {
-				appLogger.Debug("Auto Discover: running periodic scan")
-
-				// Load discovery settings
-				var discoverySettings = map[string]interface{}{
-					"subnet_scan":   true,
-					"manual_ranges": true,
-					"arp_enabled":   true,
-					"icmp_enabled":  true,
-					"tcp_enabled":   true,
-					"snmp_enabled":  true,
-					"mdns_enabled":  false,
-				}
-				if agentConfigStore != nil {
-					var stored map[string]interface{}
-					if err := agentConfigStore.GetConfigValue("discovery_settings", &stored); err == nil && stored != nil {
-						for k, v := range stored {
-							discoverySettings[k] = v
-						}
-					}
-				}
-
-				// Get saved ranges
-				var ranges []string
-				if agentConfigStore != nil {
-					savedRanges, _ := agentConfigStore.GetRangesList()
-					ranges = savedRanges
-				}
-
-				// Build DiscoveryConfig from settings
-				discoveryCfg := &agent.DiscoveryConfig{
-					ARPEnabled:  discoverySettings["arp_enabled"] == true,
-					ICMPEnabled: discoverySettings["icmp_enabled"] == true,
-					TCPEnabled:  discoverySettings["tcp_enabled"] == true,
-					SNMPEnabled: discoverySettings["snmp_enabled"] == true,
-					MDNSEnabled: discoverySettings["mdns_enabled"] == true,
-				}
-
-				// Use new scanner for periodic discovery (full mode)
-				_, err := Discover(ctx, ranges, "full", discoveryCfg, deviceStore, 50, 10)
-				if err != nil && ctx.Err() == nil {
-					appLogger.Error("Auto Discover scan error", "error", err, "ranges", len(ranges))
-				}
-			}
-			runPeriodicScan()
-
-			for {
-				select {
-				case <-ctx.Done():
-					autoDiscoverMu.Lock()
-					autoDiscoverRunning = false
-					autoDiscoverCancel = nil
-					autoDiscoverMu.Unlock()
-					appLogger.Info("Auto Discover: stopped")
-					return
-				case <-ticker.C:
-					runPeriodicScan()
-				}
-			}
-		}()
-	}
-
-	stopAutoDiscover := func() {
-		autoDiscoverMu.Lock()
-		defer autoDiscoverMu.Unlock()
-		if autoDiscoverCancel != nil {
-			appLogger.Info("Auto Discover: stopping periodic scanner")
-			autoDiscoverCancel()
-			autoDiscoverCancel = nil
-		}
-	}
-
-	// getSNMPTimeoutSeconds returns the configured SNMP timeout in seconds
-	getSNMPTimeoutSeconds := func() int {
-		scannerConfig.RLock()
-		defer scannerConfig.RUnlock()
-		timeoutSec := scannerConfig.SNMPTimeoutMs / 1000
-		if timeoutSec < 1 {
-			timeoutSec = 2 // Minimum 2 seconds
-		}
-		return timeoutSec
-	}
-
-	// handleLiveDiscovery processes a single IP from live discovery (mDNS, SSDP, WS-Discovery)
-	// Uses the new scanner to detect and store the device
-	handleLiveDiscovery := func(ip string, discoveryMethod string) {
-		ctx := context.Background()
-
-		// Check if we already know this IP from a saved device
-		// If so, do a quick refresh instead of full detection
-		if deviceStore != nil {
-			visibleTrue := true
-			devices, err := deviceStore.List(ctx, storage.DeviceFilter{
-				Visible: &visibleTrue,
-			})
-			if err == nil {
-				for _, device := range devices {
-					if device.IP == ip {
-						// Known device - liveness confirmed, do quick refresh
-						appLogger.Debug(discoveryMethod+": known device liveness confirmed, refreshing",
-							"ip", ip, "serial", device.Serial)
-
-						// Perform quick SNMP query to get updated metrics
-						pi, err := LiveDiscoveryDetect(ctx, ip, getSNMPTimeoutSeconds())
-						if err != nil {
-							appLogger.Debug(discoveryMethod+": refresh failed, updating last_seen only",
-								"ip", ip, "serial", device.Serial, "error", err)
-							// Just update last seen time even if SNMP fails
-							device.LastSeen = time.Now()
-							deviceStore.Update(ctx, device)
-							return
-						}
-
-						// Update device with fresh data
-						device.LastSeen = time.Now()
-						if pi.Serial != "" && pi.Serial == device.Serial {
-							// Serials match, update other fields if not locked
-							if device.LockedFields == nil {
-								device.LockedFields = []storage.FieldLock{}
-							}
-							isLocked := func(field string) bool {
-								for _, lf := range device.LockedFields {
-									if strings.EqualFold(lf.Field, field) {
-										return true
-									}
-								}
-								return false
-							}
-
-							if !isLocked("manufacturer") && pi.Manufacturer != "" {
-								device.Manufacturer = pi.Manufacturer
-							}
-							if !isLocked("model") && pi.Model != "" {
-								device.Model = pi.Model
-							}
-							if !isLocked("hostname") && pi.Hostname != "" {
-								device.Hostname = pi.Hostname
-							}
-
-							deviceStore.Update(ctx, device)
-
-							// Broadcast SSE update
-							sseHub.Broadcast(SSEEvent{
-								Type: "device_updated",
-								Data: map[string]interface{}{
-									"serial":       device.Serial,
-									"ip":           ip,
-									"manufacturer": device.Manufacturer,
-									"model":        device.Model,
-									"last_seen":    device.LastSeen.Format(time.RFC3339),
-									"method":       discoveryMethod,
-								},
-							})
-						}
-						return
-					}
-				}
-			}
-		}
-
-		// Not a known device - do full detection
-		// Use new scanner for live discovery detection
-		pi, err := LiveDiscoveryDetect(ctx, ip, getSNMPTimeoutSeconds())
-		if err != nil {
-			appLogger.WarnRateLimited(discoveryMethod+"_detect_"+ip, 5*time.Minute,
-				discoveryMethod+" detection failed", "ip", ip, "error", err)
-			// Don't store device without serial - it will just create errors
-			return
-		}
-
-		// If lightweight query didn't get a serial, try a full deep scan
-		// We already have proof of life from live discovery, so it's worth the extra query
-		if pi.Serial == "" {
-			appLogger.Debug(discoveryMethod+": no serial from quick scan, trying deep scan",
-				"ip", ip, "manufacturer", pi.Manufacturer, "model", pi.Model)
-
-			deepPi, deepErr := LiveDiscoveryDeepScan(ctx, ip, 30)
-			if deepErr != nil {
-				appLogger.Debug(discoveryMethod+": deep scan failed",
-					"ip", ip, "error", deepErr)
-				return
-			}
-
-			// Use deep scan result if it has a serial
-			if deepPi != nil && deepPi.Serial != "" {
-				pi = deepPi
-				appLogger.Info(discoveryMethod+": deep scan found device",
-					"ip", ip, "serial", pi.Serial, "manufacturer", pi.Manufacturer, "model", pi.Model)
-			} else {
-				appLogger.Debug(discoveryMethod+": deep scan completed but no serial found",
-					"ip", ip)
-				return
-			}
-		}
-
-		// Add discovery method
-		pi.DiscoveryMethods = append(pi.DiscoveryMethods, discoveryMethod)
-
-		// Check if this is a known device
-		if pi.Serial != "" {
-			existing, err := deviceStore.Get(ctx, pi.Serial)
-			if err == nil && existing != nil {
-				// Known device - broadcast SSE update immediately
-				existing.LastSeen = time.Now()
-				existing.IP = ip
-				if updateErr := deviceStore.Update(ctx, existing); updateErr == nil {
-					sseHub.Broadcast(SSEEvent{
-						Type: "device_updated",
-						Data: map[string]interface{}{
-							"serial":       pi.Serial,
-							"ip":           ip,
-							"manufacturer": pi.Manufacturer,
-							"model":        pi.Model,
-							"last_seen":    existing.LastSeen.Format(time.RFC3339),
-							"method":       discoveryMethod,
-						},
-					})
-					appLogger.Debug(discoveryMethod+": known device updated",
-						"ip", ip, "serial", pi.Serial)
-				}
-			} else {
-				// New device - broadcast discovery event
-				sseHub.Broadcast(SSEEvent{
-					Type: "device_discovered",
-					Data: map[string]interface{}{
-						"ip":           ip,
-						"serial":       pi.Serial,
-						"manufacturer": pi.Manufacturer,
-						"model":        pi.Model,
-						"method":       discoveryMethod,
-					},
-				})
-				appLogger.Debug(discoveryMethod+": new device discovered",
-					"ip", ip, "serial", pi.Serial)
-			}
-		}
-
-		// Store/update the device
-		agent.UpsertDiscoveredPrinter(*pi)
-	}
-
-	// Live mDNS discovery worker (only works when auto discover is enabled)
-	startLiveMDNS := func() {
-		liveMDNSMu.Lock()
-		defer liveMDNSMu.Unlock()
-		if liveMDNSRunning {
-			return
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		liveMDNSCancel = cancel
-		liveMDNSRunning = true
-		appLogger.Info("Live mDNS discovery: starting background browser")
-
-		go func() {
-			h := func(ip string) bool {
-				ip = strings.TrimSpace(ip)
-				if ip == "" {
-					return false
-				}
-				liveMDNSMu.Lock()
-				last, ok := liveMDNSSeen[ip]
-				if ok && time.Since(last) < 10*time.Minute {
-					liveMDNSMu.Unlock()
-					return false
-				}
-				liveMDNSSeen[ip] = time.Now()
-				liveMDNSMu.Unlock()
-				agent.AppendScanEvent("LIVE MDNS: discovered " + ip)
-
-				// Call LiveDiscoveryDetect directly
-				go handleLiveDiscovery(ip, "mdns")
-				return true
-			}
-			agent.StartMDNSBrowser(ctx, h)
-			liveMDNSMu.Lock()
-			liveMDNSRunning = false
-			liveMDNSCancel = nil
-			liveMDNSMu.Unlock()
-			appLogger.Info("Live mDNS discovery: stopped")
-		}()
-	}
-
-	stopLiveMDNS := func() {
-		liveMDNSMu.Lock()
-		defer liveMDNSMu.Unlock()
-		if liveMDNSCancel != nil {
-			appLogger.Info("Live mDNS discovery: stopping background browser")
-			liveMDNSCancel()
-			liveMDNSCancel = nil
-		}
-	}
-
-	// Live WS-Discovery worker (Windows network printer discovery)
-	startLiveWSDiscovery := func() {
-		liveWSDiscoveryMu.Lock()
-		defer liveWSDiscoveryMu.Unlock()
-		if liveWSDiscoveryRunning {
-			return
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		liveWSDiscoveryCancel = cancel
-		liveWSDiscoveryRunning = true
-		appLogger.Info("Live WS-Discovery: starting background listener")
-
-		go func() {
-			h := func(ip string) bool {
-				ip = strings.TrimSpace(ip)
-				if ip == "" {
-					return false
-				}
-				liveWSDiscoveryMu.Lock()
-				last, ok := liveWSDiscoverySeen[ip]
-				if ok && time.Since(last) < 10*time.Minute {
-					liveWSDiscoveryMu.Unlock()
-					return false
-				}
-				liveWSDiscoverySeen[ip] = time.Now()
-				liveWSDiscoveryMu.Unlock()
-				agent.AppendScanEvent("LIVE WS-DISCOVERY: discovered " + ip)
-
-				// Call LiveDiscoveryDetect directly
-				go handleLiveDiscovery(ip, "wsdiscovery")
-				return true
-			}
-			agent.StartWSDiscoveryBrowser(ctx, h)
-			liveWSDiscoveryMu.Lock()
-			liveWSDiscoveryRunning = false
-			liveWSDiscoveryCancel = nil
-			liveWSDiscoveryMu.Unlock()
-			appLogger.Info("Live WS-Discovery: stopped")
-		}()
-	}
-
-	stopLiveWSDiscovery := func() {
-		liveWSDiscoveryMu.Lock()
-		defer liveWSDiscoveryMu.Unlock()
-		if liveWSDiscoveryCancel != nil {
-			appLogger.Info("Live WS-Discovery: stopping background listener")
-			liveWSDiscoveryCancel()
-			liveWSDiscoveryCancel = nil
-		}
-	}
-
-	// Live SSDP/UPnP discovery worker
-	startLiveSSDP := func() {
-		liveSSDPMu.Lock()
-		defer liveSSDPMu.Unlock()
-		if liveSSDPRunning {
-			return
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		liveSSDPCancel = cancel
-		liveSSDPRunning = true
-		appLogger.Info("Live SSDP: starting background listener")
-
-		go func() {
-			h := func(ip string) bool {
-				ip = strings.TrimSpace(ip)
-				if ip == "" {
-					return false
-				}
-				liveSSDPMu.Lock()
-				last, ok := liveSSDPSeen[ip]
-				if ok && time.Since(last) < 10*time.Minute {
-					liveSSDPMu.Unlock()
-					return false
-				}
-				liveSSDPSeen[ip] = time.Now()
-				liveSSDPMu.Unlock()
-				agent.AppendScanEvent("LIVE SSDP: discovered " + ip)
-
-				// Call LiveDiscoveryDetect directly
-				go handleLiveDiscovery(ip, "ssdp")
-				return true
-			}
-			agent.StartSSDPBrowser(ctx, h)
-			liveSSDPMu.Lock()
-			liveSSDPRunning = false
-			liveSSDPCancel = nil
-			liveSSDPMu.Unlock()
-			appLogger.Info("Live SSDP: stopped")
-		}()
-	}
-
-	stopLiveSSDP := func() {
-		liveSSDPMu.Lock()
-		defer liveSSDPMu.Unlock()
-		if liveSSDPCancel != nil {
-			appLogger.Info("Live SSDP: stopping background listener")
-			liveSSDPCancel()
-			liveSSDPCancel = nil
-		}
-	}
-
-	// SNMP Trap Listener: Event-driven discovery via trap notifications
-	startSNMPTrap := func() {
-		snmpTrapMu.Lock()
-		defer snmpTrapMu.Unlock()
-
-		if snmpTrapRunning {
-			appLogger.Debug("SNMP Trap listener already running")
-			return
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		snmpTrapCancel = cancel
-		snmpTrapRunning = true
-
-		appLogger.Info("SNMP Trap: starting listener", "port", 162, "requires_admin", true)
-
-		go func() {
-			h := func(ip string) bool {
-				// Async SNMP enrichment + metrics collection
-				go func(ip string) {
-					// Use new scanner for trap handling
-					ctx := context.Background()
-					pi, err := LiveDiscoveryDetect(ctx, ip, getSNMPTimeoutSeconds())
-					if err != nil {
-						appLogger.WarnRateLimited("trap_enrich_"+ip, 5*time.Minute, "SNMP Trap: enrichment failed", "ip", ip, "error", err)
-						return
-					}
-
-					serial := pi.Serial
-					if serial == "" {
-						appLogger.Debug("SNMP Trap: no serial found for device", "ip", ip)
-						return
-					}
-
-					// Check if device exists in DB
-					existing, err := deviceStore.Get(ctx, serial)
-					if err == nil && existing != nil {
-						// Known device - update LastSeen
-						existing.LastSeen = time.Now()
-						existing.IP = ip
-						if updateErr := deviceStore.Update(ctx, existing); updateErr == nil {
-							appLogger.Debug("SNMP Trap: known device updated", "ip", ip, "serial", serial)
-						}
-					} else {
-						// New device
-						appLogger.Debug("SNMP Trap: new device discovered", "ip", ip, "serial", serial)
-					}
-
-					// Store/update the device
-					agent.UpsertDiscoveredPrinter(*pi)
-					appLogger.Info("SNMP Trap: discovered device", "ip", ip, "serial", serial)
-
-					// If metrics monitoring is enabled and device is saved, collect metrics immediately
-					metricsRescanMu.Lock()
-					metricsEnabled := metricsRescanRunning
-					metricsRescanMu.Unlock()
-
-					if metricsEnabled && deviceStore != nil && serial != "" {
-						// Check if device is saved
-						ctx := context.Background()
-						device, err := deviceStore.Get(ctx, serial)
-						if err == nil && device != nil && device.IsSaved {
-							// Extract learned OIDs from device for efficient metrics collection
-							pi := storage.DeviceToPrinterInfo(device)
-							learnedOIDs := &pi.LearnedOIDs
-
-							// Collect metrics for this device using learned OIDs if available
-							agentSnapshot, err := CollectMetricsWithOIDs(ctx, ip, serial, device.Manufacturer, 10, learnedOIDs)
-							if err != nil {
-								appLogger.WarnRateLimited("trap_metrics_"+serial, 5*time.Minute, "SNMP Trap: metrics collection failed", "serial", serial, "error", err)
-							} else {
-								// Convert to storage format
-								storageSnapshot := &storage.MetricsSnapshot{}
-								storageSnapshot.Serial = agentSnapshot.Serial
-								storageSnapshot.Timestamp = time.Now()
-								storageSnapshot.PageCount = agentSnapshot.PageCount
-								storageSnapshot.ColorPages = agentSnapshot.ColorPages
-								storageSnapshot.MonoPages = agentSnapshot.MonoPages
-								storageSnapshot.ScanCount = agentSnapshot.ScanCount
-								storageSnapshot.TonerLevels = agentSnapshot.TonerLevels
-								storageSnapshot.FaxPages = agentSnapshot.FaxPages
-								storageSnapshot.CopyPages = agentSnapshot.CopyPages
-								storageSnapshot.OtherPages = agentSnapshot.OtherPages
-								storageSnapshot.CopyMonoPages = agentSnapshot.CopyMonoPages
-								storageSnapshot.CopyFlatbedScans = agentSnapshot.CopyFlatbedScans
-								storageSnapshot.CopyADFScans = agentSnapshot.CopyADFScans
-								storageSnapshot.FaxFlatbedScans = agentSnapshot.FaxFlatbedScans
-								storageSnapshot.FaxADFScans = agentSnapshot.FaxADFScans
-								storageSnapshot.ScanToHostFlatbed = agentSnapshot.ScanToHostFlatbed
-								storageSnapshot.ScanToHostADF = agentSnapshot.ScanToHostADF
-								storageSnapshot.DuplexSheets = agentSnapshot.DuplexSheets
-								storageSnapshot.JamEvents = agentSnapshot.JamEvents
-								storageSnapshot.ScannerJamEvents = agentSnapshot.ScannerJamEvents
-
-								// Save to database (error already logged in storage layer)
-								if err := deviceStore.SaveMetricsSnapshot(ctx, storageSnapshot); err == nil {
-									appLogger.Debug("SNMP Trap: collected metrics", "serial", serial)
-								}
-							}
-						}
-					}
-				}(ip)
-				return true
-			} // Call browser with 10-minute throttle window
-			agent.StartSNMPTrapBrowser(ctx, h, snmpTrapSeen, 10*time.Minute)
-
-			snmpTrapMu.Lock()
-			snmpTrapRunning = false
-			snmpTrapCancel = nil
-			snmpTrapMu.Unlock()
-			appLogger.Info("SNMP Trap: stopped")
-		}()
-	}
-
-	stopSNMPTrap := func() {
-		snmpTrapMu.Lock()
-		defer snmpTrapMu.Unlock()
-		if snmpTrapCancel != nil {
-			appLogger.Info("SNMP Trap: stopping listener")
-			snmpTrapCancel()
-			snmpTrapCancel = nil
-		}
-	}
-
-	// LLMNR: Windows hostname resolution for printer discovery
-	startLLMNR := func() {
-		llmnrMu.Lock()
-		defer llmnrMu.Unlock()
-
-		if llmnrRunning {
-			appLogger.Debug("LLMNR listener already running")
-			return
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		llmnrCancel = cancel
-		llmnrRunning = true
-
-		appLogger.Info("LLMNR: starting listener")
-
-		go func() {
-			h := func(job scanner.ScanJob) bool {
-				ip := job.IP
-				hostname := ""
-				if job.Meta != nil {
-					if meta, ok := job.Meta.(map[string]interface{}); ok {
-						if hn, ok := meta["hostname"].(string); ok {
-							hostname = hn
-						}
-					}
-				}
-
-				// Async SNMP enrichment
-				go func(ip, hostname string) {
-					ctx := context.Background()
-					pi, err := LiveDiscoveryDetect(ctx, ip, getSNMPTimeoutSeconds())
-					if err != nil {
-						appLogger.WarnRateLimited("llmnr_enrich_"+ip, 5*time.Minute, "LLMNR: enrichment failed", "ip", ip, "hostname", hostname, "error", err)
-					} else {
-						agent.UpsertDiscoveredPrinter(*pi)
-						appLogger.Info("LLMNR: discovered device", "ip", ip, "hostname", hostname, "serial", pi.Serial)
-					}
-				}(ip, hostname)
-				return true
-			}
-
-			// Call browser with 10-minute throttle window
-			agent.StartLLMNRBrowser(ctx, h, llmnrSeen, 10*time.Minute)
-
-			llmnrMu.Lock()
-			llmnrRunning = false
-			llmnrCancel = nil
-			llmnrMu.Unlock()
-			appLogger.Info("LLMNR: stopped")
-		}()
-	}
-
-	stopLLMNR := func() {
-		llmnrMu.Lock()
-		defer llmnrMu.Unlock()
-		if llmnrCancel != nil {
-			appLogger.Info("LLMNR: stopping listener")
-			llmnrCancel()
-			llmnrCancel = nil
-		}
-	}
-
-	// Declare collectMetricsForSavedDevices first so it can be used in startMetricsRescan
-	var collectMetricsForSavedDevices func()
-
-	// Metrics Rescan: Periodically collect metrics from saved devices
-	// intervalMinutes: legacy minutes-based interval (min 1, max 1440)
-	// intervalSeconds: sub-minute interval (min 15, max 300) - takes precedence if > 0
-	startMetricsRescan := func(intervalMinutes, intervalSeconds int) {
-		metricsRescanMu.Lock()
-		defer metricsRescanMu.Unlock()
-
-		if metricsRescanRunning {
-			appLogger.Debug("Metrics rescan already running")
-			return
-		}
-
-		var interval time.Duration
-		if intervalSeconds > 0 {
-			// Use seconds-based interval for sub-minute precision
-			if intervalSeconds < 15 {
-				intervalSeconds = 15 // minimum 15 seconds
-			}
-			if intervalSeconds > 300 {
-				intervalSeconds = 300 // maximum 5 minutes for seconds mode
-			}
-			interval = time.Duration(intervalSeconds) * time.Second
-			appLogger.Info("Metrics rescan: starting with sub-minute interval", "interval_seconds", intervalSeconds)
-		} else {
-			// Use minutes-based interval
-			if intervalMinutes < 1 {
-				intervalMinutes = 1 // minimum 1 minute
-			}
-			if intervalMinutes > 1440 {
-				intervalMinutes = 1440 // maximum 24 hours
-			}
-			interval = time.Duration(intervalMinutes) * time.Minute
-			appLogger.Info("Metrics rescan: starting", "interval_minutes", intervalMinutes)
-		}
-
-		metricsRescanInterval = interval
-		ctx, cancel := context.WithCancel(context.Background())
-		metricsRescanCancel = cancel
-		metricsRescanRunning = true
-
-		appLogger.Info("Metrics rescan: starting", "interval_minutes", intervalMinutes)
-
-		go func() {
-			defer func() {
-				metricsRescanMu.Lock()
-				metricsRescanRunning = false
-				metricsRescanCancel = nil
-				metricsRescanMu.Unlock()
-			}()
-
-			// Run immediately on start
-			collectMetricsForSavedDevices()
-
-			ticker := time.NewTicker(metricsRescanInterval)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					appLogger.Info("Metrics rescan: stopped")
-					return
-				case <-ticker.C:
-					collectMetricsForSavedDevices()
-				}
-			}
-		}()
-	}
-
-	stopMetricsRescan := func() {
-		metricsRescanMu.Lock()
-		defer metricsRescanMu.Unlock()
-		if metricsRescanCancel != nil {
-			appLogger.Info("Metrics rescan: stopping")
-			metricsRescanCancel()
-			metricsRescanCancel = nil
-		}
-	}
-
-	// Define the collection function
-	// Collect metrics from ALL devices (saved + discovered) for tiered storage
-	collectMetricsForSavedDevices = func() {
-		appLogger.Debug("Metrics rescan: collecting snapshots from all devices")
-		ctx := context.Background()
-
-		// Get all devices (no IsSaved filter - collect from discovered devices too)
-		devices, err := deviceStore.List(ctx, storage.DeviceFilter{})
-		if err != nil {
-			appLogger.Error("Metrics rescan: failed to list devices", "error", err)
-			return
-		}
-
-		count := 0
-		for _, device := range devices {
-			// Extract learned OIDs from device for efficient metrics collection
-			pi := storage.DeviceToPrinterInfo(device)
-			learnedOIDs := &pi.LearnedOIDs
-
-			// Collect metrics snapshot using learned OIDs if available
-			agentSnapshot, err := CollectMetricsWithOIDs(ctx, device.IP, device.Serial, device.Manufacturer, 10, learnedOIDs)
-			if err != nil {
-				appLogger.WarnRateLimited("metrics_collect_"+device.Serial, 5*time.Minute, "Metrics rescan: collection failed", "serial", device.Serial, "ip", device.IP, "error", err)
-				continue
-			}
-
-			// Convert to storage type
-			storageSnapshot := &storage.MetricsSnapshot{}
-			storageSnapshot.Serial = agentSnapshot.Serial
-			storageSnapshot.PageCount = agentSnapshot.PageCount
-			storageSnapshot.ColorPages = agentSnapshot.ColorPages
-			storageSnapshot.MonoPages = agentSnapshot.MonoPages
-			storageSnapshot.ScanCount = agentSnapshot.ScanCount
-			storageSnapshot.TonerLevels = agentSnapshot.TonerLevels
-			storageSnapshot.FaxPages = agentSnapshot.FaxPages
-			storageSnapshot.CopyPages = agentSnapshot.CopyPages
-			storageSnapshot.OtherPages = agentSnapshot.OtherPages
-			storageSnapshot.CopyMonoPages = agentSnapshot.CopyMonoPages
-			storageSnapshot.CopyFlatbedScans = agentSnapshot.CopyFlatbedScans
-			storageSnapshot.CopyADFScans = agentSnapshot.CopyADFScans
-			storageSnapshot.FaxFlatbedScans = agentSnapshot.FaxFlatbedScans
-			storageSnapshot.FaxADFScans = agentSnapshot.FaxADFScans
-			storageSnapshot.ScanToHostFlatbed = agentSnapshot.ScanToHostFlatbed
-			storageSnapshot.ScanToHostADF = agentSnapshot.ScanToHostADF
-			storageSnapshot.DuplexSheets = agentSnapshot.DuplexSheets
-			storageSnapshot.JamEvents = agentSnapshot.JamEvents
-			storageSnapshot.ScannerJamEvents = agentSnapshot.ScannerJamEvents
-
-			// Save to database (error already logged in storage layer)
-			if err := deviceStore.SaveMetricsSnapshot(ctx, storageSnapshot); err != nil {
-				continue
-			}
-
-			count++
-		}
-
-		appLogger.Info("Metrics rescan: completed", "device_count", count)
-	}
-
-	// Helpers to apply runtime effects for settings (closures to access local start/stop functions)
-	applyDiscoveryEffects := func(req map[string]interface{}) {
-		if req == nil {
-			return
-		}
-		autoDiscoverEnabled := false
-		if v, ok := req["auto_discover_enabled"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				autoDiscoverEnabled = vb
-				if vb {
-					startAutoDiscover()
-					appLogger.Info("Auto Discover enabled via settings")
-				} else {
-					stopAutoDiscover()
-					stopLiveMDNS()
-					stopLiveWSDiscovery()
-					stopLiveSSDP()
-					stopSNMPTrap()
-					stopLLMNR()
-					appLogger.Info("Auto Discover disabled via settings")
-				}
-			}
-		}
-
-		// Master IP scanning toggle (controls subnet/manual IP scanning)
-		if v, ok := req["ip_scanning_enabled"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if !vb {
-					// Stop any periodic per-IP scanning
-					stopAutoDiscover()
-					appLogger.Info("IP scanning disabled via settings: periodic and manual per-IP scans will be blocked")
-				} else {
-					// If enabling, only start auto-discover if auto_discover_enabled is true in the provided map
-					if ad, ok := req["auto_discover_enabled"]; ok {
-						if adb, ok2 := ad.(bool); ok2 && adb {
-							startAutoDiscover()
-							appLogger.Info("IP scanning enabled via settings: starting periodic scans")
-						}
-					} else {
-						// No auto_discover change provided; do not automatically start periodic scans here
-						appLogger.Info("IP scanning enabled via settings")
-					}
-				}
-			}
-		}
-		if v, ok := req["auto_discover_live_mdns"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if vb && autoDiscoverEnabled {
-					startLiveMDNS()
-					appLogger.Info("Live mDNS discovery enabled via settings")
-				} else {
-					stopLiveMDNS()
-					appLogger.Info("Live mDNS discovery disabled via settings")
-				}
-			}
-		}
-		if v, ok := req["auto_discover_live_wsd"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if vb && autoDiscoverEnabled {
-					startLiveWSDiscovery()
-					appLogger.Info("Live WS-Discovery enabled via settings")
-				} else {
-					stopLiveWSDiscovery()
-					appLogger.Info("Live WS-Discovery disabled via settings")
-				}
-			}
-		}
-		if v, ok := req["auto_discover_live_ssdp"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if vb && autoDiscoverEnabled {
-					startLiveSSDP()
-					appLogger.Info("Live SSDP discovery enabled via settings")
-				} else {
-					stopLiveSSDP()
-					appLogger.Info("Live SSDP discovery disabled via settings")
-				}
-			}
-		}
-		if v, ok := req["auto_discover_live_snmptrap"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if vb && autoDiscoverEnabled {
-					startSNMPTrap()
-					appLogger.Info("SNMP Trap listener enabled via settings")
-				} else {
-					stopSNMPTrap()
-					appLogger.Info("SNMP Trap listener disabled via settings")
-				}
-			}
-		}
-		if v, ok := req["auto_discover_live_llmnr"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if vb && autoDiscoverEnabled {
-					startLLMNR()
-					appLogger.Info("LLMNR listener enabled via settings")
-				} else {
-					stopLLMNR()
-					appLogger.Info("LLMNR listener disabled via settings")
-				}
-			}
-		}
-		if v, ok := req["metrics_rescan_enabled"]; ok {
-			if vb, ok2 := v.(bool); ok2 {
-				if vb {
-					intervalMinutes := 60
-					intervalSeconds := 0
-					if iv, ok := req["metrics_rescan_interval_minutes"]; ok {
-						if ivf, ok2 := iv.(float64); ok2 {
-							intervalMinutes = int(ivf)
-						}
-					}
-					if iv, ok := req["metrics_rescan_interval_seconds"]; ok {
-						if ivf, ok2 := iv.(float64); ok2 {
-							intervalSeconds = int(ivf)
-						}
-					}
-					startMetricsRescan(intervalMinutes, intervalSeconds)
-					if intervalSeconds > 0 {
-						appLogger.Info("Metrics monitoring enabled", "interval_seconds", intervalSeconds)
-					} else {
-						appLogger.Info("Metrics monitoring enabled", "interval_minutes", intervalMinutes)
-					}
-				} else {
-					stopMetricsRescan()
-					appLogger.Info("Metrics monitoring disabled")
-				}
-			}
-		}
-	}
-	applyDiscoveryEffectsFunc = applyDiscoveryEffects
-	if settingsManager != nil && settingsManager.HasManagedSnapshot() {
-		cfg := loadUnifiedSettings(agentConfigStore)
-		applyEffectiveSettingsSnapshot(cfg)
-	}
-
-	// Load saved ranges from database
-	rangesText, err := agentConfigStore.GetRanges()
-	if err != nil {
-		appLogger.Error("Failed to load ranges from database", "error", err.Error())
-	} else if rangesText != "" {
-		appLogger.Info("Loaded saved ranges (preview)")
-		// show a short preview
-		lines := strings.Split(rangesText, "\n")
-		previewLines := len(lines)
-		if previewLines > 5 {
-			previewLines = 5
-		}
-		for i := 0; i < previewLines; i++ {
-			appLogger.Debug("Range preview", "line", strings.TrimSpace(lines[i]))
-		}
-		// Validate the ranges
-		res, err := agent.ParseRangeText(rangesText, 4096)
-		if err != nil {
-			appLogger.Error("Failed to parse saved ranges", "error", err.Error())
-		} else if len(res.Errors) > 0 {
-			for _, pe := range res.Errors {
-				appLogger.Warn("Saved range parse error", "line", pe.Line, "error", pe.Msg)
-			}
-		} else {
-			appLogger.Info("Validated saved addresses", "count", len(res.IPs))
-		}
-	}
-
-	// Apply configuration from TOML
-	if agentConfig != nil {
-		// Apply asset ID regex from config
-		if agentConfig.AssetIDRegex != "" {
-			agent.SetAssetIDRegex(agentConfig.AssetIDRegex)
-			appLogger.Info("AssetIDRegex configured from TOML", "pattern", agentConfig.AssetIDRegex)
-		} else {
-			// reasonable default: five digit numeric asset tags
-			agent.SetAssetIDRegex(`\b\d{5}\b`)
-			appLogger.Info("Using default AssetIDRegex", "pattern", "five-digit")
-		}
-
-		// Apply SNMP settings to environment for sub-packages
-		if agentConfig.SNMP.Version != "" {
-			_ = os.Setenv("SNMP_VERSION", agentConfig.SNMP.Version)
-		}
-		if agentConfig.SNMP.Community != "" {
-			_ = os.Setenv("SNMP_COMMUNITY", agentConfig.SNMP.Community)
-		}
-		if agentConfig.SNMP.TrapCommunity != "" {
-			_ = os.Setenv("SNMP_TRAP_COMMUNITY", agentConfig.SNMP.TrapCommunity)
-		}
-		// SNMPv3 settings
-		if agentConfig.SNMP.SecurityLevel != "" {
-			_ = os.Setenv("SNMP_SECURITY_LEVEL", agentConfig.SNMP.SecurityLevel)
-		}
-		if agentConfig.SNMP.Username != "" {
-			_ = os.Setenv("SNMP_USERNAME", agentConfig.SNMP.Username)
-		}
-		if agentConfig.SNMP.AuthProtocol != "" {
-			_ = os.Setenv("SNMP_AUTH_PROTOCOL", agentConfig.SNMP.AuthProtocol)
-		}
-		if agentConfig.SNMP.AuthPassword != "" {
-			_ = os.Setenv("SNMP_AUTH_PASSWORD", agentConfig.SNMP.AuthPassword)
-		}
-		if agentConfig.SNMP.PrivProtocol != "" {
-			_ = os.Setenv("SNMP_PRIV_PROTOCOL", agentConfig.SNMP.PrivProtocol)
-		}
-		if agentConfig.SNMP.PrivPassword != "" {
-			_ = os.Setenv("SNMP_PRIV_PASSWORD", agentConfig.SNMP.PrivPassword)
-		}
-		if agentConfig.SNMP.ContextName != "" {
-			_ = os.Setenv("SNMP_CONTEXT_NAME", agentConfig.SNMP.ContextName)
-		}
-		appLogger.Info("SNMP configured from TOML",
-			"version", agentConfig.SNMP.Version,
-			"has_community", agentConfig.SNMP.Community != "",
-			"has_v3_user", agentConfig.SNMP.Username != "")
-
-		// Apply SNMP timeout and retries settings
-		scannerConfig.Lock()
-		scannerConfig.SNMPTimeoutMs = agentConfig.SNMP.TimeoutMs
-		scannerConfig.SNMPRetries = agentConfig.SNMP.Retries
-		scannerConfig.DiscoverConcurrency = agentConfig.Concurrency
-		appLogger.Info("Scanner config applied from TOML",
-			"timeout_ms", scannerConfig.SNMPTimeoutMs,
-			"retries", scannerConfig.SNMPRetries,
-			"concurrency", scannerConfig.DiscoverConcurrency)
-		scannerConfig.Unlock()
-	}
-
-	// Load server configuration from TOML and start upload worker
-	if agentConfig != nil && agentConfig.Server.Enabled {
-		dataDir, err := config.GetDataDirectory("agent", isService)
-		if err != nil {
-			appLogger.Error("Failed to get data directory", "error", err)
-			return
-		}
-
-		go func() {
-			worker, err := startServerUploadWorker(ctx, agentConfig, dataDir, deviceStore, settingsManager, appLogger)
-			if err != nil {
-				appLogger.Error("Failed to start upload worker", "error", err)
-				return
-			}
-			uploadWorkerMu.Lock()
-			uploadWorker = worker
-			uploadWorkerMu.Unlock()
-
-			// Check if local proxy handler was set while we were starting up
-			// This handles the race condition where web server starts before upload worker finishes
-			if h := getLocalProxyHandler(); h != nil {
-				worker.SetLocalHandler(h)
-			}
-
-			// Start auto-update worker after upload worker is ready
-			go initAutoUpdateWorker(ctx, agentConfig, dataDir, isService, appLogger)
-		}()
-	}
-
-	// Load discovery settings from database (user-configurable via web UI)
-	{
-		var discoverySettings map[string]interface{}
-		if agentConfigStore != nil {
-			_ = agentConfigStore.GetConfigValue("discovery_settings", &discoverySettings)
-		}
-		if discoverySettings != nil {
-			applyDiscoveryEffects(discoverySettings)
-		}
-	}
-
-	// Ensure key handlers are registered (register sandbox explicitly so it's
-	// always present regardless of init ordering in other files). Use a
-	// Start web UI
-
-	// Lightweight health endpoint for Docker/monitoring (public).
-	http.HandleFunc("/health", handleHealth)
-
-	// Serve the UI only for the exact root path and GET method. This prevents
-	// the UI HTML from being returned as a fallback for other endpoints (e.g.
-	// POST /sandbox_simulate) when a handler is missing or not registered.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		// Serve the HTML from embedded filesystem
-		tmpl, err := template.ParseFS(webFS, "web/index.html")
-		if err != nil {
-			http.Error(w, "Template error", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		tmpl.Execute(w, nil)
-
-	})
-
-	// Serve static assets (CSS, JS) from embedded filesystem
-	http.HandleFunc("/static/", func(w http.ResponseWriter, r *http.Request) {
-		// Strip /static/ prefix to get the filename
-		fileName := strings.TrimPrefix(r.URL.Path, "/static/")
-
-		// Serve shared assets from common/web package
-		if fileName == "shared.css" {
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-			w.Write([]byte(sharedweb.SharedCSS))
-			return
-		}
-		if fileName == "shared.js" {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Write([]byte(sharedweb.SharedJS))
-			return
-		}
-		if fileName == "metrics.js" {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Write([]byte(sharedweb.MetricsJS))
-			return
-		}
-		if fileName == "cards.js" {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Write([]byte(sharedweb.CardsJS))
-			return
-		}
-		if fileName == "report.js" {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Write([]byte(sharedweb.ReportJS))
-			return
-		}
-		// Serve vendored flatpickr files from the embedded common/web package so
-		// they are served with correct MIME types and avoid CDN/CSP issues.
-		if fileName == "flatpickr/flatpickr.min.js" {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Write([]byte(sharedweb.FlatpickrJS))
-			return
-		}
-		if fileName == "flatpickr/flatpickr.min.css" {
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-			w.Write([]byte(sharedweb.FlatpickrCSS))
-			return
-		}
-		if fileName == "flatpickr/LICENSE.md" {
-			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-			w.Write([]byte(sharedweb.FlatpickrLicense))
-			return
-		}
-
-		// Serve other files from embedded filesystem
-		filePath := "web/" + fileName
-		content, err := webFS.ReadFile(filePath)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-
-		// Set appropriate content type
-		if strings.HasSuffix(filePath, ".css") {
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		} else if strings.HasSuffix(filePath, ".js") {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		}
-
-		w.Write(content)
-	})
-
-	http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if data, err := webFS.ReadFile("web/login.html"); err == nil {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write(data)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, "<!doctype html><html><head><title>Login</title></head><body><h1>Authentication Required</h1><p>The agent login interface has not been installed. Please access this agent through the central server or install the latest web assets.</p></body></html>")
-	})
-
-	// Helper function to create bool pointer
-	boolPtr := func(b bool) *bool {
-		return &b
-	}
-
-	// SSE endpoint for real-time UI updates
-	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-		// Set SSE headers
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		// The endpoint is same-origin and protected by the agent auth wrapper.
-		// Do not emit a wildcard CORS policy for a stream that can contain fleet data.
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-
-		// Create client and register with hub
-		client := sseHub.NewClient()
-		defer sseHub.RemoveClient(client)
-
-		// Send initial connection event
-		fmt.Fprintf(w, "event: connected\ndata: {\"message\":\"Connected to event stream\"}\n\n")
-		flusher.Flush()
-
-		// Send periodic keepalive comments to prevent idle timeouts in proxies
-		// and intermediaries that may close connections when no data flows.
-		// The comment format ": <text>\n\n" is ignored by EventSource but keeps the TCP/TLS
-		// session active. Use a 20s interval which is commonly safe.
-		ticker := time.NewTicker(20 * time.Second)
-		defer ticker.Stop()
-
-		// Stream events to client
-		for {
-			select {
-			case event := <-client.events:
-				// Marshal event data
-				data, err := json.Marshal(event.Data)
-				if err != nil {
-					continue
-				}
-
-				// Send SSE formatted event
-				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, string(data))
-				flusher.Flush()
-
-			case <-ticker.C:
-				// Keepalive comment for EventSource; ignored by client but prevents
-				// idle connection timeouts in proxies and network middleboxes.
-				// Format: comment line starting with ':' followed by a blank line.
-				_, _ = fmt.Fprintf(w, ": keepalive\n\n")
-				flusher.Flush()
-			case <-r.Context().Done():
-				// Client disconnected
-				return
-			}
-		}
-	})
-
-	// cancel currently running scan (if any)
-	// Discovery endpoint - scans saved IP ranges and/or local subnet using discovery pipeline
-	// Respects discovery_settings from database (manual_ranges, subnet_scan, method toggles)
-	http.HandleFunc("/discover", func(w http.ResponseWriter, r *http.Request) {
-		conc := 50
-		timeoutSeconds := 5
-
-		// Check for mode parameter (quick vs full)
-		mode := r.URL.Query().Get("mode")
-		if mode == "" {
-			mode = "full" // default to full scan
-		}
-
-		// Load discovery settings
-		var discoverySettings = map[string]interface{}{
-			"subnet_scan":   true,
-			"manual_ranges": true,
-			"arp_enabled":   true,
-			"icmp_enabled":  true,
-			"tcp_enabled":   true,
-			"snmp_enabled":  true,
-			"mdns_enabled":  false,
-		}
-		if agentConfigStore != nil {
-			var stored map[string]interface{}
-			if err := agentConfigStore.GetConfigValue("discovery_settings", &stored); err == nil && stored != nil {
-				for k, v := range stored {
-					discoverySettings[k] = v
-				}
-			}
-		}
-
-		// If IP scanning master toggle is explicitly disabled, skip discovery
-		if discoverySettings["ip_scanning_enabled"] == false {
-			agent.Info("Discovery skipped: IP scanning disabled in settings")
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "discovery skipped: IP scanning is disabled in settings")
-			return
-		}
-
-		// Get saved ranges from database (if manual ranges enabled)
-		var ranges []string
-		manualRangesEnabled := discoverySettings["manual_ranges"] == true
-		if manualRangesEnabled && agentConfigStore != nil {
-			savedRanges, err := agentConfigStore.GetRangesList()
-			if err == nil {
-				ranges = savedRanges
-			}
-		}
-
-		// Check if local subnet scanning is enabled
-		scanLocalSubnet := discoverySettings["subnet_scan"] == true
-
-		// Determine what to scan
-		if len(ranges) > 0 {
-			agent.Info(fmt.Sprintf("Starting Discover with %d saved addresses", len(ranges)))
-		} else if scanLocalSubnet {
-			agent.Info("Starting Auto Discover (local subnet)")
-			// Empty ranges will trigger auto subnet detection
-		} else {
-			agent.Info("Discovery skipped: no saved ranges and subnet scan disabled")
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "discovery skipped: enable subnet scanning or configure ranges in Settings")
-			return
-		}
-
-		// Build DiscoveryConfig from settings
-		discoveryCfg := &agent.DiscoveryConfig{
-			ARPEnabled:  discoverySettings["arp_enabled"] == true,
-			ICMPEnabled: discoverySettings["icmp_enabled"] == true,
-			TCPEnabled:  discoverySettings["tcp_enabled"] == true,
-			SNMPEnabled: discoverySettings["snmp_enabled"] == true,
-			MDNSEnabled: discoverySettings["mdns_enabled"] == true,
-		}
-
-		// Build saved device IP map for bypass when detection is disabled
-		savedDeviceIPs := make(map[string]bool)
-		if deviceStore != nil {
-			ctx := context.Background()
-			saved := true
-			savedDevices, err := deviceStore.List(ctx, storage.DeviceFilter{IsSaved: &saved})
-			if err == nil {
-				for _, dev := range savedDevices {
-					savedDeviceIPs[dev.IP] = true
-				}
-				if len(savedDeviceIPs) > 0 {
-					appLogger.Info("Discovery will bypass detection for saved devices", "count", len(savedDeviceIPs))
-				}
-			}
-		}
-
-		// Use new scanner for all discovery
-		ctx := context.Background()
-		printers, err := Discover(ctx, ranges, mode, discoveryCfg, deviceStore, conc, timeoutSeconds)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(printers)
-	})
-
-	// Synchronous discovery endpoint (quick Phase A scan) backed by discover.go
-	http.HandleFunc("/discover_now", handleDiscover)
-
-	// Removed /saved_ranges, /ranges, and /clear_ranges in favor of unified /settings
-
-	// GET /devices/discovered - List discovered devices with optional filters
-	// Query params:
-	//   - minutes: only show devices discovered in last X minutes (default: no filter)
-	//   - include_known: include already saved/known devices (default: false)
-	http.HandleFunc("/devices/discovered", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		// Parse query parameters
-		minutesStr := r.URL.Query().Get("minutes")
-		includeKnown := r.URL.Query().Get("include_known") == "true"
-
-		// Query discovered devices from database
-		ctx := context.Background()
-
-		// Build filter
-		filter := storage.DeviceFilter{
-			Visible: boolPtr(true), // Only visible devices
-		}
-
-		// Filter by save status unless include_known is true
-		if !includeKnown {
-			filter.IsSaved = boolPtr(false) // Only unsaved (new) devices
-		}
-
-		// Filter by time if minutes parameter provided
-		if minutesStr != "" {
-			if minutes, err := strconv.Atoi(minutesStr); err == nil && minutes > 0 {
-				cutoff := time.Now().Add(-time.Duration(minutes) * time.Minute)
-				filter.LastSeenAfter = &cutoff
-			}
-		}
-
-		devices, err := deviceStore.List(ctx, filter)
-		if err != nil {
-			appLogger.Error("Error listing discovered devices", "error", err.Error())
-			json.NewEncoder(w).Encode([]agent.PrinterInfo{})
-			return
-		}
-
-		// Convert devices to PrinterInfo and enrich with latest metrics
-		printers := make([]agent.PrinterInfo, len(devices))
-		for i, dev := range devices {
-			printers[i] = storage.DeviceToPrinterInfo(dev)
-
-			// Fetch latest metrics for this device
-			if dev.Serial != "" {
-				if snapshot, err := deviceStore.GetLatestMetrics(ctx, dev.Serial); err == nil && snapshot != nil {
-					printers[i].PageCount = snapshot.PageCount
-					// Convert TonerLevels from map[string]interface{} to map[string]int
-					if snapshot.TonerLevels != nil {
-						toner := make(map[string]int)
-						for k, v := range snapshot.TonerLevels {
-							if level, ok := v.(float64); ok {
-								toner[k] = int(level)
-							} else if level, ok := v.(int); ok {
-								toner[k] = level
-							}
-						}
-						printers[i].TonerLevels = toner
-					}
-				}
-			}
-		}
-
-		json.NewEncoder(w).Encode(printers)
-	})
-
-	// POST /devices/clear_discovered - Delete discovered devices (hard delete)
-	// This endpoint removes devices that are not saved (is_saved = 0) from the local DB.
-	http.HandleFunc("/devices/clear_discovered", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Delete discovered (unsaved) devices from database
-		ctx := context.Background()
-		isSaved := false
-		filter := storage.DeviceFilter{IsSaved: &isSaved}
-		count, err := deviceStore.DeleteAll(ctx, filter)
-		if err != nil {
-			appLogger.Error("Error deleting discovered devices", "error", err.Error())
-			http.Error(w, "failed to delete discovered", http.StatusInternalServerError)
-			return
-		}
-		appLogger.Info("Deleted discovered devices", "count", count)
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "deleted %d devices", count)
-	})
-
-	// POST /database/clear - Backup current database and start fresh
-	http.HandleFunc("/database/clear", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		appLogger.Info("Database clear requested - backing up and resetting")
-
-		// Get the SQLiteStore to call backupAndReset
-		if sqliteStore, ok := deviceStore.(*storage.SQLiteStore); ok {
-			if err := sqliteStore.BackupAndReset(); err != nil {
-				appLogger.Error("Failed to backup and reset database", "error", err)
-				http.Error(w, fmt.Sprintf("failed to reset database: %v", err), http.StatusInternalServerError)
-				return
-			}
-
-			appLogger.Info("Database backed up and reset successfully")
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"message": "Database backed up and reset successfully",
-				"reload":  true, // Signal UI to reload
-			})
-		} else {
-			http.Error(w, "database type does not support reset", http.StatusBadRequest)
-		}
-	})
-
-	// Use /devices/get?serial=X for device details by serial
-	// Use /devices/list with filters for querying by IP
-
-	// Use /devices/metrics/history for metrics data
-
-	http.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
-		// Optional query params: level=ERROR|WARN|INFO|DEBUG|TRACE, tail=N
-		q := r.URL.Query()
-		levelStr := strings.ToUpper(strings.TrimSpace(q.Get("level")))
-		tailStr := strings.TrimSpace(q.Get("tail"))
-
-		// Map for level parsing local to this handler
-		levelMap := map[string]int{
-			"ERROR": 0,
-			"WARN":  1,
-			"INFO":  2,
-			"DEBUG": 3,
-			"TRACE": 4,
-		}
-		minLevel, haveLevel := levelMap[levelStr]
-
-		// Parse tail count
-		tail := 0
-		if tailStr != "" {
-			if n, err := strconv.Atoi(tailStr); err == nil && n > 0 {
-				tail = n
-			}
-		}
-
-		// Get buffered entries from app logger
-		entries := appLogger.GetBuffer()
-
-		// Filter by level if requested (include entries with level <= minLevel)
-		if haveLevel {
-			filtered := make([]logger.LogEntry, 0, len(entries))
-			for _, e := range entries {
-				if int(e.Level) <= minLevel {
-					filtered = append(filtered, e)
-				}
-			}
-			entries = filtered
-		}
-
-		// Tail if requested
-		if tail > 0 && len(entries) > tail {
-			entries = entries[len(entries)-tail:]
-		}
-
-		// Write as plain text compatible with prior behavior
-		w.Header().Set("Content-Type", "text/plain")
-		var b strings.Builder
-		for i, e := range entries {
-			// Format similar to logger package
-			ts := e.Timestamp.Format("2006-01-02T15:04:05-07:00")
-			// Best-effort level name mapping
-			levelName := "INFO"
-			switch e.Level {
-			case 0:
-				levelName = "ERROR"
-			case 1:
-				levelName = "WARN"
-			case 2:
-				levelName = "INFO"
-			case 3:
-				levelName = "DEBUG"
-			case 4:
-				levelName = "TRACE"
-			}
-			b.WriteString(fmt.Sprintf("%s [%s] %s", ts, levelName, e.Message))
-			if len(e.Context) > 0 {
-				for k, v := range e.Context {
-					b.WriteString(fmt.Sprintf(" %s=%v", k, v))
-				}
-			}
-			if i < len(entries)-1 {
-				b.WriteString("\n")
-			}
-		}
-		fmt.Fprint(w, b.String())
-	})
-
-	// Download a zip archive of the entire logs directory
-	http.HandleFunc("/logs/archive", func(w http.ResponseWriter, r *http.Request) {
-		logDir := filepath.Join(".", "logs")
-		if st, err := os.Stat(logDir); err != nil || !st.IsDir() {
-			http.Error(w, "logs directory not found", http.StatusNotFound)
-			return
-		}
-		fname := fmt.Sprintf("logs_%s.zip", time.Now().Format("20060102_150405"))
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fname))
-
-		zw := zip.NewWriter(w)
-		defer zw.Close()
-
-		// Walk logs directory and add regular files.  Open each entry through
-		// os.OpenInRoot so a symlink/race cannot make the archive read outside
-		// the logs directory.
-		_ = filepath.WalkDir(logDir, func(p string, entry os.DirEntry, err error) error {
-			if err != nil {
-				return nil // skip problematic entries
-			}
-			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-				return nil
-			}
-			rel, err := filepath.Rel(logDir, p)
-			if err != nil {
-				rel = entry.Name()
-			}
-			if rel == "." || filepath.IsAbs(rel) {
-				return nil
-			}
-			// Normalize to forward slashes for zip entries
-			zipName := strings.ReplaceAll(rel, "\\", "/")
-			f, err := os.OpenInRoot(logDir, rel)
-			if err != nil {
-				return nil
-			}
-			info, err := f.Stat()
-			if err != nil || !info.Mode().IsRegular() {
-				_ = f.Close()
-				return nil
-			}
-			wtr, err := zw.Create(zipName)
-			if err != nil {
-				_ = f.Close()
-				return nil
-			}
-			_, _ = io.Copy(wtr, f)
-			_ = f.Close()
-			return nil
-		})
-	})
-
-	// Clear logs by rotating the current log file and clearing the buffer
-	http.HandleFunc("/logs/clear", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		// Force rotation to archive current log and start fresh
-		appLogger.ForceRotate()
-		// Clear the in-memory buffer
-		appLogger.ClearBuffer()
-		appLogger.Info("Logs cleared and rotated by user request")
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"success": true, "message": "Logs cleared and rotated"}`)
-	})
-
-	// Endpoint to return unknown manufacturer log entries (if present)
-	http.HandleFunc("/unknown_manufacturers", func(w http.ResponseWriter, r *http.Request) {
-		logDir := filepath.Join(".", "logs")
-		fpath := filepath.Join(logDir, "unknown_mfg.log")
-		data, err := os.ReadFile(fpath)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode([]string{})
-			return
-		}
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(lines)
-	})
-
-	// Endpoint to fetch parse debug for an IP (returns in-memory snapshot or persisted JSON)
-	http.HandleFunc("/parse_debug", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		ip := q.Get("ip")
-		if ip == "" {
-			http.Error(w, "ip parameter required", http.StatusBadRequest)
-			return
-		}
-		parsedIP := net.ParseIP(strings.TrimSpace(ip))
-		if parsedIP == nil {
-			http.Error(w, "ip must be a literal address", http.StatusBadRequest)
-			return
-		}
-		ip = parsedIP.String()
-		// try in-memory snapshot first
-		if d, ok := agent.GetParseDebug(ip); ok {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(d)
-			return
-		}
-		// fallback to persisted file
-		logDir := filepath.Join(".", "logs")
-		fileIP := strings.NewReplacer(".", "_", ":", "_").Replace(ip)
-		fpath := filepath.Join(logDir, fmt.Sprintf("parse_debug_%s.json", fileIP))
-		data, err := os.OpenInRoot(logDir, filepath.Base(fpath))
-		if err != nil {
-			http.Error(w, "no diagnostics found", http.StatusNotFound)
-			return
-		}
-		defer data.Close()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.Copy(w, data)
-	})
-
-	// POST /api/report - Submit a device data report to the proxy service
-	// This endpoint collects diagnostic data and forwards it to the cloud proxy
-	// which creates a GitHub Gist and returns URLs for the pre-filled issue.
-	http.HandleFunc("/api/report", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req agent.ReportRequest
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		// Validate required fields
-		if req.IssueType == "" {
-			http.Error(w, "issue_type is required", http.StatusBadRequest)
-			return
-		}
-
-		// Create the report submitter with a salt derived from agent ID
-		agentID := agentConfig.Server.AgentID
-		submitter := agent.NewReportSubmitter(Version, agentID, appLogger)
-
-		// Get parse debug data if available
-		var parseDebug *agent.ParseDebug
-		if req.DeviceIP != "" {
-			if pd, ok := agent.GetParseDebug(req.DeviceIP); ok {
-				parseDebug = &pd
-			}
-		}
-
-		// If FullWalk is requested, perform a complete SNMP walk to capture all OIDs
-		// This helps debug vendor-specific issues where standard OIDs don't work
-		if req.FullWalk && req.DeviceIP != "" {
-			if appLogger != nil {
-				appLogger.Info("Performing full SNMP walk for report", "ip", req.DeviceIP)
-			}
-			cfg, err := agent.GetSNMPConfig()
-			if err == nil {
-				client, err := agent.NewSNMPClient(cfg, req.DeviceIP, 10)
-				if err == nil {
-					defer client.Close()
-					// Walk standard MIB-2, Printer-MIB, and enterprise OIDs
-					cols := agent.FullDiagnosticWalk(client, nil, []string{
-						"1.3.6.1.2.1",    // MIB-2 (system, interfaces, etc.)
-						"1.3.6.1.2.1.43", // Printer-MIB
-						"1.3.6.1.4.1",    // Enterprise MIBs (vendor-specific)
-					}, 5000) // Cap at 5000 OIDs to keep report size reasonable
-
-					// Convert PDUs to RawPDU format for JSON serialization
-					fullWalkData := make([]agent.RawPDU, 0, len(cols))
-					for _, pdu := range cols {
-						fullWalkData = append(fullWalkData, agent.PDUToRawPDU(pdu))
-					}
-
-					// Create or update parseDebug with full walk data
-					if parseDebug == nil {
-						parseDebug = &agent.ParseDebug{
-							IP:        req.DeviceIP,
-							Timestamp: time.Now().Format(time.RFC3339),
-						}
-					}
-					parseDebug.FullWalkData = fullWalkData
-
-					if appLogger != nil {
-						appLogger.Info("Full SNMP walk complete", "ip", req.DeviceIP, "oids_collected", len(fullWalkData))
-					}
-				} else if appLogger != nil {
-					appLogger.Warn("Failed to create SNMP client for full walk", "ip", req.DeviceIP, "error", err)
-				}
-			} else if appLogger != nil {
-				appLogger.Warn("Failed to get SNMP config for full walk", "error", err)
-			}
-		}
-
-		// Get recent logs for context (last 50 lines, sanitized)
-		var recentLogs []string
-		logPath := filepath.Join(".", "logs", "agent.log")
-		var allLogLines []string
-		if logData, err := os.ReadFile(logPath); err == nil {
-			allLogLines = strings.Split(string(logData), "\n")
-			start := len(allLogLines) - 50
-			if start < 0 {
-				start = 0
-			}
-			recentLogs = allLogLines[start:]
-		}
-
-		// Build the report
-		issueType := agent.ParseIssueType(req.IssueType)
-		rpt := submitter.BuildReport(
-			issueType,
-			req.ExpectedValue,
-			req.UserMessage,
-			req.DeviceIP,
-			req.DeviceSerial,
-			req.DeviceModel,
-			req.DeviceMAC,
-			req.CurrentManufacturer,
-			req.CurrentHostname,
-			req.CurrentPageCount,
-			parseDebug,
-			recentLogs,
-		)
-
-		// Supplement with any client-provided SNMP data (if parse debug wasn't on server)
-		if len(rpt.SNMPResponses) == 0 && len(req.SNMPResponses) > 0 {
-			rpt.SNMPResponses = req.SNMPResponses
-		}
-		if rpt.DetectedVendor == "" && req.DetectedVendor != "" {
-			rpt.DetectedVendor = req.DetectedVendor
-		}
-		if len(rpt.DetectionSteps) == 0 && len(req.DetectionSteps) > 0 {
-			rpt.DetectionSteps = req.DetectionSteps
-		}
-
-		// Populate extended device info from request
-		rpt.Firmware = req.Firmware
-		rpt.SubnetMask = req.SubnetMask
-		rpt.Gateway = req.Gateway
-		rpt.Consumables = req.Consumables
-		rpt.StatusMessages = req.StatusMessages
-		rpt.DiscoveryMethod = req.DiscoveryMethod
-		rpt.WebUIURL = req.WebUIURL
-		rpt.DeviceType = req.DeviceType
-		rpt.SourceType = req.SourceType
-		rpt.IsUSB = req.IsUSB
-		rpt.PortName = req.PortName
-		rpt.DriverName = req.DriverName
-		rpt.IsDefault = req.IsDefault
-		rpt.IsShared = req.IsShared
-		rpt.SpoolerStatus = req.SpoolerStatus
-
-		// Populate metrics data
-		rpt.ColorPages = req.ColorPages
-		rpt.MonoPages = req.MonoPages
-		rpt.ScanCount = req.ScanCount
-		rpt.TonerLevels = req.TonerLevels
-		rpt.RawData = req.RawData
-
-		// Fetch full device record and metrics history from storage for diagnostics
-		if deviceStore != nil && req.DeviceSerial != "" {
-			// Get full device record
-			if device, err := deviceStore.Get(r.Context(), req.DeviceSerial); err == nil && device != nil {
-				deviceMap := map[string]interface{}{
-					"serial":             device.Serial,
-					"ip":                 device.IP,
-					"mac_address":        device.MACAddress,
-					"hostname":           device.Hostname,
-					"manufacturer":       device.Manufacturer,
-					"model":              device.Model,
-					"firmware":           device.Firmware,
-					"subnet_mask":        device.SubnetMask,
-					"gateway":            device.Gateway,
-					"consumables":        device.Consumables,
-					"status_messages":    device.StatusMessages,
-					"device_type":        device.DeviceType,
-					"source_type":        device.SourceType,
-					"discovery_method":   device.DiscoveryMethod,
-					"web_ui_url":         device.WebUIURL,
-					"asset_number":       device.AssetNumber,
-					"location":           device.Location,
-					"description":        device.Description,
-					"is_usb":             device.IsUSB,
-					"port_name":          device.PortName,
-					"driver_name":        device.DriverName,
-					"is_default":         device.IsDefault,
-					"is_shared":          device.IsShared,
-					"spooler_status":     device.SpoolerStatus,
-					"initial_page_count": device.InitialPageCount,
-					"is_saved":           device.IsSaved,
-					"visible":            device.Visible,
-					"first_seen":         device.FirstSeen,
-					"last_seen":          device.LastSeen,
-					"created_at":         device.CreatedAt,
-					"raw_data":           device.RawData,
-				}
-				rpt.DeviceRecord = deviceMap
-				if appLogger != nil {
-					appLogger.Info("Included device record in report", "serial", req.DeviceSerial)
-				}
-			}
-
-			// Get last 100 metrics snapshots
-			since := time.Now().AddDate(0, -6, 0) // 6 months back
-			until := time.Now()
-			if metricsHistory, err := deviceStore.GetMetricsHistory(r.Context(), req.DeviceSerial, since, until); err == nil {
-				// Limit to last 100
-				limit := 100
-				if len(metricsHistory) > limit {
-					metricsHistory = metricsHistory[:limit]
-				}
-
-				// Convert to generic maps for JSON serialization
-				metricsSlice := make([]map[string]interface{}, 0, len(metricsHistory))
-				for _, m := range metricsHistory {
-					metricsMap := map[string]interface{}{
-						"id":           m.ID,
-						"serial":       m.Serial,
-						"timestamp":    m.Timestamp,
-						"page_count":   m.PageCount,
-						"color_pages":  m.ColorPages,
-						"mono_pages":   m.MonoPages,
-						"scan_count":   m.ScanCount,
-						"toner_levels": m.TonerLevels,
-						"paper_trays":  m.PaperTrays,
-						// HP-specific extended counters (agent only)
-						"fax_pages":            m.FaxPages,
-						"copy_pages":           m.CopyPages,
-						"other_pages":          m.OtherPages,
-						"copy_mono_pages":      m.CopyMonoPages,
-						"copy_flatbed_scans":   m.CopyFlatbedScans,
-						"copy_adf_scans":       m.CopyADFScans,
-						"fax_flatbed_scans":    m.FaxFlatbedScans,
-						"fax_adf_scans":        m.FaxADFScans,
-						"scan_to_host_flatbed": m.ScanToHostFlatbed,
-						"scan_to_host_adf":     m.ScanToHostADF,
-						"duplex_sheets":        m.DuplexSheets,
-						"jam_events":           m.JamEvents,
-						"scanner_jam_events":   m.ScannerJamEvents,
-						"tier":                 m.Tier,
-					}
-					metricsSlice = append(metricsSlice, metricsMap)
-				}
-				rpt.MetricsHistory = metricsSlice
-				if appLogger != nil {
-					appLogger.Info("Included metrics history in report", "serial", req.DeviceSerial, "count", len(metricsSlice))
-				}
-			}
-		}
-
-		// Include extended agent logs (last 200 lines) for detailed debugging
-		if len(allLogLines) > 0 {
-			start := len(allLogLines) - 200
-			if start < 0 {
-				start = 0
-			}
-			rpt.AgentLogs = allLogLines[start:]
-		}
-
-		// Collect USB proxy info if this is a USB device
-		if req.IsUSB && req.DeviceSerial != "" {
-			rpt.USBProxyInfo = collectUSBProxyInfo(r.Context(), req.DeviceSerial, appLogger)
-		}
-
-		// Try to submit to proxy
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		proxyResp, err := submitter.SubmitToProxy(ctx, rpt)
-		if err != nil {
-			if appLogger != nil {
-				appLogger.Warn("Failed to submit report to proxy", "error", err)
-			}
-			// Return the report data so frontend can use fallback
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":     err.Error(),
-				"report":    rpt,
-				"issue_url": report.BuildGitHubIssueURL(rpt, ""),
-				"fallback":  true,
-			})
-			return
-		}
-
-		if appLogger != nil {
-			appLogger.Info("Report submitted successfully",
-				"report_id", rpt.ReportID,
-				"gist_url", proxyResp.GistURL,
-				"issue_type", issueType.String())
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(proxyResp)
-	})
-
-	// POST /api/report/stream - Submit a device report with SSE progress streaming
-	// This endpoint performs the same work as /api/report but streams progress updates
-	// during the SNMP walk phase via Server-Sent Events.
-	http.HandleFunc("/api/report/stream", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST required", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Set up SSE headers
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-			return
-		}
-
-		// Helper to send SSE events
-		sendEvent := func(eventType string, data interface{}) {
-			jsonData, _ := json.Marshal(data)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, jsonData)
-			flusher.Flush()
-		}
-
-		var req agent.ReportRequest
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-			sendEvent("error", map[string]string{"error": fmt.Sprintf("invalid request: %v", err)})
-			return
-		}
-
-		// Validate required fields
-		if req.IssueType == "" {
-			sendEvent("error", map[string]string{"error": "issue_type is required"})
-			return
-		}
-
-		// Send initial progress
-		sendEvent("progress", map[string]interface{}{
-			"stage":   "starting",
-			"percent": 0,
-			"message": "Preparing report...",
-		})
-
-		// Create the report submitter
-		agentID := agentConfig.Server.AgentID
-		submitter := agent.NewReportSubmitter(Version, agentID, appLogger)
-
-		// Get parse debug data if available
-		var parseDebug *agent.ParseDebug
-		if req.DeviceIP != "" {
-			if pd, ok := agent.GetParseDebug(req.DeviceIP); ok {
-				parseDebug = &pd
-			}
-		}
-
-		// If FullWalk is requested, perform a complete SNMP walk with progress
-		if req.FullWalk && req.DeviceIP != "" {
-			sendEvent("progress", map[string]interface{}{
-				"stage":   "connecting",
-				"percent": 5,
-				"message": "Connecting to device...",
-			})
-
-			if appLogger != nil {
-				appLogger.Info("Performing full SNMP walk with progress for report", "ip", req.DeviceIP)
-			}
-
-			cfg, err := agent.GetSNMPConfig()
-			if err == nil {
-				client, err := agent.NewSNMPClient(cfg, req.DeviceIP, 10)
-				if err == nil {
-					defer client.Close()
-
-					sendEvent("progress", map[string]interface{}{
-						"stage":   "walking",
-						"percent": 10,
-						"message": "Starting SNMP walk...",
-					})
-
-					// Walk with progress callback
-					progressFn := func(p agent.WalkProgress) {
-						// Map progress to 10-90% range (reserve 0-10 for setup, 90-100 for submission)
-						adjustedPercent := 10 + (p.Percent * 80 / 100)
-						sendEvent("progress", map[string]interface{}{
-							"stage":      p.Stage,
-							"percent":    adjustedPercent,
-							"message":    p.Message,
-							"oids_found": p.OIDsFound,
-							"root_oid":   p.RootOID,
-						})
-					}
-
-					cols := agent.FullDiagnosticWalkWithProgress(client, nil, []string{
-						"1.3.6.1.2.1",    // MIB-2
-						"1.3.6.1.2.1.43", // Printer-MIB
-						"1.3.6.1.4.1",    // Enterprise MIBs
-					}, 5000, progressFn)
-
-					// Convert PDUs to RawPDU format
-					fullWalkData := make([]agent.RawPDU, 0, len(cols))
-					for _, pdu := range cols {
-						fullWalkData = append(fullWalkData, agent.PDUToRawPDU(pdu))
-					}
-
-					if parseDebug == nil {
-						parseDebug = &agent.ParseDebug{
-							IP:        req.DeviceIP,
-							Timestamp: time.Now().Format(time.RFC3339),
-						}
-					}
-					parseDebug.FullWalkData = fullWalkData
-
-					if appLogger != nil {
-						appLogger.Info("Full SNMP walk complete", "ip", req.DeviceIP, "oids_collected", len(fullWalkData))
-					}
-				} else if appLogger != nil {
-					appLogger.Warn("Failed to create SNMP client for full walk", "ip", req.DeviceIP, "error", err)
-					sendEvent("progress", map[string]interface{}{
-						"stage":   "warning",
-						"percent": 90,
-						"message": "Could not connect to device for SNMP walk",
-					})
-				}
-			} else if appLogger != nil {
-				appLogger.Warn("Failed to get SNMP config for full walk", "error", err)
-			}
-		}
-
-		sendEvent("progress", map[string]interface{}{
-			"stage":   "building",
-			"percent": 90,
-			"message": "Building report...",
-		})
-
-		// Get recent logs for context
-		var recentLogs []string
-		logPath := filepath.Join(".", "logs", "agent.log")
-		var allLogLines []string
-		if logData, err := os.ReadFile(logPath); err == nil {
-			allLogLines = strings.Split(string(logData), "\n")
-			start := len(allLogLines) - 50
-			if start < 0 {
-				start = 0
-			}
-			recentLogs = allLogLines[start:]
-		}
-
-		// Build the report
-		issueType := agent.ParseIssueType(req.IssueType)
-		rpt := submitter.BuildReport(
-			issueType,
-			req.ExpectedValue,
-			req.UserMessage,
-			req.DeviceIP,
-			req.DeviceSerial,
-			req.DeviceModel,
-			req.DeviceMAC,
-			req.CurrentManufacturer,
-			req.CurrentHostname,
-			req.CurrentPageCount,
-			parseDebug,
-			recentLogs,
-		)
-
-		// Supplement with client-provided data
-		if len(rpt.SNMPResponses) == 0 && len(req.SNMPResponses) > 0 {
-			rpt.SNMPResponses = req.SNMPResponses
-		}
-		if rpt.DetectedVendor == "" && req.DetectedVendor != "" {
-			rpt.DetectedVendor = req.DetectedVendor
-		}
-		if len(rpt.DetectionSteps) == 0 && len(req.DetectionSteps) > 0 {
-			rpt.DetectionSteps = req.DetectionSteps
-		}
-
-		// Populate extended device info
-		rpt.Firmware = req.Firmware
-		rpt.SubnetMask = req.SubnetMask
-		rpt.Gateway = req.Gateway
-		rpt.Consumables = req.Consumables
-		rpt.StatusMessages = req.StatusMessages
-		rpt.DiscoveryMethod = req.DiscoveryMethod
-		rpt.WebUIURL = req.WebUIURL
-		rpt.DeviceType = req.DeviceType
-		rpt.SourceType = req.SourceType
-		rpt.IsUSB = req.IsUSB
-		rpt.PortName = req.PortName
-		rpt.DriverName = req.DriverName
-		rpt.IsDefault = req.IsDefault
-		rpt.IsShared = req.IsShared
-		rpt.SpoolerStatus = req.SpoolerStatus
-		rpt.ColorPages = req.ColorPages
-		rpt.MonoPages = req.MonoPages
-		rpt.ScanCount = req.ScanCount
-		rpt.TonerLevels = req.TonerLevels
-		rpt.RawData = req.RawData
-
-		// Fetch device record and metrics from storage
-		if deviceStore != nil && req.DeviceSerial != "" {
-			if device, err := deviceStore.Get(r.Context(), req.DeviceSerial); err == nil && device != nil {
-				deviceMap := map[string]interface{}{
-					"serial": device.Serial, "ip": device.IP, "mac_address": device.MACAddress,
-					"hostname": device.Hostname, "manufacturer": device.Manufacturer, "model": device.Model,
-					"firmware": device.Firmware, "device_type": device.DeviceType, "source_type": device.SourceType,
-				}
-				rpt.DeviceRecord = deviceMap
-			}
-
-			since := time.Now().AddDate(0, -6, 0)
-			until := time.Now()
-			if metricsHistory, err := deviceStore.GetMetricsHistory(r.Context(), req.DeviceSerial, since, until); err == nil {
-				limit := 100
-				if len(metricsHistory) > limit {
-					metricsHistory = metricsHistory[:limit]
-				}
-				metricsSlice := make([]map[string]interface{}, 0, len(metricsHistory))
-				for _, m := range metricsHistory {
-					metricsSlice = append(metricsSlice, map[string]interface{}{
-						"timestamp": m.Timestamp, "page_count": m.PageCount,
-						"color_pages": m.ColorPages, "mono_pages": m.MonoPages,
-						"toner_levels": m.TonerLevels,
-					})
-				}
-				rpt.MetricsHistory = metricsSlice
-			}
-		}
-
-		// Extended logs
-		if len(allLogLines) > 0 {
-			start := len(allLogLines) - 200
-			if start < 0 {
-				start = 0
-			}
-			rpt.AgentLogs = allLogLines[start:]
-		}
-
-		sendEvent("progress", map[string]interface{}{
-			"stage":   "submitting",
-			"percent": 95,
-			"message": "Submitting to GitHub...",
-		})
-
-		// Submit to proxy
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		proxyResp, err := submitter.SubmitToProxy(ctx, rpt)
-		if err != nil {
-			if appLogger != nil {
-				appLogger.Warn("Failed to submit report to proxy", "error", err)
-			}
-			sendEvent("error", map[string]interface{}{
-				"error":     err.Error(),
-				"report":    rpt,
-				"issue_url": report.BuildGitHubIssueURL(rpt, ""),
-				"fallback":  true,
-			})
-			return
-		}
-
-		if appLogger != nil {
-			appLogger.Info("Report submitted successfully (streamed)",
-				"report_id", rpt.ReportID,
-				"gist_url", proxyResp.GistURL,
-				"issue_type", issueType.String())
-		}
-
-		sendEvent("complete", proxyResp)
-	})
-
-	// Endpoint to return current scan metrics snapshot
-	// TODO(deprecate): Remove /scan_metrics endpoint - superseded by metrics API
-	// Still used by UI metrics display, needs replacement before removal
-	http.HandleFunc("/scan_metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(agent.GetMetricsSnapshot())
-	})
-
-	// Serve the on-disk logfile for easier inspection
-	http.HandleFunc("/logfile", func(w http.ResponseWriter, r *http.Request) {
-		fpath := filepath.Join(".", "logs", "agent.log")
-		data, err := os.ReadFile(fpath)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, "logfile not found")
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write(data)
-	})
-
-	// Check for database rotation event (GET) or clear the warning (POST)
-	http.HandleFunc("/database/rotation_warning", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		switch r.Method {
-		case "GET":
-			// Check if rotation flag is set
-			var rotationInfo map[string]interface{}
-			err := agentConfigStore.GetConfigValue("database_rotation", &rotationInfo)
-			if err != nil || rotationInfo == nil {
-				// No rotation event
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"rotated":     false,
-					"rotated_at":  nil,
-					"backup_path": nil,
-				})
-				return
-			}
-
-			// Rotation event found
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"rotated":     true,
-				"rotated_at":  rotationInfo["rotated_at"],
-				"backup_path": rotationInfo["backup_path"],
-			})
-		case "POST":
-			// Clear the rotation warning flag
-			if err := agentConfigStore.SetConfigValue("database_rotation", nil); err != nil {
-				appLogger.Error("Failed to clear rotation warning", "error", err)
-				http.Error(w, "Failed to clear warning", http.StatusInternalServerError)
-				return
-			}
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"message": "Rotation warning cleared",
-			})
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	appLogger.Info("Web UI running", "url", "http://localhost:8080")
-
-	// Refresh device profile by serial (or IP). POST JSON { "serial": "...", "ip": "optional ip" }
-	http.HandleFunc("/devices/refresh", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Serial string `json:"serial"`
-			IP     string `json:"ip"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		req.Serial = strings.TrimSpace(req.Serial)
-		if req.Serial == "" && req.IP == "" {
-			http.Error(w, "serial or ip required", http.StatusBadRequest)
-			return
-		}
-		// if serial provided but no IP, try load existing device to get IP
-		targetIP := strings.TrimSpace(req.IP)
-		if targetIP == "" && req.Serial != "" {
-			// Sanitize serial to prevent path traversal attacks
-			safeSerial := filepath.Base(req.Serial)
-			if safeSerial == "." || safeSerial == ".." || safeSerial != req.Serial {
-				http.Error(w, "invalid serial number", http.StatusBadRequest)
-				return
-			}
-			devPath := filepath.Join(".", "logs", "devices", safeSerial+".json")
-			if b, err := os.ReadFile(devPath); err == nil {
-				var doc map[string]interface{}
-				if json.Unmarshal(b, &doc) == nil {
-					if pi, ok := doc["printer_info"].(map[string]interface{}); ok {
-						if ipval, ok2 := pi["ip"].(string); ok2 {
-							targetIP = strings.TrimSpace(ipval)
-						}
-						if targetIP == "" {
-							if ipval2, ok3 := pi["IP"].(string); ok3 {
-								targetIP = strings.TrimSpace(ipval2)
-							}
-						}
-					}
-				}
-			}
-		}
-		if targetIP == "" {
-			http.Error(w, "unable to determine target ip for refresh", http.StatusBadRequest)
-			return
-		}
-		ctx := context.Background()
-		pi, err := LiveDiscoveryDetect(ctx, targetIP, getSNMPTimeoutSeconds())
-		if err != nil {
-			appLogger.Error("Device refresh failed", "ip", targetIP, "error", err)
-			http.Error(w, "refresh failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		agent.UpsertDiscoveredPrinter(*pi)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "serial": pi.Serial})
-	})
-
-	// Update device fields (now supports many fields; respects locked fields at the UI level)
-	http.HandleFunc("/devices/update", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Serial       string    `json:"serial"`
-			Manufacturer *string   `json:"manufacturer,omitempty"`
-			Model        *string   `json:"model,omitempty"`
-			Hostname     *string   `json:"hostname,omitempty"`
-			Firmware     *string   `json:"firmware,omitempty"`
-			IP           *string   `json:"ip,omitempty"`
-			SubnetMask   *string   `json:"subnet_mask,omitempty"`
-			Gateway      *string   `json:"gateway,omitempty"`
-			DNSServers   *[]string `json:"dns_servers,omitempty"`
-			DHCPServer   *string   `json:"dhcp_server,omitempty"`
-			AssetNumber  *string   `json:"asset_number,omitempty"`
-			Location     *string   `json:"location,omitempty"`
-			Description  *string   `json:"description,omitempty"`
-			WebUIURL     *string   `json:"web_ui_url,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		req.Serial = strings.TrimSpace(req.Serial)
-		if req.Serial == "" {
-			http.Error(w, "serial required", http.StatusBadRequest)
-			return
-		}
-
-		// Get existing device
-		ctx := context.Background()
-		device, err := deviceStore.Get(ctx, req.Serial)
-		if err != nil {
-			http.Error(w, "device not found: "+err.Error(), http.StatusNotFound)
-			return
-		}
-
-		// Helper to check if field is locked
-		isFieldLocked := func(fieldName string) bool {
-			if device.LockedFields == nil {
-				return false
-			}
-			for _, lf := range device.LockedFields {
-				if strings.EqualFold(lf.Field, fieldName) {
-					return true
-				}
-			}
-			return false
-		}
-
-		// Update only provided fields (skip locked fields)
-		if req.Manufacturer != nil && !isFieldLocked("manufacturer") {
-			device.Manufacturer = *req.Manufacturer
-		}
-		if req.Model != nil && !isFieldLocked("model") {
-			device.Model = *req.Model
-		}
-		if req.Hostname != nil && !isFieldLocked("hostname") {
-			device.Hostname = *req.Hostname
-		}
-		if req.Firmware != nil && !isFieldLocked("firmware") {
-			device.Firmware = *req.Firmware
-		}
-		if req.IP != nil && !isFieldLocked("ip") {
-			device.IP = *req.IP
-		}
-		if req.SubnetMask != nil && !isFieldLocked("subnet_mask") {
-			device.SubnetMask = *req.SubnetMask
-		}
-		if req.Gateway != nil && !isFieldLocked("gateway") {
-			device.Gateway = *req.Gateway
-		}
-		if req.DNSServers != nil && !isFieldLocked("dns_servers") {
-			device.DNSServers = *req.DNSServers
-		}
-		if req.DHCPServer != nil && !isFieldLocked("dhcp_server") {
-			device.DHCPServer = *req.DHCPServer
-		}
-		if req.AssetNumber != nil && !isFieldLocked("asset_number") {
-			device.AssetNumber = *req.AssetNumber
-		}
-		if req.Location != nil && !isFieldLocked("location") {
-			device.Location = *req.Location
-		}
-		if req.Description != nil && !isFieldLocked("description") {
-			device.Description = *req.Description
-		}
-		if req.WebUIURL != nil && !isFieldLocked("web_ui_url") {
-			device.WebUIURL = *req.WebUIURL
-		}
-
-		// Save updated device
-		if err := deviceStore.Update(ctx, device); err != nil {
-			appLogger.Error("Device update failed", "serial", device.Serial, "error", err)
-			http.Error(w, "update failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "serial": device.Serial})
-	})
-
-	// Preview device updates: perform a live walk+parse but DO NOT write to DB; returns proposed fields
-	http.HandleFunc("/devices/preview", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct{ Serial, IP string }
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		req.Serial = strings.TrimSpace(req.Serial)
-		// If IP not provided, try to load from DB
-		if strings.TrimSpace(req.IP) == "" && req.Serial != "" {
-			if dev, err := deviceStore.Get(context.Background(), req.Serial); err == nil {
-				req.IP = dev.IP
-			}
-		}
-		if strings.TrimSpace(req.IP) == "" {
-			http.Error(w, "ip required", http.StatusBadRequest)
-			return
-		}
-
-		// Build SNMP client and perform a full diagnostic walk (no stop keywords)
-		cfg, err := agent.GetSNMPConfig()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		client, err := agent.NewSNMPClient(cfg, req.IP, 5)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer client.Close()
-
-		cols := agent.FullDiagnosticWalk(client, nil, []string{"1.3.6.1.2.1", "1.3.6.1.2.1.43", "1.3.6.1.4.1"}, 10000)
-		pi, _ := agent.ParsePDUs(req.IP, cols, nil, func(string) {})
-		// Merge vendor-specific metrics (ICE-style OIDs)
-		agent.MergeVendorMetrics(&pi, cols, "")
-
-		// Return only the fields relevant for device details
-		proposed := map[string]interface{}{
-			"ip":           pi.IP,
-			"manufacturer": pi.Manufacturer,
-			"model":        pi.Model,
-			"hostname":     pi.Hostname,
-			"firmware":     pi.Firmware,
-			"subnet_mask":  pi.SubnetMask,
-			"gateway":      pi.Gateway,
-			"dns_servers":  pi.DNSServers,
-			"dhcp_server":  pi.DHCPServer,
-			"asset_number": pi.AssetID,
-			"location":     pi.Location,
-			"description":  pi.Description,
-			"web_ui_url":   pi.WebUIURL,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"proposed": proposed})
-	})
-
-	// Toggle a field lock on a device
-	http.HandleFunc("/devices/lock", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Serial       string      `json:"serial"`
-			Field        string      `json:"field"`
-			Lock         bool        `json:"lock"`
-			CurrentValue interface{} `json:"current_value,omitempty"` // Value to search for when locking
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		if req.Serial == "" || req.Field == "" {
-			http.Error(w, "serial and field required", http.StatusBadRequest)
-			return
-		}
-		ctx := context.Background()
-		device, err := deviceStore.Get(ctx, req.Serial)
-		if err != nil {
-			http.Error(w, "device not found: "+err.Error(), http.StatusNotFound)
-			return
-		}
-
-		// Ensure LockedFields slice exists
-		if device.LockedFields == nil {
-			device.LockedFields = []storage.FieldLock{}
-		}
-		// helper to check presence
-		has := -1
-		for i, lf := range device.LockedFields {
-			if strings.EqualFold(lf.Field, req.Field) {
-				has = i
-				break
-			}
-		}
-
-		// When locking a field, try to learn the OID for the current value
-		var foundOID string
-		if req.Lock && has == -1 && req.CurrentValue != nil {
-			// Perform SNMP walk to find OID matching the locked value
-			foundOID = tryLearnOIDForValue(ctx, device.IP, device.Manufacturer, req.Field, req.CurrentValue)
-			if foundOID != "" {
-				appLogger.Info("FIELD_LOCK_OID_LEARNED",
-					"ip", device.IP,
-					"manufacturer", device.Manufacturer,
-					"model", device.Model,
-					"serial", device.Serial,
-					"field", req.Field,
-					"value", req.CurrentValue,
-					"found_oid", foundOID)
-
-				// Store the learned OID in device RawData
-				pi := storage.DeviceToPrinterInfo(device)
-				switch strings.ToLower(req.Field) {
-				case "page_count", "total_pages":
-					pi.LearnedOIDs.PageCountOID = foundOID
-				case "mono_pages", "mono_impressions":
-					pi.LearnedOIDs.MonoPagesOID = foundOID
-				case "color_pages", "color_impressions":
-					pi.LearnedOIDs.ColorPagesOID = foundOID
-				case "serial":
-					pi.LearnedOIDs.SerialOID = foundOID
-				case "model":
-					pi.LearnedOIDs.ModelOID = foundOID
-				default:
-					// Store in vendor-specific OIDs
-					if pi.LearnedOIDs.VendorSpecificOIDs == nil {
-						pi.LearnedOIDs.VendorSpecificOIDs = make(map[string]string)
-					}
-					pi.LearnedOIDs.VendorSpecificOIDs[req.Field] = foundOID
-				}
-				// Update device with learned OIDs
-				if device.RawData == nil {
-					device.RawData = make(map[string]interface{})
-				}
-				device.RawData["learned_oids"] = pi.LearnedOIDs
-			}
-		}
-
-		if req.Lock {
-			if has == -1 {
-				device.LockedFields = append(device.LockedFields, storage.FieldLock{Field: req.Field, LockedAt: time.Now(), Reason: "user_locked"})
-			}
-		} else {
-			if has >= 0 {
-				device.LockedFields = append(device.LockedFields[:has], device.LockedFields[has+1:]...)
-			}
-		}
-		if err := deviceStore.Update(ctx, device); err != nil {
-			http.Error(w, "failed to update locks: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		response := map[string]interface{}{
-			"status": "ok",
-		}
-		if foundOID != "" {
-			response["learned_oid"] = foundOID
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	})
-
-	// Endpoint: Save Web UI credentials (moved out of proxy response modifier)
-	http.HandleFunc("/device/webui-credentials", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method { //nolint:exhaustive
-		case http.MethodGet:
-			serial := r.URL.Query().Get("serial")
-			if serial == "" {
-				http.Error(w, "serial required", http.StatusBadRequest)
-				return
-			}
-			cr, err := getCreds(serial)
-			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]any{"exists": false})
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"exists": true, "username": cr.Username, "auth_type": cr.AuthType, "auto_login": cr.AutoLogin})
-		case http.MethodPost:
-			var req struct {
-				Serial    string `json:"serial"`
-				Username  string `json:"username"`
-				Password  string `json:"password"`
-				AuthType  string `json:"auth_type"`
-				AutoLogin bool   `json:"auto_login"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "bad json", http.StatusBadRequest)
-				return
-			}
-			if req.Serial == "" {
-				http.Error(w, "serial required", http.StatusBadRequest)
-				return
-			}
-			enc := ""
-			if req.Password != "" && len(secretKey) == 32 {
-				if v, err := commonutil.EncryptToB64(secretKey, req.Password); err == nil {
-					enc = v
-				}
-			}
-			cr := credRecord{Username: req.Username, Password: enc, AuthType: strings.ToLower(req.AuthType), AutoLogin: req.AutoLogin}
-			if err := saveCreds(req.Serial, cr); err != nil {
-				http.Error(w, "save failed: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	// checkAndFallbackProtocol does a quick TCP connectivity check on the target URL.
-	// If the connection fails, it tries the alternative protocol (httpsâ†”http).
-	// This handles cases where web_ui_url is incorrectly set (e.g., HTTPS when device only supports HTTP).
-	checkAndFallbackProtocol := func(ctx context.Context, targetURL, deviceIP, serial string, log *logger.Logger) string {
-		parsed, err := url.Parse(targetURL)
-		if err != nil {
-			return targetURL
-		}
-
-		// Determine host:port to check
-		host := parsed.Host
-		if host == "" {
-			return targetURL
-		}
-
-		// Quick TCP probe with short timeout (don't block the user)
-		checkCtx, checkCancel := context.WithTimeout(ctx, 3*time.Second)
-		defer checkCancel()
-
-		d := net.Dialer{}
-		conn, err := d.DialContext(checkCtx, "tcp", host)
-		if err == nil {
-			conn.Close()
-			return targetURL // Primary URL works
-		}
-
-		// Connection failed - try alternative protocol
-		log.Debug("Proxy: primary URL unreachable, trying fallback", "url", targetURL, "error", err.Error())
-
-		var altURL string
-		if parsed.Scheme == "https" {
-			// Try HTTP on port 80
-			altURL = buildPrinterProxyURL("http", deviceIP, "")
-		} else {
-			// Try HTTPS on port 443
-			altURL = buildPrinterProxyURL("https", deviceIP, "")
-		}
-
-		altParsed, err := url.Parse(altURL)
-		if err != nil {
-			return targetURL
-		}
-
-		altConn, err := d.DialContext(checkCtx, "tcp", altParsed.Host)
-		if err == nil {
-			altConn.Close()
-			log.Info("Proxy: using fallback protocol", "serial", serial, "original", targetURL, "fallback", altURL)
-			return altURL
-		}
-
-		// Both failed - return original and let the proxy handler report the error
-		log.Warn("Proxy: both protocols unreachable", "serial", serial, "primary", targetURL, "fallback", altURL)
-		return targetURL
-	}
-
-	// Proxy printer web UI - /proxy/<serial>/<path...>
-	http.HandleFunc("/proxy/", func(w http.ResponseWriter, r *http.Request) {
-		// Determine if request is over HTTPS
-		isHTTPS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
-
-		// Set a timeout for the entire proxy request and store HTTPS status
-		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
-		defer cancel()
-		ctx = context.WithValue(ctx, isHTTPSContextKey, isHTTPS)
-		r = r.WithContext(ctx)
-
-		// Extract serial from path: /proxy/SERIAL123/remaining/path
-		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/proxy/"), "/")
-		if len(pathParts) == 0 || pathParts[0] == "" {
-			http.Error(w, "serial required in path", http.StatusBadRequest)
-			return
-		}
-		serial := pathParts[0]
-
-		// Check if this looks like a resource path without a valid serial (e.g., /proxy/js/... or /proxy/css/...)
-		// This happens when relative URLs like "../js/file.js" escape the serial directory
-		// Common resource directories that shouldn't be treated as serials
-		resourceDirs := []string{"js", "css", "images", "strings", "lib", "fonts", "assets", "static", "startwlm", "wlmeng"}
-		for _, dir := range resourceDirs {
-			if serial == dir {
-				appLogger.Debug("Proxy: detected resource path without serial", "path", r.URL.Path, "referer", r.Header.Get("Referer"))
-				// Try to extract serial from Referer header
-				if referer := r.Header.Get("Referer"); referer != "" {
-					if refURL, err := url.Parse(referer); err == nil && strings.HasPrefix(refURL.Path, "/proxy/") {
-						refParts := strings.Split(strings.TrimPrefix(refURL.Path, "/proxy/"), "/")
-						if len(refParts) > 0 && refParts[0] != "" {
-							// Check if the referer's serial is valid
-							refSerial := refParts[0]
-							isValidSerial := true
-							for _, resDir := range resourceDirs {
-								if refSerial == resDir {
-									isValidSerial = false
-									break
-								}
-							}
-							if isValidSerial {
-								// Redirect to the correct path with serial
-								correctPath := "/proxy/" + refSerial + strings.TrimPrefix(r.URL.Path, "/proxy")
-								appLogger.Debug("Proxy: redirecting resource to correct serial path", "from", r.URL.Path, "to", correctPath)
-								http.Redirect(w, r, correctPath, http.StatusFound)
-								return
-							}
-						}
-					}
-				}
-				http.Error(w, "Invalid proxy path - serial number required. Resource paths must include device serial.", http.StatusBadRequest)
-				return
-			}
-		}
-
-		// Check if this is a USB printer - if so, we'll use USB transport with the standard proxy flow
-		// This ensures all URL rewriting logic is applied consistently
-		var usbTransport http.RoundTripper
-		isUSBDevice := CanUSBProxySerial(serial) && usbProxySupported()
-		if isUSBDevice {
-			var ok bool
-			usbTransport, ok = usbProxyTransportForSerial(serial)
-			if !ok {
-				appLogger.Warn("Proxy: USB transport unavailable", "serial", serial)
-				http.Error(w, "USB printer connection failed", http.StatusBadGateway)
-				return
-			}
-			appLogger.Debug("Proxy: using USB transport", "serial", serial, "path", r.URL.Path)
-		}
-
-		// For USB devices, we don't need to look up network device info
-		// Create a virtual target URL for USB (localhost is standard for IPP-USB)
-		var device *storage.Device
-		var targetURL string
-		if isUSBDevice {
-			// USB devices use localhost as the virtual target (IPP-USB spec)
-			targetURL = "http://localhost"
-		} else {
-			// Look up network device (use the timeout context from above)
-			var err error
-			device, err = deviceStore.Get(ctx, serial)
-			if err != nil {
-				appLogger.Warn("Proxy: device lookup failed", "serial", serial, "error", err.Error(), "path", r.URL.Path)
-				http.Error(w, "device not found: "+err.Error(), http.StatusNotFound)
-				return
-			}
-			appLogger.Debug("Proxy: device found", "serial", serial, "ip", device.IP, "manufacturer", device.Manufacturer)
-
-			// Determine target URL (prefer web_ui_url, fallback to http://<ip>).
-			// Network proxy targets are canonicalized to the device's recorded
-			// literal IP before any connectivity check or reverse proxy is built.
-			// This prevents a user-controlled web_ui_url from turning the agent
-			// into an SSRF proxy for localhost or another internal service.
-			targetURL = strings.TrimSpace(device.WebUIURL)
-			if targetURL == "" {
-				targetURL = buildPrinterProxyURL("http", device.IP, "")
-			}
-			validatedTarget, validationErr := validatePrinterProxyTarget(targetURL, device.IP)
-			if validationErr != nil {
-				appLogger.Warn("Proxy: refusing unsafe printer target", "serial", serial, "error", validationErr.Error())
-				http.Error(w, "invalid printer target", http.StatusBadRequest)
-				return
-			}
-			targetURL = validatedTarget.String()
-
-			// Quick connectivity check with automatic HTTP/HTTPS fallback
-			// This helps when web_ui_url is incorrectly set (common with self-signed HTTPS)
-			targetURL = checkAndFallbackProtocol(ctx, targetURL, device.IP, serial, appLogger)
-			// The fallback is constructed from device.IP, but validate it again so
-			// future changes to the fallback logic cannot weaken this boundary.
-			validatedTarget, validationErr = validatePrinterProxyTarget(targetURL, device.IP)
-			if validationErr != nil {
-				appLogger.Warn("Proxy: refusing unsafe fallback target", "serial", serial, "error", validationErr.Error())
-				http.Error(w, "invalid printer target", http.StatusBadRequest)
-				return
-			}
-			targetURL = validatedTarget.String()
-		}
-
-		target, err := url.Parse(targetURL)
-		if err != nil {
-			http.Error(w, "invalid target URL", http.StatusInternalServerError)
-			return
-		}
-
-		// Build target path early for fast static resource detection
-		targetPath := "/"
-		if len(pathParts) > 1 {
-			targetPath = "/" + strings.Join(pathParts[1:], "/")
-		}
-		targetPath = strings.ReplaceAll(targetPath, "//", "/")
-
-		// Fast path for static resources - skip all auth logic for performance
-		// These resources don't need authentication and checking on every request is slow
-		staticExtensions := []string{".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot"}
-		isStaticResource := false
-		lowerPath := strings.ToLower(targetPath)
-		for _, ext := range staticExtensions {
-			if strings.HasSuffix(lowerPath, ext) {
-				isStaticResource = true
-				break
-			}
-		}
-
-		// Check cache for static resources first
-		if isStaticResource {
-			cacheKey := serial + ":" + targetPath
-			if data, contentType, headers, ok := staticCache.Get(cacheKey); ok {
-				appLogger.Debug("Proxy: serving from cache", "serial", serial, "path", targetPath, "size", len(data))
-				// Copy cached headers
-				for key, values := range headers {
-					for _, value := range values {
-						w.Header().Add(key, value)
-					}
-				}
-				if contentType != "" {
-					w.Header().Set("Content-Type", contentType)
-				}
-				w.Header().Set("Cache-Control", "public, max-age=3600") // Browser can cache for 1 hour
-				w.WriteHeader(http.StatusOK)
-				w.Write(data)
-				return
-			}
-		}
-
-		// Pre-authenticate for main page requests when auto-login is enabled
-		// This ensures cookies are available before the page loads (important for Kyocera)
-		if !isStaticResource && (targetPath == "/" || targetPath == "") {
-			cr, err := getCreds(serial)
-			if err == nil && cr != nil && cr.AuthType == "form" && cr.AutoLogin {
-				// Check if we have a valid session cached
-				cachedJar := proxySessionCache.Get(serial)
-				hasValidSession := false
-				if cachedJar != nil {
-					// Verify the cached jar is valid
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								appLogger.Debug("Proxy: cached session invalid on pre-auth check", "serial", serial)
-								proxySessionCache.Clear(serial)
-								cachedJar = nil
-							}
-						}()
-						if targetParsed, err := url.Parse(targetURL); err == nil {
-							cookies := cachedJar.Cookies(targetParsed)
-							hasValidSession = len(cookies) > 0
-							appLogger.Debug("Proxy: pre-auth session check", "serial", serial, "has_session", hasValidSession, "cookie_count", len(cookies))
-						}
-					}()
-				}
-
-				// If no valid session, perform login now before serving the page
-				// cr.Password is already plaintext (fetched from server or decrypted locally)
-				if !hasValidSession && cr.Password != "" {
-					appLogger.Info("Proxy: pre-authenticating for main page request", "serial", serial, "manufacturer", device.Manufacturer)
-					if adapter := proxy.GetAdapterForManufacturer(device.Manufacturer); adapter != nil {
-						if jar, err := adapter.Login(targetURL, cr.Username, cr.Password, appLogger); err == nil {
-							proxySessionCache.Set(serial, jar)
-							appLogger.Info("Proxy: pre-auth successful, cookies ready", "serial", serial, "manufacturer", device.Manufacturer)
-
-							// Send cookies to browser and redirect to same URL to reload with auth
-							if targetParsed, err := url.Parse(targetURL); err == nil {
-								cookies := jar.Cookies(targetParsed)
-								// Get HTTPS status from context
-								isHTTPS := false
-								if v := r.Context().Value(isHTTPSContextKey); v != nil {
-									isHTTPS = v.(bool)
-								}
-								for _, cookie := range cookies {
-									// Rewrite cookie path for proxy
-									if cookie.Path == "" || cookie.Path == "/" {
-										cookie.Path = "/proxy/" + serial + "/"
-									} else if !strings.HasPrefix(cookie.Path, "/proxy/"+serial) {
-										cookie.Path = "/proxy/" + serial + cookie.Path
-									}
-									cookie.Domain = ""
-									// Set Secure flag based on current connection type
-									// If agent is accessed via HTTPS, keep Secure=true; if HTTP, clear it
-									cookie.Secure = isHTTPS
-									if cookie.SameSite == 0 {
-										cookie.SameSite = http.SameSiteLaxMode
-									}
-									http.SetCookie(w, cookie)
-									appLogger.Debug("Proxy: pre-auth set cookie", "serial", serial, "name", cookie.Name, "path", cookie.Path, "secure", cookie.Secure)
-								}
-							}
-
-							// Redirect to same URL to reload with cookies
-							w.Header().Set("Location", r.URL.Path)
-							w.WriteHeader(http.StatusFound)
-							return
-						} else {
-							appLogger.Warn("Proxy: pre-auth login failed", "serial", serial, "error", err.Error())
-						}
-					}
-				}
-			}
-		}
-
-		// Create reverse proxy. Director is intentionally left unset because
-		// the Rewrite hook below (set after credential/session setup) fully
-		// replaces it - ReverseProxy panics if both Director and Rewrite are set.
-		rproxy := &httputil.ReverseProxy{}
-
-		// Handle form-based login if configured (skip for static resources)
-		var sessionJar http.CookieJar
-		var cr *credRecord
-		if !isStaticResource {
-			var err error
-			cr, err = getCreds(serial)
-			appLogger.Debug("Proxy: checking credentials", "serial", serial, "has_creds", cr != nil, "get_error", err)
-			if err == nil && cr != nil {
-				appLogger.Debug("Proxy: credentials found", "serial", serial, "auth_type", cr.AuthType, "auto_login", cr.AutoLogin, "username", cr.Username)
-			}
-			if err == nil && cr != nil && cr.AuthType == "form" && cr.AutoLogin {
-				appLogger.Info("Proxy: form auth configured for device", "serial", serial, "manufacturer", device.Manufacturer)
-				// Check session cache first - Get returns *cookiejar.Jar which can be nil
-				cachedJar := proxySessionCache.Get(serial)
-				if cachedJar != nil {
-					sessionJar = cachedJar
-					// Test if jar is actually usable by trying to get cookies
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								appLogger.Warn("Proxy: cached jar is invalid, clearing", "serial", serial, "error", fmt.Sprintf("%v", r))
-								sessionJar = nil
-								proxySessionCache.Clear(serial)
-							}
-						}()
-						if targetParsed, err := url.Parse(targetURL); err == nil {
-							_ = sessionJar.Cookies(targetParsed)
-							appLogger.Debug("Proxy: session cache check - jar is valid", "serial", serial)
-						}
-					}()
-				}
-				appLogger.Debug("Proxy: session cache check", "serial", serial, "cached", sessionJar != nil)
-				// cr.Password is already plaintext (fetched from server or decrypted locally)
-				if sessionJar == nil && cr.Password != "" {
-					appLogger.Debug("Proxy: attempting fresh login", "serial", serial, "manufacturer", device.Manufacturer)
-					// Attempt vendor-specific login
-					if adapter := proxy.GetAdapterForManufacturer(device.Manufacturer); adapter != nil {
-						appLogger.Debug("Proxy: attempting vendor login", "manufacturer", device.Manufacturer, "serial", serial, "adapter", adapter.Name())
-						if jar, err := adapter.Login(targetURL, cr.Username, cr.Password, appLogger); err == nil {
-							sessionJar = jar
-							proxySessionCache.Set(serial, jar)
-							// Log cookies that were received
-							if targetParsed, err := url.Parse(targetURL); err == nil {
-								cookies := jar.Cookies(targetParsed)
-								appLogger.Info("Proxy: logged into device", "manufacturer", device.Manufacturer, "serial", serial, "adapter", adapter.Name(), "cookies_received", len(cookies))
-								for i, c := range cookies {
-									appLogger.Debug("Proxy: received cookie", "index", i, "name", c.Name, "value_length", len(c.Value), "path", c.Path, "domain", c.Domain)
-								}
-							} else {
-								appLogger.Info("Proxy: logged into device", "manufacturer", device.Manufacturer, "serial", serial, "adapter", adapter.Name())
-							}
-						} else {
-							appLogger.WarnRateLimited("proxy_login_"+serial, 5*time.Minute, "Proxy: login failed", "serial", serial, "error", err.Error())
-						}
-					} else {
-						appLogger.Debug("Proxy: no adapter found for manufacturer", "manufacturer", device.Manufacturer, "serial", serial)
-					}
-				}
-
-				// If we have valid session cookies and user is accessing a login/password page,
-				// redirect them to the home page instead (autologin bypass)
-				if sessionJar != nil {
-					// Build target path first to check it
-					targetPath := "/"
-					if len(pathParts) > 1 {
-						targetPath = "/" + strings.Join(pathParts[1:], "/")
-					}
-					targetPath = strings.ReplaceAll(targetPath, "//", "/")
-
-					loginPaths := []string{
-						"/PRESENTATION/ADVANCED/PASSWORD",
-						"/login",
-						"/auth",
-					}
-					for _, loginPath := range loginPaths {
-						if strings.HasPrefix(strings.ToUpper(targetPath), strings.ToUpper(loginPath)) {
-							appLogger.Info("Proxy: redirecting authenticated user from login page to home", "serial", serial, "original_path", targetPath)
-
-							// Send Set-Cookie headers to browser so it stores the session cookies
-							if targetParsed, err := url.Parse(targetURL); err == nil {
-								cookies := sessionJar.Cookies(targetParsed)
-								proxyPrefix := "/proxy/" + serial
-								// Determine if we're on HTTPS to set Secure flag appropriately
-								isSecure := false
-								if v := r.Context().Value(isHTTPSContextKey); v != nil {
-									isSecure = v.(bool)
-								}
-								for _, cookie := range cookies {
-									// Clone the cookie and rewrite path for proxy
-									browserCookie := &http.Cookie{
-										Name:     cookie.Name,
-										Value:    cookie.Value,
-										Path:     proxyPrefix + "/",
-										Domain:   "",
-										MaxAge:   cookie.MaxAge,
-										Secure:   isSecure,
-										HttpOnly: cookie.HttpOnly,
-										SameSite: http.SameSiteLaxMode,
-									}
-									http.SetCookie(w, browserCookie)
-									appLogger.Debug("Proxy: sending Set-Cookie to browser", "name", cookie.Name, "path", browserCookie.Path)
-								}
-							}
-
-							// Send HTML that redirects the top-level frame (not just iframe)
-							// This ensures the entire page reloads with cookies, not just the iframe
-							w.Header().Set("Content-Type", "text/html; charset=utf-8")
-							w.WriteHeader(http.StatusOK)
-							// Escape serial for safe HTML embedding to prevent XSS
-							safeSerial := html.EscapeString(serial)
-							redirectHTML := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Logged In - Redirecting...</title>
-<script>
-// Redirect the top-level window to ensure full page reload with cookies
-window.top.location.href = '/proxy/%s/';
-</script>
-</head>
-<body>
-<p>Login successful. Redirecting...</p>
-<noscript>
-<p>Please enable JavaScript or <a href="/proxy/%s/">click here</a> to continue.</p>
-</noscript>
-</body>
-</html>`, safeSerial, safeSerial)
-							fmt.Fprint(w, redirectHTML)
-							return
-						}
-					}
-				}
-			}
-		} // End if !isStaticResource
-
-		// Rewrite request path to remove /proxy/<serial> prefix BEFORE setting Director
-		originalPath := r.URL.Path
-		// Reuse targetPath if already computed, otherwise calculate it
-		if targetPath == "/" && len(pathParts) > 1 {
-			targetPath = "/" + strings.Join(pathParts[1:], "/")
-		}
-		// Clean up double slashes
-		targetPath = strings.ReplaceAll(targetPath, "//", "/")
-
-		// Proxy prefix for this device's serial, used for URL rewriting and header adjustments
-		proxyPrefix := "/proxy/" + serial
-
-		// Capture sessionJar for safe closure access (avoid races)
-		capturedJar := sessionJar
-
-		// Rewrite requests using the modern ReverseProxy hook.
-		rproxy.Rewrite = func(pr *httputil.ProxyRequest) {
-			req := pr.Out
-
-			// Base rewrite behavior to set URL/Host/Path
-			pr.SetURL(target)
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.URL.Path = targetPath
-			req.Host = target.Host
-			// Force identity encoding so upstream doesn't gzip; simplifies any content rewriting
-			// and avoids mismatched Content-Encoding headers when we replace bodies.
-			req.Header.Del("Accept-Encoding")
-
-			// Rewrite Referer and Origin headers to the upstream origin so vendor UIs that enforce
-			// CSRF/host checks don't reject proxied form posts or XHR requests.
-			if ref := pr.In.Header.Get("Referer"); ref != "" {
-				if u, err := url.Parse(ref); err == nil {
-					if strings.HasPrefix(u.Path, proxyPrefix) {
-						upPath := strings.TrimPrefix(u.Path, proxyPrefix)
-						if upPath == "" {
-							upPath = "/"
-						}
-						newRef := target.Scheme + "://" + target.Host + upPath
-						if u.RawQuery != "" {
-							newRef += "?" + u.RawQuery
-						}
-						if u.Fragment != "" {
-							newRef += "#" + u.Fragment
-						}
-						appLogger.TraceTag("proxy_rewrite", "Rewriting Referer header", "original", ref, "rewritten", newRef)
-						req.Header.Set("Referer", newRef)
-					}
-				}
-			}
-
-			if origOrigin := pr.In.Header.Get("Origin"); origOrigin != "" {
-				newOrigin := target.Scheme + "://" + target.Host
-				appLogger.TraceTag("proxy_rewrite", "Rewriting Origin header", "original", origOrigin, "rewritten", newOrigin)
-				req.Header.Set("Origin", newOrigin)
-			}
-
-			// Add Authorization for Basic auth
-			// cr.Password is already plaintext (fetched from server or decrypted locally)
-			if cr, err := getCreds(serial); err == nil && cr != nil && cr.AuthType == "basic" && cr.AutoLogin && cr.Password != "" {
-				userpass := cr.Username + ":" + cr.Password
-				req.Header.Set("Authorization", "Basic "+basicAuth(userpass))
-			}
-
-			// Attach cookies for form auth
-			// Double-check jar is valid to prevent race conditions
-			if capturedJar != nil && target != nil {
-				// Safely get cookies with nil check
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							appLogger.Warn("Proxy: panic getting cookies", "error", fmt.Sprintf("%v", r))
-						}
-					}()
-					if cookies := capturedJar.Cookies(target); len(cookies) > 0 {
-						appLogger.Debug("Proxy Rewrite: attaching cookies", "path", req.URL.Path, "cookie_count", len(cookies))
-						for _, c := range cookies {
-							appLogger.Debug("Proxy Rewrite: adding cookie", "name", c.Name, "value_length", len(c.Value))
-							req.AddCookie(c)
-						}
-					} else {
-						appLogger.Debug("Proxy Rewrite: no cookies to attach", "path", req.URL.Path, "has_jar", capturedJar != nil)
-					}
-				}()
-			} else {
-				appLogger.Debug("Proxy Rewrite: skipping cookies", "has_jar", capturedJar != nil, "has_target", target != nil, "path", req.URL.Path)
-			}
-		}
-
-		// Configure transport - use USB transport for USB devices, HTTP transport for network
-		if usbTransport != nil {
-			rproxy.Transport = usbTransport
-		} else {
-			rproxy.Transport = &http.Transport{
-				TLSClientConfig: &tls.Config{
-					// Printer certificates must be validated against the system trust
-					// store (or an explicitly configured CA).  Accepting any certificate
-					// would allow a LAN attacker to capture printer credentials/cookies.
-					MinVersion: tls.VersionTLS12,
-				},
-				MaxIdleConns:          10,
-				IdleConnTimeout:       60 * time.Second,
-				DisableCompression:    false,
-				DisableKeepAlives:     false,
-				ResponseHeaderTimeout: 30 * time.Second,
-				DialContext: (&net.Dialer{
-					Timeout:   15 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-			}
-		}
-
-		appLogger.TraceTag("proxy_request", "Proxy request", "method", r.Method, "path", originalPath, "prefix", proxyPrefix, "target", target.String(), "target_path", targetPath)
-
-		// Modify response to rewrite URLs in content and headers
-		rproxy.ModifyResponse = func(resp *http.Response) error {
-			if resp == nil || resp.Body == nil {
-				return nil
-			}
-			if resp.ContentLength > maxAgentProxyResponseBodySize {
-				return fmt.Errorf("proxy response body exceeds %d bytes", maxAgentProxyResponseBodySize)
-			}
-			// Rewrite Set-Cookie headers to include the proxy path
-			// This ensures the browser stores cookies and includes them in iframe requests
-			if cookies := resp.Cookies(); len(cookies) > 0 {
-				resp.Header.Del("Set-Cookie")
-				// Get HTTPS status from context
-				isHTTPS := false
-				if resp.Request != nil && resp.Request.Context() != nil {
-					if v := resp.Request.Context().Value(isHTTPSContextKey); v != nil {
-						isHTTPS = v.(bool)
-					}
-				}
-				for _, cookie := range cookies {
-					// Rewrite cookie path to be relative to proxy prefix
-					if cookie.Path == "" || cookie.Path == "/" {
-						cookie.Path = proxyPrefix + "/"
-					} else if !strings.HasPrefix(cookie.Path, proxyPrefix) {
-						cookie.Path = proxyPrefix + cookie.Path
-					}
-					// Clear domain since we're proxying to a different host
-					cookie.Domain = ""
-					// Set Secure flag based on connection type
-					// If agent is accessed via HTTPS, keep Secure=true; if HTTP, clear it
-					cookie.Secure = isHTTPS
-					// Set SameSite to Lax to allow iframe requests
-					if cookie.SameSite == 0 {
-						cookie.SameSite = http.SameSiteLaxMode
-					}
-					resp.Header.Add("Set-Cookie", cookie.String())
-					appLogger.Debug("Proxy: rewriting Set-Cookie for browser", "name", cookie.Name, "path", cookie.Path, "secure", cookie.Secure)
-				}
-			}
-
-			// Rewrite Location header for redirects to stay within proxy path
-			if loc := resp.Header.Get("Location"); loc != "" {
-				if locURL, err := url.Parse(loc); err == nil {
-					// Rewrite relative or same-host absolute URLs
-					if locURL.Host == "" || locURL.Host == target.Host {
-						newPath := locURL.Path
-						if newPath == "" {
-							newPath = "/"
-						}
-						newLoc := proxyPrefix + newPath
-						if locURL.RawQuery != "" {
-							newLoc += "?" + locURL.RawQuery
-						}
-						if locURL.Fragment != "" {
-							newLoc += "#" + locURL.Fragment
-						}
-						resp.Header.Set("Location", newLoc)
-					}
-				}
-			}
-
-			// Strip headers that prevent iframe embedding
-			resp.Header.Del("X-Frame-Options")
-			resp.Header.Del("Content-Security-Policy")
-
-			// Rewrite HTML/CSS/JS content to fix relative URLs
-			contentType := resp.Header.Get("Content-Type")
-			shouldRewrite := strings.Contains(contentType, "text/html") ||
-				strings.Contains(contentType, "text/css") ||
-				strings.Contains(contentType, "application/javascript") ||
-				strings.Contains(contentType, "text/javascript") ||
-				strings.Contains(contentType, "application/x-javascript")
-
-			if shouldRewrite {
-				body, err := readBoundedProxyResponse(resp.Body)
-				if err != nil {
-					return err
-				}
-
-				content := string(body)
-				appLogger.TraceTag("proxy_body_rewrite", "Rewriting response body", "content_type", contentType, "original_size", len(body), "path", targetPath)
-				isHTML := strings.Contains(contentType, "text/html")
-				isCSS := strings.Contains(contentType, "text/css")
-
-				// Rewrite common URL patterns in HTML/CSS/JS
-				// Fix absolute paths: href="/path" -> href="/proxy/SERIAL/path"
-				content = strings.ReplaceAll(content, `href="/"`, `href="`+proxyPrefix+`/"`)
-				content = strings.ReplaceAll(content, `href='/'`, `href='`+proxyPrefix+`/'`)
-				content = strings.ReplaceAll(content, `src="/"`, `src="`+proxyPrefix+`/"`)
-				content = strings.ReplaceAll(content, `src='/'`, `src='`+proxyPrefix+`/'`)
-				content = strings.ReplaceAll(content, `action="/"`, `action="`+proxyPrefix+`/"`)
-				content = strings.ReplaceAll(content, `action='/'`, `action='`+proxyPrefix+`/'`)
-
-				// Rewrite absolute-path attributes to stay under /proxy/<serial>
-				content = strings.ReplaceAll(content, `href="/`, `href="`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `href='/`, `href='`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `src="/`, `src="`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `src='/`, `src='`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `action="/`, `action="`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `action='/`, `action='`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `data-src="/`, `data-src="`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `data-src='/`, `data-src='`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `data-href="/`, `data-href="`+proxyPrefix+`/`)
-				content = strings.ReplaceAll(content, `data-href='/`, `data-href='`+proxyPrefix+`/`)
-
-				// Fix CSS url() references: url(/path) and url("/path") and url('/path')
-				if isCSS || isHTML {
-					// CSS url() references
-					content = strings.ReplaceAll(content, `url(/`, `url(`+proxyPrefix+`/`)
-					content = strings.ReplaceAll(content, `url("/`, `url("`+proxyPrefix+`/`)
-					content = strings.ReplaceAll(content, `url('/`, `url('`+proxyPrefix+`/`)
-				}
-
-				// Fix JavaScript location redirects
-				content = strings.ReplaceAll(content, `location.href="/"`, `location.href="`+proxyPrefix+`/"`)
-				content = strings.ReplaceAll(content, `location.href='/'`, `location.href='`+proxyPrefix+`/'`)
-				content = strings.ReplaceAll(content, `window.location="/"`, `window.location="`+proxyPrefix+`/"`)
-				content = strings.ReplaceAll(content, `window.location='/'`, `window.location='`+proxyPrefix+`/'`)
-
-				// Add base tag to HTML to help resolve relative URLs
-				// IMPORTANT: base must reflect the directory of the UPSTREAM request path
-				// (not our incoming /proxy/<serial>/... path) to avoid duplicating the proxy prefix.
-				if isHTML {
-					if rewritten, ok := rewriteExistingBaseTag(content, proxyPrefix, target.Host); ok {
-						content = rewritten
-					} else if !strings.Contains(strings.ToLower(content), "<base") {
-						// Use the upstream request path from the reverse proxy response
-						upstreamPath := "/"
-						if resp != nil && resp.Request != nil && resp.Request.URL != nil {
-							upstreamPath = resp.Request.URL.Path
-						}
-						dir := path.Dir(upstreamPath)
-						if !strings.HasSuffix(dir, "/") {
-							dir += "/"
-						}
-						baseHref := proxyPrefix + dir
-						baseTag := "<base href=\"" + baseHref + "\">"
-						contentLower := strings.ToLower(content)
-						if idx := strings.Index(contentLower, "<head>"); idx != -1 {
-							content = content[:idx+6] + baseTag + content[idx+6:]
-						} else if idx := strings.Index(contentLower, "<head "); idx != -1 {
-							// Find end of <head ...> tag
-							if endIdx := strings.Index(content[idx:], ">"); endIdx != -1 {
-								insertPos := idx + endIdx + 1
-								content = content[:insertPos] + baseTag + content[insertPos:]
-							}
-						}
-					}
-				}
-
-				newBody := []byte(content)
-
-				// Detect if we got a login page despite having cached session
-				// This means the session was invalidated (user logged out)
-				if isHTML && capturedJar != nil {
-					contentLower := strings.ToLower(content)
-					// Check for common login page indicators
-					hasLoginForm := strings.Contains(contentLower, "type=\"password\"") ||
-						strings.Contains(contentLower, "type='password'")
-					hasLoginKeywords := strings.Contains(contentLower, "login") ||
-						strings.Contains(contentLower, "password") ||
-						strings.Contains(contentLower, "username") ||
-						strings.Contains(contentLower, "sign in")
-
-					// If this looks like a login page, clear the cached session
-					if hasLoginForm && hasLoginKeywords {
-						appLogger.Info("Proxy: detected login page - clearing cached session (likely logged out)", "serial", serial)
-						proxySessionCache.Clear(serial)
-					}
-				}
-
-				resp.Body = io.NopCloser(bytes.NewReader(newBody))
-				// We've rewritten the body; ensure Content-Encoding is cleared and length matches
-				resp.Header.Del("Content-Encoding")
-				resp.ContentLength = int64(len(newBody))
-				resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
-			}
-
-			// Cache static resources for performance (printers are very slow)
-			if isStaticResource && resp.StatusCode == http.StatusOK {
-				// Read the body to cache it
-				body, err := readBoundedProxyResponse(resp.Body)
-				if err == nil {
-					// Cache for 15 minutes
-					cacheKey := serial + ":" + targetPath
-					staticCache.Set(cacheKey, body, resp.Header.Get("Content-Type"), resp.Header.Clone(), 15*time.Minute)
-					appLogger.Debug("Proxy: cached static resource", "serial", serial, "path", targetPath, "size", len(body))
-					// Restore the body for the response
-					resp.Body = io.NopCloser(bytes.NewReader(body))
-					resp.ContentLength = int64(len(body))
-				} else {
-					return err
-				}
-			}
-
-			// Responses that are not rewritten or cached are streamed directly by
-			// ReverseProxy. Bound unknown-length bodies so a malicious printer cannot
-			// keep the agent or its WebSocket peer busy indefinitely.
-			if resp.Body != nil && resp.ContentLength < 0 {
-				resp.Body = &boundedProxyBody{ReadCloser: resp.Body, remaining: maxAgentProxyResponseBodySize}
-				resp.Header.Del("Content-Length")
-			}
-
-			return nil
-		}
-
-		// Add error handler for proxy failures
-		rproxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			appLogger.WarnRateLimited("proxy_error_"+serial, 1*time.Minute, "Proxy error", "serial", serial, "error", err.Error())
-			if err == context.DeadlineExceeded || r.Context().Err() == context.DeadlineExceeded {
-				http.Error(w, "Printer did not respond within 45 seconds. The device may be busy, turned off, or its web interface may be disabled.", http.StatusGatewayTimeout)
-			} else {
-				http.Error(w, fmt.Sprintf("Proxy connection failed: %v", err), http.StatusBadGateway)
-			}
-		}
-
-		// Serve the proxied request with response diagnostics
-		lrw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
-		start := time.Now()
-
-		// Ensure we always log completion/timeout via defer
-		defer func() {
-			dur := time.Since(start)
-			if dur > 30*time.Second {
-				appLogger.Warn("Proxy slow/timeout", "serial", serial, "status", lrw.status, "bytes", lrw.bytes, "duration_ms", dur.Milliseconds(), "path", originalPath)
-			} else if lrw.status >= 500 {
-				appLogger.WarnRateLimited("proxy_upstream_"+serial, 1*time.Minute, "Proxy upstream error", "serial", serial, "status", lrw.status, "bytes", lrw.bytes, "duration_ms", dur.Milliseconds(), "path", originalPath)
-			} else {
-				appLogger.TraceTag("proxy_response", "Proxy completed", "serial", serial, "status", lrw.status, "bytes", lrw.bytes, "duration_ms", dur.Milliseconds(), "path", originalPath)
-			}
-		}()
-
-		rproxy.ServeHTTP(lrw, r)
-	})
-
-	// List merged device profiles (using storage interface)
-	http.HandleFunc("/devices/list", func(w http.ResponseWriter, r *http.Request) {
-		// List only saved devices (is_saved=true)
-		saved := true
-		devices, err := deviceStore.List(context.Background(), storage.DeviceFilter{IsSaved: &saved})
-		if err != nil {
-			http.Error(w, "failed to list devices: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Format for compatibility with existing frontend
-		out := []map[string]interface{}{}
-		for _, device := range devices {
-			// Convert to PrinterInfo for compatibility
-			pi := storage.DeviceToPrinterInfo(device)
-			out = append(out, map[string]interface{}{
-				"serial":       device.Serial,
-				"path":         device.Serial + ".json", // For compatibility
-				"printer_info": pi,
-				"info":         pi, // Alias for compatibility
-				"asset_number": device.AssetNumber,
-				"location":     device.Location,
-				"web_ui_url":   device.WebUIURL,
-				// New unified device type fields
-				"device_type":        device.DeviceType,
-				"source_type":        device.SourceType,
-				"is_usb":             device.IsUSB,
-				"initial_page_count": device.InitialPageCount,
-				"port_name":          device.PortName,
-				"driver_name":        device.DriverName,
-				"is_default":         device.IsDefault,
-				"is_shared":          device.IsShared,
-				"spooler_status":     device.SpoolerStatus,
-			})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
-	})
-
-	// Get a merged device profile by serial. /devices/get?serial=SERIAL
-	http.HandleFunc("/devices/get", func(w http.ResponseWriter, r *http.Request) {
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial required", http.StatusBadRequest)
-			return
-		}
-
-		// Try database first
-		ctx := context.Background()
-		device, err := deviceStore.Get(ctx, serial)
-		if err == nil {
-			// Convert fields directly for response
-
-			// Fetch latest metrics for this device
-			var pageCount int
-			var tonerLevels map[string]interface{}
-			if snapshot, err := deviceStore.GetLatestMetrics(ctx, device.Serial); err == nil && snapshot != nil {
-				pageCount = snapshot.PageCount
-				tonerLevels = snapshot.TonerLevels
-			}
-
-			// If metrics do not contain toner_levels, try to synthesize from RawData
-			if len(tonerLevels) == 0 && device.RawData != nil {
-				// If raw_data already contains a structured toner_levels map, use it
-				if tl, ok := device.RawData["toner_levels"].(map[string]interface{}); ok && len(tl) > 0 {
-					tonerLevels = tl
-				} else {
-					// Otherwise, look for per-color keys and build a map
-					tl := map[string]interface{}{}
-					if v, ok := device.RawData["toner_level_black"].(float64); ok {
-						tl["Black"] = int(v)
-					} else if v, ok := device.RawData["toner_level_black"].(int); ok {
-						tl["Black"] = v
-					}
-					if v, ok := device.RawData["toner_level_cyan"].(float64); ok {
-						tl["Cyan"] = int(v)
-					} else if v, ok := device.RawData["toner_level_cyan"].(int); ok {
-						tl["Cyan"] = v
-					}
-					if v, ok := device.RawData["toner_level_magenta"].(float64); ok {
-						tl["Magenta"] = int(v)
-					} else if v, ok := device.RawData["toner_level_magenta"].(int); ok {
-						tl["Magenta"] = v
-					}
-					if v, ok := device.RawData["toner_level_yellow"].(float64); ok {
-						tl["Yellow"] = int(v)
-					} else if v, ok := device.RawData["toner_level_yellow"].(int); ok {
-						tl["Yellow"] = v
-					}
-					if len(tl) > 0 {
-						tonerLevels = tl
-					}
-				}
-			}
-
-			// Create response with all device fields + printer_info for compatibility
-			response := map[string]interface{}{
-				"serial":          device.Serial,
-				"ip":              device.IP,
-				"manufacturer":    device.Manufacturer,
-				"model":           device.Model,
-				"hostname":        device.Hostname,
-				"firmware":        device.Firmware,
-				"mac_address":     device.MACAddress,
-				"subnet_mask":     device.SubnetMask,
-				"gateway":         device.Gateway,
-				"dns_servers":     device.DNSServers,
-				"dhcp_server":     device.DHCPServer,
-				"page_count":      pageCount,
-				"toner_levels":    tonerLevels,
-				"consumables":     device.Consumables,
-				"status_messages": device.StatusMessages,
-				"asset_number":    device.AssetNumber,
-				"location":        device.Location,
-				"web_ui_url":      device.WebUIURL,
-				"last_seen":       device.LastSeen,
-				"created_at":      device.CreatedAt,
-				"first_seen":      device.FirstSeen,
-				"is_saved":        device.IsSaved,
-
-				// New unified device type fields
-				"device_type":        device.DeviceType,
-				"source_type":        device.SourceType,
-				"is_usb":             device.IsUSB,
-				"initial_page_count": device.InitialPageCount,
-				"port_name":          device.PortName,
-				"driver_name":        device.DriverName,
-				"is_default":         device.IsDefault,
-				"is_shared":          device.IsShared,
-				"spooler_status":     device.SpoolerStatus,
-
-				// Include RawData if present for extended fields
-				"raw_data": device.RawData,
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(response)
-			return
-		}
-		// Not found in database
-		http.Error(w, "not found", http.StatusNotFound)
-	})
-
-	// Canonical device profile endpoint (device metadata + latest metrics).
-	// GET /api/devices/profile?serial=SERIAL
-	// This avoids compatibility/merged fields in legacy /devices/get.
-	http.HandleFunc("/api/devices/profile", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial parameter required", http.StatusBadRequest)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		device, err := deviceStore.Get(ctx, serial)
-		if err != nil {
-			if err == storage.ErrNotFound {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "failed to get device: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		var snapshot *storage.MetricsSnapshot
-		if s, err := deviceStore.GetLatestMetrics(ctx, serial); err == nil {
-			snapshot = s
-		} else if err != storage.ErrNotFound {
-			http.Error(w, "failed to get latest metrics: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"device":         device,
-			"latest_metrics": snapshot,
-		})
-	})
-
-	// POST /api/devices/initial-page-count - Set initial page count baseline for audit trail
-	http.HandleFunc("/api/devices/initial-page-count", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			Serial   string `json:"serial"`
-			Count    int    `json:"count"`
-			Reason   string `json:"reason,omitempty"`
-			Username string `json:"username,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		if req.Serial == "" {
-			http.Error(w, "serial required", http.StatusBadRequest)
-			return
-		}
-		if req.Count < 0 {
-			http.Error(w, "count must be non-negative", http.StatusBadRequest)
-			return
-		}
-
-		// Default username if not provided
-		if req.Username == "" {
-			req.Username = "system"
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		if err := deviceStore.SetInitialPageCount(ctx, req.Serial, req.Count, req.Username, req.Reason); err != nil {
-			if err == storage.ErrNotFound {
-				http.Error(w, "device not found", http.StatusNotFound)
-				return
-			}
-			appLogger.Error("Failed to set initial page count", "serial", req.Serial, "error", err)
-			http.Error(w, "failed to set initial page count: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		appLogger.Info("Initial page count set", "serial", req.Serial, "count", req.Count, "by", req.Username)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"serial":  req.Serial,
-			"count":   req.Count,
-		})
-	})
-
-	// GET /api/devices/audit - Get page count audit history for a device
-	http.HandleFunc("/api/devices/audit", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial parameter required", http.StatusBadRequest)
-			return
-		}
-
-		// Optional limit parameter (default: 100)
-		limit := 100
-		if l := r.URL.Query().Get("limit"); l != "" {
-			if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-				limit = parsed
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		audits, err := deviceStore.GetPageCountAudit(ctx, serial, limit)
-		if err != nil {
-			appLogger.Error("Failed to get page count audit", "serial", serial, "error", err)
-			http.Error(w, "failed to get audit history: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"serial": serial,
-			"audits": audits,
-			"count":  len(audits),
-		})
-	})
-
-	// GET /api/devices/usage - Get page count usage since initial baseline
-	http.HandleFunc("/api/devices/usage", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial parameter required", http.StatusBadRequest)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		usage, initial, current, err := deviceStore.GetPageCountUsage(ctx, serial)
-		if err != nil {
-			if err == storage.ErrNotFound {
-				http.Error(w, "device not found", http.StatusNotFound)
-				return
-			}
-			appLogger.Error("Failed to get page count usage", "serial", serial, "error", err)
-			http.Error(w, "failed to get usage: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"serial":             serial,
-			"usage":              usage,
-			"initial_page_count": initial,
-			"current_page_count": current,
-		})
-	})
-
-	// Save a device by marking it as saved. POST { serial: "SERIAL" }
-	http.HandleFunc("/devices/save", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Serial string `json:"serial"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		if req.Serial == "" {
-			http.Error(w, "serial required", http.StatusBadRequest)
-			return
-		}
-
-		ctx := context.Background()
-		if err := deviceStore.MarkSaved(ctx, req.Serial); err != nil {
-			appLogger.Error("Failed to save device", "serial", req.Serial, "error", err)
-			http.Error(w, "failed to save device: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		appLogger.Info("Device marked as saved", "serial", req.Serial)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "saved",
-			"serial": req.Serial,
-		})
-	})
-
-	// Save all discovered devices (marks all visible unsaved devices as saved)
-	http.HandleFunc("/devices/save/all", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		ctx := context.Background()
-		count, err := deviceStore.MarkAllSaved(ctx)
-		if err != nil {
-			appLogger.Error("Failed to save all devices", "error", err)
-			http.Error(w, "failed to save all devices: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		appLogger.Info("Marked devices as saved", "count", count)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "saved",
-			"count":  count,
-		})
-	})
-
-	// Delete a device profile by serial. POST { serial: "SERIAL" }
-	http.HandleFunc("/devices/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Serial string `json:"serial"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-		if req.Serial == "" {
-			http.Error(w, "serial required", http.StatusBadRequest)
-			return
-		}
-
-		// Sanitize serial to prevent path traversal attacks
-		safeSerial := filepath.Base(req.Serial)
-		if safeSerial == "." || safeSerial == ".." || safeSerial != req.Serial {
-			http.Error(w, "invalid serial number", http.StatusBadRequest)
-			return
-		}
-
-		// Try database first
-		ctx := context.Background()
-		deletedFromDB := false
-
-		err := deviceStore.Delete(ctx, safeSerial)
-		if err == nil {
-			deletedFromDB = true
-			appLogger.Info("Deleted device from database", "serial", safeSerial)
-		} else if err != storage.ErrNotFound {
-			appLogger.Error("Database delete error", "error", err.Error())
-			// Continue to file delete as fallback
-		}
-
-		// Fallback: delete JSON file (using sanitized serial) if DB delete failed
-		if !deletedFromDB {
-			p := filepath.Join(".", "logs", "devices", safeSerial+".json")
-			if err := os.Remove(p); err != nil {
-				if os.IsNotExist(err) {
-					http.Error(w, "not found", http.StatusNotFound)
-					return
-				}
-				http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		// Notify the server about device deletion via WebSocket (if connected)
-		// Skip notification if this delete was initiated by the server (via proxy)
-		// to avoid a race condition where both the HTTP handler and WebSocket handler
-		// try to delete from server storage simultaneously.
-		if r.Header.Get("X-PrintMaster-Server-Request") == "" {
-			go notifyServerDeviceDeleted(safeSerial)
-		}
-
-		// Note: Device will naturally be re-discovered during next scan if still on network
-		// No need to immediately re-scan as this defeats the purpose of deletion
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	// Auth endpoints leverage agentAuth manager for local session enforcement
-	http.HandleFunc("/api/v1/auth/me", func(w http.ResponseWriter, r *http.Request) {
-		if agentAuth == nil {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		agentAuth.handleAuthMe(w, r)
-	})
-
-	http.HandleFunc("/api/v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
-		if agentAuth == nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]bool{"success": true})
-			return
-		}
-		agentAuth.handleAuthLogout(w, r)
-	})
-
-	http.HandleFunc("/api/v1/auth/callback", func(w http.ResponseWriter, r *http.Request) {
-		if agentAuth == nil {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		agentAuth.handleAuthCallback(w, r)
-	})
-
-	http.HandleFunc("/api/v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
-		if agentAuth == nil {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		agentAuth.handleAuthLogin(w, r)
-	})
-
-	http.HandleFunc("/api/v1/auth/options", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if agentAuth == nil {
-			http.Error(w, "authentication unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(agentAuth.optionsPayload())
-	})
-
-	// Version endpoint
-	http.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"version":    Version,
-			"build_time": BuildTime,
-			"git_commit": GitCommit,
-			"build_type": BuildType,
-			"go_version": runtime.Version(),
-			"os":         runtime.GOOS,
-			"arch":       runtime.GOARCH,
-		})
-	})
-
-	// GET /api/jobs/:id - Get status of a background job
-	http.HandleFunc("/api/jobs/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Extract job ID from path
-		jobID := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
-		if jobID == "" {
-			http.Error(w, "job_id required", http.StatusBadRequest)
-			return
-		}
-
-		job := getJob(jobID)
-		if job == nil {
-			http.Error(w, "job not found", http.StatusNotFound)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(job)
-	})
-
-	// Auto-update status and control endpoint
-	http.HandleFunc("/api/autoupdate/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		autoUpdateManagerMu.RLock()
-		manager := autoUpdateManager
-		autoUpdateManagerMu.RUnlock()
-
-		w.Header().Set("Content-Type", "application/json")
-
-		if manager == nil {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"enabled":  false,
-				"reason":   "not initialized (no server connection)",
-				"status":   "disabled",
-				"platform": agent.GetPlatformInfo(),
-				"arch":     runtime.GOARCH,
-			})
-			return
-		}
-
-		status := manager.Status()
-		json.NewEncoder(w).Encode(status)
-	})
-
-	// Trigger an immediate update check
-	http.HandleFunc("/api/autoupdate/check", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		autoUpdateManagerMu.RLock()
-		manager := autoUpdateManager
-		autoUpdateManagerMu.RUnlock()
-
-		if manager == nil {
-			if appLogger != nil {
-				appLogger.Info("Update check requested but auto-update manager not initialized (check server connection)")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error":   "auto-update not available",
-				"message": "Agent must be connected to a server for updates. Check server configuration.",
-			})
-			return
-		}
-
-		if appLogger != nil {
-			appLogger.Info("Manual update check triggered via API")
-		}
-
-		// Run check in background with a reasonable timeout
-		go func() {
-			checkCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			if err := manager.CheckNow(checkCtx); err != nil && appLogger != nil {
-				appLogger.Warn("Manual update check failed", "error", err)
-			} else if appLogger != nil {
-				appLogger.Info("Manual update check completed")
-			}
-		}()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "check_triggered",
-			"message": "Update check has been scheduled",
-		})
-	})
-
-	// Force reinstall the latest build regardless of current version
-	http.HandleFunc("/api/autoupdate/force", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		autoUpdateManagerMu.RLock()
-		manager := autoUpdateManager
-		autoUpdateManagerMu.RUnlock()
-
-		if manager == nil {
-			if appLogger != nil {
-				appLogger.Info("Force update requested but auto-update manager not initialized (check server connection)")
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error":   "auto-update not available",
-				"message": "Agent must be connected to a server for updates. Check server configuration.",
-			})
-			return
-		}
-
-		var payload struct {
-			Reason string `json:"reason"`
-		}
-		if r.Body != nil {
-			defer r.Body.Close()
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && err != io.EOF {
-				http.Error(w, "invalid JSON payload", http.StatusBadRequest)
-				return
-			}
-		}
-
-		reason := strings.TrimSpace(payload.Reason)
-		if reason == "" {
-			reason = "agent_ui_force_reinstall"
-		}
-
-		if appLogger != nil {
-			appLogger.Info("Force reinstall requested via API", "reason", reason)
-		}
-
-		go func(reason string) {
-			runCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-			defer cancel()
-			if err := manager.ForceInstallLatest(runCtx, reason); err != nil {
-				if appLogger != nil {
-					appLogger.Warn("Force reinstall failed", "error", err, "reason", reason)
-				}
-			} else if appLogger != nil {
-				appLogger.Info("Force reinstall completed successfully", "reason", reason)
-			}
-		}(reason)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "force_triggered",
-			"message": "Forced reinstall has been scheduled",
-		})
-	})
-
-	// Cancel an in-progress update
-	http.HandleFunc("/api/autoupdate/cancel", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		autoUpdateManagerMu.RLock()
-		manager := autoUpdateManager
-		autoUpdateManagerMu.RUnlock()
-
-		if manager == nil {
-			http.Error(w, "auto-update not available", http.StatusServiceUnavailable)
-			return
-		}
-
-		if !manager.Cancel() {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error": "Cannot cancel update at this stage (may already be restarting or not in progress)",
-			})
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "cancelled",
-			"message": "Update cancellation requested",
-		})
-	})
-
-	// Metrics history endpoints
-	http.HandleFunc("/api/devices/metrics/latest", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial parameter required", http.StatusBadRequest)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		snapshot, err := deviceStore.GetLatestMetrics(ctx, serial)
-		if err != nil {
-			if err == storage.ErrNotFound {
-				http.Error(w, "no metrics found", http.StatusNotFound)
-			} else {
-				http.Error(w, "failed to get metrics: "+err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(snapshot)
-	})
-
-	// GET /api/devices/metrics/bounds?serial=SERIAL
-	// Returns min/max timestamps (across all tiers) without fetching the full series.
-	http.HandleFunc("/api/devices/metrics/bounds", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial parameter required", http.StatusBadRequest)
-			return
-		}
-
-		store, ok := deviceStore.(*storage.SQLiteStore)
-		if !ok || store == nil {
-			http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		minTS, maxTS, total, err := store.GetTieredMetricsBounds(ctx, serial)
-		if err != nil {
-			if err == storage.ErrNotFound {
-				http.Error(w, "no metrics found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "failed to get metrics bounds: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"serial":        serial,
-			"min_timestamp": minTS.UTC().Format(time.RFC3339Nano),
-			"max_timestamp": maxTS.UTC().Format(time.RFC3339Nano),
-			"points":        total,
-		})
-	})
-
-	http.HandleFunc("/api/devices/metrics/history", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "GET only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		serial := r.URL.Query().Get("serial")
-		if serial == "" {
-			http.Error(w, "serial parameter required", http.StatusBadRequest)
-			return
-		}
-
-		// Parse maxPoints (default 200, reasonable for chart display)
-		maxPoints := 200
-		if mp := r.URL.Query().Get("maxPoints"); mp != "" {
-			if n, err := strconv.Atoi(mp); err == nil && n > 0 {
-				maxPoints = n
-				if maxPoints > 10000 { // Cap at 10k to prevent memory issues
-					maxPoints = 10000
-				}
-			}
-		}
-
-		// Raw mode disables downsampling
-		rawMode := r.URL.Query().Get("raw") == "true"
-
-		// Support both period-based and custom date range queries
-		var since, until time.Time
-		now := time.Now()
-
-		// Check for custom date range first
-		sinceStr := r.URL.Query().Get("since")
-		untilStr := r.URL.Query().Get("until")
-
-		if sinceStr != "" && untilStr != "" {
-			// Custom date range
-			var err error
-			since, err = time.Parse(time.RFC3339, sinceStr)
-			if err != nil {
-				http.Error(w, "invalid since parameter (use RFC3339 format)", http.StatusBadRequest)
-				return
-			}
-			until, err = time.Parse(time.RFC3339, untilStr)
-			if err != nil {
-				http.Error(w, "invalid until parameter (use RFC3339 format)", http.StatusBadRequest)
-				return
-			}
-		} else {
-			// Period-based range
-			period := r.URL.Query().Get("period")
-			if period == "" {
-				period = "week" // default
-			}
-
-			until = now
-			switch period {
-			case "day":
-				since = now.Add(-24 * time.Hour)
-			case "week":
-				since = now.Add(-7 * 24 * time.Hour)
-			case "month":
-				since = now.Add(-30 * 24 * time.Hour)
-			case "year":
-				since = now.Add(-365 * 24 * time.Hour)
-			default:
-				since = now.Add(-7 * 24 * time.Hour) // default to week
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-		defer cancel()
-		// Use tiered metrics retrieval so the store returns the best-resolution
-		// data for the requested time range (raw/hourly/daily/monthly).
-		snapshots, err := deviceStore.GetTieredMetricsHistory(ctx, serial, since, until)
-		if err != nil {
-			// Log the error server-side to aid debugging (will appear in agent logs)
-			agent.Error(fmt.Sprintf("Failed to get metrics history: serial=%s error=%v", serial, err))
-			http.Error(w, "failed to get metrics history: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Downsample if needed and not in raw mode
-		if !rawMode && len(snapshots) > maxPoints {
-			snapshots = downsampleAgentMetrics(snapshots, maxPoints)
-		}
-
-		if agent.DebugEnabled {
-			agent.Debug(fmt.Sprintf("GET /api/devices/metrics/history - serial=%s, since=%s, until=%s, found=%d snapshots, raw=%v",
-				serial, since.Format(time.RFC3339), until.Format(time.RFC3339), len(snapshots), rawMode))
-			if len(snapshots) > 0 {
-				first := snapshots[0]
-				last := snapshots[len(snapshots)-1]
-				agent.Debug(fmt.Sprintf("  First: timestamp=%s, page_count=%d", first.Timestamp.Format(time.RFC3339), first.PageCount))
-				agent.Debug(fmt.Sprintf("  Last: timestamp=%s, page_count=%d", last.Timestamp.Format(time.RFC3339), last.PageCount))
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(snapshots)
-	})
-
-	// POST /api/devices/metrics/delete - delete a single metrics row by id (tier optional)
-	http.HandleFunc("/api/devices/metrics/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			ID   int64  `json:"id"`
-			Tier string `json:"tier,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-
-		if req.ID == 0 {
-			http.Error(w, "id required", http.StatusBadRequest)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		if deviceStore == nil {
-			http.Error(w, "storage unavailable", http.StatusInternalServerError)
-			return
-		}
-
-		if err := deviceStore.DeleteMetricByID(ctx, req.Tier, req.ID); err != nil {
-			agent.Error(fmt.Sprintf("Failed to delete metrics row: id=%d tier=%s error=%v", req.ID, req.Tier, err))
-			http.Error(w, "failed to delete metrics row: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	// POST /devices/metrics/collect - Manually collect metrics for a device
-	// Supports async mode via ?async=true query param, returns job_id for progress tracking
-	http.HandleFunc("/devices/metrics/collect", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req struct {
-			Serial string `json:"serial"`
-			IP     string `json:"ip"`
-			Async  bool   `json:"async"` // If true, run in background and return job_id
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad json", http.StatusBadRequest)
-			return
-		}
-
-		// Also check query param for async mode
-		if r.URL.Query().Get("async") == "true" {
-			req.Async = true
-		}
-
-		if req.Serial == "" {
-			http.Error(w, "serial required", http.StatusBadRequest)
-			return
-		}
-
-		// Check if this is a USB device - if so, use USB metrics collection
-		var device *storage.Device
-		if deviceStore != nil {
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			var err error
-			device, err = deviceStore.Get(ctx, req.Serial)
-			if err == nil && device != nil {
-				if req.IP == "" {
-					req.IP = device.IP
-				}
-			}
-		}
-
-		// For async mode, run collection in background
-		if req.Async {
-			jobID := registerJob("metrics_collect")
-
-			// Return job ID immediately
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"job_id":  jobID,
-				"status":  "pending",
-				"message": "Metrics collection started",
-			})
-
-			// Run collection in background
-			go collectMetricsAsync(jobID, req.Serial, req.IP, device)
-			return
-		}
-
-		// Synchronous mode (original behavior)
-		// Check for USB device type
-		if device != nil && (device.DeviceType == "usb" || device.IsUSB) && usbProxySupported() {
-			// USB device - use USB proxy metrics collection
-			appLogger.Info("Collecting USB metrics", "serial", req.Serial)
-
-			storageSnapshot, ok := usbProxyMetricsSnapshot(r.Context(), req.Serial)
-			if !ok {
-				appLogger.Warn("USB metrics collection failed", "serial", req.Serial)
-				http.Error(w, "USB metrics collection failed", http.StatusInternalServerError)
-				return
-			}
-
-			// Save to database
-			saveCtx, saveCancel := context.WithTimeout(r.Context(), 10*time.Second)
-			defer saveCancel()
-			if err := deviceStore.SaveMetricsSnapshot(saveCtx, storageSnapshot); err != nil {
-				appLogger.Warn("Failed to save USB metrics", "serial", req.Serial, "error", err.Error())
-				http.Error(w, "failed to save USB metrics: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			appLogger.Info("USB metrics collected and saved", "serial", req.Serial, "total_pages", storageSnapshot.PageCount)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"serial":      req.Serial,
-				"total_pages": storageSnapshot.PageCount,
-				"source":      "usb",
-				"saved":       true,
-			})
-			return
-		}
-
-		// Network device - use SNMP metrics collection (original code)
-		if req.IP == "" {
-			http.Error(w, "ip required", http.StatusBadRequest)
-			return
-		}
-
-		// Collect metrics snapshot using new scanner
-		metricsCtx, cancelMetrics := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancelMetrics()
-		vendorHint := ""
-		// Get vendor hint from database if possible
-		if deviceStore != nil {
-			device, getErr := deviceStore.Get(metricsCtx, req.Serial)
-			if getErr == nil && device != nil {
-				vendorHint = device.Manufacturer
-			}
-		}
-
-		// Use new scanner for metrics collection
-		appLogger.Info("Collecting metrics", "serial", req.Serial, "ip", req.IP, "vendor_hint", vendorHint)
-		agentSnapshot, err := CollectMetrics(metricsCtx, req.IP, req.Serial, vendorHint, 10)
-		if err != nil {
-			appLogger.Warn("Metrics collection failed", "serial", req.Serial, "ip", req.IP, "error", err.Error())
-			if agent.DebugEnabled {
-				agent.Debug(fmt.Sprintf("POST /devices/metrics/collect - FAILED for %s (%s): %s", req.Serial, req.IP, err.Error()))
-			}
-			http.Error(w, "failed to collect metrics: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Convert to storage type
-		storageSnapshot := &storage.MetricsSnapshot{}
-		storageSnapshot.Serial = agentSnapshot.Serial
-		storageSnapshot.PageCount = agentSnapshot.PageCount
-		storageSnapshot.ColorPages = agentSnapshot.ColorPages
-		storageSnapshot.MonoPages = agentSnapshot.MonoPages
-		storageSnapshot.ScanCount = agentSnapshot.ScanCount
-		storageSnapshot.TonerLevels = agentSnapshot.TonerLevels
-		storageSnapshot.FaxPages = agentSnapshot.FaxPages
-		storageSnapshot.CopyPages = agentSnapshot.CopyPages
-		storageSnapshot.OtherPages = agentSnapshot.OtherPages
-		storageSnapshot.CopyMonoPages = agentSnapshot.CopyMonoPages
-		storageSnapshot.CopyFlatbedScans = agentSnapshot.CopyFlatbedScans
-		storageSnapshot.CopyADFScans = agentSnapshot.CopyADFScans
-		storageSnapshot.FaxFlatbedScans = agentSnapshot.FaxFlatbedScans
-		storageSnapshot.FaxADFScans = agentSnapshot.FaxADFScans
-		storageSnapshot.ScanToHostFlatbed = agentSnapshot.ScanToHostFlatbed
-		storageSnapshot.ScanToHostADF = agentSnapshot.ScanToHostADF
-		storageSnapshot.DuplexSheets = agentSnapshot.DuplexSheets
-		storageSnapshot.JamEvents = agentSnapshot.JamEvents
-		storageSnapshot.ScannerJamEvents = agentSnapshot.ScannerJamEvents
-
-		// Save to database
-		saveCtx, cancelSave := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancelSave()
-		if err := deviceStore.SaveMetricsSnapshot(saveCtx, storageSnapshot); err != nil {
-			http.Error(w, "failed to save metrics: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		appLogger.Info("Metrics collected successfully",
-			"serial", req.Serial,
-			"ip", req.IP,
-			"page_count", agentSnapshot.PageCount,
-			"color_pages", agentSnapshot.ColorPages,
-			"mono_pages", agentSnapshot.MonoPages,
-			"scan_count", agentSnapshot.ScanCount,
-			"fax_pages", agentSnapshot.FaxPages,
-			"copy_pages", agentSnapshot.CopyPages,
-			"duplex_sheets", agentSnapshot.DuplexSheets,
-			"jam_events", agentSnapshot.JamEvents)
-
-		if agent.DebugEnabled {
-			agent.Debug(fmt.Sprintf("POST /devices/metrics/collect - SUCCESS for %s (%s): PageCount=%d, ColorPages=%d, MonoPages=%d, ScanCount=%d",
-				req.Serial, req.IP, agentSnapshot.PageCount, agentSnapshot.ColorPages, agentSnapshot.MonoPages, agentSnapshot.ScanCount))
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":      "ok",
-			"serial":      req.Serial,
-			"page_count":  agentSnapshot.PageCount,
-			"color_pages": agentSnapshot.ColorPages,
-			"mono_pages":  agentSnapshot.MonoPages,
-			"scan_count":  agentSnapshot.ScanCount,
-		})
-	})
-
-	// vendor add handler moved to mib_suggestions_api.go to centralize candidate APIs
-
-	// Expose trace tags under /settings/trace_tags (moved from legacy /dev_settings)
-	http.HandleFunc("/settings/trace_tags", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			tags := appLogger.GetTraceTags()
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"tags": tags})
-			return
-		}
-
-		if r.Method == http.MethodPost {
-			var req struct {
-				Tags map[string]bool `json:"tags"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid json", http.StatusBadRequest)
-				return
-			}
-
-			appLogger.SetTraceTags(req.Tags)
-
-			// Persist to config store for restarts
-			if agentConfigStore != nil {
-				_ = agentConfigStore.SetConfigValue("trace_tags", req.Tags)
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
-
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	})
-
-	// Request the current server-managed settings immediately.
-	http.HandleFunc("/settings/reload-server", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		uploadWorkerMu.RLock()
-		worker := uploadWorker
-		uploadWorkerMu.RUnlock()
-		if worker == nil {
-			http.Error(w, "server connection unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-		if err := worker.ReloadSettings(ctx); err != nil {
-			http.Error(w, "failed to reload server settings: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
-	})
-
-	// Unified settings endpoint to get/save all settings at once
-	http.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
-		if agentConfigStore == nil {
-			http.Error(w, "config store unavailable", http.StatusInternalServerError)
-			return
-		}
-
-		switch r.Method {
-		case http.MethodGet:
-			snapshot := loadUnifiedSettings(agentConfigStore)
-			// Build response with server-managed metadata
-			isServerManaged := settingsManager != nil && settingsManager.HasManagedSnapshot()
-			resp := map[string]interface{}{
-				"discovery":        snapshot.Discovery,
-				"snmp":             snapshot.SNMP,
-				"features":         snapshot.Features,
-				"spooler":          snapshot.Spooler,
-				"logging":          snapshot.Logging,
-				"web":              snapshot.Web,
-				"server_managed":   isServerManaged,
-				"managed_sections": []string{},
-			}
-			if isServerManaged {
-				// When server-managed, discovery/snmp/features/spooler are locked (logging/web are local)
-				resp["managed_sections"] = settingsManager.ManagedSections()
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
-			return
-
-		case http.MethodPost:
-			var req struct {
-				Discovery map[string]interface{} `json:"discovery"`
-				SNMP      map[string]interface{} `json:"snmp"`
-				Features  map[string]interface{} `json:"features"`
-				Spooler   map[string]interface{} `json:"spooler"`
-				Logging   map[string]interface{} `json:"logging"`
-				Web       map[string]interface{} `json:"web"`
-				Reset     bool                   `json:"reset"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid json", http.StatusBadRequest)
-				return
-			}
-
-			// Discovery/SNMP/Features/Spooler are fleet-managed sections. When the
-			// agent has an active server-managed settings snapshot, reject attempts
-			// to change them here instead of silently persisting values that
-			// loadUnifiedSettings() will ignore on the next read (which previously
-			// made saves look successful but have no lasting effect).
-			if settingsManager != nil && settingsManager.HasManagedSnapshot() {
-				managedSections := make(map[string]bool)
-				for _, section := range settingsManager.ManagedSections() {
-					managedSections[section] = true
-				}
-				var lockedSections []string
-				if req.Discovery != nil && managedSections["discovery"] {
-					lockedSections = append(lockedSections, "discovery")
-				}
-				if req.SNMP != nil && managedSections["snmp"] {
-					lockedSections = append(lockedSections, "snmp")
-				}
-				if req.Features != nil && managedSections["features"] {
-					lockedSections = append(lockedSections, "features")
-				}
-				if req.Spooler != nil && managedSections["spooler"] {
-					lockedSections = append(lockedSections, "spooler")
-				}
-				if len(lockedSections) > 0 {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusConflict)
-					json.NewEncoder(w).Encode(map[string]interface{}{
-						"error":       "cannot modify server-managed settings",
-						"locked_keys": lockedSections,
-						"reason":      "These sections are managed by the connected server and cannot be edited locally",
-					})
-					return
-				}
-			}
-
-			if req.Reset {
-				_ = agentConfigStore.SetConfigValue("discovery_settings", map[string]interface{}{})
-				_ = agentConfigStore.SetConfigValue("settings", map[string]interface{}{})
-				stopAutoDiscover()
-				stopLiveMDNS()
-				stopLiveWSDiscovery()
-				stopLiveSSDP()
-				stopSNMPTrap()
-				stopLLMNR()
-				stopMetricsRescan()
-				agent.SetDebugEnabled(false)
-				agent.SetDumpParseDebug(false)
-				defaults := pmsettings.DefaultSettings()
-				if txt, err := agentConfigStore.GetRanges(); err == nil {
-					defaults.Discovery.RangesText = txt
-				}
-				if ipnets, err := agent.GetLocalSubnets(); err == nil && len(ipnets) > 0 {
-					defaults.Discovery.DetectedSubnet = ipnets[0].String()
-				}
-				applyFeaturesSettingsEffects(&defaults.Features)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(defaults)
-				return
-			}
-
-			current := loadUnifiedSettings(agentConfigStore)
-
-			if req.Discovery != nil {
-				updated := current.Discovery
-				mapIntoStruct(req.Discovery, &updated)
-				if _, ok := req.Discovery["ranges_text"]; ok {
-					maxAddrs := 4096
-					res, err := agent.ParseRangeText(updated.RangesText, maxAddrs)
-					if err != nil {
-						http.Error(w, "validation error: "+err.Error(), http.StatusBadRequest)
-						return
-					}
-					if len(res.Errors) > 0 {
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusBadRequest)
-						_ = json.NewEncoder(w).Encode(res)
-						return
-					}
-					if err := agentConfigStore.SetRanges(updated.RangesText); err != nil {
-						http.Error(w, "failed to save ranges: "+err.Error(), http.StatusInternalServerError)
-						return
-					}
-				}
-				discMap := structToMap(updated)
-				delete(discMap, "ranges_text")
-				delete(discMap, "detected_subnet")
-				if err := agentConfigStore.SetConfigValue("discovery_settings", discMap); err != nil {
-					http.Error(w, "failed to save discovery settings: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
-				applyDiscoveryEffects(discMap)
-				current.Discovery = updated
-			}
-
-			// Save all settings to unified envelope
-			var envelope map[string]interface{}
-			_ = agentConfigStore.GetConfigValue("settings", &envelope)
-			if envelope == nil {
-				envelope = map[string]interface{}{}
-			}
-
-			if req.SNMP != nil {
-				updated := current.SNMP
-				mapIntoStruct(req.SNMP, &updated)
-				envelope["snmp"] = structToMap(updated)
-				current.SNMP = updated
-			}
-
-			if req.Features != nil {
-				updated := current.Features
-				mapIntoStruct(req.Features, &updated)
-				envelope["features"] = structToMap(updated)
-				current.Features = updated
-			}
-
-			if req.Spooler != nil {
-				updated := current.Spooler
-				mapIntoStruct(req.Spooler, &updated)
-				envelope["spooler"] = structToMap(updated)
-				current.Spooler = updated
-				// Apply spooler settings immediately (restart worker if needed)
-				applySpoolerSettings(&current.Spooler)
-			}
-
-			if req.Logging != nil {
-				updated := current.Logging
-				mapIntoStruct(req.Logging, &updated)
-				envelope["logging"] = structToMap(updated)
-				current.Logging = updated
-				// Apply log level immediately
-				if appLogger != nil && updated.Level != "" {
-					if lvl := logger.LevelFromString(updated.Level); lvl >= 0 {
-						appLogger.SetLevel(lvl)
-						appLogger.Info("Log level changed", "level", updated.Level)
-					}
-				}
-				// Apply debug flags
-				agent.SetDebugEnabled(updated.Level == "debug")
-				agent.SetDumpParseDebug(updated.DumpParseDebug)
-			}
-
-			if req.Web != nil {
-				updated := current.Web
-				mapIntoStruct(req.Web, &updated)
-				envelope["web"] = structToMap(updated)
-				current.Web = updated
-			}
-
-			if err := agentConfigStore.SetConfigValue("settings", envelope); err != nil {
-				http.Error(w, "failed to save settings: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			pmsettings.Sanitize(&current)
-			applyFeaturesSettingsEffects(&current.Features)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(current)
-			return
-		}
-
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	})
-
-	http.HandleFunc("/settings/server", func(w http.ResponseWriter, r *http.Request) {
-		dataDir, err := config.GetDataDirectory("agent", isService)
-		if err != nil {
-			http.Error(w, "failed to determine data directory", http.StatusInternalServerError)
-			return
-		}
-
-		switch r.Method {
-		case http.MethodGet:
-			status := snapshotServerConnectionStatus(agentConfig, dataDir)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(status)
-			return
-		case http.MethodDelete:
-			if err := disconnectFromServer(agentConfig, dataDir); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			status := snapshotServerConnectionStatus(agentConfig, dataDir)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"status":  status,
-			})
-			return
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-	})
-
-	// Join the central server using a join token issued by the server.
-	// Body: {"server_url":"https://central:9443","token":"<raw join token>","ca_path":"/path/to/ca.pem","insecure":false}
-	http.HandleFunc("/settings/probe-server", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var in struct {
-			ServerURL string `json:"server_url"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-			return
-		}
-		result, err := probeServer(r.Context(), in.ServerURL)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
-	})
-
-	http.HandleFunc("/settings/join", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		var in struct {
-			ServerURL string `json:"server_url"`
-			Token     string `json:"token"`
-			CAPath    string `json:"ca_path,omitempty"`
-			Insecure  bool   `json:"insecure,omitempty"`
-			AgentName string `json:"agent_name,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid json"}`))
-			return
-		}
-		if in.ServerURL == "" || in.Token == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"server_url and token required"}`))
-			return
-		}
-		if in.Insecure {
-			writeAgentJSONError(w, http.StatusBadRequest, "insecure TLS verification is not permitted")
-			return
-		}
-
-		result, err := performServerJoin(
-			r.Context(),
-			ctx,
-			serverJoinParams{
-				ServerURL: in.ServerURL,
-				Token:     in.Token,
-				CAPath:    in.CAPath,
-				Insecure:  in.Insecure,
-				AgentName: in.AgentName,
-			},
-			agentConfig,
-			agentConfigStore,
-			deviceStore,
-			settingsManager,
-			appLogger,
-			isService,
-		)
-		if err != nil {
-			status := joinErrorStatus(err)
-			writeAgentJSONError(w, status, err.Error())
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":     true,
-			"tenant_id":   result.TenantID,
-			"agent_token": result.AgentToken,
-		})
-	})
-
-	http.HandleFunc("/settings/device-auth/start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var in struct {
-			ServerURL string `json:"server_url"`
-			CAPath    string `json:"ca_path,omitempty"`
-			Insecure  bool   `json:"insecure,omitempty"`
-			AgentName string `json:"agent_name,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid json"}`))
-			return
-		}
-		serverURL := strings.TrimSpace(in.ServerURL)
-		if serverURL == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"server_url required"}`))
-			return
-		}
-		validatedServerURL, err := validateOnboardingServerURL(serverURL)
-		if err != nil {
-			writeAgentJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		serverURL = validatedServerURL
-		if in.Insecure {
-			writeAgentJSONError(w, http.StatusBadRequest, "insecure TLS verification is not permitted")
-			return
-		}
-		// Validate CA path to prevent path traversal attacks
-		caPath := strings.TrimSpace(in.CAPath)
-		if caPath != "" {
-			// Only allow .pem, .crt, .cer extensions for CA certificates
-			ext := strings.ToLower(filepath.Ext(caPath))
-			if ext != ".pem" && ext != ".crt" && ext != ".cer" {
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error":"ca_path must be a .pem, .crt, or .cer file"}`))
-				return
-			}
-			// Verify the file exists (but don't allow path traversal outside data dir)
-			if strings.Contains(caPath, "..") {
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error":"ca_path cannot contain path traversal characters"}`))
-				return
-			}
-		}
-		dataDir, err := config.GetDataDirectory("agent", isService)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to determine data directory"}`))
-			return
-		}
-		agentID, err := LoadOrGenerateAgentID(dataDir)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to load or generate agent id"}`))
-			return
-		}
-		agentName := resolveAgentDisplayName(agentConfig, in.AgentName)
-		hostname, _ := os.Hostname()
-		reqBody := agent.DeviceAuthStartRequest{
-			AgentID:      agentID,
-			AgentName:    agentName,
-			AgentVersion: Version,
-			Hostname:     hostname,
-			Platform:     agent.GetPlatformInfo(),
-		}
-		client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, in.Insecure)
-		respBody, err := client.DeviceAuthStart(r.Context(), reqBody)
-		if err != nil {
-			writeAgentJSONError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		if respBody == nil {
-			w.WriteHeader(http.StatusBadGateway)
-			w.Write([]byte(`{"error":"server returned empty response"}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":       true,
-			"code":          respBody.Code,
-			"poll_token":    respBody.PollToken,
-			"expires_at":    respBody.ExpiresAt,
-			"authorize_url": respBody.AuthorizeURL,
-			"agent_id":      agentID,
-			"agent_name":    agentName,
-		})
-	})
-
-	http.HandleFunc("/settings/device-auth/poll", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var in struct {
-			ServerURL string `json:"server_url"`
-			PollToken string `json:"poll_token"`
-			CAPath    string `json:"ca_path,omitempty"`
-			Insecure  bool   `json:"insecure,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid json"}`))
-			return
-		}
-		serverURL := strings.TrimSpace(in.ServerURL)
-		pollToken := strings.TrimSpace(in.PollToken)
-		if serverURL == "" || pollToken == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"server_url and poll_token required"}`))
-			return
-		}
-		validatedServerURL, err := validateOnboardingServerURL(serverURL)
-		if err != nil {
-			writeAgentJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		serverURL = validatedServerURL
-		if in.Insecure {
-			writeAgentJSONError(w, http.StatusBadRequest, "insecure TLS verification is not permitted")
-			return
-		}
-		// Validate CA path to prevent path traversal attacks
-		caPath := strings.TrimSpace(in.CAPath)
-		if caPath != "" {
-			ext := strings.ToLower(filepath.Ext(caPath))
-			if ext != ".pem" && ext != ".crt" && ext != ".cer" {
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error":"ca_path must be a .pem, .crt, or .cer file"}`))
-				return
-			}
-			if strings.Contains(caPath, "..") {
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error":"ca_path cannot contain path traversal characters"}`))
-				return
-			}
-		}
-		dataDir, err := config.GetDataDirectory("agent", isService)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to determine data directory"}`))
-			return
-		}
-		agentID, err := LoadOrGenerateAgentID(dataDir)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"failed to load or generate agent id"}`))
-			return
-		}
-		agentName := resolveAgentDisplayName(agentConfig, "")
-		client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, in.Insecure)
-		respBody, err := client.DeviceAuthPoll(r.Context(), pollToken)
-		if err != nil {
-			writeAgentJSONError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		if respBody == nil {
-			w.WriteHeader(http.StatusBadGateway)
-			w.Write([]byte(`{"error":"server returned empty response"}`))
-			return
-		}
-		out := map[string]interface{}{
-			"success": respBody.Success,
-			"status":  respBody.Status,
-			"code":    respBody.Code,
-			"message": respBody.Message,
-		}
-		if respBody.JoinToken != "" {
-			out["join_token"] = respBody.JoinToken
-		}
-		if respBody.TenantID != "" {
-			out["tenant_id"] = respBody.TenantID
-		}
-		if respBody.AgentName != "" {
-			out["agent_name"] = respBody.AgentName
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
-	})
-
-	// Legacy subnet scan endpoint (deprecated, use /settings/discovery)
-	http.HandleFunc("/settings/subnet_scan", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" {
-			w.Header().Set("Content-Type", "application/json")
-			enabled := true // default to true
-			if agentConfigStore != nil {
-				var setting struct {
-					Enabled bool `json:"enabled"`
-				}
-				setting.Enabled = true // default
-				_ = agentConfigStore.GetConfigValue("subnet_scan_enabled", &setting)
-				enabled = setting.Enabled
-			}
-			json.NewEncoder(w).Encode(map[string]interface{}{"enabled": enabled})
-			return
-		}
-		if r.Method == "POST" {
-			var req struct {
-				Enabled bool `json:"enabled"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid json", http.StatusBadRequest)
-				return
-			}
-			if agentConfigStore != nil {
-				if err := agentConfigStore.SetConfigValue("subnet_scan_enabled", map[string]bool{"enabled": req.Enabled}); err != nil {
-					http.Error(w, "failed to save setting: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
-			}
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	})
-
-	// API endpoint to regenerate TLS certificates
-	http.HandleFunc("/api/regenerate-certs", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Get data directory
-		dataDir, err := storage.GetDataDir("PrintMaster")
-		if err != nil {
-			http.Error(w, "failed to get data directory: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		certFile := filepath.Join(dataDir, "server.crt")
-		keyFile := filepath.Join(dataDir, "server.key")
-
-		// Delete existing certificates
-		os.Remove(certFile)
-		os.Remove(keyFile)
-
-		// Generate new certificates
-		newCertFile, newKeyFile, err := ensureTLSCertificates("", "")
-		if err != nil {
-			http.Error(w, "failed to generate certificates: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"message": "Certificates regenerated successfully. Restart agent to use new certificates.",
-			"cert":    newCertFile,
-			"key":     newKeyFile,
-		})
-	})
-
-	// Register local printer (spooler) API handlers
-	// Type assert to get LocalPrinterStore interface (SQLiteStore implements both DeviceStore and LocalPrinterStore)
-	if localPrinterStore, ok := deviceStore.(storage.LocalPrinterStore); ok {
-		// Store globally for runtime settings changes
-		globalLocalPrinterStore = localPrinterStore
-		RegisterSpoolerHandlers(localPrinterStore)
-
-		// Start spooler worker for USB/local printer tracking (Windows/macOS/Linux via CUPS)
-		// Check if spooler tracking is enabled via unified settings
-		unified := loadUnifiedSettings(agentConfigStore)
-		if unified.Spooler.Enabled {
-			pollInterval := time.Duration(unified.Spooler.PollIntervalSeconds) * time.Second
-			if pollInterval < 5*time.Second {
-				pollInterval = 5 * time.Second
-			}
-			config := SpoolerWorkerConfig{
-				PollInterval:           pollInterval,
-				IncludeNetworkPrinters: unified.Spooler.IncludeNetworkPrinters,
-				IncludeVirtualPrinters: unified.Spooler.IncludeVirtualPrinters,
-				AutoTrackUSB:           true,
-				AutoTrackLocal:         false,
-			}
-			if err := StartSpoolerWorker(localPrinterStore, config, appLogger); err != nil {
-				appLogger.Warn("Failed to start spooler worker", "error", err)
-			}
-		}
-		// Ensure spooler worker is stopped on shutdown
-		defer StopSpoolerWorker()
-	} else {
-		appLogger.Warn("Device store does not support local printer operations, spooler tracking disabled")
-	}
-
-	// Initialize USB proxy for IPP-USB printers (Windows only)
-	// This enables web UI access for USB-connected printers via the same /proxy/ endpoint
-	RegisterUSBProxyHandlers()
-	if err := InitUSBProxy(appLogger); err != nil {
-		appLogger.Warn("Failed to initialize USB proxy", "error", err)
-	} else {
-		appLogger.Info("USB proxy initialized")
-	}
-	defer StopUSBProxy()
-
-	// Get HTTP/HTTPS settings
-	bindAddress := "127.0.0.1"
-	if agentConfig != nil && agentConfig.Web.BindAddress != "" {
-		bindAddress = agentConfig.Web.BindAddress
-	}
-	enableHTTP := true
-	enableHTTPS := true
-	httpPort := "8080"
-	httpsPort := "8443"
-	redirectHTTPToHTTPS := false
-	customCertPath := ""
-	customKeyPath := ""
-
-	// Try to load settings from unified_settings (new format) first, then fall back to legacy
-	if agentConfigStore != nil {
-		// First try new unified settings (v2 schema)
-		unified := loadUnifiedSettings(agentConfigStore)
-		// Check if web settings have been loaded (HTTPPort is always set with defaults)
-		if unified.Web.HTTPPort != "" {
-			enableHTTP = unified.Web.EnableHTTP
-			enableHTTPS = unified.Web.EnableHTTPS
-			httpPort = unified.Web.HTTPPort
-			if unified.Web.HTTPSPort != "" {
-				httpsPort = unified.Web.HTTPSPort
-			}
-			redirectHTTPToHTTPS = unified.Web.RedirectHTTPToHTTPS
-			customCertPath = unified.Web.CustomCertPath
-			customKeyPath = unified.Web.CustomKeyPath
-		} else {
-			// Legacy fallback: read from old security_settings key
-			var securitySettings map[string]interface{}
-			if err := agentConfigStore.GetConfigValue("security_settings", &securitySettings); err == nil {
-				if val, ok := securitySettings["enable_http"].(bool); ok {
-					enableHTTP = val
-				}
-				if val, ok := securitySettings["enable_https"].(bool); ok {
-					enableHTTPS = val
-				}
-				if val, ok := securitySettings["http_port"].(string); ok && val != "" {
-					httpPort = val
-				}
-				if val, ok := securitySettings["https_port"].(string); ok && val != "" {
-					httpsPort = val
-				}
-				if val, ok := securitySettings["redirect_http_to_https"].(bool); ok {
-					redirectHTTPToHTTPS = val
-				}
-				if val, ok := securitySettings["custom_cert_path"].(string); ok {
-					customCertPath = val
-				}
-				if val, ok := securitySettings["custom_key_path"].(string); ok {
-					customKeyPath = val
-				}
-			}
-		}
-	}
-
-	// Load or generate TLS certificates for HTTPS
-	certFile, keyFile, err := ensureTLSCertificates(customCertPath, customKeyPath)
-	if err != nil {
-		appLogger.Error("Failed to setup TLS certificates", "error", err.Error())
-		certFile = ""
-		keyFile = ""
-	}
-
-	// Default to HTTPS if certificates are available
-	if certFile == "" || keyFile == "" {
-		enableHTTPS = false
-		appLogger.Warn("HTTPS disabled: TLS certificates not available")
-	}
-
-	// Ensure at least one server is enabled
-	if !enableHTTP && !enableHTTPS {
-		if isLoopbackHost(bindAddress) {
-			// Plain HTTP remains useful for an explicitly local development
-			// instance when no certificate is available.
-			enableHTTP = true
-			appLogger.Warn("Both HTTP and HTTPS disabled in settings, enabling loopback HTTP for local development")
-		} else {
-			// Never make a failed TLS setup silently expose an internet-facing
-			// listener. The operator must repair certificates/configuration first.
-			appLogger.Error("Both HTTP and HTTPS disabled; refusing to start on a non-loopback bind address", "bind_address", bindAddress)
-			return
-		}
-	}
-	if enableHTTP && !isLoopbackHost(bindAddress) {
-		// Credentials, callback tokens, and printer data must not traverse
-		// plaintext HTTP on a remotely reachable interface. Use HTTPS directly
-		// (or put a TLS reverse proxy in front of a loopback-bound agent).
-		enableHTTP = false
-		appLogger.Warn("Plain HTTP disabled on non-loopback bind address; HTTPS is required", "bind_address", bindAddress)
-		if !enableHTTPS {
-			appLogger.Error("HTTPS is unavailable; agent listener will not start", "bind_address", bindAddress)
-			return
-		}
-	}
-
-	rootHandler := http.Handler(http.DefaultServeMux)
-	if agentAuth != nil {
-		rootHandler = agentAuth.Wrap(rootHandler)
-	}
-
-	// Register local handler globally for direct proxy invocation
-	// This allows the server to proxy to the agent's web UI without HTTP round-trip
-	// The handler is set globally so it's available even if upload worker starts later
-	setLocalProxyHandler(rootHandler)
-
-	// Create server instances for graceful shutdown
-	var httpServer *http.Server
-	var httpsServer *http.Server
-	var wg sync.WaitGroup
-
-	// Start HTTP server
-	if enableHTTP {
-		// Create HTTP server with optional redirect to HTTPS
-		var httpHandler http.Handler
-		if redirectHTTPToHTTPS && enableHTTPS {
-			// Redirect handler using 302 (temporary redirect)
-			httpHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// Build HTTPS URL
-				host := r.Host
-				// Replace port if it's the HTTP port
-				if strings.Contains(host, ":"+httpPort) {
-					host = strings.Replace(host, ":"+httpPort, ":"+httpsPort, 1)
-				} else if !strings.Contains(host, ":") {
-					// No port specified, add HTTPS port
-					host = host + ":" + httpsPort
-				}
-
-				httpsURL := "https://" + host + r.RequestURI
-				// Use 302 (Found) for temporary redirect, not 301 (permanent)
-				http.Redirect(w, r, httpsURL, http.StatusFound)
-			})
-			appLogger.Info("HTTP server will redirect to HTTPS", "httpPort", httpPort, "httpsPort", httpsPort)
-		} else {
-			// Use default handler (http.DefaultServeMux with all registered routes)
-			httpHandler = rootHandler
-		}
-
-		httpServer = &http.Server{
-			Addr:              net.JoinHostPort(bindAddress, httpPort),
-			Handler:           httpHandler,
-			ReadTimeout:       30 * time.Second,
-			ReadHeaderTimeout: 10 * time.Second,
-			WriteTimeout:      30 * time.Second,
-			IdleTimeout:       120 * time.Second,
-			MaxHeaderBytes:    16 << 10,
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			appLogger.Info("Starting HTTP server", "port", httpPort)
-			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				appLogger.Error("HTTP server failed", "error", err.Error())
-			}
-		}()
-	}
-
-	// Start HTTPS server
-	if enableHTTPS && certFile != "" && keyFile != "" {
-		// Load TLS certificate
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			appLogger.Error("Failed to load TLS certificate", "error", err.Error())
-		} else {
-			tlsCfg := &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
-			}
-
-			httpsServer = &http.Server{
-				Handler:           rootHandler,
-				ReadTimeout:       30 * time.Second,
-				ReadHeaderTimeout: 10 * time.Second,
-				WriteTimeout:      120 * time.Second, // USB proxy can be very slow (5-10s per page)
-				IdleTimeout:       120 * time.Second,
-				MaxHeaderBytes:    16 << 10,
-			}
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				// Create base TCP listener
-				baseListener, err := net.Listen("tcp", net.JoinHostPort(bindAddress, httpsPort))
-				if err != nil {
-					appLogger.Error("Failed to create HTTPS listener", "error", err.Error())
-					return
-				}
-
-				// Wrap with HTTP redirect detection (handles http:// requests to HTTPS port)
-				redirectListener := newHTTPRedirectListener(baseListener, httpsPort)
-
-				// Wrap with TLS
-				tlsListener := tls.NewListener(redirectListener, tlsCfg)
-
-				appLogger.Info("Starting HTTPS server", "port", httpsPort)
-				appLogger.Info("HTTPâ†’HTTPS redirect enabled on HTTPS port")
-
-				if err := httpsServer.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
-					appLogger.Error("HTTPS server failed", "error", err.Error())
-				}
-			}()
-		}
-	}
-
-	// Wait for shutdown signal
-	<-ctx.Done()
-	appLogger.Info("Shutdown signal received, stopping servers...")
-
-	// Stop background services first (quick operations)
-	uploadWorkerMu.Lock()
-	if uploadWorker != nil {
-		uploadWorker.Stop()
-		uploadWorker = nil
-	}
-	uploadWorkerMu.Unlock()
-	if sseHub != nil {
-		sseHub.Stop()
-	}
-
-	// Graceful shutdown with 20 second timeout (well before service 30s timeout)
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer shutdownCancel()
-
-	if httpServer != nil {
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			appLogger.Error("HTTP server shutdown error", "error", err.Error())
-		} else {
-			appLogger.Info("HTTP server stopped gracefully")
-		}
-	}
-
-	if httpsServer != nil {
-		if err := httpsServer.Shutdown(shutdownCtx); err != nil {
-			appLogger.Error("HTTPS server shutdown error", "error", err.Error())
-		} else {
-			appLogger.Info("HTTPS server stopped gracefully")
-		}
-	}
-
-	// Wait for servers to finish
-	wg.Wait()
-	appLogger.Info("All servers stopped")
-}
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×M4Ótèµ©hºÚn¶X§zÍKËÈš[\‹ÐÛÜY\ˆ›Y]X[˜YÙ[Y[YÙ[[ˆÛÂ‹ËÈÜ›ÜÜË\]›Ü›HYÙ[›ÜˆÓ“Tš[\ˆ\ØÛÝ™\žH[™™\Ü[™ÂœXÚØYÙHXZ[‚‚š[\Ü
+‚H˜\˜Ú]™KÞš\‚‚H˜ž]\È‚‚H˜ÛÛ^‚‚H˜Üž\ËÜ˜[™‚‚H˜Üž\ËÜœØH‚‚H˜Üž\ËÝÈ‚‚H˜Üž\ËÞLH‚‚H˜Üž\ËÞLKÜÚ^‚‚H™[X™Y‚‚H™[˜ÛÙ[™ËØ˜\ÙM‚‚H™[˜ÛÙ[™ËÚœÛÛˆ‚‚H™[˜ÛÙ[™ËÜ[H‚‚H™\œ›ÜœÈ‚‚H™›YÈ‚‚H™›]‚‚Hš[‚‚Hš[Ý[\]H‚‚Hš[È‚‚H›X]ØšYÈ‚‚H›™]‚‚H›™]Ú‚‚H›™]ÚÚ][‚‚H›™]Ý\›‚‚H›ÜÈ‚‚H›ÜËÙ^XÈ‚‚Hœ]‚‚Hœ]Ùš[\]‚‚Hœš[X\Ý\‹ØYÙ[ØYÙ[‚‚Hœš[X\Ý\‹ØYÙ[Ø]]Ý\]H‚‚Hœš[X\Ý\‹ØYÙ[Ù™X]\™Y›YÜÈ‚‚Hœš[X\Ý\‹ØYÙ[Ü›ÞH‚‚Hœš[X\Ý\‹ØYÙ[ÜØØ[›™\ˆ‚‚Hœš[X\Ý\‹ØYÙ[ÜÝÜ˜YÙH‚‚Hœš[X\Ý\‹ØÛÛ[[Û‹ØÛÛ™šYÈ‚‚Hœš[X\Ý\‹ØÛÛ[[Û‹ÛÙÙÙ\ˆ‚‚Hœš[X\Ý\‹ØÛÛ[[Û‹Ü™\Ü‚‚Hœš[X\Ý\‹ØÛÛ[[Û‹Ü™\]Y\Ý]]‚‚\\Ù][™ÜÈœš[X\Ý\‹ØÛÛ[[Û‹ÜÙ][™ÜÈ‚‚XÛÛ[[Û][œš[X\Ý\‹ØÛÛ[[Û‹Ý][‚‚\Ú\™YÙXˆœš[X\Ý\‹ØÛÛ[[Û‹ÝÙXˆ‚‚]ÜØÛÛ[[Ûˆœš[X\Ý\‹ØÛÛ[[Û‹ÝÜÈ‚‚Hœ[[YH‚‚HœÝ˜ÛÛˆ‚‚HœÝš[™ÜÈ‚‚HœÞ[˜È‚‚H[YH‚‚‚H™Ú]X‹˜ÛÛKÙÛÜÛ›\ÙÛÜÛ›\‚‚H™Ú]X‹˜ÛÛKÚØ\™X[›ÜËÜÙ\šXÙH‚ŠB‚‹ËÈ™\œÚ[Ûˆ[™›Ü›X][Ûˆ
+Ù]]Z[[YHšXH[›YÜÊB˜\ˆ
+‚U™\œÚ[ÛˆH™]ˆˆËÈÙ[X[XÈ™\œÚ[Ûˆ
+K™Ë‹ŒKŒŒŠB‚PZ[[YHH[šÛ›ÝÛˆˆËÈZ[[Y\Ý[\‚QÚ]ÛÛ[Z]H[šÛ›ÝÛˆˆËÈÚ]ÛÛ[Z]\Ú‚PZ[\HH™]ˆˆËÈ™]ˆˆÜˆœ™[X\ÙH‚ŠB‚‹ËÙÛÎ™[X™YÙX‚˜\ˆÙX‘”È[X™Y‘”Â‚‹ËÈÙÙÚ[™Ô™\ÜÛœÙUÜš]\ˆØ\\™\ÈÝ]\ÈÛÙH[™ž]HÛÝ[›ÜˆXYÛ›ÜÝXÜÂ\HÙÙÚ[™Ô™\ÜÛœÙUÜš]\ˆÝXÝÂ‚Z”™\ÜÛœÙUÜš]\‚‚\Ý]\È[‚Xž]\È[ŸB‚™[˜ÈÜš]PYÙ[”ÓÓ‘\œ›ÜŠÈ”™\ÜÛœÙUÜš]\‹Ý]\È[Y\ÜØYÙHÝš[™ÊHÂ‚]Ë’XY\Š
+K”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚]Ë•Üš]RXY\ŠÝ]\ÊB‚WÈHœÛÛ‹“™]Ñ[˜ÛÙ\ŠÊK‘[˜ÛÙJX\ÜÝš[™×\Ýš[™ÞÈ™\œ›ÜˆŽˆY\ÜØYÙ_JBŸB‚™[˜È
+È
+›ÙÙÚ[™Ô™\ÜÛœÙUÜš]\ŠHÜš]RXY\ŠÛÙH[
+HÂ‚[ËœÝ]\ÈHÛÙB‚[Ë”™\ÜÛœÙUÜš]\‹•Üš]RXY\ŠÛÙJBŸB‚™[˜È
+È
+›ÙÙÚ[™Ô™\ÜÛœÙUÜš]\ŠHÜš]Jˆ×Xž]JH
+[\œ›ÜŠHÂ‚[‹\œˆHË”™\ÜÛœÙUÜš]\‹•Üš]JŠB‚[Ë˜ž]\È
+ÏH‚‚\™]\›ˆ‹\œ‚ŸB‚‹ËÈ›\Ú›ÞY\È›\ÚÈH[™\›Z[™ÈÜš]\ˆÚ[ˆÝ\ÜY™[˜È
+È
+›ÙÙÚ[™Ô™\ÜÛœÙUÜš]\ŠH›\Ú
+
+HÂ‚ZYˆ‹ÚÈHË”™\ÜÛœÙUÜš]\‹Š‘›\Ú\ŠNÈÚÈÂ‚BY‹‘›\Ú
+
+B‚_BŸB‚‹ËÈ™XYœ›ÛH[œÝ\™\È[ËÛÜHØ[ˆ\ÙH[ˆÜ[Z^™Y]Ú[HÝ[ÛÝ[[™Èž]\Â™[˜È
+È
+›ÙÙÚ[™Ô™\ÜÛœÙUÜš]\ŠH™XYœ›ÛJˆ[Ë”™XY\ŠH
+[\œ›ÜŠHÂ‚KËÈ\ÙH[ËÛÜHÚXÚÚ[Ø[Ë•Üš]K™\Ù\š[™ÈHž]HÛÝ[\‚‚\™]\›ˆ[ËÛÜJËŠBŸB‚‹ËÈ˜\ÚXÐ]]™]\›œÈ˜\ÙMÙˆ\Ù\Žœ\ÜÈ\ˆ‘ÍÍŒMÂ™[˜È˜\ÚXÐ]]
+\Ù\œ\ÜÈÝš[™ÊHÝš[™ÈÂ‚\™]\›ˆ˜\ÙM”Ý[˜ÛÙ[™Ë‘[˜ÛÙUÔÝš[™Ê×Xž]J\Ù\œ\ÜÊJBŸB‚‹ËÈ™]Üš]Q^\Ý[™Ð˜\ÙUYÈš[™ÈH]šXÙK\Ý\YY˜\ÙH™YH‹‹‹ˆˆYÈ[™‹ËÈ™]Üš]\È]ÈÝ^H[™\ˆ›ÞT™Yš^ˆÛÛYH™[™ÜˆR\È
+K™ËˆÞ[ØÙ\˜B‹ËÈÛÛ[X[™Ù[\ˆ–
+HÚ\Z\ˆÝÛˆ˜\ÙH™YH‹ÈˆÛÈ™[]]™H\ÜÙ]‹ËÈ™\]Y\ÝÈ[Ø^\È™\ÛÛ™Hœ›ÛHH]šXÙIÜÈÙXˆ›ÛÝÈY[ÝXÚYÜÙB‹ËÈ™\]Y\ÝÈ\ØØ\HH›ÞH™Yš^[™]HÙ\™\‰ÜÈÝÛˆÜ[]™[›Ý]\Â‹ËÈ
+ÈÈQœ˜[YKSÜ[ÛœËX›ØÚÙY›ÛÝYÙJH[œÝXYÙˆHš[\‹ˆ™]\›œÂ‹ËÈH™]Üš][ˆÛÛ[[™Ú]\ˆHYÈØ\È›Ý[™[™[ÙYšYY‚™[˜È™]Üš]Q^\Ý[™Ð˜\ÙUYÊÛÛ[›ÞT™Yš^\™Ù]ÜÝÝš[™ÊH
+Ýš[™Ë›ÛÛ
+HÂ‚XÛÛ[ÝÙ\ˆHÝš[™ÜË•ÓÝÙ\ŠÛÛ[
+B‚X˜\ÙRYHÝš[™ÜË’[™^
+ÛÛ[ÝÙ\‹˜\ÙHŠB‚ZYˆ˜\ÙRYOHLHÂ‚B\™]\›ˆÛÛ[˜[ÙB‚_B‚]YÑ[™HÝš[™ÜË’[™^
+ÛÛ[Ø˜\ÙRY—KˆŠB‚ZYˆYÑ[™OHLHÂ‚B\™]\›ˆÛÛ[˜[ÙB‚_B‚]YÑ[™
+ÏH˜\ÙRY
+ÈHËÈÜÚ][Ûˆ\ÝY\ˆ	Ï‰Â‚]YÈHÛÛ[Ø˜\ÙRYYÑ[™B‚]YÓÝÙ\ˆHÝš[™ÜË•ÓÝÙ\ŠYÊB‚‚\][ÝHHž]J	È‰ÊB‚Z™Y’YHÝš[™ÜË’[™^
+YÓÝÙ\‹™YH˜
+B‚ZYˆ™Y’YOHLHÂ‚BZ™Y’YHÝš[™ÜË’[™^
+YÓÝÙ\‹™YIØ
+B‚B\][ÝHH	×	ÉÂ‚_B‚ZYˆ™Y’YOHLHÂ‚B\™]\›ˆÛÛ[˜[ÙB‚_B‚]˜[YTÝ\H™Y’Y
+È[Š™YH˜
+B‚]˜[YQ[™HÝš[™ÜË’[™^ž]JYÖÝ˜[YTÝ\—K][ÝJB‚ZYˆ˜[YQ[™OHLHÂ‚B\™]\›ˆÛÛ[˜[ÙB‚_B‚]˜[YQ[™
+ÏH˜[YTÝ\‚Z™YˆHYÖÝ˜[YTÝ\˜[YQ[™B‚‚KËÈÝš\ØÚ[YJÚÜÝYˆH™Yˆ\ÈH[Ø[YKZÜÝT“‚Z™Y”]H™Y‚‚ZYˆK\œˆH\›”\œÙJ™YŠNÈ\œˆOHš[	‰ˆK’ÜÝOHˆˆÂ‚BZYˆ\Ýš[™ÜË‘\]X[›Û
+K’ÜÝ\™Ù]ÜÝ
+HÂ‚BB\™]\›ˆÛÛ[˜[ÙHËÈY™™\™[ÜÝX]™H[Û™B‚B_B‚BZ™Y”]HK”]‚BZYˆ™Y”]OHˆˆÂ‚BBZ™Y”]H‹È‚‚B_B‚_B‚‚ZYˆ\Ýš[™ÜË’\Ô™Yš^
+™Y”]‹ÈŠHÝš[™ÜË’\Ô™Yš^
+™Y”]›ÞT™Yš^
+HÂ‚B\™]\›ˆÛÛ[˜[ÙHËÈ™[]]™HÜˆ[™XYH™]Üš][‚‚_B‚‚[™]Ò™YˆH›ÞT™Yš^
+È™Y”]‚[™]ÕYÈHYÖÎ˜[YTÝ\H
+È™]Ò™Yˆ
+ÈYÖÝ˜[YQ[™—B‚\™]\›ˆÛÛ[Î˜˜\ÙRYH
+È™]ÕYÈ
+ÈÛÛ[ÝYÑ[™—KYBŸB‚™[˜È\ÒÞ[ØÙ\˜S[Ù[ØÜš\
+\™Ù]]Ýš[™ÊH›ÛÛÂ‚\]HÝš[™ÜË•ÓÝÙ\Š\™Ù]]
+B‚\™]\›ˆÝš[™ÜË’\Ô™Yš^
+]‹ÚœËÚœÜÜ˜ËÛ[Ù[ÈŠH	‰ˆÝš[™ÜË’\ÔÝY™š^
+]‹›[Ù[šHŠBŸB‚‹ËÈÛØ˜[Ù\ÜÚ[ÛˆØXÚH›Üˆ›Ü›KX˜\ÙYÙÚ[œÂ˜\ˆ›ÞTÙ\ÜÚ[ÛØXÚHH›ÞK“™]ÔÙ\ÜÚ[ÛØXÚJ
+B‚˜\ˆYÙ[Ù\ÜÚ[ÛœÈH™]ÐYÙ[Ù\ÜÚ[Û“X[˜YÙ\Š
+B˜\ˆYÙ[]]
+˜YÙ[]]X[˜YÙ\‚‚‹ËÈÛØ˜[ØØ[š[\”ÝÜ™HÛÈ™Y™\™[˜ÙHÈHØØ[š[\ˆÝÜ™H›Üˆ[[YHÙ][™ÜÈÚ[™Ù\Â˜\ˆÛØ˜[ØØ[š[\”ÝÜ™HÝÜ˜YÙK“ØØ[š[\”ÝÜ™B‚‹ËÈYÙ[š[˜Ú\[™\™\Ù[È[ˆ]][XØ]YRHÛÛ^
+XÙZÛ\ˆ›Üˆ]\™H]]
+B\HYÙ[š[˜Ú\[ÝXÝÂ‚U\Ù\›˜[YHÝš[™ÈœÛÛŽˆ\Ù\›˜[YH˜‚T›ÛHÝš[™ÈœÛÛŽˆœ›ÛH˜‚TÛÝ\˜ÙHÝš[™ÈœÛÛŽˆœÛÝ\˜ÙH˜‚U[˜[QÈ×\Ýš[™ÈœÛÛŽˆ[˜[ÚYËÛZ][\H˜ŸB‚\HÛÛ^Ù^HÝš[™Â‚˜ÛÛœÝ
+‚Z\ÒÐÛÛ^Ù^HÛÛ^Ù^HHš\ÒÈ‚‚XYÙ[š[˜Ú\[ÛÛ^Ù^HÛÛ^Ù^HH˜YÙ[š[˜Ú\[‚ŠB‚˜ÛÛœÝ
+‚XYÙ[Ù\ÜÚ[ÛÛÛÚÚYS˜[YHHœWØYÙ[ÜÙ\ÜÚ[Ûˆ‚‚YY˜][YÙ[Ù\ÜÚ[Û•H
+ˆ[YK’Ý\‚‚\Ù\™\]][Y[Ý]HMH
+ˆ[YK”ÙXÛÛ™‚[X^YÙ[™\]Y\Ý›ÙTÚ^™HHˆŒËÈˆZPŽÈ™\ÜÜ›ÞH[™\œÈ\HYÚ\ˆ[Z]Â‚[X^YÙ[›ÞT™\ÜÛœÙP›ÙTÚ^™HHŒËÈ›Ý[™š[\ˆÛÛ[™Y›Ü™H]™XXÚ\ÈHÙ\™\ˆÙX”ÛØÚÙ]ŠB‚‹ËÈ›Ý[™Y›ÞP›ÙH™]™[ÈHš[\ˆ
+ÜˆHTÐˆ]šXÙJHœ›ÛH^]\Ý[™ÈB‹ËÈYÙ[Ú[HHœ›ÝÜÙ\ˆ›ÞH™\ÜÛœÙH\È™Z[™È›ÜØ\™YÈHÙ\™\‹‚\H›Ý[™Y›ÞP›ÙHÝXÝÂ‚Z[Ë”™XYÛÜÙ\‚‚\™[XZ[š[™È[ŸB‚™[˜È
+ˆ
+˜›Ý[™Y›ÞP›ÙJH™XY
+×Xž]JH
+[\œ›ÜŠHÂ‚ZYˆˆOHš[‹”™XYÛÜÙ\ˆOHš[Â‚B\™]\›ˆ[Ë‘SÑ‚‚_B‚ZYˆ‹œ™[XZ[š[™ÈHÂ‚B\™]\›ˆ[Ë‘SÑ‚‚_B‚ZYˆ[
+[Š
+JHˆ‹œ™[XZ[š[™ÈÂ‚B\HÎ˜‹œ™[XZ[š[™×B‚_B‚[‹\œˆH‹”™XYÛÜÙ\‹”™XY
+
+B‚X‹œ™[XZ[š[™ÈOH[
+ŠB‚\™]\›ˆ‹\œ‚ŸB‚™[˜È™XY›Ý[™Y›ÞT™\ÜÛœÙJ›ÙH[Ë”™XYÛÜÙ\ŠH
+×Xž]K\œ›ÜŠHÂ‚ZYˆ›ÙHOHš[Â‚B\™]\›ˆš[š[‚_B‚YY™\ˆ›ÙKÛÜÙJ
+B‚Y]K\œˆH[Ë”™XY[
+[Ë“[Z]™XY\Š›ÙKX^YÙ[›ÞT™\ÜÛœÙP›ÙTÚ^™JÌJJB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[\œ‚‚_B‚ZYˆ[Š]JHˆX^YÙ[›ÞT™\ÜÛœÙP›ÙTÚ^™HÂ‚B\™]\›ˆš[›]‘\œ›Ü™Šœ›ÞH™\ÜÛœÙH›ÙH^ÙYYÈ	Yž]\È‹X^YÙ[›ÞT™\ÜÛœÙP›ÙTÚ^™JB‚_B‚\™]\›ˆ]Kš[ŸB‚\HYÙ[Ù\ÜÚ[ÛˆÝXÝÂ‚RQÝš[™Â‚Tš[˜Ú\[
+YÙ[š[˜Ú\[‚TÙ\™\•ÚÙ[ˆÝš[™Â‚Q^\™\Ð][YK•[YBŸB‚\HYÙ[Ù\ÜÚ[Û“X[˜YÙ\ˆÝXÝÂ‚[]HÞ[˜Ë”•Ó]]^‚\Ù\ÜÚ[ÛœÈX\ÜÝš[™×J˜YÙ[Ù\ÜÚ[Û‚ŸB‚™[˜È™]ÐYÙ[Ù\ÜÚ[Û“X[˜YÙ\Š
+H
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\ˆÂ‚\™]\›ˆ	˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\žÜÙ\ÜÚ[ÛœÎˆXZÙJX\ÜÝš[™×J˜YÙ[Ù\ÜÚ[ÛŠ_BŸB‚™[˜È
+H
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\ŠHÜ™X]Jš[˜Ú\[
+YÙ[š[˜Ú\[Ù\™\•ÚÙ[ˆÝš[™Ë^\™\Ð][YK•[YJHÝš[™ÈÂ‚ZYˆš[˜Ú\[OHš[Â‚B\™]\›ˆˆ‚‚_B‚ZYˆ^\™\Ð]’\Ö™\›Ê
+HÂ‚BY^\™\Ð]H[YK“›ÝÊ
+KY
+
+ˆ[YK’Ý\ŠB‚_B‚]ÚÙ[ˆH˜[™ÛTÙ\ÜÚ[Û•ÚÙ[Š
+B‚KËÈ™]™\ˆ˜[˜XÚÈÈH[Y\Ý[\
+Üˆ[žHÝ\ˆ™YXÝX›H˜[YJHÚ[ˆB‚KËÈÞ\Ý[HÔÔ“‘È\È[˜]˜Z[X›KˆHZ\ÜÚ[™ÈÙ\ÜÚ[Ûˆ\ÈØY™\ˆ[ˆ\ÜÝZ[™ÈB‚KËÈÝY\ÜØX›H™X\™\ˆÜ™Y[X[‚‚ZYˆÚÙ[ˆOHˆˆÂ‚B\™]\›ˆˆ‚‚_B‚[K›]K“ØÚÊ
+B‚YY™\ˆK›]K•[›ØÚÊ
+B‚[K˜ÛX[\ØÚÙY
+
+B‚[KœÙ\ÜÚ[ÛœÖÝÚÙ[—HH	˜YÙ[Ù\ÜÚ[ÛžÂ‚BRQˆÚÙ[‹‚BTš[˜Ú\[ˆš[˜Ú\[‚BTÙ\™\•ÚÙ[ŽˆÙ\™\•ÚÙ[‹‚BQ^\™\Ð]ˆ^\™\Ð]‚_B‚\™]\›ˆÚÙ[‚ŸB‚™[˜È
+H
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\ŠHÙ]
+ÚÙ[ˆÝš[™ÊH
+
+˜YÙ[Ù\ÜÚ[Û‹›ÛÛ
+HÂ‚ZYˆÚÙ[ˆOHˆˆÂ‚B\™]\›ˆš[˜[ÙB‚_B‚[K›]K”“ØÚÊ
+B‚\Ù\ÜËÚÈHKœÙ\ÜÚ[ÛœÖÝÚÙ[—B‚[K›]K”•[›ØÚÊ
+B‚ZYˆ[ÚÈÂ‚B\™]\›ˆš[˜[ÙB‚_B‚ZYˆ[YK“›ÝÊ
+KY\ŠÙ\ÜË‘^\™\Ð]
+HÂ‚B[K‘[]JÚÙ[ŠB‚B\™]\›ˆš[˜[ÙB‚_B‚\™]\›ˆÙ\ÜËYBŸB‚™[˜È
+H
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\ŠH[]JÚÙ[ˆÝš[™ÊHÂ‚ZYˆÚÙ[ˆOHˆˆÂ‚B\™]\›‚‚_B‚[K›]K“ØÚÊ
+B‚Y[]JKœÙ\ÜÚ[ÛœËÚÙ[ŠB‚[K›]K•[›ØÚÊ
+BŸB‚™[˜È
+H
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\ŠHÛX[\ØÚÙY
+
+HÂ‚[›ÝÈH[YK“›ÝÊ
+B‚Y›ÜˆÙ^KÙ\ÜÈH˜[™ÙHKœÙ\ÜÚ[ÛœÈÂ‚BZYˆ›ÝËY\ŠÙ\ÜË‘^\™\Ð]
+HÂ‚BBY[]JKœÙ\ÜÚ[ÛœËÙ^JB‚B_B‚_BŸB‚™[˜È˜[™ÛTÙ\ÜÚ[Û•ÚÙ[Š
+HÝš[™ÈÂ‚XˆHXZÙJ×Xž]KÌŠB‚ZYˆË\œˆH˜[™”™XY
+ŠNÈ\œˆOHš[Â‚B\™]\›ˆˆ‚‚_B‚\™]\›ˆ˜\ÙM”˜]ÕT“[˜ÛÙ[™Ë‘[˜ÛÙUÔÝš[™ÊŠBŸB‚˜\ˆ
+‚Y\œ’[˜[YÜ™Y[X[ÈH\œ›ÜœË“™]Êš[˜[YÜ™Y[X[ÈŠBŠB‚\HYÙ[]]X[˜YÙ\ˆÝXÝÂ‚[[ÙHÝš[™Â‚X[ÝÓØØ[YZ[ˆ›ÛÛ‚\Ù\™\•T“Ýš[™Â‚XYÙ[QÝš[™Â‚\Ù\™\ÐT]Ýš[™Â‚\Ù\™\”ÚÚ\™\šYžH›ÛÛ‚\Ù\ÜÚ[ÛœÈ
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\‚‚\X›XÑ^XÝX\ÜÝš[™×\ÝXÝßB‚\X›XÔ™Yš^\È×\Ýš[™ÂŸB‚\HYÙ[]]Ü[ÛœÈÝXÝÂ‚S[ÙHÝš[™ÈœÛÛŽˆ›[ÙH˜‚P[ÝÓØØ[YZ[ˆ›ÛÛœÛÛŽˆ˜[Ý×ÛØØ[ØYZ[ˆ˜‚TÙ\™\•T“Ýš[™ÈœÛÛŽˆœÙ\™\—Ý\›ÛZ][\H˜‚TÙ\™\]]T“Ýš[™ÈœÛÛŽˆœÙ\™\—Ø]]Ý\›ÛZ][\H˜ËÈT“È™Y\™XÝ›ÜˆÙ\™\ˆ]]‚PYÙ[QÝš[™ÈœÛÛŽˆ˜YÙ[ÚYÛZ][\H˜‚SÙÚ[”Ý\ÜY›ÛÛœÛÛŽˆ›ÙÚ[—ÜÝ\ÜY˜ŸB‚™[˜È™]ÐYÙ[]]X[˜YÙ\ŠÙ™È
+YÙ[ÛÛ™šYËÙ\ÜÚ[ÛœÈ
+˜YÙ[Ù\ÜÚ[Û“X[˜YÙ\ŠH
+˜YÙ[]]X[˜YÙ\ˆÂ‚[[ÙHH›ØØ[‚‚X[ÝÓØØ[H˜[ÙB‚\Ù\™\•T“Hˆ‚‚XYÙ[QHˆ‚‚\Ù\™\ÐHHˆ‚‚\Ù\™\”ÚÚ\H˜[ÙB‚ZYˆÙ™ÈOHš[Â‚BZYˆÙ™Ë•ÙX‹]]“[ÙHOHˆˆÂ‚BB[[ÙHHÝš[™ÜË•ÓÝÙ\ŠÝš[™ÜË•š[TÜXÙJÙ™Ë•ÙX‹]]“[ÙJJB‚B_B‚BKËÈÔÛÜ˜XÚÈ›Ý™\ÈÛ›H]H›ØÙ\ÜÈ\ÈØØ[È]Ù\È›Ý›Ý™B‚BKËÈÚXÚÚ[™ÝÜÈ\Ù\ˆÝÛœÈ]›ØÙ\ÜËˆHYØXÞHÙ][™È\ÈYÛ›Ü™Y‚‚BX[ÝÓØØ[H˜[ÙB‚B\Ù\™\•T“HÝš[™ÜË•š[TÜXÙJÙ™Ë”Ù\™\‹•T“
+B‚BZYˆÙ\™\•T“OHˆˆÂ‚BB]˜[Y]Y\œˆH˜[Y]SÛ˜›Ø\™[™ÔÙ\™\•T“
+Ù\™\•T“
+B‚BBZYˆ\œˆOHš[Â‚BBBKËÈÙY\[ˆ[˜[Y[™YY]YT“œ›ÛH™XÛÛZ[™ÈH™Y\™XÝÜ‚‚BBBKËÈÜ™Y[X[\Ý[˜][Û‹ˆH\ØYÛÜšÙ\ˆ™\ÜÈHØ[YB‚BBBKËÈÛÛ™šYÝ\˜][Ûˆ\œ›Üˆ]Ý\\‚‚BBBZYˆ\ÙÙÙ\ˆOHš[Â‚BBBBX\ÙÙÙ\‹‘\œ›ÜŠ’[˜[YÛÛ™šYÝ\™YÙ\™\ˆT“ÈÙ\™\ˆ[YÜ˜][Ûˆ\ØX›Y‹™\œ›Üˆ‹\œ‹‘\œ›ÜŠ
+JB‚BBB_B‚BBB\Ù\™\•T“Hˆ‚‚BB_H[ÙHÂ‚BBB\Ù\™\•T“H˜[Y]Y‚BB_B‚B_B‚B\Ù\™\ÐHHÝš[™ÜË•š[TÜXÙJÙ™Ë”Ù\™\‹ÐT]
+B‚B\Ù\™\”ÚÚ\HÙ™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžB‚BXYÙ[QHÝš[™ÜË•š[TÜXÙJÙ™Ë”Ù\™\‹YÙ[Q
+B‚‚BKËÈ]]ËY[˜X›HÙ\™\ˆ[ÙHYˆÙ\™\ˆT“\ÈÛÛ™šYÝ\™Y[™[ÙH›Ý^XÚ]HÙ]‚BZYˆÙ\™\•T“OHˆˆ	‰ˆÙ™Ë•ÙX‹]]“[ÙHOHˆˆÂ‚BB[[ÙHHœÙ\™\ˆ‚‚B_B‚_B‚ZYˆ[ÙHOH™\ØX›YˆÂ‚BKËÈH\ÝÜšXÈ[˜]][XØ]Y[ÙHÜ˜[Y]™\žHØ[\ˆYZ[ˆXØÙ\ÜË‚‚BKËÈ™\Ù\™HÝ\\ÛÛ\]Xš[]HÚ]Ý]™\Ù\š[™È]š]š[YÙK‚‚B[[ÙHH›ØØ[‚‚_B‚\™]\›ˆ	˜YÙ[]]X[˜YÙ\žÂ‚B[[ÙNˆ[ÙK‚BX[ÝÓØØ[YZ[Žˆ[ÝÓØØ[‚B\Ù\™\•T“ˆÙ\™\•T“‚BXYÙ[QˆYÙ[Q‚B\Ù\™\ÐT]ˆÙ\™\ÐK‚B\Ù\™\”ÚÚ\™\šYžNˆÙ\™\”ÚÚ\‚B\Ù\ÜÚ[ÛœÎˆÙ\ÜÚ[ÛœË‚B\X›XÑ^XÝˆX\ÜÝš[™×\ÝXÝß^Â‚BBH‹ÛÙÚ[ˆŽˆßK‚BBH‹Ù˜]šXÛÛ‹šXÛÈŽˆßK‚BBH‹ÚX[ŽˆßK‚BBH‹Ø\KÝ™\œÚ[ÛˆŽˆßK‚BBH‹Ø\KÝŒKØ]]ÛÜ[ÛœÈŽˆßK‚BBH‹Ø\KÝŒKØ]]ÛÙÚ[ˆŽˆßK‚BBH‹Ø\KÝŒKØ]]ÛÙÛÝ]ŽˆßK‚BBH‹Ø\KÝŒKØ]]ÛYHŽˆßK‚BBH‹Ø\KÝŒKØ]]ØØ[˜XÚÈŽˆßKËÈÙ\™\ˆ]]Ø[˜XÚÂ‚B_K‚B\X›XÔ™Yš^\Îˆ×\Ýš[™ÞÂ‚BBH‹ÜÝ]XËÈ‹‚B_K‚_BŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÜ[ÛœÔ^[ØY
+
+HYÙ[]]Ü[ÛœÈÂ‚ZYˆHOHš[Â‚B\™]\›ˆYÙ[]]Ü[ÛœÞÓ[ÙNˆ›ØØ[‹[ÝÓØØ[YZ[Žˆ˜[ÙKÙÚ[”Ý\ÜYˆ˜[Ù_B‚_B‚\Ù\™\•T“HÝš[™ÜË•š[TÜXÙJKœÙ\™\•T“
+B‚Z\ÔÙ\™\ˆHÙ\™\•T“OHˆ‚‚[ÙÚ[”Ý\ÜYH\ÔÙ\™\ˆ	‰ˆK›[ÙHOHœÙ\™\ˆ‚‚[ÜÈHYÙ[]]Ü[ÛœÞÂ‚BS[ÙNˆK›[ÙK‚BP[ÝÓØØ[YZ[ŽˆK˜[ÝÓØØ[YZ[‹‚BPYÙ[QˆK˜YÙ[Q‚BSÙÚ[”Ý\ÜYˆÙÚ[”Ý\ÜY‚_B‚ZYˆ\ÔÙ\™\ˆÂ‚B[ÜË”Ù\™\•T“HÙ\™\•T“‚BKËÈ[Ø^\È›ÝšYHHÙ\™\ˆ]]T“Ú[ˆÙ\™\ˆ\ÈÛÛ™šYÝ\™Y‚BKËÈ\È[˜X›\È™Y\™XÝX˜\ÙY]]]™[ˆÚ[ˆ\™XÝÙÚ[ˆ\Û‰ÝÝ\ÜY‚B[ÜË”Ù\™\]]T“HÝš[™ÜË•š[TšYÚ
+Ù\™\•T“‹ÈŠH
+È‹ÛÙÚ[ˆ‚‚_B‚\™]\›ˆÜÂŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÜ˜\
+™^’[™\ŠH’[™\ˆÂ‚\™]\›ˆ’[™\‘[˜Ê[˜ÊÈ”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚BZ[™\ˆH™^‚BZYˆ[™\ˆOHš[Â‚BBZ[™\ˆH‘Y˜][Ù\™S]^‚B_B‚BZYˆ‹›ÙHOHš[Â‚BBKËÈ›Ý[™]™\žH™\]Y\Ý™Y›Ü™HH›Ý]K\ÜXÚYšXÈXÛÙ\ˆ[œËˆ\È[ÛÂ‚BBKËÈÛÝ™\œÈYØXÞH[™\œÈ]Ý[\ÙHœÛÛ‹‘XÛÙ\ˆ\™XÝK‚‚BB\‹›ÙHH“X^ž]\Ô™XY\ŠË‹›ÙKX^YÙ[™\]Y\Ý›ÙTÚ^™JB‚B_B‚BWË\ÝY›ÞHH™\]Y\Ý]]”›ÞTš[˜Ú\[œ›ÛPÛÛ^
+‹ÛÛ^
+
+JB‚BZYˆ]\ÝY›ÞH	‰ˆ‹•T“”]OH‹Ø\KÝŒKØ]]ØØ[˜XÚÈˆ	‰ˆ\™\]Y\Ý]]œ›ÝÜÙ\”™\]Y\Ý[ÝÙY
+ŠHÂ‚BBZ‘\œ›ÜŠË˜Ü›ÜÜË[ÜšYÚ[ˆ™\]Y\Ý™Z™XÝY‹”Ý]\Ñ›Ü˜šY[ŠB‚BB\™]\›‚‚B_B‚BZYˆHOHš[KœÚÝ[ž\\ÜÊŠHÂ‚BBZ[™\‹”Ù\™R
+ËŠB‚BB\™]\›‚‚B_B‚B\š[˜Ú\[ÚÈHK˜]][XØ]JŠB‚BZYˆ[ÚÈÂ‚BBXKœ™\ÜÛ™[˜]]Üš^™Y
+ËŠB‚BB\™]\›‚‚B_B‚BZYˆXYÙ[›ÛP[ÝÜÊš[˜Ú\[ŠHÂ‚BBZ‘\œ›ÜŠË™›Ü˜šY[ˆ‹”Ý]\Ñ›Ü˜šY[ŠB‚BB\™]\›‚‚B_B‚BXÝHÛÛ^•Ú]˜[YJ‹ÛÛ^
+
+KYÙ[š[˜Ú\[ÛÛ^Ù^Kš[˜Ú\[
+B‚BZ[™\‹”Ù\™R
+Ë‹•Ú]ÛÛ^
+Ý
+JB‚_JBŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÚÝ[ž\\ÜÊˆ
+š”™\]Y\Ý
+H›ÛÛÂ‚ZYˆHOHš[Â‚B\™]\›ˆYB‚_B‚\]H‹•T“”]‚ZYˆËÚÈHKœX›XÑ^XÝÜ]NÈÚÈÂ‚B\™]\›ˆYB‚_B‚Y›ÜˆË™Yš^H˜[™ÙHKœX›XÔ™Yš^\ÈÂ‚BZYˆÝš[™ÜË’\Ô™Yš^
+]™Yš^
+HÂ‚BB\™]\›ˆYB‚B_B‚_B‚\™]\›ˆ˜[ÙBŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHš[˜Ú\[›Ü”™\]Y\Ý
+ˆ
+š”™\]Y\Ý
+H
+
+YÙ[š[˜Ú\[›ÛÛ
+HÂ‚\™]\›ˆK˜]][XØ]JŠBŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH]][XØ]Jˆ
+š”™\]Y\Ý
+H
+
+YÙ[š[˜Ú\[›ÛÛ
+HÂ‚ZYˆÚÈH™\]Y\Ý]]”›ÞTš[˜Ú\[œ›ÛPÛÛ^
+‹ÛÛ^
+
+JNÈÚÈÂ‚B\™]\›ˆ	YÙ[š[˜Ú\[Õ\Ù\›˜[YNˆ•\Ù\›˜[YK›ÛNˆ”›ÛKÛÝ\˜ÙNˆœÙ\™\‹\›ÞHŸKYB‚_B‚ZYˆHOHš[Â‚B\™]\›ˆš[˜[ÙB‚_B‚ZYˆÙ\ÜÈHKœÙ\ÜÚ[Û‘œ›ÛT™\]Y\Ý
+ŠNÈÙ\ÜÈOHš[Â‚B\™]\›ˆÙ\ÜË”š[˜Ú\[YB‚_B‚\ÝÚ]ÚK›[ÙHÂ‚XØ\ÙH›ØØ[Ž‚‚B\™]\›ˆš[˜[ÙB‚XØ\ÙHœÙ\™\ˆŽ‚‚B\™]\›ˆš[˜[ÙB‚YY˜][‚‚B\™]\›ˆš[˜[ÙB‚_BŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH™\ÜÛ™[˜]]Üš^™Y
+È”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚ZYˆHOHš[	‰ˆK›[ÙHOHœÙ\™\ˆˆ	‰ˆÝš[™ÜË•š[TÜXÙJKœÙ\™\•T“
+HOHˆˆ	‰ˆXØÙ\ÒS
+ŠHÂ‚BZ”™Y\™XÝ
+Ë‹KœÙ\™\“ÙÚ[•T“
+ŠK”Ý]\Ñ›Ý[™
+B‚B\™]\›‚‚_B‚ZYˆXØÙ\ÒS
+ŠHÂ‚B\™Y\™XÝÈH‹ÛÙÚ[ˆ‚‚BZYˆ‹•T“OHš[	‰ˆ‹•T“”]OH‹ÛÙÚ[ˆˆÂ‚BB\™Y\™XÝÈH™Y\™XÝÈ
+ÈÜ™]\›—ÝÏHˆ
+È\›”]Y\žQ\ØØ\J‹•T“”™\]Y\ÝT’J
+JB‚B_B‚BZ”™Y\™XÝ
+Ë‹™Y\™XÝË”Ý]\Ñ›Ý[™
+B‚B\™]\›‚‚_B‚Z‘\œ›ÜŠË[˜]]Üš^™Y‹”Ý]\Õ[˜]]Üš^™Y
+BŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÙ\ÜÚ[Û‘œ›ÛT™\]Y\Ý
+ˆ
+š”™\]Y\Ý
+H
+˜YÙ[Ù\ÜÚ[ÛˆÂ‚ZYˆHOHš[KœÙ\ÜÚ[ÛœÈOHš[Â‚B\™]\›ˆš[‚_B‚XÛÛÚÚYK\œˆH‹ÛÛÚÚYJYÙ[Ù\ÜÚ[ÛÛÛÚÚYS˜[YJB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[‚_B‚\Ù\ÜËÚÈHKœÙ\ÜÚ[ÛœË‘Ù]
+ÛÛÚÚYK•˜[YJB‚ZYˆ[ÚÈÂ‚B\™]\›ˆš[‚_B‚\™]\›ˆÙ\ÜÂŸB‚™[˜È™\]Y\Ý\ÓÛÜ˜XÚÊˆ
+š”™\]Y\Ý
+H›ÛÛÂ‚ZYˆˆOHš[Â‚B\™]\›ˆ˜[ÙB‚_B‚XÚXÚÒÜÝH[˜Ê˜[YHÝš[™ÊH›ÛÛÂ‚BZYˆ˜[YHOHˆˆÂ‚BB\™]\›ˆ˜[ÙB‚B_B‚BZÜÝH˜[YB‚BZYˆÝš[™ÜËÛÛZ[œÊÜÝŽˆŠHÂ‚BBZYˆ\œÙYÜÝË\œˆH™]”Ü]ÜÝÜ
+˜[YJNÈ\œˆOHš[Â‚BBBZÜÝH\œÙYÜÝ‚BB_B‚B_B‚BZ\H™]”\œÙRT
+Ýš[™ÜË•š[TÜXÙJÜÝ
+JB‚B\™]\›ˆ\OHš[	‰ˆ\’\ÓÛÜ˜XÚÊ
+B‚_B‚\™]\›ˆÚXÚÒÜÝ
+‹”™[[ÝPYŠBŸB‚™[˜È™\]Y\Ý\ÒÊˆ
+š”™\]Y\Ý
+H›ÛÛÂ‚ZYˆˆOHš[Â‚B\™]\›ˆ˜[ÙB‚_B‚ZYˆ‹•ÈOHš[Â‚B\™]\›ˆYB‚_B‚ZYˆˆH‹ÛÛ^
+
+K•˜[YJ\ÒÐÛÛ^Ù^JNÈˆOHš[Â‚BZYˆ›YËÚÈH‹Š›ÛÛ
+NÈÚÈ	‰ˆ›YÈÂ‚BB\™]\›ˆYB‚B_B‚_B‚\›ÝÈHÝš[™ÜË•š[TÜXÙJÝš[™ÜË•ÓÝÙ\Š‹’XY\‹‘Ù]
+–Q›ÜØ\™YT›ÝÈŠJJB‚\™]\›ˆ›ÝÈOHšÈ‚ŸB‚‹ËÈ\ÔØY™T™]\›”]˜[Y]\È]Hœ™]\›—ÝÈˆ™Y\™XÝ\™Ù]\ÈHØØ[‹ËÈØ[YK[ÜšYÚ[ˆ]
+™]™[ÈÜ[‹\™Y\™XÝ]XÚÜÊKˆ]™Z™XÝÈXœÛÛ]B‹ËÈT“Ë›ÝØÛÛ\™[]]™HT“È
+ËÚÜÝÜˆ×ÜÝ
+K[™ÛÛ›ÛÚ\˜XÝ\œÂ‹ËÈ
+X‹ÐÔ‹Ó‹Ù]ËŠH]ÛÛYHœ›ÝÜÙ\œÈÝš\Üˆ›Ü›X[^™H™Y›Ü™H˜]šYØ][™Ë‹ËÈÚXÚÛÝ[Ý\Ú\ÙH™H\ÙYÈÛ]YÙÛH‹ËÚÜÝˆ\ÝH˜Z]™H™Yš^ÚXÚÂ‹ËÈ
+K™Ëˆ‹×Ù]š[˜ÛÛHˆ\ÈÝš\YÈ‹ËÙ]š[˜ÛÛHˆžHÛÛYHœ›ÝÜÙ\œÊK‚™[˜È\ÔØY™T™]\›”]
+Ýš[™ÊH›ÛÛÂ‚ZYˆOHˆˆ\Ýš[™ÜË’\Ô™Yš^
+‹ÈŠHÂ‚B\™]\›ˆ˜[ÙB‚_B‚ZYˆÝš[™ÜË’\Ô™Yš^
+‹ËÈŠHÝš[™ÜË’\Ô™Yš^
+‹×ŠHÂ‚B\™]\›ˆ˜[ÙB‚_B‚ZYˆÝš[™ÜËÛÛZ[œÊŽ‹ËÈŠHÂ‚B\™]\›ˆ˜[ÙB‚_B‚Y›ÜˆËˆH˜[™ÙHÂ‚BZYˆˆHYˆˆOHÙˆÂ‚BB\™]\›ˆ˜[ÙB‚B_B‚_B‚\™]\›ˆYBŸB‚‹ËÈ[™RX[™\ÜÛ™ÈÚ]HÚ[\H”ÓÓˆ^[ØY[™XØ][™ÈHYÙ[\È[]™K‚™[˜È[™RX[
+È”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚]Ë’XY\Š
+K”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚ZœÛÛ‹“™]Ñ[˜ÛÙ\ŠÊK‘[˜ÛÙJX\ÜÝš[™×Z[\™˜XÙ^ß^Â‚BHœÝ]\ÈŽˆšX[H‹‚BH[Y\Ý[\Žˆ[YK“›ÝÊ
+K•UÊ
+K‚_JBŸB‚\HYÙ[X[][\ÝXÝÂ‚]\›Ýš[™Â‚Z[œÙXÝ\™H›ÛÛŸB‚‹ËÈ[YÙ[X[ÚXÚÈ›Ø™\ÈHØØ[ÚX[[™Ú[\Ú[™ÈÛÛ™šYÝ\™YÜË‚‹ËÈ™]\›œÈš[Ú[ˆX[NÈÝ\Ú\ÙH[ˆ\œ›ÜˆÝ[[X\š^š[™È˜Z[\™\Ë‚™[˜È[YÙ[X[ÚXÚÊÛÛ™šYÑ›YÈÝš[™ÊH\œ›ÜˆÂ‚XÙ™ÈHY˜][YÙ[ÛÛ™šYÊ
+B‚‚ZYˆ™\ÛÛ™YHÛÛ™šYË”™\ÛÛ™PÛÛ™šYÔ]
+QÑS•‹ÛÛ™šYÑ›YÊNÈ™\ÛÛ™YOHˆˆÂ‚BZYˆË\œˆHÜË”Ý]
+™\ÛÛ™Y
+NÈ\œˆOHš[Â‚BBZYˆØYYØY\œˆHØYYÙ[ÛÛ™šYÊ™\ÛÛ™Y
+NÈØY\œˆOHš[Â‚BBBXÙ™ÈHØYY‚BB_B‚B_B‚_B‚‚X][\ÈHXZÙJ×XYÙ[X[][\ŠB‚ZYˆÙ™Ë•ÙX‹’ÜˆÂ‚BX][\ÈH\[™
+][\ËYÙ[X[][\Ý\›ˆ›]”Üš[Šš‹ËÌLËŒŒŒN‰YÚX[‹Ù™Ë•ÙX‹’Ü
+_JB‚_B‚ZYˆÙ™Ë•ÙX‹’ÔÜˆÂ‚BX][\ÈH\[™
+][\ËYÙ[X[][\Ý\›ˆ›]”Üš[ŠšÎ‹ËÌLËŒŒŒN‰YÚX[‹Ù™Ë•ÙX‹’ÔÜ
+K[œÙXÝ\™NˆY_JB‚_B‚‚ZYˆ[Š][\ÊHOHÂ‚BX][\ÈH\[™
+][\ËYÙ[X[][\Ý\›ˆš‹ËÌLËŒŒŒNŽÚX[ŸJB‚_B‚‚]˜\ˆ\œœÈ×\Ýš[™Â‚Y›ÜˆË][\H˜[™ÙH][\ÈÂ‚BZYˆ\œˆH›Ø™PYÙ[X[
+][\\›][\š[œÙXÝ\™JNÈ\œˆOHš[Â‚BBY\œ“\ÙÈH›]”Üš[Š‰\Îˆ	]ˆ‹][\\›\œŠB‚BBY\œœÈH\[™
+\œœË\œ“\ÙÊB‚BBXÛÛ[YB‚B_B‚B\™]\›ˆš[‚_B‚‚ZYˆ[Š\œœÊHOHÂ‚B\™]\›ˆ›]‘\œ›Ü™Š››ÈX[[™Ú[ÈÈ›Ø™HŠB‚_B‚‚\™]\›ˆ›]‘\œ›Ü™Š‰\È‹Ýš[™ÜË’›Ú[Š\œœËŽÈŠJBŸB‚™[˜È›Ø™PYÙ[X[
+[™Ú[Ýš[™Ë[œÙXÝ\™H›ÛÛ
+H\œ›ÜˆÂ‚XÛY[H	šÛY[Õ[Y[Ý]ˆH
+ˆ[YK”ÙXÛÛ™B‚ZYˆ[œÙXÝ\™HÂ‚BZYˆZ\ÓÛÜ˜XÚÒX[[™Ú[
+[™Ú[
+HÂ‚BB\™]\›ˆ›]‘\œ›Ü™Šš[œÙXÝ\™HX[›Ø™\È\™H™\ÝšXÝYÈÛÜ˜XÚÈŠB‚B_B‚BKËÈÛ›ÜÙXÈÍˆKHH[™Ú[\ÈÚXÚÙYX›Ý™H[™\Èš^YÛÜ˜XÚÎÂ‚BKËÈHYÙ[X^H\ÙHHÙ[‹\ÚYÛ™YÙ\YšXØ]H›Üˆ\ÈØØ[›Ø™HÛ›K‚‚BXÛY[•˜[œÜÜH	š•˜[œÜÜÕÐÛY[ÛÛ™šYÎˆ	ËÛÛ™šYÞÒ[œÙXÝ\™TÚÚ\™\šYžNˆY__B‚_B‚‚\™\K\œˆH“™]Ô™\]Y\ÝÚ]ÛÛ^
+ÛÛ^˜XÚÙÜ›Ý[™
+
+K“Y]ÙÙ][™Ú[š[
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ\œ‚‚_B‚‚\™\Ü\œˆHÛY[‘Ê™\JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ\œ‚‚_B‚YY™\ˆ™\Ü›ÙKÛÜÙJ
+B‚‚ZYˆ™\Ü”Ý]\ÐÛÙHOH”Ý]\ÓÒÈÂ‚B\™]\›ˆ›]‘\œ›Ü™Š[™^XÝYÝ]\È	Y‹™\Ü”Ý]\ÐÛÙJB‚_B‚‚]˜\ˆ^[ØYÝXÝÂ‚BTÝ]\ÈÝš[™ÈœÛÛŽˆœÝ]\È˜‚_B‚‚ZYˆ\œˆHœÛÛ‹“™]ÑXÛÙ\Š[Ë“[Z]™XY\Š™\Ü›ÙKL
+JK‘XÛÙJ	œ^[ØY
+NÈ\œˆOHš[Â‚B\™]\›ˆ›]‘\œ›Ü™Š™XÛÙH™\ÜÛœÙNˆ	]È‹\œŠB‚_B‚‚ZYˆÝš[™ÜË•ÓÝÙ\ŠÝš[™ÜË•š[TÜXÙJ^[ØY”Ý]\ÊJHOHšX[HˆÂ‚B\™]\›ˆ›]‘\œ›Ü™ŠœÝ]\ÏI\È‹^[ØY”Ý]\ÊB‚_B‚‚\™]\›ˆš[ŸB‚™[˜È\ÓÛÜ˜XÚÒX[[™Ú[
+[™Ú[Ýš[™ÊH›ÛÛÂ‚\\œÙY\œˆH\›”\œÙJ[™Ú[
+B‚ZYˆ\œˆOHš[\œÙY”ØÚ[YHOHšÈˆ\œÙY’ÜÝOHˆˆ\œÙY•\Ù\ˆOHš[\œÙY”˜]Ô]Y\žHOHˆˆ\œÙY‘œ˜YÛY[OHˆˆÂ‚B\™]\›ˆ˜[ÙB‚_B‚ZÜÝHÝš[™ÜË•ÓÝÙ\ŠÝš[™ÜË•š[J\œÙY’ÜÝ˜[YJ
+K–×HŠJB‚\™]\›ˆÜÝOHŒLËŒŒŒHˆÜÝOHŽŽŒHˆÜÝOH›ØØ[ÜÝ‚ŸB‚™[˜ÈXØÙ\ÒS
+ˆ
+š”™\]Y\Ý
+H›ÛÛÂ‚ZYˆˆOHš[Â‚B\™]\›ˆ˜[ÙB‚_B‚ZXY\ˆH‹’XY\‹‘Ù]
+XØÙ\ŠB‚ZYˆÝš[™ÜËÛÛZ[œÊXY\‹^Ú[ŠHÂ‚B\™]\›ˆYB‚_B‚\™]\›ˆ‹•T“OHš[	‰ˆ‹•T“”]OH‹È‚ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH\ÜÝYTÙ\ÜÚ[ÛÛÛÚÚYJÈ”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ýš[˜Ú\[
+YÙ[š[˜Ú\[Ù\™\•ÚÙ[ˆÝš[™Ë^\™\Ð][YK•[YJH
+Ýš[™Ë\œ›ÜŠHÂ‚ZYˆHOHš[KœÙ\ÜÚ[ÛœÈOHš[š[˜Ú\[OHš[Â‚B\™]\›ˆˆ‹\œ›ÜœË“™]Ê˜]][XØ][Ûˆ\ØX›YŠB‚_B‚ZYˆ^\™\Ð]’\Ö™\›Ê
+H^\™\Ð]™Y›Ü™J[YK“›ÝÊ
+JHÂ‚BY^\™\Ð]H[YK“›ÝÊ
+KY
+Y˜][YÙ[Ù\ÜÚ[Û•
+B‚_B‚\Ù\ÜÚ[Û’QHKœÙ\ÜÚ[ÛœËÜ™X]Jš[˜Ú\[Ù\™\•ÚÙ[‹^\™\Ð]
+B‚ZYˆÙ\ÜÚ[Û’QOHˆˆÂ‚B\™]\›ˆˆ‹\œ›ÜœË“™]Ê™˜Z[YÈÙ[™\˜]HÙXÝ\™HÙ\ÜÚ[ÛˆÚÙ[ˆŠB‚_B‚XÛÛÚÚYHH	šÛÛÚÚY^Â‚BS˜[YNˆYÙ[Ù\ÜÚ[ÛÛÛÚÚYS˜[YK‚BU˜[YNˆÙ\ÜÚ[Û’Q‚BT]ˆ‹È‹‚BRÛ›NˆYK‚BTÙXÝ\™Nˆ™\]Y\Ý\ÒÊŠK‚BTØ[YTÚ]Nˆ”Ø[YTÚ]S^[ÙK‚BQ^\™\Îˆ^\™\Ð]‚_B‚ZYˆ^\™\Ð]Y\Š[YK“›ÝÊ
+JHÂ‚BXÛÛÚÚYK“X^YÙHH[
+[YK•[[
+^\™\Ð]
+K”ÙXÛÛ™Ê
+JB‚_B‚Z”Ù]ÛÛÚÚYJËÛÛÚÚYJB‚\™]\›ˆÙ\ÜÚ[Û’Qš[ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÛX\”Ù\ÜÚ[ÛÛÛÚÚYJÈ”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚Z”Ù]ÛÛÚÚYJË	šÛÛÚÚY^Â‚BS˜[YNˆYÙ[Ù\ÜÚ[ÛÛÛÚÚYS˜[YK‚BU˜[YNˆˆ‹‚BT]ˆ‹È‹‚BQ^\™\Îˆ[YK•[š^
+
+K‚BSX^YÙNˆLK‚BRÛ›NˆYK‚BTÙXÝ\™Nˆ™\]Y\Ý\ÒÊŠK‚BTØ[YTÚ]Nˆ”Ø[YTÚ]S^[ÙK‚_JBŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH[™P]]YJÈ”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚ZYˆ‹“Y]ÙOH“Y]ÙÙ]Â‚BZ‘\œ›ÜŠË›Y]Ù›Ý[ÝÙY‹”Ý]\ÓY]Ù›Ý[ÝÙY
+B‚B\™]\›‚‚_B‚‚ZYˆš[˜Ú\[ÚÈHK˜]][XØ]JŠNÈÚÈ	‰ˆš[˜Ú\[OHš[Â‚B]Ë’XY\Š
+K”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚BZœÛÛ‹“™]Ñ[˜ÛÙ\ŠÊK‘[˜ÛÙJš[˜Ú\[
+B‚B\™]\›‚‚_B‚Z‘\œ›ÜŠË[˜]][XØ]Y‹”Ý]\Õ[˜]]Üš^™Y
+BŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH[™P]]ÙÚ[ŠÈ”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚ZYˆ‹“Y]ÙOH“Y]ÙÜÝÂ‚BZ‘\œ›ÜŠË›Y]Ù›Ý[ÝÙY‹”Ý]\ÓY]Ù›Ý[ÝÙY
+B‚B\™]\›‚‚_B‚ZYˆHOHš[Â‚BZ‘\œ›ÜŠË˜]][XØ][Ûˆ[˜]˜Z[X›H‹”Ý]\ÔÙ\šXÙU[˜]˜Z[X›JB‚B\™]\›‚‚_B‚]˜\ˆ™\HÝXÝÂ‚BU\Ù\›˜[YHÝš[™ÈœÛÛŽˆ\Ù\›˜[YH˜‚BT\ÜÝÛÜ™Ýš[™ÈœÛÛŽˆœ\ÜÝÛÜ™˜‚_B‚ZYˆ\œˆHœÛÛ‹“™]ÑXÛÙ\Š‹›ÙJK‘XÛÙJ	œ™\JNÈ\œˆOHš[Â‚BZ‘\œ›ÜŠË˜˜Y™\]Y\Ý‹”Ý]\Ð˜Y™\]Y\Ý
+B‚B\™]\›‚‚_B‚]\Ù\›˜[YHHÝš[™ÜË•š[TÜXÙJ™\K•\Ù\›˜[YJB‚\\ÜÝÛÜ™H™\K”\ÜÝÛÜ™‚ZYˆ\Ù\›˜[YHOHˆˆ\ÜÝÛÜ™OHˆˆÂ‚BZ‘\œ›ÜŠË\Ù\›˜[YH[™\ÜÝÛÜ™™\]Z\™Y‹”Ý]\Ð˜Y™\]Y\Ý
+B‚B\™]\›‚‚_B‚\ÝÚ]ÚK›[ÙHÂ‚XØ\ÙHœÙ\™\ˆŽ‚‚B\š[˜Ú\[Ù\™\•ÚÙ[‹^\™\Ð]\œˆHKœÙ\™\“ÙÚ[Š‹ÛÛ^
+
+K\Ù\›˜[YK\ÜÝÛÜ™
+B‚BZYˆ\œˆOHš[Â‚BBZYˆ\œ›ÜœË’\Ê\œ‹\œ’[˜[YÜ™Y[X[ÊHÂ‚BBBZ‘\œ›ÜŠËš[˜[YÜ™Y[X[È‹”Ý]\Õ[˜]]Üš^™Y
+B‚BBB\™]\›‚‚BB_B‚BBZYˆ\ÙÙÙ\ˆOHš[Â‚BBBX\ÙÙÙ\‹•Ø\›Š”Ù\™\ˆÙÚ[ˆšXHYÙ[˜Z[Y‹™\œ›Üˆ‹\œ‹‘\œ›ÜŠ
+JB‚BB_B‚BBZ‘\œ›ÜŠË›ÙÚ[ˆ˜Z[Y‹”Ý]\Ð˜YØ]]Ø^JB‚BB\™]\›‚‚B_B‚BZYˆË\œˆHKš\ÜÝYTÙ\ÜÚ[ÛÛÛÚÚYJË‹š[˜Ú\[Ù\™\•ÚÙ[‹^\™\Ð]
+NÈ\œˆOHš[Â‚BBZ‘\œ›ÜŠË™˜Z[YÈÜ™X]HÙ\ÜÚ[Ûˆ‹”Ý]\Ò[\›˜[Ù\™\‘\œ›ÜŠB‚BB\™]\›‚‚B_B‚B]Ë’XY\Š
+K”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚BZœÛÛ‹“™]Ñ[˜ÛÙ\ŠÊK‘[˜ÛÙJX\ÜÝš[™×Z[\™˜XÙ^ß^Â‚BBHœÝXØÙ\ÜÈŽˆYK‚BBH\Ù\ˆŽˆš[˜Ú\[‚B_JB‚B\™]\›‚‚XØ\ÙH™\ØX›YŽ‚‚BZ‘\œ›ÜŠË˜]][XØ][Ûˆ\ØX›Y‹”Ý]\Ñ›Ü˜šY[ŠB‚B\™]\›‚‚YY˜][‚‚BZ‘\œ›ÜŠË›ÙÚ[ˆ[ÙH›ÝÝ\ÜY‹”Ý]\Ó›Ý[\[Y[Y
+B‚B\™]\›‚‚_BŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH[™P]]ÙÛÝ]
+È”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚ZYˆ‹“Y]ÙOH“Y]ÙÜÝÂ‚BZ‘\œ›ÜŠË›Y]Ù›Ý[ÝÙY‹”Ý]\ÓY]Ù›Ý[ÝÙY
+B‚B\™]\›‚‚_B‚ZYˆHOHš[Â‚B]Ë’XY\Š
+K”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚BZœÛÛ‹“™]Ñ[˜ÛÙ\ŠÊK‘[˜ÛÙJX\ÜÝš[™×X›ÛÛÈœÝXØÙ\ÜÈŽˆY_JB‚B\™]\›‚‚_B‚]˜\ˆÙ\™\•ÚÙ[ˆÝš[™Â‚XÛÛÚÚYK\œˆH‹ÛÛÚÚYJYÙ[Ù\ÜÚ[ÛÛÛÚÚYS˜[YJB‚ZYˆ\œˆOHš[	‰ˆÛÛÚÚYK•˜[YHOHˆˆÂ‚BZYˆÙ\ÜËÚÈHKœÙ\ÜÚ[ÛœË‘Ù]
+ÛÛÚÚYK•˜[YJNÈÚÈÂ‚BB\Ù\™\•ÚÙ[ˆHÙ\ÜË”Ù\™\•ÚÙ[‚‚B_B‚BXKœÙ\ÜÚ[ÛœË‘[]JÛÛÚÚYK•˜[YJB‚_B‚XK˜ÛX\”Ù\ÜÚ[ÛÛÛÚÚYJËŠB‚ZYˆÙ\™\•ÚÙ[ˆOHˆˆ	‰ˆK›[ÙHOHœÙ\™\ˆˆÂ‚BZYˆ\œˆHKœÙ\™\“ÙÛÝ]
+‹ÛÛ^
+
+KÙ\™\•ÚÙ[ŠNÈ\œˆOHš[	‰ˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹•Ø\›Š‘˜Z[YÈÙÈÝ]œ›ÛHÙ\™\ˆ‹™\œ›Üˆ‹\œ‹‘\œ›ÜŠ
+JB‚B_B‚_B‚]Ë’XY\Š
+K”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚ZœÛÛ‹“™]Ñ[˜ÛÙ\ŠÊK‘[˜ÛÙJX\ÜÝš[™×X›ÛÛÈœÝXØÙ\ÜÈŽˆY_JBŸB‚‹ËÈ[™P]]Ø[˜XÚÈ[™\ÈÑUØ\KÝŒKØ]]ØØ[˜XÚÂ‹ËÈ\È\ÈØ[YÚ[ˆHÙ\™\ˆ™Y\™XÝÈ˜XÚÈÈHYÙ[Y\ˆ]][XØ][Û‹‚‹ËÈHÙ\™\ˆ[˜ÛY\ÈHÚÜ[]™YØ[˜XÚÈÚÙ[ˆ]ÙH˜[Y]HÈÜ™X]HHØØ[Ù\ÜÚ[Û‹‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH[™P]]Ø[˜XÚÊÈ”™\ÜÛœÙUÜš]\‹ˆ
+š”™\]Y\Ý
+HÂ‚]Ë’XY\Š
+K”Ù]
+ØXÚKPÛÛ›Û‹››Ë\ÝÜ™HŠB‚]Ë’XY\Š
+K”Ù]
+”˜YÛXH‹››ËXØXÚHŠB‚]Ë’XY\Š
+K”Ù]
+”™Y™\œ™\‹TÛXÞH‹››Ë\™Y™\œ™\ˆŠB‚ZYˆHOHš[Â‚BZ‘\œ›ÜŠË˜]][XØ][Ûˆ[˜]˜Z[X›H‹”Ý]\ÔÙ\šXÙU[˜]˜Z[X›JB‚B\™]\›‚‚_B‚‚KËÈÙ]HØ[˜XÚÈÚÙ[ˆœ›ÛH]Y\žH\˜[\Â‚]ÚÙ[ˆHÝš[™ÜË•š[TÜXÙJ‹•T“”]Y\žJ
+K‘Ù]
+ÚÙ[ˆŠJB‚\™]\›•ÈHÝš[™ÜË•š[TÜXÙJ‹•T“”]Y\žJ
+K‘Ù]
+œ™]\›—ÝÈŠJB‚ZYˆ™]\›•ÈOHˆˆZ\ÔØY™T™]\›”]
+™]\›•ÊHÂ‚B\™]\›•ÈH‹È‚‚_B‚‚ZYˆÚÙ[ˆOHˆˆÂ‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹•Ø\›Š]]Ø[˜XÚÈZ\ÜÚ[™ÈÚÙ[ˆŠB‚B_B‚BKËÈ™Y\™XÝÈÙÚ[ˆÚ]\œ›Ü‚‚BZ”™Y\™XÝ
+Ë‹‹ÛÙÚ[Ù\œ›Ü[Z\ÜÚ[™×ÝÚÙ[‰œ™]\›—ÝÏHŠÝ\›”]Y\žQ\ØØ\J™]\›•ÊK”Ý]\Ñ›Ý[™
+B‚B\™]\›‚‚_B‚‚KËÈ˜[Y]HHÚÙ[ˆÚ]HÙ\™\‚‚\š[˜Ú\[Ù\™\•ÚÙ[‹^\™\Ð]\œˆHK˜[Y]TÙ\™\Ø[˜XÚÕÚÙ[Š‹ÛÛ^
+
+KÚÙ[ŠB‚ZYˆ\œˆOHš[Â‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹•Ø\›Š]]Ø[˜XÚÈÚÙ[ˆ˜[Y][Ûˆ˜Z[Y‹™\œ›Üˆ‹\œ‹‘\œ›ÜŠ
+JB‚B_B‚BZ”™Y\™XÝ
+Ë‹‹ÛÙÚ[Ù\œ›ÜZ[˜[YÝÚÙ[‰œ™]\›—ÝÏHŠÝ\›”]Y\žQ\ØØ\J™]\›•ÊK”Ý]\Ñ›Ý[™
+B‚B\™]\›‚‚_B‚‚KËÈÜ™X]HHØØ[Ù\ÜÚ[Û‚‚ZYˆË\œˆHKš\ÜÝYTÙ\ÜÚ[ÛÛÛÚÚYJË‹š[˜Ú\[Ù\™\•ÚÙ[‹^\™\Ð]
+NÈ\œˆOHš[Â‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹‘\œ›ÜŠ‘˜Z[YÈÜ™X]HÙ\ÜÚ[ÛˆY\ˆØ[˜XÚÈ‹™\œ›Üˆ‹\œ‹‘\œ›ÜŠ
+JB‚B_B‚BZ‘\œ›ÜŠË™˜Z[YÈÜ™X]HÙ\ÜÚ[Ûˆ‹”Ý]\Ò[\›˜[Ù\™\‘\œ›ÜŠB‚B\™]\›‚‚_B‚‚ZYˆ\ÙÙÙ\ˆOHš[Â‚BX\ÙÙÙ\‹’[™›Ê]]Ø[˜XÚÈÝXØÙ\ÜÙ[‹\Ù\›˜[YH‹š[˜Ú\[•\Ù\›˜[YKœ™]\›—ÝÈ‹™]\›•ÊB‚_B‚‚KËÈ™Y\™XÝÈHÜšYÚ[˜[\Ý[˜][Û‚‚Z”™Y\™XÝ
+Ë‹™]\›•Ë”Ý]\Ñ›Ý[™
+BŸB‚‹ËÈ˜[Y]TÙ\™\Ø[˜XÚÕÚÙ[ˆ˜[Y]\ÈHØ[˜XÚÈÚÙ[ˆÚ]HÙ\™\ˆ[™™]\›œÈ\Ù\ˆ[™›Ë‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH˜[Y]TÙ\™\Ø[˜XÚÕÚÙ[ŠÝÛÛ^ÛÛ^ÚÙ[ˆÝš[™ÊH
+
+YÙ[š[˜Ú\[Ýš[™Ë[YK•[YK\œ›ÜŠHÂ‚ZYˆHOHš[Ýš[™ÜË•š[TÜXÙJKœÙ\™\•T“
+HOHˆˆÂ‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™ŠœÙ\™\ˆ˜[Y][Ûˆ[˜]˜Z[X›HŠB‚_B‚ZYˆÝš[™ÜË•š[TÜXÙJK˜YÙ[Q
+HOHˆˆÂ‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™Š˜YÙ[Y[]H[˜]˜Z[X›HŠB‚_B‚‚ZYˆ\ÙÙÙ\ˆOHš[Â‚BX\ÙÙÙ\‹‘XYÊ•˜[Y][™ÈØ[˜XÚÈÚÙ[ˆÚ]Ù\™\ˆ‹œÙ\™\—Ý\›‹KœÙ\™\•T“
+B‚_B‚‚XÛY[\œˆHK›™]ÔÙ\™\’ÛY[
+
+B‚ZYˆ\œˆOHš[Â‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹‘XYÊ‘˜Z[YÈÜ™X]HÛY[›ÜˆÚÙ[ˆ˜[Y][Ûˆ‹™\œ›Üˆ‹\œ‹‘\œ›ÜŠ
+JB‚B_B‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚‚\^[ØYHX\ÜÝš[™×\Ýš[™ÞÈÚÙ[ˆŽˆÚÙ[‹˜YÙ[ÚYŽˆK˜YÙ[QB‚XYˆH	˜ž]\ËY™™\žßB‚ZYˆ\œˆHœÛÛ‹“™]Ñ[˜ÛÙ\ŠYŠK‘[˜ÛÙJ^[ØY
+NÈ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚‚\™\K\œˆH“™]Ô™\]Y\ÝÚ]ÛÛ^
+Ý“Y]ÙÜÝKœÙ\™\TUT“
+‹Ø\KÝŒKØ]]ØYÙ[XØ[˜XÚËÝ˜[Y]HŠKž]\Ë“™]Ô™XY\ŠY‹ž]\Ê
+JJB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚\™\K’XY\‹”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚\™\K’XY\‹”Ù]
+•\Ù\‹PYÙ[‹›]”Üš[Š”š[X\Ý\‹PYÙ[É\È‹™\œÚ[ÛŠJB‚‚\™\Ü\œˆHÛY[‘Ê™\JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚YY™\ˆ™\Ü›ÙKÛÜÙJ
+B‚‚Y]K\œˆH[Ë”™XY[
+[Ë“[Z]™XY\Š™\Ü›ÙKOŒ
+JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚‚ZYˆ™\Ü”Ý]\ÐÛÙHOH”Ý]\ÓÒÈÂ‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹‘XYÊ”Ù\™\ˆ™]\›™Y›Û‹SÒÈÝ]\È›ÜˆÚÙ[ˆ˜[Y][Ûˆ‹œÝ]\È‹™\Ü”Ý]\ÐÛÙJB‚B_B‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™ŠÚÙ[ˆ˜[Y][Ûˆ˜Z[YˆÝ]\È	Y‹™\Ü”Ý]\ÐÛÙJB‚_B‚‚]˜\ˆ™\Ý[ÝXÝÂ‚BU˜[Y›ÛÛœÛÛŽˆ˜[Y˜‚BU\Ù\’Q[œÛÛŽˆ\Ù\—ÚY˜‚BU\Ù\›˜[YHÝš[™ÈœÛÛŽˆ\Ù\›˜[YH˜‚BT›ÛHÝš[™ÈœÛÛŽˆœ›ÛH˜‚BU[˜[QÝš[™ÈœÛÛŽˆ[˜[ÚY˜‚BU[˜[QÈ×\Ýš[™ÈœÛÛŽˆ[˜[ÚYÈ˜‚BQ^\™\Ð]Ýš[™ÈœÛÛŽˆ™^\™\×Ø]˜‚_B‚ZYˆ\œˆHœÛÛ‹•[›X\œÚ[
+]K	œ™\Ý[
+NÈ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚‚ZYˆ\™\Ý[•˜[YÂ‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹‘XYÊ”Ù\™\ˆ™\ÜYÚÙ[ˆ\È[˜[YŠB‚B_B‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™ŠÚÙ[ˆ[˜[YŠB‚_B‚‚Y^\™\Ð]ÈH[YK”\œÙJ[YK”‘ÌÌÌÎK™\Ý[‘^\™\Ð]
+B‚ZYˆ^\™\Ð]’\Ö™\›Ê
+HÂ‚BY^\™\Ð]H[YK“›ÝÊ
+KY
+Œ
+ˆ[YK“Z[]JHËÈY˜][ÈHÝ\‚‚_B‚‚\š[˜Ú\[H	YÙ[š[˜Ú\[Â‚BU\Ù\›˜[YNˆ™\Ý[•\Ù\›˜[YK‚BT›ÛNˆ™\Ý[”›ÛK‚BTÛÝ\˜ÙNˆœÙ\™\‹XØ[˜XÚÈ‹‚_B‚‚ZYˆ\ÙÙÙ\ˆOHš[Â‚BX\ÙÙÙ\‹‘XYÊ•ÚÙ[ˆ˜[Y][ÛˆÝXØÙ\ÜÙ[‹\Ù\›˜[YH‹™\Ý[•\Ù\›˜[YKœ›ÛH‹™\Ý[”›ÛK™^\™\×Ø]‹^\™\Ð]‘›Ü›X]
+[YK”‘ÌÌÌÎJJB‚_B‚‚KËÈ™]\›ˆHÚÙ[ˆ]Ù[ˆ\ÈHœÙ\™\ˆÚÙ[ˆˆ›ÜˆÙÛÝ]\œÜÙ\Â‚KËÈ[ˆH[[\[Y[][Û‹[ÝHZYÚØ[ÈÜ™X]HH›Ü\ˆÙ\™\ˆÙ\ÜÚ[Û‚‚\™]\›ˆš[˜Ú\[ÚÙ[‹^\™\Ð]š[ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÙ\™\“ÙÚ[ŠÝÛÛ^ÛÛ^\Ù\›˜[YK\ÜÝÛÜ™Ýš[™ÊH
+
+YÙ[š[˜Ú\[Ýš[™Ë[YK•[YK\œ›ÜŠHÂ‚ZYˆHOHš[Ýš[™ÜË•š[TÜXÙJKœÙ\™\•T“
+HOHˆˆÂ‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™ŠœÙ\™\ˆÙÚ[ˆ[˜]˜Z[X›HŠB‚_B‚XÛY[\œˆHK›™]ÔÙ\™\’ÛY[
+
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚\^[ØYHX\ÜÝš[™×\Ýš[™ÞÈ\Ù\›˜[YHŽˆ\Ù\›˜[YKœ\ÜÝÛÜ™Žˆ\ÜÝÛÜ™B‚XYˆH	˜ž]\ËY™™\žßB‚ZYˆ\œˆHœÛÛ‹“™]Ñ[˜ÛÙ\ŠYŠK‘[˜ÛÙJ^[ØY
+NÈ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚\™\K\œˆH“™]Ô™\]Y\ÝÚ]ÛÛ^
+Ý“Y]ÙÜÝKœÙ\™\TUT“
+‹Ø\KÝŒKØ]]ÛÙÚ[ˆŠKž]\Ë“™]Ô™XY\ŠY‹ž]\Ê
+JJB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚\™\K’XY\‹”Ù]
+ÛÛ[U\H‹˜\XØ][Û‹ÚœÛÛˆŠB‚\™\K’XY\‹”Ù]
+•\Ù\‹PYÙ[‹›]”Üš[Š”š[X\Ý\‹PYÙ[É\È‹™\œÚ[ÛŠJB‚\™\Ü\œˆHÛY[‘Ê™\JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚YY™\ˆ™\Ü›ÙKÛÜÙJ
+B‚Y]K\œˆH[Ë”™XY[
+[Ë“[Z]™XY\Š™\Ü›ÙKOŒ
+JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚ZYˆ™\Ü”Ý]\ÐÛÙHOH”Ý]\Õ[˜]]Üš^™YÂ‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ’[˜[YÜ™Y[X[Â‚_B‚ZYˆ™\Ü”Ý]\ÐÛÙHOH”Ý]\ÓÒÈÂ‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™ŠœÙ\™\ˆÙÚ[ˆ˜Z[YˆÝ]\È	Y‹™\Ü”Ý]\ÐÛÙJB‚_B‚]˜\ˆÙÚ[”™\ÜÝXÝÂ‚BUÚÙ[ˆÝš[™ÈœÛÛŽˆÚÙ[ˆ˜‚BQ^\™\Ð]Ýš[™ÈœÛÛŽˆ™^\™\×Ø]˜‚_B‚ZYˆ\œˆHœÛÛ‹•[›X\œÚ[
+]K	›ÙÚ[”™\Ü
+NÈ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚ZYˆÙÚ[”™\Ü•ÚÙ[ˆOHˆˆÂ‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK›]‘\œ›Ü™ŠœÙ\™\ˆÙÚ[ˆ˜Z[YˆZ\ÜÚ[™ÈÚÙ[ˆŠB‚_B‚Y^\™\Ð]H[YK“›ÝÊ
+KY
+Y˜][YÙ[Ù\ÜÚ[Û•
+B‚ZYˆÙÚ[”™\Ü‘^\™\Ð]OHˆˆÂ‚BZYˆ\œÙY\œˆH[YK”\œÙJ[YK”‘ÌÌÌÎKÙÚ[”™\Ü‘^\™\Ð]
+NÈ\œˆOHš[Â‚BBY^\™\Ð]H\œÙY‚B_B‚_B‚\š[˜Ú\[\œˆHK™™]ÚÙ\™\”š[˜Ú\[
+ÝÛY[ÙÚ[”™\Ü•ÚÙ[ŠB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[ˆ‹[YK•[Y^ßK\œ‚‚_B‚\™]\›ˆš[˜Ú\[ÙÚ[”™\Ü•ÚÙ[‹^\™\Ð]š[ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÙ\™\“ÙÛÝ]
+ÝÛÛ^ÛÛ^Ù\™\•ÚÙ[ˆÝš[™ÊH\œ›ÜˆÂ‚ZYˆHOHš[Ù\™\•ÚÙ[ˆOHˆˆÂ‚B\™]\›ˆš[‚_B‚XÛY[\œˆHK›™]ÔÙ\™\’ÛY[
+
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ\œ‚‚_B‚\™\K\œˆH“™]Ô™\]Y\ÝÚ]ÛÛ^
+Ý“Y]ÙÜÝKœÙ\™\TUT“
+‹Ø\KÝŒKØ]]ÛÙÛÝ]ŠKš[
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ\œ‚‚_B‚\™\KYÛÛÚÚYJ	šÛÛÚÚY^Ó˜[YNˆœWÜÙ\ÜÚ[Ûˆ‹˜[YNˆÙ\™\•ÚÙ[ŸJB‚\™\K’XY\‹”Ù]
+•\Ù\‹PYÙ[‹›]”Üš[Š”š[X\Ý\‹PYÙ[É\È‹™\œÚ[ÛŠJB‚\™\Ü\œˆHÛY[‘Ê™\JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ\œ‚‚_B‚YY™\ˆ™\Ü›ÙKÛÜÙJ
+B‚WËÈH[ËÛÜJ[Ë‘\ØØ\™[Ë“[Z]™XY\Š™\Ü›ÙKL
+JB‚ZYˆ™\Ü”Ý]\ÐÛÙHHÂ‚B\™]\›ˆ›]‘\œ›Ü™ŠœÙ\™\ˆÙÛÝ]˜Z[YˆÝ]\È	Y‹™\Ü”Ý]\ÐÛÙJB‚_B‚\™]\›ˆš[ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH™]ÚÙ\™\”š[˜Ú\[
+ÝÛÛ^ÛÛ^ÛY[
+šÛY[Ù\™\•ÚÙ[ˆÝš[™ÊH
+
+YÙ[š[˜Ú\[\œ›ÜŠHÂ‚\™\K\œˆH“™]Ô™\]Y\ÝÚ]ÛÛ^
+Ý“Y]ÙÙ]KœÙ\™\TUT“
+‹Ø\KÝŒKØ]]ÛYHŠKš[
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[\œ‚‚_B‚\™\KYÛÛÚÚYJ	šÛÛÚÚY^Ó˜[YNˆœWÜÙ\ÜÚ[Ûˆ‹˜[YNˆÙ\™\•ÚÙ[ŸJB‚\™\K’XY\‹”Ù]
+•\Ù\‹PYÙ[‹›]”Üš[Š”š[X\Ý\‹PYÙ[É\È‹™\œÚ[ÛŠJB‚\™\Ü\œˆHÛY[‘Ê™\JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[\œ‚‚_B‚YY™\ˆ™\Ü›ÙKÛÜÙJ
+B‚ZYˆ™\Ü”Ý]\ÐÛÙHOH”Ý]\ÓÒÈÂ‚B\™]\›ˆš[›]‘\œ›Ü™Š˜]]™\šYšXØ][Ûˆ˜Z[YˆÝ]\È	Y‹™\Ü”Ý]\ÐÛÙJB‚_B‚]˜\ˆ^[ØYÝXÝÂ‚BU\Ù\›˜[YHÝš[™ÈœÛÛŽˆ\Ù\›˜[YH˜‚BT›ÛHÝš[™ÈœÛÛŽˆœ›ÛH˜‚BU[˜[QÝš[™ÈœÛÛŽˆ[˜[ÚY˜‚BU[˜[QÈ×\Ýš[™ÈœÛÛŽˆ[˜[ÚYÈ˜‚_B‚ZYˆ\œˆHœÛÛ‹“™]ÑXÛÙ\Š[Ë“[Z]™XY\Š™\Ü›ÙKOŒ
+JK‘XÛÙJ	œ^[ØY
+NÈ\œˆOHš[Â‚B\™]\›ˆš[\œ‚‚_B‚ZYÈH^[ØY•[˜[QÂ‚ZYˆ[ŠYÊHOH	‰ˆ^[ØY•[˜[QOHˆˆÂ‚BZYÈH×\Ýš[™ÞÜ^[ØY•[˜[QB‚_B‚\™]\›ˆ	YÙ[š[˜Ú\[Â‚BU\Ù\›˜[YNˆ^[ØY•\Ù\›˜[YK‚BT›ÛNˆ^[ØY”›ÛK‚BTÛÝ\˜ÙNˆœÙ\™\ˆ‹‚BU[˜[QÎˆYË‚_Kš[ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠH™]ÔÙ\™\’ÛY[
+
+H
+
+šÛY[\œ›ÜŠHÂ‚ZYˆHOHš[Â‚B\™]\›ˆš[›]‘\œ›Ü™Š˜]][XØ][ÛˆX[˜YÙ\ˆ[˜]˜Z[X›HŠB‚_B‚ZYˆË\œˆH˜[Y]SÛ˜›Ø\™[™ÔÙ\™\•T“
+KœÙ\™\•T“
+NÈ\œˆOHš[Â‚B\™]\›ˆš[›]‘\œ›Ü™Šš[˜[YÙ\™\ˆT“ˆ	]È‹\œŠB‚_B‚ZYˆKœÙ\™\”ÚÚ\™\šYžHÂ‚B\™]\›ˆš[›]‘\œ›Ü™Šš[œÙXÝ\™HÙ\™\ˆÈ™\šYšXØ][Ûˆ\È›Ý\›Z]YŠB‚_B‚]ÐÛÛ™šYÈH	ËÛÛ™šYÞÓZ[•™\œÚ[ÛŽˆË•™\œÚ[Û•ÌLŸB‚ZYˆKœÙ\™\ÐT]OHˆˆÂ‚B\[Q]K\œˆHÜË”™XYš[JKœÙ\™\ÐT]
+B‚BZYˆ\œˆOHš[Â‚BB\™]\›ˆš[\œ‚‚B_B‚B\ÛÛHLK“™]ÐÙ\ÛÛ
+
+B‚BZYˆ\ÛÛ\[™Ù\Ñœ›ÛTSJ[Q]JHÂ‚BB\™]\›ˆš[›]‘\œ›Ü™Š™˜Z[YÈ\œÙHÙ\™\ˆÐHÙ\YšXØ]HŠB‚B_B‚B]ÐÛÛ™šYË”›ÛÝÐ\ÈHÛÛ‚_B‚]˜[œÜÜH	š•˜[œÜÜÕÐÛY[ÛÛ™šYÎˆÐÛÛ™šYßB‚\™]\›ˆ	šÛY[Õ[Y[Ý]ˆÙ\™\]][Y[Ý]˜[œÜÜˆ˜[œÜÜKš[ŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÙ\™\TUT“
+Ýš[™ÊHÝš[™ÈÂ‚X˜\ÙHHÝš[™ÜË•š[TšYÚ
+KœÙ\™\•T“‹ÈŠB‚ZYˆ˜\ÙHOHˆˆÂ‚B\™]\›ˆ‚_B‚ZYˆ\Ýš[™ÜË’\Ô™Yš^
+‹ÈŠHÂ‚B\H‹Èˆ
+È‚_B‚\™]\›ˆ˜\ÙH
+ÈŸB‚™[˜È
+H
+˜YÙ[]]X[˜YÙ\ŠHÙ\™\“ÙÚ[•T“
+ˆ
+š”™\]Y\Ý
+HÝš[™ÈÂ‚ZYˆHOHš[Ýš[™ÜË•š[TÜXÙJKœÙ\™\•T“
+HOHˆˆÂ‚B\™]\›ˆ‹ÛÙÚ[ˆ‚‚_B‚\Ù\™\•T“\œˆH˜[Y]SÛ˜›Ø\™[™ÔÙ\™\•T“
+KœÙ\™\•T“
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ‹ÛÙÚ[Ù\œ›ÜZ[˜[YÜÙ\™\—Ý\›‚‚_B‚KËÈ]\›Z[™HÚ]T“H\Ù\ˆÜšYÚ[˜[HØ[Y‚\™]\›•ÈH‹È‚‚ZYˆˆOHš[	‰ˆ‹•T“OHš[Â‚BZYˆ\šHH‹•T“”™\]Y\ÝT’J
+NÈ\šHOHˆˆÂ‚BB\™]\›•ÈH\šB‚B_B‚_B‚‚KËÈZ[HYÙ[Ø[˜XÚÈT“]HÙ\™\ˆÚ[™Y\™XÝÈY\ˆ]]‚KËÈÙH™YYÈ]\›Z[™HHYÙ[	ÜÈ^\›˜[T“‚XYÙ[Ø[˜XÚÕT“HZ[YÙ[Ø[˜XÚÕT“
+‹™]\›•ÊB‚‚KËÈ\ÙH	Ü™Y\™XÝ	È\˜[Y]\ˆ›Üˆ^\›˜[™Y\™XÝÈ
+Ù\™\ˆÙÚ[ˆYÙHÛÛ™[[ÛŠB‚\™]\›ˆÙ\™\•T“
+È‹ÛÙÚ[Ü™Y\™XÝHˆ
+È\›”]Y\žQ\ØØ\JYÙ[Ø[˜XÚÕT“
+BŸB‚‹ËÈZ[YÙ[Ø[˜XÚÕT“ÛÛœÝXÝÈHØ[˜XÚÈT“]HÙ\™\ˆÚÝ[™Y\™XÝÈY\ˆ]]™[˜ÈZ[YÙ[Ø[˜XÚÕT“
+ˆ
+š”™\]Y\Ý™]\›•ÈÝš[™ÊHÝš[™ÈÂ‚KËÈžHÈ]\›Z[™HHYÙ[	ÜÈ˜\ÙHT“œ›ÛHH™\]Y\Ý‚\ØÚ[YHHš‚‚ZYˆˆOHš[	‰ˆ‹•ÈOHš[Â‚B\ØÚ[YHHšÈ‚‚_B‚KËÈÚXÚÈ›ÜˆQ›ÜØ\™YT›ÝÈXY\‚‚ZYˆˆOHš[Â‚BZYˆ›ÝÈH‹’XY\‹‘Ù]
+–Q›ÜØ\™YT›ÝÈŠNÈ›ÝÈOHˆˆÂ‚BBKËÈ\ÝÛ›HHš\œÝÝ[™\™›ÜØ\™[™È˜[YH[™ÙY\B‚BBKËÈÙ[™\˜]YØ[˜XÚÈT“Ú][ˆ
+ÊKˆHÙ\™\ˆ\™›Ü›\ÈB‚BBKËÈÙXÛÛ™ÜÝØYÙ[š[™[™ÈÚXÚÈ™Y›Ü™HZ[[™ÈH™X\™\ˆÚÙ[‹‚‚BB\›ÝÈHÝš[™ÜË•ÓÝÙ\ŠÝš[™ÜË•š[TÜXÙJÝš[™ÜË”Ü]
+›ÝË‹ŠVÌJJB‚BBZYˆ›ÝÈOHšˆ›ÝÈOHšÈˆÂ‚BBB\ØÚ[YHH›ÝÂ‚BB_B‚B_B‚_B‚‚ZÜÝH›ØØ[ÜÝŽˆËÈY˜][˜[˜XÚÂ‚ZYˆˆOHš[	‰ˆ‹’ÜÝOHˆˆÂ‚BZÜÝH‹’ÜÝ‚_B‚‚KËÈZ[HØ[˜XÚÈT“‚XØ[˜XÚÕT“H›]”Üš[Š‰\Î‹ËÉ\ËØ\KÝŒKØ]]ØØ[˜XÚÏÜ™]\›—ÝÏI\È‹ØÚ[YKÜÝ\›”]Y\žQ\ØØ\J™]\›•ÊJB‚\™]\›ˆØ[˜XÚÕT“ŸB‚\HÝ]XÔ™\ÛÝ\˜ÙPØXÚHÝXÝÂ‚\Þ[˜Ë”•Ó]]^‚Z][\ÈX\ÜÝš[™×XØXÚY™\ÛÝ\˜ÙBŸB‚\HØXÚY™\ÛÝ\˜ÙHÝXÝÂ‚Y]H×Xž]B‚XÛÛ[\HÝš[™Â‚ZXY\œÈ’XY\‚‚Y^\žH[YK•[YBŸB‚™[˜È™]ÔÝ]XÔ™\ÛÝ\˜ÙPØXÚJ
+H
+œÝ]XÔ™\ÛÝ\˜ÙPØXÚHÂ‚\™]\›ˆ	œÝ]XÔ™\ÛÝ\˜ÙPØXÚ^Ú][\ÎˆXZÙJX\ÜÝš[™×XØXÚY™\ÛÝ\˜ÙJ_BŸB‚™[˜È
+È
+œÝ]XÔ™\ÛÝ\˜ÙPØXÚJHÙ]
+Ù^HÝš[™ÊH
+×Xž]KÝš[™Ë’XY\‹›ÛÛ
+HÂ‚XË”“ØÚÊ
+B‚YY™\ˆË”•[›ØÚÊ
+B‚Z][KÚÈHËš][\ÖÚÙ^WB‚ZYˆ[ÚÈ[YK“›ÝÊ
+KY\Š][K™^\žJHÂ‚B\™]\›ˆš[ˆ‹š[˜[ÙB‚_B‚\™]\›ˆ][K™]K][K˜ÛÛ[\K][KšXY\œËYBŸB‚™[˜È
+È
+œÝ]XÔ™\ÛÝ\˜ÙPØXÚJHÙ]
+Ù^HÝš[™Ë]H×Xž]KÛÛ[\HÝš[™ËXY\œÈ’XY\‹[YK‘\˜][ÛŠHÂ‚XË“ØÚÊ
+B‚YY™\ˆË•[›ØÚÊ
+B‚XËš][\ÖÚÙ^WHHØXÚY™\ÛÝ\˜Ù^Â‚BY]Nˆ]K‚BXÛÛ[\NˆÛÛ[\K‚BZXY\œÎˆXY\œË‚BY^\žNˆ[YK“›ÝÊ
+KY
+
+K‚_BŸB‚˜\ˆ
+‚\Ý]XÐØXÚHH™]ÔÝ]XÔ™\ÛÝ\˜ÙPØXÚJ
+B‚]\ØYÛÜšÙ\“]HÞ[˜Ë”•Ó]]^‚]\ØYÛÜšÙ\ˆ
+•\ØYÛÜšÙ\‚‚KËÈØØ[›ÞR[™\ˆ\ÈH›ÛÝ[™\ˆ›Üˆ\™XÝ›ÞH[›ØØ][Û‚‚KËÈ\È\ÈÙ]Ú[ˆHÙXˆÙ\™\ˆÝ\È[™\ÙYžHÙX”ÛØÚÙ]›ÞH™\]Y\ÝÂ‚[ØØ[›ÞR[™\ˆ’[™\‚‚[ØØ[›ÞR[™\“]HÞ[˜Ë”•Ó]]^‚KËÈ]šXÙTÝÜ™H\ÈÚ\™YXÜ›ÜÜÈHYÙ[›Üˆ\œÚ\Ý[˜ÙHXØÙ\ÜÂ‚Y]šXÙTÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™B‚KËÈYÙ[ÛÛ™šYÔÝÜ™HÝÜ™\È\Ù\‹XÛÛ™šYÝ\˜X›HÙ][™ÜËÜ˜[™Ù\Â‚XYÙ[ÛÛ™šYÔÝÜ™HÝÜ˜YÙKYÙ[ÛÛ™šYÔÝÜ™B‚\Ù][™ÜÓX[˜YÙ\ˆ
+”Ù][™ÜÓX[˜YÙ\‚‚KËÈ\Q\ØÛÝ™\žQY™™XÝÑ[˜È[ÝÜÈY™\œ™YÚ\š[™ÈÙˆ\ØÛÝ™\žHÙ][™ÜÈÛÚÜÂ‚X\Q\ØÛÝ™\žQY™™XÝÑ[˜È[˜ÊX\ÜÝš[™×Z[\™˜XÙ^ßJB‚KËÈÛÛ™šYÑ\ÛÛ”™[[ÝS[ÙQ[˜X›Y˜XÚÜÈÛØ˜[™X]\™H›YÈÝ]B‚XÛÛ™šYÑ\ÛÛ”™[[ÝS[ÙQ[˜X›Y›ÛÛ‚KËÈÛØ˜[ÝXÝ\™YÙÙÙ\ˆ[œÝ[˜ÙB‚X\ÙÙÙ\ˆ
+›ÙÙÙ\‹“ÙÙÙ\‚‚KËÈ]]Õ\]SX[˜YÙ\“]H›ÝXÝÈXØÙ\ÜÈÈ]]Õ\]SX[˜YÙ\‚‚X]]Õ\]SX[˜YÙ\“]HÞ[˜Ë”•Ó]]^‚KËÈ]]Õ\]SX[˜YÙ\ˆ[™\ÈYÙ[Ù[‹]\]HÜ\˜][ÛœÂ‚X]]Õ\]SX[˜YÙ\ˆ
+˜]]Ý\]K“X[˜YÙ\‚‚KËÈØØ[›™\ÛÛ™šYÈÙ[˜[^™\È[[YKXY\ÝX›HØØ[›™\ˆ\˜[Y]\œÂ‚\ØØ[›™\ÛÛ™šYÈÝXÝÂ‚B\Þ[˜Ë”•Ó]]^‚BTÓ“T[Y[Ý]\È[‚BTÓ“T™]šY\È[‚BQ\ØÛÝ™\ÛÛ˜Ý\œ™[˜ÞH[‚_BŠB‚‹ËÈÙ]ØØ[›ÞR[™\ˆÙ]ÈHÛØ˜[[™\ˆ›Üˆ\™XÝ›ÞH[›ØØ][Û‹‚‹ËÈØ[YÚ[ˆHÙXˆÙ\™\ˆÝ\Ë‚™[˜ÈÙ]ØØ[›ÞR[™\Š’[™\ŠHÂ‚[ØØ[›ÞR[™\“]K“ØÚÊ
+B‚[ØØ[›ÞR[™\ˆH‚[ØØ[›ÞR[™\“]K•[›ØÚÊ
+B‚‚KËÈ[ÛÈÙ]]ÛˆH\ØYÛÜšÙ\ˆYˆ]^\ÝÂ‚]\ØYÛÜšÙ\“]K”“ØÚÊ
+B‚]ÈH\ØYÛÜšÙ\‚‚]\ØYÛÜšÙ\“]K”•[›ØÚÊ
+B‚ZYˆÈOHš[Â‚B]Ë”Ù]ØØ[[™\Š
+B‚_BŸB‚‹ËÈÙ]ØØ[›ÞR[™\ˆ™]\›œÈHÛØ˜[[™\ˆ›Üˆ\™XÝ›ÞH[›ØØ][Û‹‚™[˜ÈÙ]ØØ[›ÞR[™\Š
+H’[™\ˆÂ‚[ØØ[›ÞR[™\“]K”“ØÚÊ
+B‚YY™\ˆØØ[›ÞR[™\“]K”•[›ØÚÊ
+B‚\™]\›ˆØØ[›ÞR[™\‚ŸB‚‹ËÈ›ÝYžTÙ\™\‘]šXÙQ[]YÙ[™ÈH]šXÙWÙ[]Y›ÝYšXØ][ÛˆÈHÙ\™\ˆšXHÙX”ÛØÚÙ]‚‹ËÈ\È\ÈØ[YY\ˆH]šXÙH\È[]YØØ[HÛÈHÙ\™\ˆØ[ˆ[ÛÈ™[[Ý™H]‚‹ËÈ[œÈ\È™\ÝYY™›ÜHÙ\È›Ý›ØÚÈÜˆ˜Z[YˆHÙ\™\ˆ\È[œ™XXÚX›K‚™[˜È›ÝYžTÙ\™\‘]šXÙQ[]Y
+Ù\šX[Ýš[™ÊHÂ‚]\ØYÛÜšÙ\“]K”“ØÚÊ
+B‚]ÛÜšÙ\ˆH\ØYÛÜšÙ\‚‚]\ØYÛÜšÙ\“]K”•[›ØÚÊ
+B‚‚ZYˆÛÜšÙ\ˆOHš[Â‚B\™]\›‚‚_B‚‚]ÜÐÛY[HÛÜšÙ\‹•ÔÐÛY[
+
+B‚ZYˆÜÐÛY[OHš[]ÜÐÛY[’\ÐÛÛ›™XÝY
+
+HÂ‚B\™]\›‚‚_B‚‚[\ÙÈHÜØÛÛ[[Û‹“Y\ÜØYÙ^Â‚BU\NˆÜØÛÛ[[Û‹“Y\ÜØYÙU\Q]šXÙQ[]Y‚BQ]NˆX\ÜÝš[™×Z[\™˜XÙ^ß^Â‚BBHœÙ\šX[ŽˆÙ\šX[‚B_K‚BU[Y\Ý[\ˆ[YK“›ÝÊ
+K‚_B‚‚ZYˆ\œˆHÜÐÛY[”Ù[™Y\ÜØYÙJ\ÙÊNÈ\œˆOHš[Â‚BKËÈÙÈ]Û‰Ý˜Z[H›ÝYšXØ][Ûˆ\È™\ÝYY™›Ü‚BX\ÙÙÙ\‹‘XYÊ‘˜Z[YÈ›ÝYžHÙ\™\ˆX›Ý]]šXÙH[][Ûˆ‹œÙ\šX[‹Ù\šX[™\œ›Üˆ‹\œŠB‚_H[ÙHÂ‚BX\ÙÙÙ\‹’[™›Ê“›ÝYšYYÙ\™\ˆX›Ý]]šXÙH[][Ûˆ‹œÙ\šX[‹Ù\šX[
+B‚_BŸB‚™[˜È[‘Ø\˜˜YÙPÛÛXÝ[ÛŠÝÛÛ^ÛÛ^ÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™KÛÛ™šYÈ
+˜YÙ[”™][[ÛÛÛ™šYÊHÂ‚]XÚÙ\ˆH[YK“™]ÕXÚÙ\Š
+ˆ[YK’Ý\ŠHËÈ[ˆZ[B‚YY™\ˆXÚÙ\‹”ÝÜ
+
+B‚‚KËÈÚXÚÈYˆÛÛ^\È[™XYHØ[˜Ù[Y™Y›Ü™H[›š[™Â‚\Ù[XÝÂ‚XØ\ÙHXÝ‘Û™J
+N‚‚B\™]\›‚‚YY˜][‚‚BKËÈ[ˆ[[YYX][HÛˆÝ\\‚BYÑØ\˜˜YÙPÛÛXÝ[ÛŠÝÜ™KÛÛ™šYÊB‚_B‚‚Y›ÜˆÂ‚B\Ù[XÝÂ‚BXØ\ÙH]XÚÙ\‹Î‚‚BBYÑØ\˜˜YÙPÛÛXÝ[ÛŠÝÜ™KÛÛ™šYÊB‚BXØ\ÙHXÝ‘Û™J
+N‚‚BB\™]\›‚‚B_B‚_BŸB‚‹ËÈÑØ\˜˜YÙPÛÛXÝ[Ûˆ\™›Ü›\ÈHXÝX[ÛX[\ÛÜšÂ™[˜ÈÑØ\˜˜YÙPÛÛXÝ[ÛŠÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™KÛÛ™šYÈ
+˜YÙ[”™][[ÛÛÛ™šYÊHÂ‚XÝHÛÛ^˜XÚÙÜ›Ý[™
+
+B‚‚KËÈØ[Ý[]HÝ]Ù™ˆ[Y\Ý[\Â‚\ØØ[’\ÝÜžPÝ]Ù™ˆH[YK“›ÝÊ
+KY]JXÛÛ™šYË”ØØ[’\ÝÜžQ^\ÊK•[š^
+
+B‚ZY[‘]šXÙ\ÐÝ]Ù™ˆH[YK“›ÝÊ
+KY]JXÛÛ™šYË’Y[‘]šXÙ\Ñ^\ÊK•[š^
+
+B‚‚KËÈ[]HÛØØ[ˆ\ÝÜžB‚ZYˆØØ[œÑ[]Y\œˆHÝÜ™K‘[]SÛØØ[œÊÝØØ[’\ÝÜžPÝ]Ù™ŠNÈ\œˆOHš[Â‚BX\ÙÙÙ\‹‘\œ›ÜŠ‘Ø\˜˜YÙHÛÛXÝ[ÛŽˆ˜Z[YÈ[]HÛØØ[œÈ‹™\œ›Üˆ‹\œ‹˜Ý]Ù™—Ù^\È‹ÛÛ™šYË”ØØ[’\ÝÜžQ^\ÊB‚_H[ÙHYˆØØ[œÑ[]YˆÂ‚BX\ÙÙÙ\‹’[™›Ê‘Ø\˜˜YÙHÛÛXÝ[ÛŽˆ[]YÛØØ[ˆ\ÝÜžH‹˜ÛÝ[‹ØØ[œÑ[]Y˜YÙWÙ^\È‹ÛÛ™šYË”ØØ[’\ÝÜžQ^\ÊB‚_B‚‚KËÈ[]HÛY[ˆ]šXÙ\Â‚ZYˆ]šXÙ\Ñ[]Y\œˆHÝÜ™K‘[]SÛY[‘]šXÙ\ÊÝY[‘]šXÙ\ÐÝ]Ù™ŠNÈ\œˆOHš[Â‚BX\ÙÙÙ\‹‘\œ›ÜŠ‘Ø\˜˜YÙHÛÛXÝ[ÛŽˆ˜Z[YÈ[]HÛY[ˆ]šXÙ\È‹™\œ›Üˆ‹\œ‹˜Ý]Ù™—Ù^\È‹ÛÛ™šYË’Y[‘]šXÙ\Ñ^\ÊB‚_H[ÙHYˆ]šXÙ\Ñ[]YˆÂ‚BX\ÙÙÙ\‹’[™›Ê‘Ø\˜˜YÙHÛÛXÝ[ÛŽˆ[]YÛY[ˆ]šXÙ\È‹˜ÛÝ[‹]šXÙ\Ñ[]Y˜YÙWÙ^\È‹ÛÛ™šYË’Y[‘]šXÙ\Ñ^\ÊB‚_BŸB‚‹ËÈ[“Y]šXÜÑÝÛœØ[\\ˆ[œÈ\š[ÙXÈÝÛœØ[\[™ÈÙˆY]šXÜÈ]B‹ËÈ\È[\[Y[È™]]K\Ý[HY\™YÝÜ˜YÙNˆ˜]È8¡¤ˆÝ\›H8¡¤ˆZ[H8¡¤ˆ[ÛB™[˜È[“Y]šXÜÑÝÛœØ[\\ŠÝÛÛ^ÛÛ^ÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™JHÂ‚KËÈ[ˆ]™\žHˆÝ\œÈ
+[Y\È\ˆ^JB‚]XÚÙ\ˆH[YK“™]ÕXÚÙ\Šˆ
+ˆ[YK’Ý\ŠB‚YY™\ˆXÚÙ\‹”ÝÜ
+
+B‚‚KËÈ[ˆ[[YYX][HÛˆÝ\\
+Ú]HÛX[[^HÈ]H\[š]X[^™JB‚\Ù[XÝÂ‚XØ\ÙH][YKY\ŠÌ
+ˆ[YK”ÙXÛÛ™
+N‚‚BYÓY]šXÜÑÝÛœØ[\[™ÊÝÜ™JB‚XØ\ÙHXÝ‘Û™J
+N‚‚B\™]\›‚‚_B‚‚Y›ÜˆÂ‚B\Ù[XÝÂ‚BXØ\ÙH]XÚÙ\‹Î‚‚BBYÓY]šXÜÑÝÛœØ[\[™ÊÝÜ™JB‚BXØ\ÙHXÝ‘Û™J
+N‚‚BB\™]\›‚‚B_B‚_BŸB‚‹ËÈÓY]šXÜÑÝÛœØ[\[™È\™›Ü›\ÈHXÝX[ÝÛœØ[\[™ÈÛÜšÂ™[˜ÈÓY]šXÜÑÝÛœØ[\[™ÊÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™JHÂ‚XÝHÛÛ^˜XÚÙÜ›Ý[™
+
+B‚‚X\ÙÙÙ\‹’[™›Ê“Y]šXÜÈÝÛœØ[\[™ÎˆÝ\[™ÈY\™YYÙÜ™YØ][ÛˆŠB‚‚KËÈ\™›Ü›H[ÝÛœØ[\[™Îˆ˜]ø¡¤šÝ\›KÝ\›x¡¤™Z[KZ[x¡¤›[ÛKÛX[\‚ZYˆ\œˆHÝÜ™K”\™›Ü›Q[ÝÛœØ[\[™ÊÝ
+NÈ\œˆOHš[Â‚BX\ÙÙÙ\‹‘\œ›ÜŠ“Y]šXÜÈÝÛœØ[\[™Îˆ˜Z[Y‹™\œ›Üˆ‹\œŠB‚_H[ÙHÂ‚BX\ÙÙÙ\‹’[™›Ê“Y]šXÜÈÝÛœØ[\[™ÎˆÛÛ\]YÝXØÙ\ÜÙ[HŠB‚_BŸB‚‹ËÈÝÛœØ[\PYÙ[Y]šXÜÈ™YXÙ\ÈH[X™\ˆÙˆ]HÚ[ÈÚ[H™\Ù\š[™Èš\œÝ\Ý‹ËÈ[™™\™\Ù[]]™HØ[\\È›ÝYÚÝ]H˜[™ÙKˆ\Ù\È‹Z[œÜ\™Y[ÛÜš]B‹ËÈ›Üˆš\ÝX[HÚYÛšYšXØ[Ú[Ù[XÝ[Û‹‚™[˜ÈÝÛœØ[\PYÙ[Y]šXÜÊ]H×JœÝÜ˜YÙK“Y]šXÜÔÛ˜\ÚÝ\™Ù]Ú[È[
+H×JœÝÜ˜YÙK“Y]šXÜÔÛ˜\ÚÝÂ‚[ˆH[Š]JB‚ZYˆˆH\™Ù]Ú[È\™Ù]Ú[ÈÈÂ‚B\™]\›ˆ]B‚_B‚‚KËÈ[Ø^\ÈÙY\š\œÝ[™\ÝÚ[Â‚\™\Ý[HXZÙJ×JœÝÜ˜YÙK“Y]šXÜÔÛ˜\ÚÝ\™Ù]Ú[ÊB‚\™\Ý[H\[™
+™\Ý[]VÌJB‚‚KËÈØ[Ý[]HXÚÙ]Ú^™H›ÜˆZYHÚ[Â‚XXÚÙ]Ú^™HH›Ø]
+‹LŠHÈ›Ø]
+\™Ù]Ú[ËLŠB‚‚KËÈÙ[XÝ™\™\Ù[]]™HÚ[Èœ›ÛHXXÚXÚÙ]‚KËÈÚ[\H\›ØXÚˆXÚÈHÚ[Ú]H[ÜÝÚ[™ÙH
+È™\Ù\™HXZÜËÝ˜[^\ÊB‚Y›ÜˆHHÈH\™Ù]Ú[ËLŽÈJÊÈÂ‚BXXÚÙ]Ý\H[
+›Ø]
+JJ˜XÚÙ]Ú^™JH
+ÈB‚BXXÚÙ][™H[
+›Ø]
+JÌJJ˜XÚÙ]Ú^™JH
+ÈB‚BZYˆXÚÙ][™ˆ‹LHÂ‚BBXXÚÙ][™HˆHB‚B_B‚BZYˆXÚÙ]Ý\HXÚÙ][™Â‚BBXÛÛ[YB‚B_B‚‚BKËÈš[™HÚ[Ú]X^[Hœ›ÛH[™X\ˆ[\œÛ][Ûˆ
+™\Ù\™\ÈXZÜÊB‚BX™\ÝYHXÚÙ]Ý\‚B[X^[HHŒ‚B\™]•˜[YHH›Ø]
+]VØXÚÙ]Ý\LWK”YÙPÛÝ[
+B‚B[™^˜[YHH›Ø]
+]VØXÚÙ][™K”YÙPÛÝ[
+B‚‚BY›ÜˆˆHXÚÙ]Ý\ÈˆXÚÙ][™ÈŠÊÈÂ‚BBKËÈ^XÝY˜[YHšXH[™X\ˆ[\œÛ][Û‚‚BB]H›Ø]
+‹XXÚÙ]Ý\
+ÌJHÈ›Ø]
+XÚÙ][™XXÚÙ]Ý\
+ÌJB‚BBY^XÝYH™]•˜[YH
+È
+Š™^˜[YK\™]•˜[YJB‚BBXXÝX[H›Ø]
+]VÚ—K”YÙPÛÝ[
+B‚BBY[HH^XÝYHXÝX[‚BBZYˆ[HÂ‚BBBY[HHY[B‚BB_B‚BBZYˆ[HˆX^[HÂ‚BBB[X^[HH[B‚BBBX™\ÝYH‚‚BB_B‚B_B‚‚B\™\Ý[H\[™
+™\Ý[]VØ™\ÝYJB‚_B‚‚\™\Ý[H\[™
+™\Ý[]VÛ‹LWJB‚\™]\›ˆ™\Ý[ŸB‚‹ËÈ[œÝ\™UÐÙ\YšXØ]\ÈÙ[™\˜]\ÈÜˆØYÈÈÙ\YšXØ]\È›ÜˆÂ‹ËÈYˆÝ\ÝÛPÙ\][™Ý\ÝÛRÙ^T]\™H›ÝšYY\Ù\ÈÜÙH[œÝXY™[˜È[œÝ\™UÐÙ\YšXØ]\ÊÝ\ÝÛPÙ\]Ý\ÝÛRÙ^T]Ýš[™ÊH
+Ù\š[KÙ^Qš[HÝš[™Ë\œˆ\œ›ÜŠHÂ‚KËÈYˆÝ\ÝÛHÙ\]È›ÝšYY˜[Y]H[™\ÙH[B‚ZYˆÝ\ÝÛPÙ\]OHˆˆ	‰ˆÝ\ÝÛRÙ^T]OHˆˆÂ‚BZYˆË\œˆHÜË”Ý]
+Ý\ÝÛPÙ\]
+NÈ\œˆOHš[Â‚BBZYˆË\œˆHÜË”Ý]
+Ý\ÝÛRÙ^T]
+NÈ\œˆOHš[Â‚BBBX\ÙÙÙ\‹’[™›Ê•\Ú[™ÈÝ\ÝÛHÈÙ\YšXØ]\È‹˜Ù\‹Ý\ÝÛPÙ\]šÙ^H‹Ý\ÝÛRÙ^T]
+B‚BBB\™]\›ˆÝ\ÝÛPÙ\]Ý\ÝÛRÙ^T]š[‚BB_B‚B_B‚BX\ÙÙÙ\‹•Ø\›ŠÝ\ÝÛHÈÙ\YšXØ]H]È[˜[Y˜[[™È˜XÚÈÈ]]ËYÙ[™\˜]Y‹˜Ù\‹Ý\ÝÛPÙ\]šÙ^H‹Ý\ÝÛRÙ^T]
+B‚_B‚‚KËÈÙ]]H\™XÝÜžB‚Y]Q\‹\œˆHÝÜ˜YÙK‘Ù]]Q\Š”š[X\Ý\ˆŠB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÙ]]H\™XÝÜžNˆ	]È‹\œŠB‚_B‚‚XÙ\š[HHš[\]’›Ú[Š]Q\‹œÙ\™\‹˜ÜŠB‚ZÙ^Qš[HHš[\]’›Ú[Š]Q\‹œÙ\™\‹šÙ^HŠB‚‚KËÈÚXÚÈYˆÙ\YšXØ]\È[™XYH^\Ý‚ZYˆË\œˆHÜË”Ý]
+Ù\š[JNÈ\œˆOHš[Â‚BZYˆË\œˆHÜË”Ý]
+Ù^Qš[JNÈ\œˆOHš[Â‚BBKËÈ›Ýš[\È^\ÝˆYÚ[ˆ\›Z\ÜÚ[ÛœÈÛˆš[\ÈÜ™X]YžHB‚BBKËÈYÙ[]Ù[ˆ[ˆØ\ÙH[ˆÛ\ˆ™[X\ÙHY[HÛÜ›\™XYX›K‚‚BBZYˆ\œˆH\™[•Ñš[T\›Z\ÜÚ[ÛœÊÙ\š[KÙ^Qš[JNÈ\œˆOHš[Â‚BBB\™]\›ˆˆ‹ˆ‹\œ‚‚BB_B‚BB\™]\›ˆÙ\š[KÙ^Qš[Kš[‚B_B‚_B‚‚KËÈÙ[™\˜]H™]ÈÙ[‹\ÚYÛ™YÙ\YšXØ]B‚X\ÙÙÙ\‹’[™›Ê‘Ù[™\˜][™ÈÙ[‹\ÚYÛ™YÈÙ\YšXØ]HŠB‚‚\š]‹\œˆHœØK‘Ù[™\˜]RÙ^J˜[™”™XY\‹Œ
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÙ[™\˜]Hš]˜]HÙ^Nˆ	]È‹\œŠB‚_B‚‚KËÈÜ™X]HÙ\YšXØ]H[\]B‚[›Ý™Y›Ü™HH[YK“›ÝÊ
+B‚[›ÝY\ˆH›Ý™Y›Ü™KY
+ÍH
+ˆ
+ˆ[YK’Ý\ˆ
+ˆL
+HËÈLYX\œÂ‚‚\Ù\šX[[X™\‹\œˆH˜[™’[
+˜[™”™XY\‹™]ÊšYË’[
+K“Ú
+šYË“™]Ò[
+JKLŽ
+JB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÙ[™\˜]HÙ\šX[[X™\Žˆ	]È‹\œŠB‚_B‚‚][\]HHLKÙ\YšXØ]^Â‚BTÙ\šX[[X™\ŽˆÙ\šX[[X™\‹‚BTÝXš™XÝˆÚ^“˜[Y^Â‚BBSÜ™Ø[š^˜][ÛŽˆ×\Ýš[™ÞÈ”š[X\Ý\ˆŸK‚BBPÛÛ[[Û“˜[YNˆ”š[X\Ý\ˆYÙ[‹‚B_K‚BS›Ý™Y›Ü™Nˆ›Ý™Y›Ü™K‚BS›ÝY\Žˆ›ÝY\‹‚BRÙ^U\ØYÙNˆLK’Ù^U\ØYÙRÙ^Q[˜Ú\\›Y[LK’Ù^U\ØYÙQYÚ][ÚYÛ˜]\™K‚BQ^Ù^U\ØYÙNˆ×^LK‘^Ù^U\ØYÙ^ÞLK‘^Ù^U\ØYÙTÙ\™\]]K‚BP˜\ÚXÐÛÛœÝ˜Z[Õ˜[YˆYK‚BQ”Ó˜[Y\Îˆ×\Ýš[™ÞÈ›ØØ[ÜÝŸK‚BRTY™\ÜÙ\Îˆ×[™]’TÛ™]”\œÙRT
+ŒLËŒŒŒHŠK™]”\œÙRT
+ŽŽŒHŠ_K‚_B‚‚KËÈÜ™X]HÙ[‹\ÚYÛ™YÙ\YšXØ]B‚Y\ž]\Ë\œˆHLKÜ™X]PÙ\YšXØ]J˜[™”™XY\‹	[\]K	[\]K	œš]‹”X›XÒÙ^Kš]ŠB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÜ™X]HÙ\YšXØ]Nˆ	]È‹\œŠB‚_B‚‚KËÈÜš]HÙ\YšXØ]Hš[B‚XÙ\Ý]\œˆHÜË“Ü[‘š[JÙ\š[KÜË“×ÕÔ“Ó“_ÜË“×ÐÔ‘PU_ÜË“×Õ•SË
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÜ™X]HÙ\š[Nˆ	]È‹\œŠB‚_B‚ZYˆ\œˆH[K‘[˜ÛÙJÙ\Ý]	œ[K›ØÚÞÕ\NˆÑT•Q’PÐUH‹ž]\Îˆ\ž]\ßJNÈ\œˆOHš[Â‚BXÙ\Ý]ÛÜÙJ
+B‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÜš]HÙ\ˆ	]È‹\œŠB‚_B‚XÙ\Ý]ÛÜÙJ
+B‚‚KËÈÜš]Hš]˜]HÙ^Hš[B‚ZÙ^SÝ]\œˆHÜË“Ü[‘š[JÙ^Qš[KÜË“×ÕÔ“Ó“_ÜË“×ÐÔ‘PU_ÜË“×Õ•SËŒ
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÜ™X]HÙ^Hš[Nˆ	]È‹\œŠB‚_B‚\š]ž]\Ë\œˆHLK“X\œÚ[ÐÔÎš]˜]RÙ^Jš]ŠB‚ZYˆ\œˆOHš[Â‚BZÙ^SÝ]ÛÜÙJ
+B‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈX\œÚ[š]˜]HÙ^Nˆ	]È‹\œŠB‚_B‚ZYˆ\œˆH[K‘[˜ÛÙJÙ^SÝ]	œ[K›ØÚÞÕ\Nˆ”’UUHÑVH‹ž]\Îˆš]ž]\ßJNÈ\œˆOHš[Â‚BZÙ^SÝ]ÛÜÙJ
+B‚B\™]\›ˆˆ‹ˆ‹›]‘\œ›Ü™Š™˜Z[YÈÜš]HÙ^Nˆ	]È‹\œŠB‚_B‚ZÙ^SÝ]ÛÜÙJ
+B‚ZYˆ\œˆH\™[•Ñš[T\›Z\ÜÚ[ÛœÊÙ\š[KÙ^Qš[JNÈ\œˆOHš[Â‚B\™]\›ˆˆ‹ˆ‹\œ‚‚_B‚‚X\ÙÙÙ\‹’[™›Ê‘Ù[™\˜]YÙ[‹\ÚYÛ™YÈÙ\YšXØ]H‹˜Ù\‹Ù\š[KšÙ^H‹Ù^Qš[JB‚\™]\›ˆÙ\š[KÙ^Qš[Kš[ŸB‚‹ËÈ\™[•Ñš[T\›Z\ÜÚ[ÛœÈ\Y\ÈX\Ý\š]š[YÙH\›Z\ÜÚ[ÛœÈÈB‹ËÈYÙ[YÙ[™\˜]YÙ\YšXØ]HZ\‹ˆHÙ\YšXØ]H\ÈX›XÈX]\šX[ÈB‹ËÈš]˜]HÙ^H]\Ý™[XZ[ˆ™XYX›HÛ›HžHHXØÛÝ[[›š[™ÈHYÙ[‚™[˜È\™[•Ñš[T\›Z\ÜÚ[ÛœÊÙ\š[KÙ^Qš[HÝš[™ÊH\œ›ÜˆÂ‚ZYˆÝš[™ÜË•š[TÜXÙJÙ\š[JHOHˆˆÝš[™ÜË•š[TÜXÙJÙ^Qš[JHOHˆˆÂ‚B\™]\›ˆ›]‘\œ›Ü™Š•ÈÙ\YšXØ]H]È\™H™\]Z\™YŠB‚_B‚ZYˆ\œˆHÜËÚ[Ù
+Ù\š[K
+NÈ\œˆOHš[Â‚B\™]\›ˆ›]‘\œ›Ü™Š™˜Z[YÈÙ]ÈÙ\YšXØ]H\›Z\ÜÚ[ÛœÎˆ	]È‹\œŠB‚_B‚ZYˆ\œˆHÜËÚ[Ù
+Ù^Qš[KŒ
+NÈ\œˆOHš[Â‚B\™]\›ˆ›]‘\œ›Ü™Š™˜Z[YÈÙ]Èš]˜]HÙ^H\›Z\ÜÚ[ÛœÎˆ	]È‹\œŠB‚_B‚\™]\›ˆš[ŸB‚‹ËÈ]šXÙTÝÜ˜YÙPY\\ˆ[\[Y[ÈYÙ[‘]šXÙTÝÜ˜YÙH[\™˜XÙB\H]šXÙTÝÜ˜YÙPY\\ˆÝXÝÂ‚\ÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™BŸB‚™[˜È
+H
+™]šXÙTÝÜ˜YÙPY\\ŠHÝÜ™Q\ØÛÝ™\™Y]šXÙJÝÛÛ^ÛÛ^HYÙ[”š[\’[™›ÊH\œ›ÜˆÂ‚KËÈÛÛ™\š[\’[™›ÈÈ]šXÙB‚Y]šXÙHHÝÜ˜YÙK”š[\’[™›ÕÑ]šXÙJK˜[ÙJB‚Y]šXÙK•š\ÚX›HHYB‚‚\Û˜\ÚÝHÝÜ˜YÙK”š[\’[™›ÕÔØØ[”Û˜\ÚÝ
+JB‚[Y]šXÜÈHÝÜ˜YÙK”š[\’[™›ÕÓY]šXÜÔÛ˜\ÚÝ
+JB‚ZYˆ\œˆHKœÝÜ™K”ÝÜ™Q\ØÛÝ™\žP]ÛZXÊÝ]šXÙKÛ˜\ÚÝY]šXÜÊNÈ\œˆOHš[Â‚B\™]\›ˆ›]‘\œ›Ü™Š™˜Z[YÈ\œÚ\Ý\ØÛÝ™\žH]ÛZXØ[Nˆ	]È‹\œŠB‚_B‚‚KËÈœ›ØYØ\Ý]šXÙH\]HšXHÔÑB‚ZYˆÜÙRXˆOHš[Â‚BZ\Ó™]ÈH]šXÙK‘š\œÝÙY[‹‘\]X[
+]šXÙK“\ÝÙY[ŠH[YK”Ú[˜ÙJ]šXÙK‘š\œÝÙY[ŠH[YK”ÙXÛÛ™‚BY]™[\HH™]šXÙWÝ\]Y‚‚BZYˆ\Ó™]ÈÂ‚BBY]™[\HH™]šXÙWÙ\ØÛÝ™\™Y‚‚B_B‚B\ÜÙRX‹œ›ØYØ\Ý
+ÔÑQ]™[Â‚BBU\Nˆ]™[\K‚BBQ]NˆX\ÜÝš[™×Z[\™˜XÙ^ß^Â‚BBBHœÙ\šX[Žˆ]šXÙK”Ù\šX[‚BBBHš\Žˆ]šXÙK’T‚BBBH›XZÙHŽˆ]šXÙK“X[Y˜XÝ\™\‹‚BBBH›[Ù[Žˆ]šXÙK“[Ù[‚BB_K‚B_JB‚_B‚‚\™]\›ˆš[ŸB‚‹ËÈÔÑH
+Ù\™\‹TÙ[]™[ÊHXˆ›Üˆ™X[][YHRH\]\Â\HÔÑQ]™[ÝXÝÂ‚U\HÝš[™ÈœÛÛŽˆ\H˜‚Q]HX\ÜÝš[™×Z[\™˜XÙ^ßHœÛÛŽˆ™]H˜ŸB‚\HÔÑPÛY[ÝXÝÂ‚ZYÝš[™Â‚Y]™[ÈÚ[ˆÔÑQ]™[ŸB‚\HÔÑRXˆÝXÝÂ‚XÛY[ÈX\ÜÝš[™×J”ÔÑPÛY[‚Xœ›ØYØ\ÝÚ[ˆÔÑQ]™[‚\™YÚ\Ý\ˆÚ[ˆ
+”ÔÑPÛY[‚][œ™YÚ\Ý\ˆÚ[ˆ
+”ÔÑPÛY[‚\Ú]ÝÛˆÚ[ˆÝXÝßB‚[]HÞ[˜Ë”•Ó]]^ŸB‚™[˜È™]ÔÔÑRXŠ
+H
+”ÔÑRXˆÂ‚ZXˆH	”ÔÑRXžÂ‚BXÛY[ÎˆXZÙJX\ÜÝš[™×J”ÔÑPÛY[
+K‚BXœ›ØYØ\ÝˆXZÙJÚ[ˆÔÑQ]™[L
+K‚B\™YÚ\Ý\ŽˆXZÙJÚ[ˆ
+”ÔÑPÛY[
+K‚B][œ™YÚ\Ý\ŽˆXZÙJÚ[ˆ
+”ÔÑPÛY[
+K‚B\Ú]ÝÛŽˆXZÙJÚ[ˆÝXÝßJK‚_B‚YÛÈX‹œ[Š
+B‚\™]\›ˆX‚ŸB‚™[˜È
+
+”ÔÑRXŠH[Š
+HÂ‚Y›ÜˆÂ‚B\Ù[XÝÂ‚BXØ\ÙHÛY[HZœ™YÚ\Ý\Ž‚‚BBZ›]K“ØÚÊ
+B‚BBZ˜ÛY[ÖØÛY[šYHHÛY[‚BBZ›]K•[›ØÚÊ
+B‚BXØ\ÙHÛY[HZ[œ™YÚ\Ý\Ž‚‚BBZ›]K“ØÚÊ
+B‚BBZYˆËÚÈH˜ÛY[ÖØÛY[šYNÈÚÈÂ‚BBBY[]J˜ÛY[ËÛY[šY
+B‚BBBXÛÜÙJÛY[™]™[ÊB‚BB_B‚BBZ›]K•[›ØÚÊ
+B‚BXØ\ÙH]™[HZ˜œ›ØYØ\Ý‚‚BBZ›]K”“ØÚÊ
+B‚BBY›ÜˆËÛY[H˜[™ÙH˜ÛY[ÈÂ‚BBB\Ù[XÝÂ‚BBBXØ\ÙHÛY[™]™[ÈH]™[‚‚BBBYY˜][‚‚BBBBKËÈÛY[	ÜÈY™™\ˆ\È[ÚÚ\‚BBB_B‚BB_B‚BBZ›]K”•[›ØÚÊ
+B‚BXØ\ÙHZœÚ]ÝÛŽ‚‚BBKËÈÛÜÙH[ÛY[ÛÛ›™XÝ[ÛœÂ‚BBZ›]K“ØÚÊ
+B‚BBY›ÜˆËÛY[H˜[™ÙH˜ÛY[ÈÂ‚BBBXÛÜÙJÛY[™]™[ÊB‚BB_B‚BBZ˜ÛY[ÈHXZÙJX\ÜÝš[™×J”ÔÑPÛY[
+B‚BBZ›]K•[›ØÚÊ
+B‚BB\™]\›‚‚B_B‚_BŸB‚™[˜È
+
+”ÔÑRXŠHÝÜ
+
+HÂ‚XÛÜÙJœÚ]ÝÛŠBŸB‚™[˜È
+
+”ÔÑRXŠHœ›ØYØ\Ý
+]™[ÔÑQ]™[
+HÂ‚\Ù[XÝÂ‚XØ\ÙH˜œ›ØYØ\ÝH]™[‚‚YY˜][‚‚BKËÈœ›ØYØ\ÝY™™\ˆ[ÚÚ\]™[‚_BŸB‚™[˜È
+
+”ÔÑRXŠH™]ÐÛY[
+
+H
+”ÔÑPÛY[Â‚XÛY[H	”ÔÑPÛY[Â‚BZYˆ›]”Üš[Š˜ÛY[ÉY‹[YK“›ÝÊ
+K•[š^˜[›Ê
+JK‚BY]™[ÎˆXZÙJÚ[ˆÔÑQ]™[L
+K‚_B‚Zœ™YÚ\Ý\ˆHÛY[‚\™]\›ˆÛY[ŸB‚™[˜È
+
+”ÔÑRXŠH™[[Ý™PÛY[
+ÛY[
+”ÔÑPÛY[
+HÂ‚Z[œ™YÚ\Ý\ˆHÛY[ŸB‚˜\ˆÜÙRXˆ
+”ÔÑRX‚‚™[˜ÈX\[ÔÝXÝ
+Ü˜ÈX\ÜÝš[™×Z[\™˜XÙ^ßKÝ[\™˜XÙ^ßJHÂ‚ZYˆÜ˜ÈOHš[ÝOHš[Â‚B\™]\›‚‚_B‚Y]K\œˆHœÛÛ‹“X\œÚ[
+Ü˜ÊB‚ZYˆ\œˆOHš[Â‚B\™]\›‚‚_B‚WÈHœÛÛ‹•[›X\œÚ[
+]KÝ
+BŸB‚™[˜ÈÝXÝÓX\
+Ü˜È[\™˜XÙ^ßJHX\ÜÝš[™×Z[\™˜XÙ^ßHÂ‚ZYˆÜ˜ÈOHš[Â‚B\™]\›ˆX\ÜÝš[™×Z[\™˜XÙ^ß^ßB‚_B‚Y]K\œˆHœÛÛ‹“X\œÚ[
+Ü˜ÊB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆX\ÜÝš[™×Z[\™˜XÙ^ß^ßB‚_B‚]˜\ˆÝ]X\ÜÝš[™×Z[\™˜XÙ^ßB‚ZYˆ\œˆHœÛÛ‹•[›X\œÚ[
+]K	›Ý]
+NÈ\œˆOHš[Â‚B\™]\›ˆX\ÜÝš[™×Z[\™˜XÙ^ß^ßB‚_B‚\™]\›ˆÝ]ŸB‚™[˜È\Q™X]\™\ÔÙ][™ÜÑY™™XÝÊ™X]
+œ\Ù][™ÜË‘™X]\™\ÔÙ][™ÜÊHÂ‚ZYˆ™X]OHš[Â‚B\™]\›‚‚_B‚XÛÛ™šYÑ[˜X›YHÛÛ™šYÑ\ÛÛ”™[[ÝS[ÙQ[˜X›Y‚YY™™XÝ]™HH™X]‘\ÛÛ”™[[ÝS[ÙQ[˜X›YÛÛ™šYÑ[˜X›Y‚\™]š[Ý\ÈH™X]\™Y›YÜË‘\ÛÛ”™[[ÝS[ÙQ[˜X›Y
+
+B‚Y™X]\™Y›YÜË”Ù]\ÛÛ”™[[ÝS[ÙJY™™XÝ]™JB‚ZYˆÛÛ™šYÑ[˜X›YÂ‚BY™X]‘\ÛÛ”™[[ÝS[ÙQ[˜X›YHY™™XÝ]™B‚_B‚ZYˆ\ÙÙÙ\ˆOHš[	‰ˆY™™XÝ]™HOH™]š[Ý\ÈÂ‚BX\ÙÙÙ\‹’[™›Ê‘\ÛÛˆ™[[ÝH[ÙH\]Y‹™[˜X›Y‹Y™™XÝ]™K˜ÛÛ™šY×ÛÝ™\œšYH‹ÛÛ™šYÑ[˜X›Y
+B‚_BŸB‚™[˜È\TÜÛÛ\”Ù][™ÜÊÜÛÛ\ˆ
+œ\Ù][™ÜË”ÜÛÛ\”Ù][™ÜÊHÂ‚ZYˆÜÛÛ\ˆOHš[Â‚B\™]\›‚‚_B‚KËÈÝÜHÝ\œ™[ÛÜšÙ\ˆYˆ[›š[™Â‚TÝÜÜÛÛ\•ÛÜšÙ\Š
+B‚‚ZYˆ\ÜÛÛ\‹‘[˜X›YÂ‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹’[™›Ê”ÜÛÛ\ˆ˜XÚÚ[™È\ØX›YŠB‚B_B‚B\™]\›‚‚_B‚‚KËÈÝ\Ú]™]ÈÛÛ™šYÈYˆ[˜X›Y[™ÙH]™HHÝÜ™B‚ZYˆÛØ˜[ØØ[š[\”ÝÜ™HOHš[Â‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹•Ø\›ŠØ[››ÝÝ\ÜÛÛ\ˆÛÜšÙ\Žˆ›ÈØØ[š[\ˆÝÜ™H]˜Z[X›HŠB‚B_B‚B\™]\›‚‚_B‚‚\Û[\˜[H[YK‘\˜][ÛŠÜÛÛ\‹”Û[\˜[ÙXÛÛ™ÊH
+ˆ[YK”ÙXÛÛ™‚ZYˆÛ[\˜[J[YK”ÙXÛÛ™Â‚B\Û[\˜[HH
+ˆ[YK”ÙXÛÛ™‚_B‚ZYˆÛ[\˜[ˆJ[YK“Z[]HÂ‚B\Û[\˜[HH
+ˆ[YK“Z[]B‚_B‚‚XÛÛ™šYÈHÜÛÛ\•ÛÜšÙ\ÛÛ™šYÞÂ‚BTÛ[\˜[ˆÛ[\˜[‚BR[˜ÛYS™]ÛÜšÔš[\œÎˆÜÛÛ\‹’[˜ÛYS™]ÛÜšÔš[\œË‚BR[˜ÛYUš\X[š[\œÎˆÜÛÛ\‹’[˜ÛYUš\X[š[\œË‚BP]]Õ˜XÚÕTÐŽˆYK‚BP]]Õ˜XÚÓØØ[ˆ˜[ÙK‚_B‚‚ZYˆ\œˆHÝ\ÜÛÛ\•ÛÜšÙ\ŠÛØ˜[ØØ[š[\”ÝÜ™KÛÛ™šYË\ÙÙÙ\ŠNÈ\œˆOHš[Â‚BZYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹•Ø\›Š‘˜Z[YÈÝ\ÜÛÛ\ˆÛÜšÙ\ˆÚ]™]ÈÙ][™ÜÈ‹™\œ›Üˆ‹\œŠB‚B_B‚_H[ÙHYˆ\ÙÙÙ\ˆOHš[Â‚BX\ÙÙÙ\‹’[™›Ê”ÜÛÛ\ˆÛÜšÙ\ˆ™\Ý\YÚ]™]ÈÙ][™ÜÈ‹‚BBHœÛÚ[\˜[‹Û[\˜[‚BBHš[˜ÛYWÛ™]ÛÜšÈ‹ÜÛÛ\‹’[˜ÛYS™]ÛÜšÔš[\œË‚BBHš[˜ÛYWÝš\X[‹ÜÛÛ\‹’[˜ÛYUš\X[š[\œÊB‚_BŸB‚™[˜È\QY™™XÝ]™TÙ][™ÜÔÛ˜\ÚÝ
+Ù™È\Ù][™ÜË”Ù][™ÜÊHÂ‚ZYˆ\Q\ØÛÝ™\žQY™™XÝÑ[˜ÈOHš[Â‚BY\ØÓX\HÝXÝÓX\
+Ù™Ë‘\ØÛÝ™\žJB‚BY[]J\ØÓX\œ˜[™Ù\×Ý^ŠB‚BY[]J\ØÓX\™]XÝYÜÝX›™]ŠB‚BX\Q\ØÛÝ™\žQY™™XÝÑ[˜Ê\ØÓX\
+B‚_B‚X\Q™X]\™\ÔÙ][™ÜÑY™™XÝÊ	˜Ù™Ë‘™X]\™\ÊBŸB‚™[˜ÈØY[šYšYYÙ][™ÜÊÝÜ™HÝÜ˜YÙKYÙ[ÛÛ™šYÔÝÜ™JH\Ù][™ÜË”Ù][™ÜÈÂ‚X˜\ÙHH\Ù][™ÜË‘Y˜][Ù][™ÜÊ
+B‚[X[˜YÙYH˜[ÙB‚ZYˆÙ][™ÜÓX[˜YÙ\ˆOHš[Â‚BX˜\ÙKX[˜YÙYHÙ][™ÜÓX[˜YÙ\‹˜˜\ÙTÙ][™ÜÊ
+B‚_B‚ZYˆÝÜ™HOHš[Â‚B\\Ù][™ÜË”Ø[š]^™J	˜˜\ÙJB‚B\™]\›ˆ˜\ÙB‚_B‚ZYˆ[X[˜YÙYÂ‚B]˜\ˆ\ØÈX\ÜÝš[™×Z[\™˜XÙ^ßB‚BZYˆ\œˆHÝÜ™K‘Ù]ÛÛ™šYÕ˜[YJ™\ØÛÝ™\žWÜÙ][™ÜÈ‹	™\ØÊNÈ\œˆOHš[	‰ˆ\ØÈOHš[Â‚BB[X\[ÔÝXÝ
+\ØË	˜˜\ÙK‘\ØÛÝ™\žJB‚B_B‚_B‚ZYˆ\œˆHÝÜ™K‘Ù]˜[™Ù\Ê
+NÈ\œˆOHš[Â‚BX˜\ÙK‘\ØÛÝ™\žK”˜[™Ù\Õ^H‚_B‚ZYˆ\™]Ë\œˆHYÙ[‘Ù]ØØ[ÝX›™]Ê
+NÈ\œˆOHš[	‰ˆ[Š\™]ÊHˆÂ‚BX˜\ÙK‘\ØÛÝ™\žK‘]XÝYÝX›™]H\™]ÖÌK”Ýš[™Ê
+B‚_B‚KËÈØY[šYšYYÙ][™ÜÈÝXÝ\™B‚]˜\ˆ[šYšYYX\ÜÝš[™×Z[\™˜XÙ^ßB‚ZYˆ\œˆHÝÜ™K‘Ù]ÛÛ™šYÕ˜[YJœÙ][™ÜÈ‹	[šYšYY
+NÈ\œˆOHš[	‰ˆ[šYšYYOHš[Â‚BKËÈÓ“TÙ][™ÜÈ
+›Y][X[˜YÙYÛ‰Ý[ÝÈØØ[Ý™\œšYHÚ[ˆX[˜YÙY
+B‚BZYˆÛ›\˜]ËÚÈH[šYšYYÈœÛ›\—KŠX\ÜÝš[™×Z[\™˜XÙ^ßJNÈÚÈ	‰ˆ[X[˜YÙYÂ‚BB[X\[ÔÝXÝ
+Û›\˜]Ë	˜˜\ÙK”Ó“T
+B‚B_B‚BKËÈ™X]\™\ÈÙ][™ÜÈ
+›Y][X[˜YÙYÛ‰Ý[ÝÈØØ[Ý™\œšYHÚ[ˆX[˜YÙY
+B‚BZYˆ™X]˜]ËÚÈH[šYšYYÈ™™X]\™\È—KŠX\ÜÝš[™×Z[\™˜XÙ^ßJNÈÚÈ	‰ˆ[X[˜YÙYÂ‚BB[X\[ÔÝXÝ
+™X]˜]Ë	˜˜\ÙK‘™X]\™\ÊB‚B_B‚BKËÈÙÙÚ[™ÈÙ][™ÜÈ
+YÙ[[ØØ[[Ø^\È[ÝÈØØ[Ý™\œšYJB‚BZYˆÙÔ˜]ËÚÈH[šYšYYÈ›ÙÙÚ[™È—KŠX\ÜÝš[™×Z[\™˜XÙ^ßJNÈÚÈÂ‚BB[X\[ÔÝXÝ
+ÙÔ˜]Ë	˜˜\ÙK“ÙÙÚ[™ÊB‚B_B‚BKËÈÙXˆÙ][™ÜÈ
+YÙ[[ØØ[[Ø^\È[ÝÈØØ[Ý™\œšYJB‚BZYˆÙX”˜]ËÚÈH[šYšYYÈÙXˆ—KŠX\ÜÝš[™×Z[\™˜XÙ^ßJNÈÚÈÂ‚BB[X\[ÔÝXÝ
+ÙX”˜]Ë	˜˜\ÙK•ÙXŠB‚B_B‚_B‚\\Ù][™ÜË”Ø[š]^™J	˜˜\ÙJB‚X\Q™X]\™\ÔÙ][™ÜÑY™™XÝÊ	˜˜\ÙK‘™X]\™\ÊB‚\™]\›ˆ˜\ÙBŸB‚‹ËÈ\TÙ\™\ÛÛ™šYÑœ›ÛTÝÜ™HY\™Ù\È\œÚ\ÝYÙ\™\ˆÛÛ›™XÝ[ÛˆÙ][™ÜÈœ›ÛHB‹ËÈYÙ[ÛÛ™šYÈ]X˜\ÙH[ÈH[‹[Y[[ÜžHÛÛ™šYÝ\˜][ÛˆÛÈ]RKYš]™[ˆ›Ú[‚‹ËÈ›ÝÜÈØ[ˆ[˜X›H\ØYÈÚ]Ý]Y][™ÈÛÛ™šYËÛ[X[X[K‚‹ËÈ›ÝNˆ[š\›Û›Y[˜\šXX›\ÈZÙH™XÙY[˜ÙHÝ™\ˆÝÜ™YÛÛ™šYÈ˜[Y\Ë‚™[˜È\TÙ\™\ÛÛ™šYÑœ›ÛTÝÜ™JYÙ[Ù™È
+YÙ[ÛÛ™šYËÝÜ™HÝÜ˜YÙKYÙ[ÛÛ™šYÔÝÜ™KÙÈ
+›ÙÙÙ\‹“ÙÙÙ\ŠHÂ‚ZYˆYÙ[Ù™ÈOHš[ÝÜ™HOHš[Â‚B\™]\›‚‚_B‚‚]˜\ˆ\œÚ\ÝYÙ\™\ÛÛ›™XÝ[ÛÛÛ™šYÂ‚ZYˆ\œˆHÝÜ™K‘Ù]ÛÛ™šYÕ˜[YJœÙ\™\ˆ‹	œ\œÚ\ÝY
+NÈ\œˆOHš[Â‚BZYˆÙÈOHš[Â‚BB[ÙË•Ø\›Š‘˜Z[YÈØYÙ\™\ˆÙ][™ÜÈœ›ÛHÛÛ™šYÈÝÜ™H‹™\œ›Üˆ‹\œŠB‚B_B‚B\™]\›‚‚_B‚‚ZYˆÝš[™ÜË•š[TÜXÙJ\œÚ\ÝY•T“
+HOHˆˆÂ‚B\™]\›‚‚_B‚‚KËÈÛ›H\HÝÜ™YT“Yˆ›È[š\›Û›Y[˜\šXX›H\ÈÙ]‚KËÈ\È[ÝÜÈÑT•‘T—ÕT“[ˆ˜\ˆÈÝ™\œšYHÝÜ™YÛÛ™šYÈ
+ØÚÙ\ˆÛÛ\ÜÙHØÙ[˜\š[ÊB‚Y[•T“HÜË‘Ù][Š”ÑT•‘T—ÕT“ŠB‚ZYˆ[•T“OHˆˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹•T“HÝš[™ÜË•š[TÜXÙJ\œÚ\ÝY•T“
+B‚_H[ÙHYˆÙÈOHš[Â‚B[ÙË‘XYÊ”ÑT•‘T—ÕT“[š\›Û›Y[˜\šXX›HÙ]ÈYÛ›Üš[™ÈÝÜ™YT“‹‚BBH™[—Ý\›‹[•T“‚BBHœÝÜ™YÝ\›‹\œÚ\ÝY•T“
+B‚_B‚ZYˆ\œÚ\ÝY“˜[YHOHˆˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹“˜[YHH\œÚ\ÝY“˜[YB‚_B‚XYÙ[Ù™Ë”Ù\™\‹ÐT]H\œÚ\ÝYÐT]‚KËÈÛ›H\H[œÙXÝ\™TÚÚ\™\šYžHœ›ÛHÝÜ™HYˆ[ˆ˜\ˆ›ÝÙ]‚ZYˆÜË‘Ù][Š”ÑT•‘T—ÒS”ÑPÕT‘WÔÒÒTÕ‘T’Q–HŠHOHˆˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžHH\œÚ\ÝY’[œÙXÝ\™TÚÚ\™\šYžB‚_B‚ZYˆ\œÚ\ÝY•\ØY[\˜[ˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹•\ØY[\˜[H\œÚ\ÝY•\ØY[\˜[‚_B‚ZYˆ\œÚ\ÝY’X\™X][\˜[ˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹’X\™X][\˜[H\œÚ\ÝY’X\™X][\˜[‚_B‚ZYˆ\œÚ\ÝYYÙ[QOHˆˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹YÙ[QH\œÚ\ÝYYÙ[Q‚_B‚ZYˆ\œÚ\ÝY•ÚÙ[ˆOHˆˆÂ‚BXYÙ[Ù™Ë”Ù\™\‹•ÚÙ[ˆH\œÚ\ÝY•ÚÙ[‚‚_B‚ZYˆ\œÚ\ÝY‘[˜X›YÂ‚BXYÙ[Ù™Ë”Ù\™\‹‘[˜X›YHYB‚_H[ÙHYˆYÙ[Ù™Ë”Ù\™\‹•T“OHˆˆÂ‚BKËÈY˜][È[˜X›YÚ[ˆHT“\È™\Ù[]YØXÞH]HÛZ]YH›YÂ‚BXYÙ[Ù™Ë”Ù\™\‹‘[˜X›YHYB‚_B‚‚ZYˆÙÈOHš[Â‚B[ÙË’[™›Ê“ØYYÙ\™\ˆÛÛ™šYÝ\˜][Ûˆœ›ÛHYÙ[]X˜\ÙH‹‚BBH\›‹YÙ[Ù™Ë”Ù\™\‹•T“‚BBH™[˜X›Y‹YÙ[Ù™Ë”Ù\™\‹‘[˜X›Y‚BBHš[œÙXÝ\™WÜÚÚ\Ý™\šYžH‹YÙ[Ù™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžJB‚_BŸB‚\HÙ\™\ÛÛ›™XÝ[Û”Ý]\ÈÝXÝÂ‚Q[˜X›Y›ÛÛœÛÛŽˆ™[˜X›Y˜‚UT“Ýš[™ÈœÛÛŽˆ\›˜‚S˜[YHÝš[™ÈœÛÛŽˆ›˜[YH˜‚PYÙ[QÝš[™ÈœÛÛŽˆ˜YÙ[ÚY˜‚R[œÙXÝ\™TÚÚ\™\šYžH›ÛÛœÛÛŽˆš[œÙXÝ\™WÜÚÚ\Ý™\šYžH˜‚PÐT]Ýš[™ÈœÛÛŽˆ˜ØWÜ]˜‚U\ØY[\˜[[œÛÛŽˆ\ØYÚ[\˜[˜‚RX\™X][\˜[[œÛÛŽˆšX\™X]Ú[\˜[˜‚PÛÛ›™XÝY›ÛÛœÛÛŽˆ˜ÛÛ›™XÝY˜‚PÛÛ›™XÝ[Û“[ÙHÝš[™ÈœÛÛŽˆ˜ÛÛ›™XÝ[Û—Û[ÙH˜‚S\ÝX\™X]
+[YK•[YHœÛÛŽˆ›\ÝÚX\™X]ÛZ][\H˜‚S\Ý]šXÙU\ØY
+[YK•[YHœÛÛŽˆ›\ÝÙ]šXÙWÝ\ØYÛZ][\H˜‚S\ÝY]šXÜÕ\ØY
+[YK•[YHœÛÛŽˆ›\ÝÛY]šXÜ×Ý\ØYÛZ][\H˜‚R\ÐYÙ[ÚÙ[ˆ›ÛÛœÛÛŽˆš\×ØYÙ[ÝÚÙ[ˆ˜‚R\Ò›Ú[•ÚÙ[ˆ›ÛÛœÛÛŽˆš\×Ú›Ú[—ÝÚÙ[ˆ˜‚UÙX”ÛØÚÙ][˜X›Y›ÛÛœÛÛŽˆÙXœÛØÚÙ]Ù[˜X›Y˜‚UÙX”ÛØÚÙ]ÛÛ›™XÝY›ÛÛœÛÛŽˆÙXœÛØÚÙ]ØÛÛ›™XÝY˜ŸB‚˜\ˆ
+‚\Ù\™\”Ý]\Ó]HÞ[˜Ë“]]^‚\Ù\™\”Ý]\Ñš[™Ù\œš[Ýš[™ÂŠB‚™[˜ÈÛ˜\ÚÝÙ\™\ÛÛ›™XÝ[Û”Ý]\ÊYÙ[Ù™È
+YÙ[ÛÛ™šYË]Q\ˆÝš[™ÊHÙ\™\ÛÛ›™XÝ[Û”Ý]\ÈÂ‚\Ý]\ÈHÙ\™\ÛÛ›™XÝ[Û”Ý]\ÞßB‚ZYˆYÙ[Ù™ÈOHš[Â‚B\Ý]\Ë‘[˜X›YHYÙ[Ù™Ë”Ù\™\‹‘[˜X›Y‚B\Ý]\Ë•T“HYÙ[Ù™Ë”Ù\™\‹•T“‚B\Ý]\Ë“˜[YHHYÙ[Ù™Ë”Ù\™\‹“˜[YB‚B\Ý]\ËYÙ[QHYÙ[Ù™Ë”Ù\™\‹YÙ[Q‚B\Ý]\Ë’[œÙXÝ\™TÚÚ\™\šYžHHYÙ[Ù™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžB‚B\Ý]\ËÐT]HYÙ[Ù™Ë”Ù\™\‹ÐT]‚B\Ý]\Ë•\ØY[\˜[HYÙ[Ù™Ë”Ù\™\‹•\ØY[\˜[‚B\Ý]\Ë’X\™X][\˜[HYÙ[Ù™Ë”Ù\™\‹’X\™X][\˜[‚_B‚‚]\ØYÛÜšÙ\“]K”“ØÚÊ
+B‚]ÛÜšÙ\ˆH\ØYÛÜšÙ\‚‚]\ØYÛÜšÙ\“]K”•[›ØÚÊ
+B‚ZYˆÛÜšÙ\ˆOHš[Â‚B]ÔÝ]\ÈHÛÜšÙ\‹”Ý]\Ê
+B‚B\Ý]\ËÛÛ›™XÝYHÝ]\Ë‘[˜X›Y	‰ˆÔÝ]\Ë”[›š[™Â‚B\Ý]\Ë“\ÝX\™X]H[YTŠÔÝ]\Ë“\ÝX\™X]
+B‚B\Ý]\Ë“\Ý]šXÙU\ØYH[YTŠÔÝ]\Ë“\Ý]šXÙU\ØY
+B‚B\Ý]\Ë“\ÝY]šXÜÕ\ØYH[YTŠÔÝ]\Ë“\ÝY]šXÜÕ\ØY
+B‚B\Ý]\Ë•ÙX”ÛØÚÙ][˜X›YHÔÝ]\Ë•ÙX”ÛØÚÙ][˜X›Y‚B\Ý]\Ë•ÙX”ÛØÚÙ]ÛÛ›™XÝYHÔÝ]\Ë•ÙX”ÛØÚÙ]ÛÛ›™XÝY‚_H[ÙHÂ‚B\Ý]\ËÛÛ›™XÝYH˜[ÙB‚_B‚[[ÙHH™\ØÛÛ›™XÝY‚‚ZYˆÝ]\Ë‘[˜X›Y	‰ˆÝ]\Ë•T“OHˆˆÂ‚BZYˆÝ]\ËÛÛ›™XÝYÂ‚BB[[ÙHH˜ÛÛ›™XÝY‚‚BBZYˆÝ]\Ë•ÙX”ÛØÚÙ][˜X›Y	‰ˆÝ]\Ë•ÙX”ÛØÚÙ]ÛÛ›™XÝYÂ‚BBB[[ÙHH›]™H‚‚BB_B‚B_B‚_B‚\Ý]\ËÛÛ›™XÝ[Û“[ÙHH[ÙB‚‚ZYˆ]Q\ˆOHˆˆÂ‚B\Ý]\Ë’\ÐYÙ[ÚÙ[ˆHØYÙ\™\•ÚÙ[Š]Q\ŠHOHˆ‚‚B\Ý]\Ë’\Ò›Ú[•ÚÙ[ˆHØYÙ\™\’›Ú[•ÚÙ[Š]Q\ŠHOHˆ‚‚_B‚‚\™]\›ˆÝ]\ÂŸB‚™[˜ÈÙ\™\”Ý]\Ò\Ú
+Ý]\ÈÙ\™\ÛÛ›™XÝ[Û”Ý]\ÊHÝš[™ÈÂ‚Y]K\œˆHœÛÛ‹“X\œÚ[
+Ý]\ÊB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆ›]”Üš[Š™˜[˜XÚÎ‰]Ž‰]ˆ‹Ý]\Ë‘[˜X›Y[YK“›ÝÊ
+K•[š^˜[›Ê
+JB‚_B‚\™]\›ˆÝš[™Ê]JBŸB‚™[˜ÈÙ]Ù\™\”Ý]\Ñš[™Ù\œš[
+Ý]\ÈÙ\™\ÛÛ›™XÝ[Û”Ý]\ÊHÂ‚\Ù\™\”Ý]\Ó]K“ØÚÊ
+B‚YY™\ˆÙ\™\”Ý]\Ó]K•[›ØÚÊ
+B‚\Ù\™\”Ý]\Ñš[™Ù\œš[HÙ\™\”Ý]\Ò\Ú
+Ý]\ÊBŸB‚™[˜ÈX\šÔÙ\™\”Ý]\Ñš[™Ù\œš[
+Ý]\ÈÙ\™\ÛÛ›™XÝ[Û”Ý]\ÊH›ÛÛÂ‚Z\ÚHÙ\™\”Ý]\Ò\Ú
+Ý]\ÊB‚\Ù\™\”Ý]\Ó]K“ØÚÊ
+B‚YY™\ˆÙ\™\”Ý]\Ó]K•[›ØÚÊ
+B‚ZYˆ\ÚOHÙ\™\”Ý]\Ñš[™Ù\œš[Â‚B\™]\›ˆ˜[ÙB‚_B‚\Ù\™\”Ý]\Ñš[™Ù\œš[H\Ú‚\™]\›ˆYBŸB‚™[˜Èœ›ØYØ\ÝÙ\™\”Ý]\ÔÛ˜\ÚÝ
+Ý]\ÈÙ\™\ÛÛ›™XÝ[Û”Ý]\Ë™X\ÛÛˆÝš[™ÊHÂ‚ZYˆÜÙRXˆOHš[Â‚B\™]\›‚‚_B‚\^[ØYHX\ÜÝš[™×Z[\™˜XÙ^ß^Â‚BHœÝ]\ÈŽˆÝ]\Ë‚_B‚ZYˆ™X\ÛÛˆOHˆˆÂ‚B\^[ØYÈœ™X\ÛÛˆ—HH™X\ÛÛ‚‚_B‚\ÜÙRX‹œ›ØYØ\Ý
+ÔÑQ]™[Õ\NˆœÙ\™\—ÜÝ]\È‹]Nˆ^[ØYJBŸB‚™[˜Èœ›ØYØ\ÝÙ\™\”Ý]\ÊYÙ[Ù™È
+YÙ[ÛÛ™šYË]Q\ˆÝš[™Ë™X\ÛÛˆÝš[™Ë›Ü˜ÙH›ÛÛ
+HÂ‚ZYˆÜÙRXˆOHš[Â‚B\™]\›‚‚_B‚\Ý]\ÈHÛ˜\ÚÝÙ\™\ÛÛ›™XÝ[Û”Ý]\ÊYÙ[Ù™Ë]Q\ŠB‚ZYˆ›Ü˜ÙHÂ‚B\Ù]Ù\™\”Ý]\Ñš[™Ù\œš[
+Ý]\ÊB‚BXœ›ØYØ\ÝÙ\™\”Ý]\ÔÛ˜\ÚÝ
+Ý]\Ë™X\ÛÛŠB‚B\™]\›‚‚_B‚ZYˆX\šÔÙ\™\”Ý]\Ñš[™Ù\œš[
+Ý]\ÊHÂ‚BXœ›ØYØ\ÝÙ\™\”Ý]\ÔÛ˜\ÚÝ
+Ý]\Ë™X\ÛÛŠB‚_BŸB‚™[˜ÈÝ\Ù\™\”Ý]\Ó[Ûš]ÜŠÝÛÛ^ÛÛ^YÙ[Ù™È
+YÙ[ÛÛ™šYË]Q\ˆÝš[™Ë[\˜[[YK‘\˜][ÛŠHÂ‚ZYˆYÙ[Ù™ÈOHš[]Q\ˆOHˆˆÂ‚B\™]\›‚‚_B‚YÛÈ[˜Ê
+HÂ‚B]XÚÙ\ˆH[YK“™]ÕXÚÙ\Š[\˜[
+B‚BYY™\ˆXÚÙ\‹”ÝÜ
+
+B‚BY›ÜˆÂ‚BB\Ù[XÝÂ‚BBXØ\ÙHXÝ‘Û™J
+N‚‚BBB\™]\›‚‚BBXØ\ÙH]XÚÙ\‹Î‚‚BBBXœ›ØYØ\ÝÙ\™\”Ý]\ÊYÙ[Ù™Ë]Q\‹ˆ‹˜[ÙJB‚BB_B‚B_B‚_J
+BŸB‚™[˜È[YTŠ[YK•[YJH
+[YK•[YHÂ‚ZYˆ’\Ö™\›Ê
+HÂ‚B\™]\›ˆš[‚_B‚]˜[YHH‚\™]\›ˆ	˜[YBŸB‚™[˜È\ØÛÛ›™XÝœ›ÛTÙ\™\ŠYÙ[Ù™È
+YÙ[ÛÛ™šYË]Q\ˆÝš[™ÊH\œ›ÜˆÂ‚ZYˆ\ÙÙÙ\ˆOHš[Â‚BX\ÙÙÙ\‹’[™›Ê‘\ØÛÛ›™XÝ[™ÈYÙ[œ›ÛHÙ\™\ˆŠB‚_B‚]\ØYÛÜšÙ\“]K“ØÚÊ
+B‚ZYˆ\ØYÛÜšÙ\ˆOHš[Â‚B]\ØYÛÜšÙ\‹”ÝÜ
+
+B‚B]\ØYÛÜšÙ\ˆHš[‚_B‚]\ØYÛÜšÙ\“]K•[›ØÚÊ
+B‚‚ZYˆÝš[™ÜË•š[TÜXÙJ]Q\ŠHOHˆˆÂ‚BZYˆ\œˆH[]TÙ\™\•ÚÙ[Š]Q\ŠNÈ\œˆOHš[Â‚BB\™]\›ˆ›]‘\œ›Ü™Š™˜Z[YÈ™[[Ý™HÙ\™\ˆÚÙ[Žˆ	]È‹\œŠB‚B_B‚BZYˆ\œˆHØ]™TÙ\™\’›Ú[•ÚÙ[Š]Q\‹ˆŠNÈ\œˆOHš[Â‚BB\™]\›ˆ›]‘\œ›Ü™Š™˜Z[YÈÛX\ˆ›Ú[ˆÚÙ[Žˆ	]È‹\œŠB‚B_B‚_B‚‚ZYˆYÙ[Ù™ÈOHš[Â‚BXYÙ[Ù™Ë”Ù\™\‹‘[˜X›YH˜[ÙB‚BXYÙ[Ù™Ë”Ù\™\‹•T“Hˆ‚‚BXYÙ[Ù™Ë”Ù\™\‹“˜[YHHˆ‚‚BXYÙ[Ù™Ë”Ù\™\‹ÐT]Hˆ‚‚BXYÙ[Ù™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžHH˜[ÙB‚BXYÙ[Ù™Ë”Ù\™\‹•ÚÙ[ˆHˆ‚‚_B‚‚ZYˆYÙ[ÛÛ™šYÔÝÜ™HOHš[Â‚B\\œÚ\ÝYHÙ\™\ÛÛ›™XÝ[ÛÛÛ™šYÞßB‚BZYˆYÙ[Ù™ÈOHš[Â‚BB\\œÚ\ÝYYÙ[QHYÙ[Ù™Ë”Ù\™\‹YÙ[Q‚B_B‚BZYˆ\œˆHYÙ[ÛÛ™šYÔÝÜ™K”Ù]ÛÛ™šYÕ˜[YJœÙ\™\ˆ‹\œÚ\ÝY
+NÈ\œˆOHš[Â‚BB\™]\›ˆ›]‘\œ›Ü™Š™˜Z[YÈ\œÚ\ÝÙ\™\ˆ\ØÛÛ›™XÝˆ	]È‹\œŠB‚B_B‚_B‚‚KËÈÛX\ˆÙ\™\‹[X[˜YÙYÙ][™ÜÈÛ˜\ÚÝÛÈÙ][™ÜÈ™XÛÛYHY]X›HYØZ[‚‚ZYˆÙ][™ÜÓX[˜YÙ\ˆOHš[Â‚BZYˆ\œˆHÙ][™ÜÓX[˜YÙ\‹ÛX\“X[˜YÙYÛ˜\ÚÝ
+
+NÈ\œˆOHš[Â‚BBZYˆ\ÙÙÙ\ˆOHš[Â‚BBBX\ÙÙÙ\‹•Ø\›Š‘˜Z[YÈÛX\ˆÙ\™\‹[X[˜YÙYÙ][™ÜÈ‹™\œ›Üˆ‹\œŠB‚BB_B‚B_H[ÙHYˆ\ÙÙÙ\ˆOHš[Â‚BBX\ÙÙÙ\‹’[™›ÊÛX\™YÙ\™\‹[X[˜YÙYÙ][™ÜËØØ[Y][™È›ÝÈ[›ØÚÙYŠB‚B_B‚_B‚‚Xœ›ØYØ\ÝÙ\™\”Ý]\ÊYÙ[Ù™Ë]Q\‹™\ØÛÛ›™XÝY‹YJB‚\™]\›ˆš[ŸB‚‹ËÈÝ\Ù\™\•\ØYÛÜšÙ\ˆ[˜Ø\Ý[]\È\ØYÛÜšÙ\ˆ›ÛÝÝ˜\
+YÙ[‹ËÈ™YÚ\Ý˜][Û‹ÚÙ[ˆ\œÚ\Ý[˜ÙKÙX”ÛØÚÙ]Ù]\
+HÛÈ]Ø[ˆ™H[›ÚÙY]‹ËÈÝ\\[™YØZ[ˆY\ˆH›Ú[ˆ]™[Ú]Ý]\XØ][™ÈÙÚXË‚™[˜ÈÝ\Ù\™\•\ØYÛÜšÙ\Š‚XÝÛÛ^ÛÛ^‚XYÙ[Ù™È
+YÙ[ÛÛ™šYË‚Y]Q\ˆÝš[™Ë‚Y]šXÙTÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™K‚\Ù][™ÜÈ
+”Ù][™ÜÓX[˜YÙ\‹‚]ÛÜšÙ\“ÙÙÙ\ˆÙÙÙ\‹ŠH
+
+•\ØYÛÜšÙ\‹\œ›ÜŠHÂ‚ZYˆYÙ[Ù™ÈOHš[Â‚B\™]\›ˆš[›]‘\œ›Ü™Š˜YÙ[ÛÛ™šYÝ\˜][Ûˆ[˜]˜Z[X›HŠB‚_B‚ZYˆÝš[™ÜË•š[TÜXÙJYÙ[Ù™Ë”Ù\™\‹•T“
+HOHˆˆÂ‚B\™]\›ˆš[›]‘\œ›Ü™ŠœÙ\™\ˆT“›ÝÛÛ™šYÝ\™YŠB‚_B‚]˜[Y]YÙ\™\•T“\œˆH˜[Y]SÛ˜›Ø\™[™ÔÙ\™\•T“
+YÙ[Ù™Ë”Ù\™\‹•T“
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[›]‘\œ›Ü™Šš[˜[YÙ\™\ˆT“ˆ	]È‹\œŠB‚_B‚KËÈÙY\]™\žHÝXœÙ\]Y[[™ÙX”ÛØÚÙ]ÛY[ÛˆHØ[›ÛšXØ[‚KËÈ˜[Y]YÜšYÚ[‹ˆ[ˆ\XÝ[\‹È›Ý[ÝÈH[™YY]YÛÛ™šYÈÂ‚KËÈÙ[™HYÙ[ÚÙ[ˆÈH™[[ÝHZ[^[™Ú[‚‚XYÙ[Ù™Ë”Ù\™\‹•T“H˜[Y]YÙ\™\•T“‚‚XYÙ[QHYÙ[Ù™Ë”Ù\™\‹YÙ[Q‚ZYˆYÙ[QOHˆˆÂ‚B]˜\ˆ\œˆ\œ›Ü‚‚BXYÙ[Q\œˆHØYÜ‘Ù[™\˜]PYÙ[Q
+]Q\ŠB‚BZYˆ\œˆOHš[Â‚BB\™]\›ˆš[›]‘\œ›Ü™Š™˜Z[YÈØYÜˆÙ[™\˜]HYÙ[Qˆ	]È‹\œŠB‚B_B‚BXYÙ[Ù™Ë”Ù\™\‹YÙ[QHYÙ[Q‚B]ÛÜšÙ\“ÙÙÙ\‹’[™›Ê‘Ù[™\˜]Y™]ÈYÙ[Q‹˜YÙ[ÚY‹YÙ[Q
+B‚_B‚‚XYÙ[˜[YHHYÙ[Ù™Ë”Ù\™\‹“˜[YB‚ZYˆYÙ[˜[YHOHˆˆÂ‚BZYˆÜÝ˜[YK\œˆHÜË’ÜÝ˜[YJ
+NÈ\œˆOHš[Â‚BBXYÙ[˜[YHHÜÝ˜[YB‚B_B‚_B‚‚]ÛÜšÙ\“ÙÙÙ\‹’[™›Ê”Ù\™\ˆ[YÜ˜][Ûˆ[˜X›Y‹‚BH\›‹YÙ[Ù™Ë”Ù\™\‹•T“‚BH˜YÙ[ÚY‹YÙ[Q‚BH˜YÙ[Û˜[YH‹YÙ[˜[YK‚BH˜ØWÜ]‹YÙ[Ù™Ë”Ù\™\‹ÐT]‚BH\ØYÚ[\˜[‹YÙ[Ù™Ë”Ù\™\‹•\ØY[\˜[‚BHšX\™X]Ú[\˜[‹YÙ[Ù™Ë”Ù\™\‹’X\™X][\˜[
+B‚‚]ÚÙ[ˆHØYÙ\™\•ÚÙ[Š]Q\ŠB‚ZYˆÚÙ[ˆOHˆˆÂ‚B]ÛÜšÙ\“ÙÙÙ\‹‘XYÊ“›ÈØ]™YÙ\™\ˆÚÙ[ˆ›Ý[™ŠB‚_B‚‚\Ù\™\ÛY[HYÙ[“™]ÔÙ\™\ÛY[Ú]˜[YJ‚BXYÙ[Ù™Ë”Ù\™\‹•T“‚BXYÙ[Q‚BXYÙ[˜[YK‚B]ÚÙ[‹‚BXYÙ[Ù™Ë”Ù\™\‹ÐT]‚BXYÙ[Ù™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžK‚JB‚ZYˆY[]KY[]Q\œˆHYÙ[“ØYÛY[Y[]J]Q\ŠNÈY[]Q\œˆOHš[Â‚B]ÛÜšÙ\“ÙÙÙ\‹•Ø\›Š”ÝÜ™YYÙ[UÈY[]HÛÝ[›Ý™HØYY‹™\œ›Üˆ‹Y[]Q\œŠB‚_H[ÙHYˆY[]HOHš[Â‚BZYˆ\œˆHÙ\™\ÛY[”Ù]ÛY[Y[]JY[]JNÈ\œˆOHš[Â‚BB]ÛÜšÙ\“ÙÙÙ\‹•Ø\›Š”ÝÜ™YYÙ[UÈY[]HÛÝ[›Ý™H[œÝ[Y‹™\œ›Üˆ‹\œŠB‚B_H[ÙHÂ‚BB]ÛÜšÙ\“ÙÙÙ\‹’[™›Ê“ØYYYÙ[UÈY[]H‹˜Ü™Y[X[ÚY‹Y[]KÜ™Y[X[Q™^\™\×Ø]‹Y[]K‘^\™\Ð]
+B‚B_B‚_B‚‚]ÛÜšÙ\ÛÛ™šYÈH\ØYÛÜšÙ\ÛÛ™šYÞÂ‚BRX\™X][\˜[ˆ[YK‘\˜][ÛŠYÙ[Ù™Ë”Ù\™\‹’X\™X][\˜[
+H
+ˆ[YK”ÙXÛÛ™‚BU\ØY[\˜[ˆ[YK‘\˜][ÛŠYÙ[Ù™Ë”Ù\™\‹•\ØY[\˜[
+H
+ˆ[YK”ÙXÛÛ™‚BT™]žP][\ÎˆË‚BT™]žP˜XÚÛÙ™Žˆˆ
+ˆ[YK”ÙXÛÛ™‚BU\ÙUÙX”ÛØÚÙ]ˆYK‚_B‚ZYˆÛÜšÙ\ÛÛ™šYË’X\™X][\˜[HÂ‚B]ÛÜšÙ\ÛÛ™šYË’X\™X][\˜[HŒ
+ˆ[YK”ÙXÛÛ™‚_B‚ZYˆÛÜšÙ\ÛÛ™šYË•\ØY[\˜[HÂ‚B]ÛÜšÙ\ÛÛ™šYË•\ØY[\˜[HH
+ˆ[YK“Z[]B‚_B‚‚]\ØYÛÜšÙ\ˆH™]Õ\ØYÛÜšÙ\ŠÙ\™\ÛY[]šXÙTÝÜ™KÛÜšÙ\“ÙÙÙ\‹Ù][™ÜËÛÜšÙ\ÛÛ™šYË]Q\ŠB‚‚KËÈÙ]ØØ[[™\ˆYˆÙXˆÙ\™\ˆ\È[™XYHÝ\Y‚ZYˆHÙ]ØØ[›ÞR[™\Š
+NÈOHš[Â‚B]\ØYÛÜšÙ\‹”Ù]ØØ[[™\Š
+B‚_B‚‚KËÈZ[™\œÚ[Ûˆ[™›È›ÜˆX\™X]Â‚]™\œÚ[Û’[™›ÈH	˜YÙ[YÙ[™\œÚ[Û’[™›ÞÂ‚BU™\œÚ[ÛŽˆ™\œÚ[Û‹‚BT›ÝØÛÛ™\œÚ[ÛŽˆŒH‹‚BPZ[\NˆZ[\K‚BQÚ]ÛÛ[Z]ˆÚ]ÛÛ[Z]‚_B‚‚ZYˆ\œˆH\ØYÛÜšÙ\‹”Ý\Ú]™\œÚ[Û’[™›ÊÝ™\œÚ[Û‹™\œÚ[Û’[™›ÊNÈ\œˆOHš[Â‚B\™]\›ˆš[\œ‚‚_B‚‚ZYˆ™]ÕÚÙ[ˆHÙ\™\ÛY[‘Ù]ÚÙ[Š
+NÈ™]ÕÚÙ[ˆOHˆˆ	‰ˆ™]ÕÚÙ[ˆOHÚÙ[ˆÂ‚BZYˆ\œˆHØ]™TÙ\™\•ÚÙ[Š]Q\‹™]ÕÚÙ[ŠNÈ\œˆOHš[Â‚BB]ÛÜšÙ\“ÙÙÙ\‹‘\œ›ÜŠ‘˜Z[YÈØ]™HÙ\™\ˆÚÙ[ˆ‹™\œ›Üˆ‹\œŠB‚B_H[ÙHÂ‚BB]ÛÜšÙ\“ÙÙÙ\‹’[™›Ê”Ù\™\ˆÚÙ[ˆØ]™YŠB‚B_B‚_B‚‚Xœ›ØYØ\ÝÙ\™\”Ý]\ÊYÙ[Ù™Ë]Q\‹\ØYÝÛÜšÙ\—ÜÝ\Y‹YJB‚\™]\›ˆ\ØYÛÜšÙ\‹š[ŸB‚\HÙ\™\’›Ú[”\˜[\ÈÝXÝÂ‚TÙ\™\•T“Ýš[™Â‚UÚÙ[ˆÝš[™Â‚PÐT]Ýš[™Â‚R[œÙXÝ\™H›ÛÛ‚PYÙ[˜[YHÝš[™ÂŸB‚\HÙ\™\’›Ú[”™\Ý[ÝXÝÂ‚U[˜[QÝš[™Â‚PYÙ[ÚÙ[ˆÝš[™Â‚PYÙ[˜[YHÝš[™Â‚PYÙ[QÝš[™ÂŸB‚\H›Ú[‘\œ›ÜˆÝXÝÂ‚\Ý]\È[‚Y\œˆ\œ›Ü‚ŸB‚™[˜È
+H
+š›Ú[‘\œ›ÜŠH\œ›ÜŠ
+HÝš[™ÈÂ‚ZYˆHOHš[K™\œˆOHš[Â‚B\™]\›ˆˆ‚‚_B‚\™]\›ˆK™\œ‹‘\œ›ÜŠ
+BŸB‚™[˜È
+H
+š›Ú[‘\œ›ÜŠH[Ü˜\
+
+H\œ›ÜˆÂ‚ZYˆHOHš[Â‚B\™]\›ˆš[‚_B‚\™]\›ˆK™\œ‚ŸB‚™[˜È™]Ò›Ú[‘\œ›ÜŠÝ]\È[\œˆ\œ›ÜŠH\œ›ÜˆÂ‚ZYˆ\œˆOHš[Â‚BY\œˆH›]‘\œ›Ü™Š[šÛ›ÝÛˆ›Ú[ˆ\œ›ÜˆŠB‚_B‚\™]\›ˆ	š›Ú[‘\œ›ÜžÜÝ]\ÎˆÝ]\Ë\œŽˆ\œŸBŸB‚™[˜È›Ú[‘\œ›Ü”Ý]\Ê\œˆ\œ›ÜŠH[Â‚]˜\ˆ™H
+š›Ú[‘\œ›Ü‚‚ZYˆ\œ›ÜœË\Ê\œ‹	š™JHÂ‚B\™]\›ˆ™KœÝ]\Â‚_B‚\™]\›ˆ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‚ŸB‚™[˜È™\ÛÛ™PYÙ[\Ü^S˜[YJYÙ[Ù™È
+YÙ[ÛÛ™šYËØ[™Y]HÝš[™ÊHÝš[™ÈÂ‚ZYˆ˜[YHHÝš[™ÜË•š[TÜXÙJØ[™Y]JNÈ˜[YHOHˆˆÂ‚B\™]\›ˆ˜[YB‚_B‚ZYˆYÙ[Ù™ÈOHš[Â‚BZYˆÙ™Ó˜[YHHÝš[™ÜË•š[TÜXÙJYÙ[Ù™Ë”Ù\™\‹“˜[YJNÈÙ™Ó˜[YHOHˆˆÂ‚BB\™]\›ˆÙ™Ó˜[YB‚B_B‚_B‚ZYˆÜÝ\œˆHÜË’ÜÝ˜[YJ
+NÈ\œˆOHš[	‰ˆÝš[™ÜË•š[TÜXÙJÜÝ
+HOHˆˆÂ‚B\™]\›ˆÝš[™ÜË•š[TÜXÙJÜÝ
+B‚_B‚\™]\›ˆ”š[X\Ý\ˆYÙ[‚ŸB‚™[˜È\™›Ü›TÙ\™\’›Ú[Š‚\™\PÝÛÛ^ÛÛ^‚X\ÝÛÛ^ÛÛ^‚\\˜[\ÈÙ\™\’›Ú[”\˜[\Ë‚XYÙ[Ù™È
+YÙ[ÛÛ™šYË‚XÙ™ÔÝÜ™HÝÜ˜YÙKYÙ[ÛÛ™šYÔÝÜ™K‚Y]šXÙTÝÜ™HÝÜ˜YÙK‘]šXÙTÝÜ™K‚\Ù][™ÜÈ
+”Ù][™ÜÓX[˜YÙ\‹‚[ÙÙÙ\ˆ
+›ÙÙÙ\‹“ÙÙÙ\‹‚Z\ÔÝ˜È›ÛÛŠH
+
+œÙ\™\’›Ú[”™\Ý[\œ›ÜŠHÂ‚\Ù\™\•T“\œˆH˜[Y]SÛ˜›Ø\™[™ÔÙ\™\•T“
+\˜[\Ë”Ù\™\•T“
+B‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜Y™\]Y\Ý\œŠB‚_B‚ZYˆ\˜[\Ë’[œÙXÝ\™HÂ‚B\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜Y™\]Y\Ý›]‘\œ›Ü™Šš[œÙXÝ\™HÈ™\šYšXØ][Ûˆ\È›Ý\›Z]YŠJB‚_B‚Z›Ú[•ÚÙ[ˆHÝš[™ÜË•š[TÜXÙJ\˜[\Ë•ÚÙ[ŠB‚ZYˆ›Ú[•ÚÙ[ˆOHˆˆÂ‚B\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜Y™\]Y\Ý›]‘\œ›Ü™ŠÚÙ[ˆ™\]Z\™YŠJB‚_B‚Y]Q\‹\œˆHÛÛ™šYË‘Ù]]Q\™XÝÜžJ˜YÙ[‹\ÔÝ˜ÊB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›]‘\œ›Ü™Š™˜Z[YÈ]\›Z[™H]H\™XÝÜžNˆ	]È‹\œŠJB‚_B‚XYÙ[Q\œˆHØYÜ‘Ù[™\˜]PYÙ[Q
+]Q\ŠB‚ZYˆ\œˆOHš[Â‚B\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›]‘\œ›Ü™Š™˜Z[YÈØYÜˆÙ[™\˜]HYÙ[Yˆ	]È‹\œŠJB‚_B‚XØT]HÝš[™ÜË•š[TÜXÙJ\˜[\ËÐT]
+B‚XYÙ[˜[YHH™\ÛÛ™PYÙ[\Ü^S˜[YJYÙ[Ù™Ë\˜[\ËYÙ[˜[YJB‚XÛY[HYÙ[“™]ÔÙ\™\ÛY[Ú]˜[YJÙ\™\•T“YÙ[QYÙ[˜[YKˆ‹ØT]\˜[\Ë’[œÙXÝ\™JB‚]˜\ˆYÙ[ÚÙ[‹[˜[QÝš[™Â‚]˜\ˆ]Ñ[œ›ÛY›ÛÛ‚KËÈH™]š[Ý\ÈÛ˜›Ø\™[™È][\X^H]™HÛÛœÝ[YYHÛ™K][YH›Ú[ˆÚÙ[‚‚KËÈ[™\œÚ\ÝYHÙ\YšXØ]H™Y›Ü™HHXÝ]˜][Ûˆ™\ÜÛœÙHØ\ÈÜÝ‚‚KËÈ™]žH]XÝ]˜][Ûˆ™Y›Ü™H][\[™È[›Ý\ˆ[œ›ÛY[‚‚ZYˆ[™[™ÒY[]K[™[™Ñ\œˆHYÙ[“ØY[™[™ÐÛY[Y[]J]Q\ŠNÈ[™[™Ñ\œˆOHš[Â‚B\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹[™[™Ñ\œŠB‚_H[ÙHYˆ[™[™ÒY[]HOHš[Â‚BZYˆÙ]\œˆHÛY[”Ù]ÛY[Y[]J[™[™ÒY[]JNÈÙ]\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹Ù]\œŠB‚B_B‚BZYˆXÝ]˜]Q\œˆHÛY[XÝ]˜]SUÊ™\PÝ
+NÈXÝ]˜]Q\œˆOHš[Â‚BBXÛY[ÛX\ÛY[Y[]J
+B‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜YØ]]Ø^K›]‘\œ›Ü™Šœ[™[™ÈUÈXÝ]˜][ÛŽˆ	]È‹XÝ]˜]Q\œŠJB‚B_B‚BZYˆ›Û[ÝQ\œˆHYÙ[”›Û[ÝT[™[™ÐÛY[Y[]J]Q\ŠNÈ›Û[ÝQ\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›Û[ÝQ\œŠB‚B_B‚BZYˆ][\][\\œˆHYÙ[“ØY[œ›ÛY[][\
+]Q\‹YÙ[Q
+NÈ][\\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹][\\œŠB‚B_H[ÙHYˆ][\OHš[Â‚BBZYˆÛÛ\]Q\œˆHYÙ[ÛÛ\]Q[œ›ÛY[][\
+]Q\‹][\‘[œ›ÛY[][\Q
+NÈÛÛ\]Q\œˆOHš[Â‚BBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹ÛÛ\]Q\œŠB‚BB_B‚B_B‚B][˜[Q]Ñ[œ›ÛYH[™[™ÒY[]K•[˜[QYB‚_B‚ZYˆ[]Ñ[œ›ÛYÂ‚BZYˆ[™[™ËÜÜ‘\œˆHYÙ[“ØYÜÜ™X]Q[œ›ÛY[][\
+]Q\‹YÙ[Q
+NÈÜÜ‘\œˆOHš[Â‚BBZYˆ™YÚ\Ý˜][Û‹]Ñ\œˆHÛY[”™YÚ\Ý\•Ú]UÊ™\PÝ›Ú[•ÚÙ[‹Ýš[™Ê[™[™ËÔÔ”SJK™\œÚ[Û‹[™[™Ë‘[œ›ÛY[][\Q
+NÈ]Ñ\œˆOHš[Â‚BBBZY[]KZ[\œˆHYÙ[Z[ÛY[Y[]J™YÚ\Ý˜][Û‹Ü™Y[X[Q™YÚ\Ý˜][Û‹‘^\™\Ð]™YÚ\Ý˜][Û‹ÛY[Ù\YšXØ]K[™[™Ë”š]˜]RÙ^TSJB‚BBBZYˆZ[\œˆOHš[Â‚BBBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜YØ]]Ø^KZ[\œŠB‚BBB_B‚BBBZY[]K•[˜[QH™YÚ\Ý˜][Û‹•[˜[Q‚BBBZYˆØ]™Q\œˆHYÙ[”Ø]™T[™[™ÐÛY[Y[]J]Q\‹Y[]K™YÚ\Ý˜][Û‹ÛY[Ù\YšXØ]K[™[™Ë”š]˜]RÙ^TSJNÈØ]™Q\œˆOHš[Â‚BBBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹Ø]™Q\œŠB‚BBB_B‚BBBZYˆÙ]\œˆHÛY[”Ù]ÛY[Y[]JY[]JNÈÙ]\œˆOHš[Â‚BBBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹Ù]\œŠB‚BBB_B‚BBBZYˆXÝ]˜]Q\œˆHÛY[XÝ]˜]SUÊ™\PÝ
+NÈXÝ]˜]Q\œˆOHš[Â‚BBBBXÛY[ÛX\ÛY[Y[]J
+B‚BBBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜YØ]]Ø^K›]‘\œ›Ü™Š›UÈXÝ]˜][ÛŽˆ	]È‹XÝ]˜]Q\œŠJB‚BBB_B‚BBBZYˆ›Û[ÝQ\œˆHYÙ[”›Û[ÝT[™[™ÐÛY[Y[]J]Q\ŠNÈ›Û[ÝQ\œˆOHš[Â‚BBBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›Û[ÝQ\œŠB‚BBB_B‚BBBZYˆÛÛ\]Q\œˆHYÙ[ÛÛ\]Q[œ›ÛY[][\
+]Q\‹[™[™Ë‘[œ›ÛY[][\Q
+NÈÛÛ\]Q\œˆOHš[Â‚BBBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹ÛÛ\]Q\œŠB‚BBB_B‚BBB][˜[Q]Ñ[œ›ÛYH™YÚ\Ý˜][Û‹•[˜[QYB‚BB_H[ÙHYˆ][\][\\œˆHYÙ[“ØY[œ›ÛY[][\
+]Q\‹YÙ[Q
+NÈ][\\œˆOHš[Â‚BBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹][\\œŠB‚BB_H[ÙHYˆ][\OHš[Â‚BBB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜YØ]]Ø^K›]‘\œ›Ü™Š›UÈ[œ›ÛY[Ú[™H™]šYYÚ]\œÚ\ÝY][\ˆ	]È‹]Ñ\œŠJB‚BB_B‚B_H[ÙHÂ‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹ÜÜ‘\œŠB‚B_B‚_B‚ZYˆ[]Ñ[œ›ÛYÂ‚BXYÙ[ÚÙ[‹[˜[Q\œˆHÛY[”™YÚ\Ý\•Ú]ÚÙ[Š™\PÝ›Ú[•ÚÙ[‹™\œÚ[ÛŠB‚BZYˆ\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ð˜YØ]]Ø^K\œŠB‚B_B‚_B‚ZYˆYÙ[Ù™ÈOHš[Â‚BXYÙ[Ù™Ë”Ù\™\‹‘[˜X›YHYB‚BXYÙ[Ù™Ë”Ù\™\‹•T“HÙ\™\•T“‚BXYÙ[Ù™Ë”Ù\™\‹“˜[YHHYÙ[˜[YB‚BXYÙ[Ù™Ë”Ù\™\‹ÐT]HØT]‚BXYÙ[Ù™Ë”Ù\™\‹’[œÙXÝ\™TÚÚ\™\šYžHH\˜[\Ë’[œÙXÝ\™B‚BXYÙ[Ù™Ë”Ù\™\‹YÙ[QHYÙ[Q‚_B‚ZYˆÙ™ÔÝÜ™HOHš[Â‚B]\ØY[\˜[H‚BZX\™X][\˜[H‚BZYˆYÙ[Ù™ÈOHš[Â‚BB]\ØY[\˜[HYÙ[Ù™Ë”Ù\™\‹•\ØY[\˜[‚BBZX\™X][\˜[HYÙ[Ù™Ë”Ù\™\‹’X\™X][\˜[‚B_B‚B\\œÚ\ÝYHÙ\™\ÛÛ›™XÝ[ÛÛÛ™šYÞÂ‚BBQ[˜X›YˆYK‚BBUT“ˆÙ\™\•T“‚BBS˜[YNˆYÙ[˜[YK‚BBPÐT]ˆØT]‚BBR[œÙXÝ\™TÚÚ\™\šYžNˆ\˜[\Ë’[œÙXÝ\™K‚BBU\ØY[\˜[ˆ\ØY[\˜[‚BBRX\™X][\˜[ˆX\™X][\˜[‚BBPYÙ[QˆYÙ[Q‚B_B‚BZYˆ\œˆHÙ™ÔÝÜ™K”Ù]ÛÛ™šYÕ˜[YJœÙ\™\ˆ‹\œÚ\ÝY
+NÈ\œˆOHš[Â‚BBZYˆÙÙÙ\ˆOHš[Â‚BBB[ÙÙÙ\‹•Ø\›Š‘˜Z[YÈ\œÚ\ÝÙ\™\ˆÙ][™ÜÈ‹™\œ›Üˆ‹\œŠB‚BB_B‚B_B‚_B‚ZYˆ]Ñ[œ›ÛYÂ‚BZYˆ\œˆH[]TÙ\™\•ÚÙ[Š]Q\ŠNÈ\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›]‘\œ›Ü™Š™˜Z[YÈÛX\ˆYØXÞHÙ\™\ˆÚÙ[Žˆ	]È‹\œŠJB‚B_B‚BZYˆ\œˆHØ]™TÙ\™\’›Ú[•ÚÙ[Š]Q\‹ˆŠNÈ\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›]‘\œ›Ü™Š™˜Z[YÈÛX\ˆ›Ú[ˆÚÙ[Žˆ	]È‹\œŠJB‚B_B‚_H[ÙHÂ‚BZYˆ\œˆHØ]™TÙ\™\•ÚÙ[Š]Q\‹YÙ[ÚÙ[ŠNÈ\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›]‘\œ›Ü™Š™˜Z[YÈØ]™HÙ\™\ˆÚÙ[Žˆ	]È‹\œŠJB‚B_B‚BZYˆ\œˆHØ]™TÙ\™\’›Ú[•ÚÙ[Š]Q\‹›Ú[•ÚÙ[ŠNÈ\œˆOHš[Â‚BB\™]\›ˆš[™]Ò›Ú[‘\œ›ÜŠ”Ý]\Ò[\›˜[Ù\™\‘\œ›Ü‹›]‘\œ›Ü™Š™˜Z[YÈØ]™H›Ú[ˆÚÙ[Žˆ	]È‹\œŠJB‚B_B‚_B‚]\ØYÛÜšÙ\“]K”“ØÚÊ
+B‚Y^\Ý[™ÕÛÜšÙ\ˆH\ØYÛÜšÙ\‚‚]\ØYÛÜšÙ\“]K”•[›ØÚÊ
+B‚ZYˆ^\Ý[™ÕÛÜšÙ\ˆOHš[	‰ˆ^\Ý[™ÕÛÜšÙ\‹˜ÛY[OHš[Â‚BY^\Ý[™ÕÛÜšÙ\‹˜ÛY[”Ù]ÚÙ[ŠYÙ[ÚÙ[ŠB‚BY^\Ý[™ÕÛÜšÙ\‹˜ÛY[˜\ÙUT“HÙ\™\•T“‚BZYˆ]Ñ[œ›ÛYÂ‚BBZYˆY[]KY[]Q\œˆHYÙ[“ØYÛY[Y[]J]Q\ŠNÈY[]Q\œˆOHš[	‰ˆY[]HOHš[Â‚BBBZYˆÙ]\œˆH^\Ý[™ÕÛÜšÙ\‹˜ÛY[”Ù]ÛY[Y[]JY[]JNÈÙ]\œˆOHš[Â‚BBBBY^\Ý[™ÕÛÜšÙ\‹ÜÐÛY[]K”“ØÚÊ
+B‚BBBB]ÜÐÛY[H^\Ý[™ÕÛÜšÙ\‹ÜÐÛY[‚BBBBY^\Ý[™ÕÛÜšÙ\‹ÜÐÛY[]K”•[›ØÚÊ
+B‚BBBBZYˆÜÐÛY[OHš[Â‚BBBBB]ÜÐÛY[”Ù]ÐÛÛ™šYÊ^\Ý[™ÕÛÜšÙ\‹˜ÛY[•ÐÛÛ™šYÊ
+JB‚BBBB_B‚BBB_B‚BB_B‚B_B‚B[X^X™TÝ\]]Õ\]UÛÜšÙ\Š\ÝYÙ[Ù™Ë]Q\‹\ÔÝ˜ËÙÙÙ\ŠB‚_H[ÙHÂ‚BYÛÈ[˜Ê
+HÂ‚BB]ÛÜšÙ\‹\œˆHÝ\Ù\™\•\ØYÛÜšÙ\Š\ÝYÙ[Ù™Ë]Q\‹]šXÙTÝÜ™KÙ][™ÜËÙÙÙ\ŠB‚BBZYˆ\œˆOHš[Â‚BBBZYˆÙÙÙ\ˆOHš[Â‚BBBB[ÙÙÙ\‹‘\œ›ÜŠ‘˜Z[YÈÝ\\ØYÛÜšÙ\ˆY\ˆ›Ú[ˆ‹™\œ›Üˆ‹\œŠB‚BBB_B‚BBB\™]\›‚‚BB_B‚BB]\ØYÛÜšÙ\“]K“ØÚÊ
+B‚BB]\ØYÛÜšÙ\ˆHÛÜšÙ\‚‚BB]\ØYÛÜšÙ\“]K•[›ØÚÊ
+B‚‚BBKËÈÚXÚÈYˆØØ[›ÞH[™\ˆØ\ÈÙ]Ú[HÙHÙ\™HÝ\[™È\‚BBZYˆHÙ]ØØ[›ÞR[™\Š
+NÈOHš[Â‚BBB]ÛÜšÙ\‹”Ù]ØØ[[™\Š
+B‚BB_B‚‚BB[X^X™TÝ\]]Õ\]UÛÜšÙ\Š\ÝYÙ[Ù™Ë]Q\‹\ÔÝ˜ËÙÙÙ\ŠB‚B_J
+B‚_B‚Xœ›ØYØ\ÝÙ\™\”Ý]\ÊYÙ[Ù™Ë]Q\‹š›Ú[™Y‹YJB‚\™]\›ˆ	œÙ\™\’›Ú[”™\Ý[Â‚BU[˜[Qˆ[˜[Q‚BPYÙ[ÚÙ[ŽˆYÙ[ÚÙ[‹‚BPYÙ[˜[YNˆYÙ[˜[YK‚BPYÙ[QˆYÙ[Q‚_Kš[ŸB‚™[˜ÈX^X™TÝ\]]Õ\]UÛÜšÙ\Š\ÝÛÛ^ÛÛ^YÙ[Ù™È
+YÙ[ÛÛ™šYË]Q\ˆÝš[™Ë\ÔÙ\šXÙH›ÛÛÙÈ
+›ÙÙÙ\‹“ÙÙÙ\ŠHÂ‚X]]Õ\]SX[˜YÙ\“]K”“ØÚÊ
+B‚X[™XYT[›š[™ÈH]]Õ\]SX[˜YÙ\ˆOHš[‚X]]Õ\]SX[˜YÙ\“]K”•[›ØÚÊ
+B‚ZYˆ[™XYT[›š[™ÈÂ‚B\™]\›‚‚_B‚YÛÈ[š]]]Õ\]UÛÜšÙ\Š\ÝYÙ[Ù™Ë]Q\‹\ÔÙ\šXÙKÙÊBŸB‚‹ËÈžSX\›“ÒQ›Ü•˜[YH\™›Ü›\È[ˆÓ“TØ[ÈÈš[™[ˆÒQ]™]\›œÈHÜXÚYšYY˜[YB‹ËÈ™]\›œÈHÒQYˆ›Ý[™[\HÝš[™ÈÝ\Ú\ÙB™[˜ÈžSX\›“ÒQ›Ü•˜[YJÝÛÛ^ÛÛ^\Ýš[™Ë™[™Ü’[Ýš[™ËšY[˜[YHÝš[™Ë\™Ù]˜[YH[\™˜XÙ^ßJHÝš[™ÈÂ‚ZYˆ\OHˆˆÂ‚B\™]\›ˆˆ‚‚_B‚‚KËÈÛÛ™\\™Ù]˜[YHÈÝš[™È›ÜˆÛÛ\\š\ÛÛ‚‚]\™Ù]ÝˆH›]”Üš[Š‰]ˆ‹\™Ù]˜[YJB‚ZYˆ\™Ù]ÝˆOHˆˆÂ‚B\™]\›ˆˆ‚‚_B‚‚KËÈ\™›Ü›HH\™Ù]YÓ“TØ[ÈÛˆÛÛ[[ÛˆRPˆ›ÛÝÂ‚X\ÙÙÙ\‹’[™›Ê][\[™ÈÈX\›ˆÒQ›ÜˆØÚÙYšY[‹š\‹\™šY[‹šY[˜[YK\™Ù]Ý˜[YH‹\™Ù]ÝŠB‚‚\™\Ý[\œˆHØØ[›™\‹”]Y\žQ]šXÙJÝ\ØØ[›™\‹”]Y\žQ[™[™Ü’[L
+B‚ZYˆ\œˆOHš[Â‚BX\ÙÙÙ\‹•Ø\›Š‘˜Z[YÈ]Y\žH]šXÙH›ÜˆÒQX\›š[™È‹š\‹\™\œ›Üˆ‹\œŠB‚B\™]\›ˆˆ‚‚_B‚‚ZYˆ™\Ý[OHš[[Š™\Ý[”\ÊHOHÂ‚B\™]\›ˆˆ‚‚_B‚‚KËÈÙX\˜Ú›ÝYÚ\È›ÜˆX]Ú[™È˜[YB‚Y›ÜˆËHH˜[™ÙH™\Ý[”\ÈÂ‚B]˜\ˆU˜[YTÝˆÝš[™Â‚‚BKËÈÛÛ™\H˜[YHÈÝš[™È˜\ÙYÛˆ\B‚B\ÝÚ]ÚK•\HÂ‚BXØ\ÙHÛÜÛ›\“ØÝ]Ýš[™Î‚‚BBZYˆž]\ËÚÈHK•˜[YKŠ×Xž]JNÈÚÈÂ‚BBB\U˜[YTÝˆHÝš[™Êž]\ÊB‚BB_H[ÙHÂ‚BBB\U˜[YTÝˆH›]”Üš[Š‰]ˆ‹K•˜[YJB‚BB_B‚BXØ\ÙHÛÜÛ›\’[YÙ\‹ÛÜÛ›\ÛÝ[\ŒÌ‹ÛÜÛ›\‘Ø]YÙLÌ‹ÛÜÛ›\ÛÝ[\‚‚BB\U˜[YTÝˆH›]”Üš[Š‰]ˆ‹K•˜[YJB‚BYY˜][‚‚BB\U˜[YTÝˆH›]”Üš[Š‰]ˆ‹K•˜[YJB‚B_B‚‚BKËÈÚXÚÈ›Üˆ^XÝX]ÚÜˆ[Y\šXÈX]Ú‚BZYˆU˜[YTÝˆOH\™Ù]ÝˆÂ‚BBX\ÙÙÙ\‹’[™›Ê‘›Ý[™X]Ú[™ÈÒQ›ÜˆšY[‹š\‹\™šY[‹šY[˜[YK›ÚY‹K“˜[YK˜[YH‹U˜[YTÝŠB‚BB\™]\›ˆK“˜[YB‚B_B‚‚BKËÈ›Üˆ[Y\šXÈšY[ËžH\œÚ[™È[™ÛÛ\\š[™È\È[YÙ\œÂ‚BZYˆÝš[™ÜËÛÛZ[œÊÝš[™ÜË•ÓÝÙ\ŠšY[˜[YJKœYÙHŠHÝš[™ÜËÛÛZ[œÊÝš[™ÜË•ÓÝÙ\ŠšY[˜[YJK˜ÛÝ[ŠHÂ‚BB]\™Ù][\™Ù]\œˆHÝ˜ÛÛ‹”\œÙR[
+\™Ù]Ý‹L
+B‚BB\R[Q\œˆHÝ˜ÛÛ‹”\œÙR[
+U˜[YTÝ‹L
+B‚BBZYˆ\™Ù]\œˆOHš[	‰ˆQ\œˆOHš[	‰ˆ\™Ù][OHR[Â‚BBBX\ÙÙÙ\‹’[™›Ê‘›Ý[™X]Ú[™ÈÒQ›Üˆ[Y\šXÈšY[‹š\‹\™šY[‹šY[˜[YK›ÚY‹K“˜[YK˜[YH‹R[
+B‚BBB\™]\›ˆK“˜[YB‚BB_B‚B_B‚_B‚‚X\ÙÙÙ\‹’[™›Ê“›ÈX]Ú[™ÈÒQ›Ý[™›ÜˆšY[‹š\‹\™šY[‹šY[˜[YK\™Ù]Ý˜[YH‹\™Ù]Ý‹œ\×ØÚXÚÙY‹[Š™\Ý[”\ÊJB‚\™]\›ˆˆ‚ŸB‚™[˜ÈXZ[Š
+HÂ‚KËÈ\œÙHÛÛ[X[™[[™H›YÜÈ›ÜˆÙ\šXÙHX[˜YÙ[Y[‚XÛÛ™šYÔ]H›YË”Ýš[™Ê˜ÛÛ™šYÈ‹˜ÛÛ™šYËÛ[‹ÛÛ™šYÝ\˜][Ûˆš[H]ŠB‚YÙ[™\˜]PÛÛ™šYÈH›YË›ÛÛ
+™Ù[™\˜]KXÛÛ™šYÈ‹˜[ÙK‘Ù[™\˜]HY˜][ÛÛ™šYÈš[H[™^]ŠB‚\Ù\šXÙPÛYH›YË”Ýš[™ÊœÙ\šXÙH‹ˆ‹”Ù\šXÙHÛÛ›Ûˆ[œÝ[[š[œÝ[Ý\ÝÜ[ˆŠB‚\ÚÝÕ™\œÚ[ÛˆH›YË›ÛÛ
+™\œÚ[Ûˆ‹˜[ÙK”ÚÝÈ™\œÚ[Ûˆ[™›Ü›X][Ûˆ[™^]ŠB‚\]ZY]H›YË›ÛÛ
+œ]ZY]‹˜[ÙK”Ý\™\ÜÈ[™›Ü›X][Û˜[Ý]]
+\œ›ÜœËÝØ\›š[™ÜÈÝ[ÚÝÛŠHŠB‚Y›YË›ÛÛ˜\Š]ZY]œH‹˜[ÙK”ÚÜ[™›ÜˆK\]ZY]ŠB‚\Ú[[H›YË›ÛÛ
+œÚ[[‹˜[ÙK”Ý\™\ÜÈSÝ]]
+ÛÛ\]HÚ[[˜ÙJHŠB‚Y›YË›ÛÛ˜\ŠÚ[[œÈ‹˜[ÙK”ÚÜ[™›ÜˆK\Ú[[ŠB‚ZX[ÚXÚÈH›YË›ÛÛ
+šX[‹˜[ÙK”\™›Ü›HØØ[X[ÚXÚÈYØZ[œÝÚX[[™^]ŠB‚Y›YË”\œÙJ
+B‚‚KËÈÙ]]ZY]ÜÚ[[[ÙHÛØ˜[H›Üˆ][[˜Ý[ÛœÂ‚ZYˆ
+œÚ[[Â‚BXÛÛ[[Û][”Ù]Ú[[[ÙJYJB‚_H[ÙHÂ‚BXÛÛ[[Û][”Ù]]ZY][ÙJ
+œ]ZY]
+B‚_B‚‚KËÈÚÝÈ™\œÚ[ÛˆYˆ™\]Y\ÝY‚ZYˆ
+œÚÝÕ™\œÚ[ÛˆÂ‚BY›]”š[Š”š[X\Ý\ˆYÙ[	\×ˆ‹™\œÚ[ÛŠB‚BY›]”š[ŠZ[[YNˆ	\×ˆ‹Z[[YJB‚BY›]”š[Š‘Ú]ÛÛ[Z]ˆ	\×ˆ‹Ú]ÛÛ[Z]
+B‚BY›]”š[ŠZ[\Nˆ	\×ˆ‹Z[\JB‚BY›]”š[Š‘ÛÈ™\œÚ[ÛŽˆ	\×ˆ‹[[YK•™\œÚ[ÛŠ
+JB‚BY›]”š[Š“ÔËÐ\˜Úˆ	\ËÉ\×ˆ‹[[YK‘ÓÓÔË[[YK‘ÓÐTÒ
+B‚B\™]\›‚‚_B‚‚KËÈÙ[™\˜]HY˜][ÛÛ™šYÈYˆ™\]Y\ÝY‚ZYˆ
+™Ù[™\˜]PÛÛ™šYÈÂ‚BZYˆ\œˆHÜš]QY˜][YÙ[ÛÛ™šYÊ
+˜ÛÛ™šYÔ]
+NÈ\œˆOHš[Â‚BBY›]‘œš[ŠÜË”Ý\œ‹‘˜Z[YÈÙ[™\˜]HÛÛ™šYÎˆ	]—ˆ‹\œŠB‚BB[ÜË‘^]
+JB‚B_B‚BY›]”š[Š‘Ù[™\˜]YY˜][ÛÛ™šYÝ\˜][Ûˆ]	\×ˆ‹
+˜ÛÛ™šYÔ]
+B‚B\™]\›‚‚_B‚‚KËÈYÚÙZYÚX[›Ø™H›ÜˆØÚÙ\‹Û[Ûš]Üš[™ÎˆØ[ØØ[ÚX[[™^]‚‚ZYˆ
+šX[ÚXÚÈÂ‚BZYˆ\œˆH[YÙ[X[ÚXÚÊ
+˜ÛÛ™šYÔ]
+NÈ\œˆOHš[Â‚BBY›]‘œš[ŠÜË”Ý\œ‹šX[ÚXÚÈ˜Z[Yˆ	]—ˆ‹\œŠB‚BB[ÜË‘^]
+JB‚B_B‚BY›]”š[ŠšX[HŠB‚B\™]\›‚‚_B‚‚KËÈ[™HÙ\šXÙHÛÛ[X[™Â‚ZYˆ
+œÙ\šXÙPÛYOHˆˆÂ‚BZ[™TÙ\šXÙPÛÛ[X[™
+
+œÙ\šXÙPÛY
+B‚B\™]\›‚‚_B‚‚KËÈÚXÚÈYˆ[›š[™È\ÈÙ\šXÙH[™Ý\\›ÜšX][B‚ZYˆ\Ù\šXÙK’[\˜XÝ]™J
+HÂ‚BKËÈ[›š[™È\ÈÙ\šXÙK\ÙHÙ\šXÙHÜ˜\\‚‚B\[\ÔÙ\šXÙJ
+B‚B\™]\›‚‚_B‚‚KËÈ[›š[™È[\˜XÝ]™[KÝ\›Ü›X[H
+›ÈÛÛ^YX[œÈ[ˆ›Ü™]™\ŠB‚\[’[\˜XÝ]™JÛÛ^˜XÚÙÜ›Ý[™
+
+K
+˜ÛÛ™šYÔ]
+BŸB‚‹ËÈ[™TÙ\šXÙPÛÛ[X[™›ØÙ\ÜÙ\ÈÙ\šXÙH[œÝ[Ý[š[œÝ[ÜÝ\ÜÝÜÛÛ[X[™Â™[˜È[™TÙ\šXÙPÛÛ[X[™
+ÛYÝš[™ÊHÂ‚\Ý˜ÐÛÛ™šYÈHÙ]Ù\šXÙPÛÛ™šYÊ
+B‚\™ÈH	œ›ÙÜ˜[^ßB‚\Ë\œˆHÙ\šXÙK“™]Ê™ËÝ˜ÐÛÛ™šYÊB‚ZYˆ\œˆOHš[Â‚BY›]‘œš[ŠÜË”Ý\œ‹‘˜Z[YÈÜ™X]HÙ\šXÙNˆ	]—ˆ‹\œŠB‚B[ÜË‘^]
+JB‚_B‚‚\ÝÚ]ÚÛYÂ‚XØ\ÙHš[œÝ[Ž‚‚BKËÈÚÝÈ˜[›™\‚‚BXÛÛ[[Û][”ÚÝÐ˜[›™\Š™\œÚ[Û‹Ú]ÛÛ[Z]Z[[YK‘›Y]X[˜YÙ[Y[YÙ[ŠB‚‚BKËÈÚXÚÈYˆÙ\šXÙH[™XYH^\ÝÈ[™[™HÜ˜XÙY[B‚B\Ý]\ËÈHË”Ý]\Ê
+B‚BZYˆÝ]\ÈOHÙ\šXÙK”Ý]\Õ[šÛ›ÝÛˆÂ‚BBXÛÛ[[Û][”ÚÝÕØ\›š[™Ê”Ù\šXÙH[™XYH^\ÝË™[[Ýš[™Èš\œÝ‹‹ˆŠB‚‚BBKËÈÝÜYˆ[›š[™Â‚BBZYˆÝ]\ÈOHÙ\šXÙK”Ý]\Ô[›š[™ÈÂ‚BBBXÛÛ[[Û][”ÚÝÒ[™›Ê”ÝÜ[™È^\Ý[™ÈÙ\šXÙK‹‹ˆŠB‚BBBWÈHË”ÝÜ
+
+B‚BBB][YK”ÛY\
+ˆ
+ˆ[YK”ÙXÛÛ™
+B‚BBBXÛÛ[[Û][”ÚÝÔÝXØÙ\ÜÊ”Ù\šXÙHÝÜYŠB‚BB_B‚‚BBKËÈ[š[œÝ[^\Ý[™Â‚BBXÛÛ[[Û][”ÚÝÒ[™›Ê”™[[Ýš[™È^\Ý[™ÈÙ\šXÙK‹‹ˆŠB‚BBZYˆ\œˆHË•[š[œÝ[
+
+NÈ\œˆOHš[Â‚BBBKËÈYÛ›Ü™H›X\šÙY›Üˆ[][Ûˆˆ\œ›ÜœÈHÙHØ[ˆÝ[[œÝ[Ý™\ˆ]‚BBBZYˆ\Ýš[™ÜËÛÛZ[œÊ\œ‹‘\œ›ÜŠ
+K›X\šÙY›Üˆ[][ÛˆŠHÂ‚BBBBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈ™[[Ý™H^\Ý[™ÈÙ\šXÙNˆ	]ˆ‹\œŠJB‚BBBBXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[Š˜[ÙK’[œÝ[][Ûˆ˜Z[YŠB‚BBBB[ÜË‘^]
+JB‚BBB_B‚BBBXÛÛ[[Û][”ÚÝÕØ\›š[™Ê”Ù\šXÙHX\šÙY›Üˆ[][Û‹Ú[[œÝ[[ž]Ø^HŠB‚BB_H[ÙHÂ‚BBBXÛÛ[[Û][”ÚÝÔÝXØÙ\ÜÊ‘^\Ý[™ÈÙ\šXÙH™[[Ý™YŠB‚BB_B‚BB][YK”ÛY\
+L
+ˆ[YK“Z[\ÙXÛÛ™
+B‚B_B‚‚BKËÈÜ™X]HÙ\šXÙH\™XÝÜšY\Èš\œÝ‚BXÛÛ[[Û][”ÚÝÒ[™›Ê”Ù][™È\\™XÝÜšY\Ë‹‹ˆŠB‚B][YK”ÛY\
+Ì
+ˆ[YK“Z[\ÙXÛÛ™
+B‚BZYˆ\œˆHÙ]\Ù\šXÙQ\™XÝÜšY\Ê
+NÈ\œˆOHš[Â‚BBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈÙ]\Ù\šXÙH\™XÝÜšY\Îˆ	]ˆ‹\œŠJB‚BBXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[Š˜[ÙK’[œÝ[][Ûˆ˜Z[YŠB‚BB[ÜË‘^]
+JB‚B_B‚BXÛÛ[[Û][”ÚÝÔÝXØÙ\ÜÊ‘\™XÝÜšY\È™XYHŠB‚‚BXÛÛ[[Û][”ÚÝÒ[™›Ê’[œÝ[[™ÈÙ\šXÙK‹‹ˆŠB‚B][YK”ÛY\
+L
+ˆ[YK“Z[\ÙXÛÛ™
+B‚BY\œˆHË’[œÝ[
+
+B‚BZYˆ\œˆOHš[Â‚BBKËÈYˆÙ\šXÙH[™XYH^\ÝË]	ÜÈXÝX[HÚØ^H›Üˆ[œÝ[‚BBZYˆÝš[™ÜËÛÛZ[œÊ\œ‹‘\œ›ÜŠ
+K˜[™XYH^\ÝÈŠHÂ‚BBBXÛÛ[[Û][”ÚÝÕØ\›š[™Ê”Ù\šXÙH[™XYH^\ÝÈ
+\È\È›Ü›X[
+HŠB‚BB_H[ÙHÂ‚BBBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈ[œÝ[Ù\šXÙNˆ	]ˆ‹\œŠJB‚BBBXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[Š˜[ÙK’[œÝ[][Ûˆ˜Z[YŠB‚BBB[ÜË‘^]
+JB‚BB_B‚B_B‚BXÛÛ[[Û][”ÚÝÔÝXØÙ\ÜÊ”Ù\šXÙH[œÝ[YŠB‚‚BXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[ŠYK”Ù\šXÙH[œÝ[YHŠB‚BY›]”š[Š
+B‚BXÛÛ[[Û][”ÚÝÒ[™›Ê•\ÙH	ËK\Ù\šXÙHÝ\	ÈÈÝ\HÙ\šXÙHŠB‚‚XØ\ÙH[š[œÝ[Ž‚‚BY\œˆHË•[š[œÝ[
+
+B‚BZYˆ\œˆOHš[Â‚BBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈ[š[œÝ[Ù\šXÙNˆ	]ˆ‹\œŠJB‚BB[ÜË‘^]
+JB‚B_B‚BXÛÛ[[Û][”ÚÝÒ[™›Ê”š[X\Ý\ˆYÙ[Ù\šXÙH[š[œÝ[YÝXØÙ\ÜÙ[HŠB‚‚XØ\ÙHœÝ\Ž‚‚BKËÈÚÝÈ˜[›™\‚‚BXÛÛ[[Û][”ÚÝÐ˜[›™\Š™\œÚ[Û‹Ú]ÛÛ[Z]Z[[YK‘›Y]X[˜YÙ[Y[YÙ[ŠB‚‚BXÛÛ[[Û][”ÚÝÒ[™›Ê”Ý\[™ÈÙ\šXÙK‹‹ˆŠB‚BY\œˆHË”Ý\
+
+B‚BZYˆ\œˆOHš[Â‚BBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈÝ\Ù\šXÙNˆ	]ˆ‹\œŠJB‚BBXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[Š˜[ÙK”Ý\˜Z[YŠB‚BB[ÜË‘^]
+JB‚B_B‚BXÛÛ[[Û][”ÚÝÔÝXØÙ\ÜÊ”Ù\šXÙHÝ\YŠB‚‚BXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[ŠYK”Ù\šXÙHÝ\YHŠB‚‚XØ\ÙHœÝÜŽ‚‚BKËÈÚÝÈ˜[›™\‚‚BXÛÛ[[Û][”ÚÝÐ˜[›™\Š™\œÚ[Û‹Ú]ÛÛ[Z]Z[[YK‘›Y]X[˜YÙ[Y[YÙ[ŠB‚‚BXÛÛ[[Û][”ÚÝÒ[™›Ê”ÝÜ[™ÈÙ\šXÙK‹‹ˆŠB‚BYÛ™HHXZÙJÚ[ˆ›ÛÛ
+B‚BYÛÈÛÛ[[Û][[š[X]T›ÙÜ™\ÜÊ”ÝÜ[™ÈÙ\šXÙH
+X^HZÙH\ÈÌÙXÛÛ™ÊH‹Û™JB‚BY\œˆHË”ÝÜ
+
+B‚BYÛ™HHYB‚‚BZYˆ\œˆOHš[Â‚BBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈÝÜÙ\šXÙNˆ	]ˆ‹\œŠJB‚BBXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[Š˜[ÙK”ÝÜ˜Z[YŠB‚BB[ÜË‘^]
+JB‚B_B‚BXÛÛ[[Û][”ÚÝÔÝXØÙ\ÜÊ”Ù\šXÙHÝÜYŠB‚‚BXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[ŠYK”Ù\šXÙHÝÜYHŠB‚‚XØ\ÙHœÝ]\ÈŽ‚‚BKËÈÚÝÈ˜[›™\‚‚BXÛÛ[[Û][”ÚÝÐ˜[›™\Š™\œÚ[Û‹Ú]ÛÛ[Z]Z[[YK‘›Y]X[˜YÙ[Y[YÙ[ŠB‚‚BKËÈÙ]Ù\šXÙHÝ]\Â‚B\Ý]\ËÝ]\Ñ\œˆHË”Ý]\Ê
+B‚‚BY›]”š[Š
+B‚BXÛÛ[[Û][”ÚÝÒ[™›Ê”Ù\šXÙHÝ]\È[™›Ü›X][ÛˆŠB‚BY›]”š[Š
+B‚‚BKËÈÙ\šXÙHÝ]B‚B]˜\ˆÝ]\Õ^Ý]\ÐÛÛÜˆÝš[™Â‚B\ÝÚ]ÚÝ]\ÈÈËÛ›Û[™^]\Ý]™B‚BXØ\ÙHÙ\šXÙK”Ý]\Ô[›š[™Î‚‚BB\Ý]\Õ^H”•S“’S‘È‚‚BB\Ý]\ÐÛÛÜˆHÛÛ[[Û][ÛÛÜ‘Ü™Y[‚‚BXØ\ÙHÙ\šXÙK”Ý]\ÔÝÜY‚‚BB\Ý]\Õ^H”ÕÔQ‚‚BB\Ý]\ÐÛÛÜˆHÛÛ[[Û][ÛÛÜ–Y[ÝÂ‚BXØ\ÙHÙ\šXÙK”Ý]\Õ[šÛ›ÝÛŽ‚‚BB\Ý]\Õ^H““ÕS”ÕSQ‚‚BB\Ý]\ÐÛÛÜˆHÛÛ[[Û][ÛÛÜ”™Y‚BYY˜][‚‚BB\Ý]\Õ^H•S’Ó“ÕÓˆ‚‚BB\Ý]\ÐÛÛÜˆHÛÛ[[Û][ÛÛÜ‘[B‚B_B‚‚BZYˆÝ]\Ñ\œˆOHš[Â‚BBY›]”š[Šˆ	\ÔÙ\šXÙHÝ]N‰\È	\É\É\È
+	]ŠWˆ‹‚BBBXÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]‚BBB\Ý]\ÐÛÛÜ‹Ý]\Õ^ÛÛ[[Û][ÛÛÜ”™\Ù]‚BBB\Ý]\Ñ\œŠB‚B_H[ÙHÂ‚BBY›]”š[Šˆ	\ÔÙ\šXÙHÝ]N‰\È	\É\É\×ˆ‹‚BBBXÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]‚BBB\Ý]\ÐÛÛÜ‹ÛÛ[[Û][ÛÛÜ›Û
+ÜÝ]\Õ^ÛÛ[[Û][ÛÛÜ”™\Ù]
+B‚B_B‚‚BKËÈÙ\šXÙHÛÛ™šYÝ\˜][Û‚‚BXÙ™ÈHÙ]Ù\šXÙPÛÛ™šYÊ
+B‚BY›]”š[Šˆ	\ÔÙ\šXÙH˜[YN‰\È	\×ˆ‹ÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]Ù™Ë“˜[YJB‚BY›]”š[Šˆ	\Ñ\Ü^H˜[YN‰\È	\×ˆ‹ÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]Ù™Ë‘\Ü^S˜[YJB‚BY›]”š[Šˆ	\Ñ\ØÜš\[ÛŽ‰\È	\×ˆ‹ÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]Ù™Ë‘\ØÜš\[ÛŠB‚BY›]”š[Šˆ	\Ñ]H\™XÝÜžN‰\È	\×ˆ‹ÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]Ù™Ë•ÛÜšÚ[™Ñ\™XÝÜžJB‚‚BKËÈžHÈÙ][Ü™H]Z[ÈÛˆÚ[™ÝÜÂ‚BZYˆ[[YK‘ÓÓÔÈOHÚ[™ÝÜÈˆ	‰ˆÝ]\ÈOHÙ\šXÙK”Ý]\Ô[›š[™ÈÂ‚BBY›]”š[Š
+B‚BBXÛÛ[[Û][”ÚÝÒ[™›ÊÚXÚÚ[™ÈÙ\šXÙH]Z[Ë‹‹ˆŠB‚‚BBKËÈ\ÙHØË™^HÈ]Y\žHÙ\šXÙH›Üˆ[Ü™H[™›Â‚BBXÛYH^XËÛÛ[X[™
+œØÈ‹œ]Y\žH‹Ù™Ë“˜[YJB‚BB[Ý]]\œˆHÛY“Ý]]
+
+B‚BBZYˆ\œˆOHš[Â‚BBB[[™\ÈHÝš[™ÜË”Ü]
+Ýš[™ÊÝ]]
+K—ˆŠB‚BBBY›ÜˆË[™HH˜[™ÙH[™\ÈÂ‚BBBB[[™HHÝš[™ÜË•š[TÜXÙJ[™JB‚BBBBZYˆÝš[™ÜËÛÛZ[œÊ[™K”QŠHÂ‚BBBBBY›]”š[Šˆ	\É\É\×ˆ‹ÛÛ[[Û][ÛÛÜ‘[K[™KÛÛ[[Û][ÛÛÜ”™\Ù]
+B‚BBBB_B‚BBB_B‚BB_B‚‚BBKËÈžHÈÙ]\[YHšXHÛZXÂ‚BBXÛYH^XËÛÛ[X[™
+ÛZXÈ‹œÙ\šXÙH‹Ú\™H‹›]”Üš[Š›˜[YOIÉ\ÉÈ‹Ù™Ë“˜[YJK™Ù]‹”›ØÙ\ÜÒYÝ\Y‹‹Ý˜[YHŠB‚BB[Ý]]\œˆHÛY“Ý]]
+
+B‚BBZYˆ\œˆOHš[Â‚BBBY›]”š[Šˆ	\É\É\×ˆ‹ÛÛ[[Û][ÛÛÜ‘[KÝš[™ÜË•š[TÜXÙJÝš[™ÊÝ]]
+JKÛÛ[[Û][ÛÛÜ”™\Ù]
+B‚BB_B‚B_B‚‚BY›]”š[Š
+B‚‚BKËÈÚÝÈ[[™^Ý\È˜\ÙYÛˆÝ]\Â‚B\ÝÚ]ÚÝ]\ÈÂ‚BXØ\ÙHÙ\šXÙK”Ý]\Ô[›š[™Î‚‚BBXÛÛ[[Û][”ÚÝÒ[™›Ê”Ù\šXÙH\È[›š[™È›Ü›X[HŠB‚BBY›]”š[Š
+B‚BBY›]”š[Šˆ	\ÕÙXˆRN‰\È‹ËÛØØ[ÜÝŽÜˆÎ‹ËÛØØ[ÜÝŽ×ˆ‹ÛÛ[[Û][ÛÛÜ‘[KÛÛ[[Û][ÛÛÜ”™\Ù]
+B‚BXØ\ÙHÙ\šXÙK”Ý]\ÔÝÜY‚‚BBXÛÛ[[Û][”ÚÝÕØ\›š[™Ê”Ù\šXÙH\È[œÝ[Y]›Ý[›š[™ÈH\ÙH	ËK\Ù\šXÙHÝ\	ÈÈÝ\HÙ\šXÙHŠB‚BYY˜][‚‚BBXÛÛ[[Û][”ÚÝÕØ\›š[™Ê”Ù\šXÙH\È›Ý[œÝ[YH\ÙH	ËK\Ù\šXÙH[œÝ[	ÈÈ[œÝ[HÙ\šXÙHŠB‚B_B‚‚BY›]”š[Š
+B‚BXÛÛ[[Û][”›Û\ÐÛÛ[YJ
+B‚‚XØ\ÙHœ™\Ý\Ž‚‚BKËÈÚÝÈ˜[›™\‚‚BXÛÛ[[Û][”ÚÝÐ˜[›™\Š™\œÚ[Û‹Ú]ÛÛ[Z]Z[[YK‘›Y]X[˜YÙ[Y[YÙ[ŠB‚‚BXÛÛ[[Û][”ÚÝÒ[™›Ê”ÝÜ[™ÈÙ\šXÙK‹‹ˆŠB‚BZYˆ\œˆHË”ÝÜ
+
+NÈ\œˆOHš[Â‚BBXÛÛ[[Û][”ÚÝÑ\œ›ÜŠ›]”Üš[Š‘˜Z[YÈÝÜÙ\šXÙNˆ	]ˆ‹\œŠJB‚BBXÛÛ[[Û][”ÚÝÐÛÛ\][Û”ØÜ™Y[Š˜[ÙK”™\Ý\˜ZxÓM7¶‰žËkºwµç}…Ý¥Ñ …ÕÑ ($$$$$$%¥˜Ñ…É•ÑA…ÉÍ•°•ÉÈ€èôÕÉ°¹A…ÉÍ”¡Ñ…É•ÑUI0¤ì•ÉÈ€ôô¹¥°ì($$$$$$$%½½­¥•Ì€èô©…È¹½½­¥•Ì¡Ñ…É•ÑA…ÉÍ•¤($$$$$$$$¼¼•Ð!QQALÍÑ…ÑÕÌ™É½´½¹Ñ•áÐ($$$$$$$%¥Í!QQAL€èô™…±Í”($$$$$$$%¥˜Ø€èôÈ¹½¹Ñ•áÐ ¤¹Y…±Õ”¡¥Í!QQAM½¹Ñ•áÑ-•ä¤ìØ€„ô¹¥°ì($$$$$$$$%¥Í!QQAL€ôØ¸¡‰½½°¤($$$$$$$%ô($$$$$$$%™½È|°½½­¥”€èôÉ…¹”½½­¥•Ìì($$$$$$$$$¼¼I•ÝÉ¥Ñ”½½­¥”Á…Ñ ™½ÈÁÉ½áä($$$$$$$$%¥˜½½­¥”¹A…Ñ €ôô€ˆˆñð½½­¥”¹A…Ñ €ôô€ˆ¼ˆì($$$$$$$$$%½½­¥”¹A…Ñ €ô€ˆ½ÁÉ½áä¼ˆ€¬Í•É¥…°€¬€ˆ¼ˆ($$$$$$$$%ô•±Í”¥˜€…ÍÑÉ¥¹Ì¹!…ÍAÉ•™¥à¡½½­¥”¹A…Ñ °€ˆ½ÁÉ½áä¼ˆ­Í•É¥…°¤ì($$$$$$$$$%½½­¥”¹A…Ñ €ô€ˆ½ÁÉ½áä¼ˆ€¬Í•É¥…°€¬½½­¥”¹A…Ñ ($$$$$$$$%ô($$$$$$$$%½½­¥”¹½µ…¥¸€ô€ˆˆ($$$$$$$$$¼¼M•ÐM•ÕÉ”™±…œ‰…Í•½¸ÕÉÉ•¹Ð½¹¹•Ñ¥½¸ÑåÁ”($$$$$$$$$¼¼%˜…•¹Ð¥Ì…•ÍÍ•Ù¥„!QQAL°­••ÀM•ÕÉ”õÑÉÕ”ì¥˜!QQ@°±•…È¥Ð($$$$$$$$%½½­¥”¹M•ÕÉ”€ô¥Í!QQAL($$$$$$$$%¥˜½½­¥”¹M…µ•M¥Ñ”€ôô€Àì($$$$$$$$$%½½­¥”¹M…µ•M¥Ñ”€ô¡ÑÑÀ¹M…µ•M¥Ñ•1…á5½‘”($$$$$$$$%ô($$$$$$$$%¡ÑÑÀ¹M•Ñ½½­¥”¡Ü°½½­¥”¤($$$$$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÁÉ”µ…ÕÑ Í•Ð½½­¥”ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰¹…µ”ˆ°½½­¥”¹9…µ”°€‰Á…Ñ ˆ°½½­¥”¹A…Ñ °€‰Í•ÕÉ”ˆ°½½­¥”¹M•ÕÉ”¤($$$$$$$%ô($$$$$$%ô(($$$$$$$¼¼I•‘¥É•ÐÑ¼Í…µ”UI0Ñ¼É•±½…Ý¥Ñ ½½­¥•Ì($$$$$$%Ü¹!•…‘•È ¤¹M•Ð ‰1½…Ñ¥½¸ˆ°È¹UI0¹A…Ñ ¤($$$$$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ½Õ¹¤($$$$$$%É•ÑÕÉ¸($$$$$%ô•±Í”ì($$$$$$%…ÁÁ1½•È¹]…É¸ ‰AÉ½áäèÁÉ”µ…ÕÑ ±½¥¸™…¥±•ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$$$$%ô($$$$%ô($$$%ô($$%ô($%ô(($$¼¼É•…Ñ”É•Ù•ÉÍ”ÁÉ½áä¸¥É•Ñ½È¥Ì¥¹Ñ•¹Ñ¥½¹…±±ä±•™ÐÕ¹Í•Ð‰•…ÕÍ”($$¼¼Ñ¡”I•ÝÉ¥Ñ”¡½½¬‰•±½Ü€¡Í•Ð…™Ñ•ÈÉ•‘•¹Ñ¥…°½Í•ÍÍ¥½¸Í•ÑÕÀ¤™Õ±±ä($$¼¼É•Á±…•Ì¥Ð€´I•Ù•ÉÍ•AÉ½áäÁ…¹¥Ì¥˜‰½Ñ ¥É•Ñ½È…¹I•ÝÉ¥Ñ”…É”Í•Ð¸($%ÉÁÉ½áä€èô€™¡ÑÑÁÕÑ¥°¹I•Ù•ÉÍ•AÉ½áåíô(($$¼¼!…¹‘±”™½É´µ‰…Í•±½¥¸¥˜½¹™¥ÕÉ•€¡Í­¥À™½ÈÍÑ…Ñ¥ŒÉ•Í½ÕÉ•Ì¤($%Ù…ÈÍ•ÍÍ¥½¹)…È¡ÑÑÀ¹½½­¥•)…È($%Ù…ÈÈ€©É•‘I•½É($%¥˜€…¥ÍMÑ…Ñ¥I•Í½ÕÉ”ì($$%Ù…È•ÉÈ•ÉÉ½È($$%È°•ÉÈ€ô•ÑÉ•‘Ì¡Í•É¥…°¤($$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäè¡•­¥¹œÉ•‘•¹Ñ¥…±Ìˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰¡…Í}É•‘Ìˆ°È€„ô¹¥°°€‰•Ñ}•ÉÉ½Èˆ°•ÉÈ¤($$%¥˜•ÉÈ€ôô¹¥°€˜˜È€„ô¹¥°ì($$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÉ•‘•¹Ñ¥…±Ì™½Õ¹ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰…ÕÑ¡}ÑåÁ”ˆ°È¹ÕÑ¡QåÁ”°€‰…ÕÑ½}±½¥¸ˆ°È¹ÕÑ½1½¥¸°€‰ÕÍ•É¹…µ”ˆ°È¹UÍ•É¹…µ”¤($$%ô($$%¥˜•ÉÈ€ôô¹¥°€˜˜È€„ô¹¥°€˜˜È¹ÕÑ¡QåÁ”€ôô€‰™½É´ˆ€˜˜È¹ÕÑ½1½¥¸ì($$$%…ÁÁ1½•È¹%¹™¼ ‰AÉ½áäè™½É´…ÕÑ ½¹™¥ÕÉ•™½È‘•Ù¥”ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰µ…¹Õ™…ÑÕÉ•Èˆ°‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È¤($$$$¼¼¡•¬Í•ÍÍ¥½¸…¡”™¥ÉÍÐ€´•ÐÉ•ÑÕÉ¹Ì€©½½­¥•©…È¹)…ÈÝ¡¥ …¸‰”¹¥°($$$%…¡•‘)…È€èôÁÉ½áåM•ÍÍ¥½¹…¡”¹•Ð¡Í•É¥…°¤($$$%¥˜…¡•‘)…È€„ô¹¥°ì($$$$%Í•ÍÍ¥½¹)…È€ô…¡•‘)…È($$$$$¼¼Q•ÍÐ¥˜©…È¥Ì…ÑÕ…±±äÕÍ…‰±”‰äÑÉå¥¹œÑ¼•Ð½½­¥•Ì($$$$%™Õ¹Œ ¤ì($$$$$%‘•™•È™Õ¹Œ ¤ì($$$$$$%¥˜È€èôÉ•½Ù•È ¤ìÈ€„ô¹¥°ì($$$$$$$%…ÁÁ1½•È¹]…É¸ ‰AÉ½áäè…¡•©…È¥Ì¥¹Ù…±¥°±•…É¥¹œˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰•ÉÉ½Èˆ°™µÐ¹MÁÉ¥¹Ñ˜ ˆ•Øˆ°È¤¤($$$$$$$%Í•ÍÍ¥½¹)…È€ô¹¥°($$$$$$$%ÁÉ½áåM•ÍÍ¥½¹…¡”¹±•…È¡Í•É¥…°¤($$$$$$%ô($$$$$%ô ¤($$$$$%¥˜Ñ…É•ÑA…ÉÍ•°•ÉÈ€èôÕÉ°¹A…ÉÍ”¡Ñ…É•ÑUI0¤ì•ÉÈ€ôô¹¥°ì($$$$$$%|€ôÍ•ÍÍ¥½¹)…È¹½½­¥•Ì¡Ñ…É•ÑA…ÉÍ•¤($$$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÍ•ÍÍ¥½¸…¡”¡•¬€´©…È¥ÌÙ…±¥ˆ°€‰Í•É¥…°ˆ°Í•É¥…°¤($$$$$%ô($$$$%ô ¤($$$%ô($$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÍ•ÍÍ¥½¸…¡”¡•¬ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰…¡•ˆ°Í•ÍÍ¥½¹)…È€„ô¹¥°¤($$$$¼¼È¹A…ÍÍÝ½É¥Ì…±É•…‘äÁ±…¥¹Ñ•áÐ€¡™•Ñ¡•™É½´Í•ÉÙ•È½È‘•ÉåÁÑ•±½…±±ä¤($$$%¥˜Í•ÍÍ¥½¹)…È€ôô¹¥°€˜˜È¹A…ÍÍÝ½É€„ô€ˆˆì($$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäè…ÑÑ•µÁÑ¥¹œ™É•Í ±½¥¸ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰µ…¹Õ™…ÑÕÉ•Èˆ°‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È¤($$$$$¼¼ÑÑ•µÁÐÙ•¹‘½ÈµÍÁ•¥™¥Œ±½¥¸($$$$%¥˜…‘…ÁÑ•È€èôÁÉ½áä¹•Ñ‘…ÁÑ•É½É5…¹Õ™…ÑÕÉ•È¡‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È¤ì…‘…ÁÑ•È€„ô¹¥°ì($$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäè…ÑÑ•µÁÑ¥¹œÙ•¹‘½È±½¥¸ˆ°€‰µ…¹Õ™…ÑÕÉ•Èˆ°‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È°€‰Í•É¥…°ˆ°Í•É¥…°°€‰…‘…ÁÑ•Èˆ°…‘…ÁÑ•È¹9…µ” ¤¤($$$$$%¥˜©…È°•ÉÈ€èô…‘…ÁÑ•È¹1½¥¸¡Ñ…É•ÑUI0°È¹UÍ•É¹…µ”°È¹A…ÍÍÝ½É°…ÁÁ1½•È¤ì•ÉÈ€ôô¹¥°ì($$$$$$%Í•ÍÍ¥½¹)…È€ô©…È($$$$$$%ÁÉ½áåM•ÍÍ¥½¹…¡”¹M•Ð¡Í•É¥…°°©…È¤($$$$$$$¼¼1½œ½½­¥•ÌÑ¡…ÐÝ•É”É••¥Ù•($$$$$$%¥˜Ñ…É•ÑA…ÉÍ•°•ÉÈ€èôÕÉ°¹A…ÉÍ”¡Ñ…É•ÑUI0¤ì•ÉÈ€ôô¹¥°ì($$$$$$$%½½­¥•Ì€èô©…È¹½½­¥•Ì¡Ñ…É•ÑA…ÉÍ•¤($$$$$$$%…ÁÁ1½•È¹%¹™¼ ‰AÉ½áäè±½•¥¹Ñ¼‘•Ù¥”ˆ°€‰µ…¹Õ™…ÑÕÉ•Èˆ°‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È°€‰Í•É¥…°ˆ°Í•É¥…°°€‰…‘…ÁÑ•Èˆ°…‘…ÁÑ•È¹9…µ” ¤°€‰½½­¥•Í}É••¥Ù•ˆ°±•¸¡½½­¥•Ì¤¤($$$$$$$%™½È¤°Œ€èôÉ…¹”½½­¥•Ìì($$$$$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÉ••¥Ù•½½­¥”ˆ°€‰¥¹‘•àˆ°¤°€‰¹…µ”ˆ°Œ¹9…µ”°€‰Ù…±Õ•}±•¹Ñ ˆ°±•¸¡Œ¹Y…±Õ”¤°€‰Á…Ñ ˆ°Œ¹A…Ñ °€‰‘½µ…¥¸ˆ°Œ¹½µ…¥¸¤($$$$$$$%ô($$$$$$%ô•±Í”ì($$$$$$$%…ÁÁ1½•È¹%¹™¼ ‰AÉ½áäè±½•¥¹Ñ¼‘•Ù¥”ˆ°€‰µ…¹Õ™…ÑÕÉ•Èˆ°‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È°€‰Í•É¥…°ˆ°Í•É¥…°°€‰…‘…ÁÑ•Èˆ°…‘…ÁÑ•È¹9…µ” ¤¤($$$$$$%ô($$$$$%ô•±Í”ì($$$$$$%…ÁÁ1½•È¹]…É¹I…Ñ•1¥µ¥Ñ• ‰ÁÉ½áå}±½¥¹|ˆ­Í•É¥…°°€Ô©Ñ¥µ”¹5¥¹ÕÑ”°€‰AÉ½áäè±½¥¸™…¥±•ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$$$$%ô($$$$%ô•±Í”ì($$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäè¹¼…‘…ÁÑ•È™½Õ¹™½Èµ…¹Õ™…ÑÕÉ•Èˆ°€‰µ…¹Õ™…ÑÕÉ•Èˆ°‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È°€‰Í•É¥…°ˆ°Í•É¥…°¤($$$$%ô($$$%ô(($$$$¼¼%˜Ý”¡…Ù”Ù…±¥Í•ÍÍ¥½¸½½­¥•Ì…¹ÕÍ•È¥Ì…•ÍÍ¥¹œ„±½¥¸½Á…ÍÍÝ½ÉÁ…”°($$$$¼¼É•‘¥É•ÐÑ¡•´Ñ¼Ñ¡”¡½µ”Á…”¥¹ÍÑ•…€¡…ÕÑ½±½¥¸‰åÁ…ÍÌ¤($$$%¥˜Í•ÍÍ¥½¹)…È€„ô¹¥°ì($$$$$¼¼	Õ¥±Ñ…É•ÐÁ…Ñ ™¥ÉÍÐÑ¼¡•¬¥Ð($$$$%Ñ…É•ÑA…Ñ €èô€ˆ¼ˆ($$$$%¥˜±•¸¡Á…Ñ¡A…ÉÑÌ¤€ø€Äì($$$$$%Ñ…É•ÑA…Ñ €ô€ˆ¼ˆ€¬ÍÑÉ¥¹Ì¹)½¥¸¡Á…Ñ¡A…ÉÑÍlÄét°€ˆ¼ˆ¤($$$$%ô($$$$%Ñ…É•ÑA…Ñ €ôÍÑÉ¥¹Ì¹I•Á±…•±°¡Ñ…É•ÑA…Ñ °€ˆ¼¼ˆ°€ˆ¼ˆ¤(($$$$%±½¥¹A…Ñ¡Ì€èômuÍÑÉ¥¹ì($$$$$$ˆ½AIM9QQ%=8½Y9½AMM]=Iˆ°($$$$$$ˆ½±½¥¸ˆ°($$$$$$ˆ½…ÕÑ ˆ°($$$$%ô($$$$%™½È|°±½¥¹A…Ñ €èôÉ…¹”±½¥¹A…Ñ¡Ìì($$$$$%¥˜ÍÑÉ¥¹Ì¹!…ÍAÉ•™¥à¡ÍÑÉ¥¹Ì¹Q½UÁÁ•È¡Ñ…É•ÑA…Ñ ¤°ÍÑÉ¥¹Ì¹Q½UÁÁ•È¡±½¥¹A…Ñ ¤¤ì($$$$$$%…ÁÁ1½•È¹%¹™¼ ‰AÉ½áäèÉ•‘¥É•Ñ¥¹œ…ÕÑ¡•¹Ñ¥…Ñ•ÕÍ•È™É½´±½¥¸Á…”Ñ¼¡½µ”ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰½É¥¥¹…±}Á…Ñ ˆ°Ñ…É•ÑA…Ñ ¤(($$$$$$$¼¼M•¹M•Ðµ½½­¥”¡•…‘•ÉÌÑ¼‰É½ÝÍ•ÈÍ¼¥ÐÍÑ½É•ÌÑ¡”Í•ÍÍ¥½¸½½­¥•Ì($$$$$$%¥˜Ñ…É•ÑA…ÉÍ•°•ÉÈ€èôÕÉ°¹A…ÉÍ”¡Ñ…É•ÑUI0¤ì•ÉÈ€ôô¹¥°ì($$$$$$$%½½­¥•Ì€èôÍ•ÍÍ¥½¹)…È¹½½­¥•Ì¡Ñ…É•ÑA…ÉÍ•¤($$$$$$$%ÁÉ½áåAÉ•™¥à€èô€ˆ½ÁÉ½áä¼ˆ€¬Í•É¥…°($$$$$$$$¼¼•Ñ•Éµ¥¹”¥˜Ý”É”½¸!QQALÑ¼Í•ÐM•ÕÉ”™±…œ…ÁÁÉ½ÁÉ¥…Ñ•±ä($$$$$$$%¥ÍM•ÕÉ”€èô™…±Í”($$$$$$$%¥˜Ø€èôÈ¹½¹Ñ•áÐ ¤¹Y…±Õ”¡¥Í!QQAM½¹Ñ•áÑ-•ä¤ìØ€„ô¹¥°ì($$$$$$$$%¥ÍM•ÕÉ”€ôØ¸¡‰½½°¤($$$$$$$%ô($$$$$$$%™½È|°½½­¥”€èôÉ…¹”½½­¥•Ìì($$$$$$$$$¼¼±½¹”Ñ¡”½½­¥”…¹É•ÝÉ¥Ñ”Á…Ñ ™½ÈÁÉ½áä($$$$$$$$%‰É½ÝÍ•É½½­¥”€èô€™¡ÑÑÀ¹½½­¥•ì($$$$$$$$$%9…µ”è€€€€½½­¥”¹9…µ”°($$$$$$$$$%Y…±Õ”è€€€½½­¥”¹Y…±Õ”°($$$$$$$$$%A…Ñ è€€€€ÁÉ½áåAÉ•™¥à€¬€ˆ¼ˆ°($$$$$$$$$%½µ…¥¸è€€€ˆˆ°($$$$$$$$$%5…á”è€€½½­¥”¹5…á”°($$$$$$$$$%M•ÕÉ”è€€¥ÍM•ÕÉ”°($$$$$$$$$%!ÑÑÁ=¹±äè½½­¥”¹!ÑÑÁ=¹±ä°($$$$$$$$$%M…µ•M¥Ñ”è¡ÑÑÀ¹M…µ•M¥Ñ•1…á5½‘”°($$$$$$$$%ô($$$$$$$$%¡ÑÑÀ¹M•Ñ½½­¥”¡Ü°‰É½ÝÍ•É½½­¥”¤($$$$$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÍ•¹‘¥¹œM•Ðµ½½­¥”Ñ¼‰É½ÝÍ•Èˆ°€‰¹…µ”ˆ°½½­¥”¹9…µ”°€‰Á…Ñ ˆ°‰É½ÝÍ•É½½­¥”¹A…Ñ ¤($$$$$$$%ô($$$$$$%ô(($$$$$$$¼¼M•¹!Q50Ñ¡…ÐÉ•‘¥É•ÑÌÑ¡”Ñ½Àµ±•Ù•°™É…µ”€¡¹½Ð©ÕÍÐ¥™É…µ”¤($$$$$$$¼¼Q¡¥Ì•¹ÍÕÉ•ÌÑ¡”•¹Ñ¥É”Á…”É•±½…‘ÌÝ¥Ñ ½½­¥•Ì°¹½Ð©ÕÍÐÑ¡”¥™É…µ”($$$$$$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰Ñ•áÐ½¡Ñµ°ì¡…ÉÍ•ÐõÕÑ˜´àˆ¤($$$$$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ=,¤($$$$$$$¼¼Í…Á”Í•É¥…°™½ÈÍ…™”!Q50•µ‰•‘‘¥¹œÑ¼ÁÉ•Ù•¹ÐaML($$$$$$%Í…™•M•É¥…°€èô¡Ñµ°¹Í…Á•MÑÉ¥¹œ¡Í•É¥…°¤($$$$$$%É•‘¥É•Ñ!Q50€èô™µÐ¹MÁÉ¥¹Ñ˜¡€ð…=QeA¡Ñµ°ø(ñ¡Ñµ°ø(ñ¡•…ø(ñµ•Ñ„¡…ÉÍ•Ðô‰ÕÑ˜´àˆø(ñÑ¥Ñ±”ù1½•%¸€´I•‘¥É•Ñ¥¹œ¸¸¸ð½Ñ¥Ñ±”ø(ñÍÉ¥ÁÐø(¼¼I•‘¥É•ÐÑ¡”Ñ½Àµ±•Ù•°Ý¥¹‘½ÜÑ¼•¹ÍÕÉ”™Õ±°Á…”É•±½…Ý¥Ñ ½½­¥•Ì)Ý¥¹‘½Ü¹Ñ½À¹±½…Ñ¥½¸¹¡É•˜€ô€œ½ÁÉ½áä¼•Ì¼œì(ð½ÍÉ¥ÁÐø(ð½¡•…ø(ñ‰½‘äø(ñÀù1½¥¸ÍÕ•ÍÍ™Õ°¸I•‘¥É•Ñ¥¹œ¸¸¸ð½Àø(ñ¹½ÍÉ¥ÁÐø(ñÀùA±•…Í”•¹…‰±”)…Ù…MÉ¥ÁÐ½È€ñ„¡É•˜ôˆ½ÁÉ½áä¼•Ì¼ˆù±¥¬¡•É”ð½„øÑ¼½¹Ñ¥¹Õ”¸ð½Àø(ð½¹½ÍÉ¥ÁÐø(ð½‰½‘äø(ð½¡Ñµ°ù€°Í…™•M•É¥…°°Í…™•M•É¥…°¤($$$$$$%™µÐ¹ÁÉ¥¹Ð¡Ü°É•‘¥É•Ñ!Q50¤($$$$$$%É•ÑÕÉ¸($$$$$%ô($$$$%ô($$$%ô($$%ô($%ô€¼¼¹¥˜€…¥ÍMÑ…Ñ¥I•Í½ÕÉ”(($$¼¼I•ÝÉ¥Ñ”É•ÅÕ•ÍÐÁ…Ñ Ñ¼É•µ½Ù”€½ÁÉ½áä¼ñÍ•É¥…°øÁÉ•™¥à	=IÍ•ÑÑ¥¹œ¥É•Ñ½È($%½É¥¥¹…±A…Ñ €èôÈ¹UI0¹A…Ñ ($$¼¼I•ÕÍ”Ñ…É•ÑA…Ñ ¥˜…±É•…‘ä½µÁÕÑ•°½Ñ¡•ÉÝ¥Í”…±Õ±…Ñ”¥Ð($%¥˜Ñ…É•ÑA…Ñ €ôô€ˆ¼ˆ€˜˜±•¸¡Á…Ñ¡A…ÉÑÌ¤€ø€Äì($$%Ñ…É•ÑA…Ñ €ô€ˆ¼ˆ€¬ÍÑÉ¥¹Ì¹)½¥¸¡Á…Ñ¡A…ÉÑÍlÄét°€ˆ¼ˆ¤($%ô($$¼¼±•…¸ÕÀ‘½Õ‰±”Í±…Í¡•Ì($%Ñ…É•ÑA…Ñ €ôÍÑÉ¥¹Ì¹I•Á±…•±°¡Ñ…É•ÑA…Ñ °€ˆ¼¼ˆ°€ˆ¼ˆ¤(($$¼¼AÉ½áäÁÉ•™¥à™½ÈÑ¡¥Ì‘•Ù¥”ÌÍ•É¥…°°ÕÍ•™½ÈUI0É•ÝÉ¥Ñ¥¹œ…¹¡•…‘•È…‘©ÕÍÑµ•¹ÑÌ($%ÁÉ½áåAÉ•™¥à€èô€ˆ½ÁÉ½áä¼ˆ€¬Í•É¥…°(($$¼¼…ÁÑÕÉ”Í•ÍÍ¥½¹)…È™½ÈÍ…™”±½ÍÕÉ”…•ÍÌ€¡…Ù½¥É…•Ì¤($%…ÁÑÕÉ•‘)…È€èôÍ•ÍÍ¥½¹)…È(($$¼¼I•ÝÉ¥Ñ”É•ÅÕ•ÍÑÌÕÍ¥¹œÑ¡”µ½‘•É¸I•Ù•ÉÍ•AÉ½áä¡½½¬¸($%ÉÁÉ½áä¹I•ÝÉ¥Ñ”€ô™Õ¹Œ¡ÁÈ€©¡ÑÑÁÕÑ¥°¹AÉ½áåI•ÅÕ•ÍÐ¤ì($$%É•Ä€èôÁÈ¹=ÕÐ(($$$¼¼	…Í”É•ÝÉ¥Ñ”‰•¡…Ù¥½ÈÑ¼Í•ÐUI0½!½ÍÐ½A…Ñ ($$%ÁÈ¹M•ÑUI0¡Ñ…É•Ð¤($$%É•Ä¹UI0¹M¡•µ”€ôÑ…É•Ð¹M¡•µ”($$%É•Ä¹UI0¹!½ÍÐ€ôÑ…É•Ð¹!½ÍÐ($$%É•Ä¹UI0¹A…Ñ €ôÑ…É•ÑA…Ñ ($$%É•Ä¹!½ÍÐ€ôÑ…É•Ð¹!½ÍÐ($$$¼¼½É”¥‘•¹Ñ¥Ñä•¹½‘¥¹œÍ¼ÕÁÍÑÉ•…´‘½•Í¸Ðé¥ÀìÍ¥µÁ±¥™¥•Ì…¹ä½¹Ñ•¹ÐÉ•ÝÉ¥Ñ¥¹œ($$$¼¼…¹…Ù½¥‘Ìµ¥Íµ…Ñ¡•½¹Ñ•¹Ðµ¹½‘¥¹œ¡•…‘•ÉÌÝ¡•¸Ý”É•Á±…”‰½‘¥•Ì¸($$%É•Ä¹!•…‘•È¹•° ‰•ÁÐµ¹½‘¥¹œˆ¤(($$$¼¼I•ÝÉ¥Ñ”I•™•É•È…¹=É¥¥¸¡•…‘•ÉÌÑ¼Ñ¡”ÕÁÍÑÉ•…´½É¥¥¸Í¼Ù•¹‘½ÈU%ÌÑ¡…Ð•¹™½É”($$$¼¼MI½¡½ÍÐ¡•­Ì‘½¸ÐÉ•©•ÐÁÉ½á¥•™½É´Á½ÍÑÌ½Èa!HÉ•ÅÕ•ÍÑÌ¸($$%¥˜É•˜€èôÁÈ¹%¸¹!•…‘•È¹•Ð ‰I•™•É•Èˆ¤ìÉ•˜€„ô€ˆˆì($$$%¥˜Ô°•ÉÈ€èôÕÉ°¹A…ÉÍ”¡É•˜¤ì•ÉÈ€ôô¹¥°ì($$$$%¥˜ÍÑÉ¥¹Ì¹!…ÍAÉ•™¥à¡Ô¹A…Ñ °ÁÉ½áåAÉ•™¥à¤ì($$$$$%ÕÁA…Ñ €èôÍÑÉ¥¹Ì¹QÉ¥µAÉ•™¥à¡Ô¹A…Ñ °ÁÉ½áåAÉ•™¥à¤($$$$$%¥˜ÕÁA…Ñ €ôô€ˆˆì($$$$$$%ÕÁA…Ñ €ô€ˆ¼ˆ($$$$$%ô($$$$$%¹•ÝI•˜€èôÑ…É•Ð¹M¡•µ”€¬€ˆè¼¼ˆ€¬Ñ…É•Ð¹!½ÍÐ€¬ÕÁA…Ñ ($$$$$%¥˜Ô¹I…ÝEÕ•Éä€„ô€ˆˆì($$$$$$%¹•ÝI•˜€¬ô€ˆüˆ€¬Ô¹I…ÝEÕ•Éä($$$$$%ô($$$$$%¥˜Ô¹É…µ•¹Ð€„ô€ˆˆì($$$$$$%¹•ÝI•˜€¬ô€ˆŒˆ€¬Ô¹É…µ•¹Ð($$$$$%ô($$$$$%…ÁÁ1½•È¹QÉ…•Q…œ ‰ÁÉ½áå}É•ÝÉ¥Ñ”ˆ°€‰I•ÝÉ¥Ñ¥¹œI•™•É•È¡•…‘•Èˆ°€‰½É¥¥¹…°ˆ°É•˜°€‰É•ÝÉ¥ÑÑ•¸ˆ°¹•ÝI•˜¤($$$$$%É•Ä¹!•…‘•È¹M•Ð ‰I•™•É•Èˆ°¹•ÝI•˜¤($$$$%ô($$$%ô($$%ô(($$%¥˜½É¥=É¥¥¸€èôÁÈ¹%¸¹!•…‘•È¹•Ð ‰=É¥¥¸ˆ¤ì½É¥=É¥¥¸€„ô€ˆˆì($$$%¹•Ý=É¥¥¸€èôÑ…É•Ð¹M¡•µ”€¬€ˆè¼¼ˆ€¬Ñ…É•Ð¹!½ÍÐ($$$%…ÁÁ1½•È¹QÉ…•Q…œ ‰ÁÉ½áå}É•ÝÉ¥Ñ”ˆ°€‰I•ÝÉ¥Ñ¥¹œ=É¥¥¸¡•…‘•Èˆ°€‰½É¥¥¹…°ˆ°½É¥=É¥¥¸°€‰É•ÝÉ¥ÑÑ•¸ˆ°¹•Ý=É¥¥¸¤($$$%É•Ä¹!•…‘•È¹M•Ð ‰=É¥¥¸ˆ°¹•Ý=É¥¥¸¤($$%ô(($$$¼¼‘ÕÑ¡½É¥é…Ñ¥½¸™½È	…Í¥Œ…ÕÑ ($$$¼¼È¹A…ÍÍÝ½É¥Ì…±É•…‘äÁ±…¥¹Ñ•áÐ€¡™•Ñ¡•™É½´Í•ÉÙ•È½È‘•ÉåÁÑ•±½…±±ä¤($$%¥˜È°•ÉÈ€èô•ÑÉ•‘Ì¡Í•É¥…°¤ì•ÉÈ€ôô¹¥°€˜˜È€„ô¹¥°€˜˜È¹ÕÑ¡QåÁ”€ôô€‰‰…Í¥Œˆ€˜˜È¹ÕÑ½1½¥¸€˜˜È¹A…ÍÍÝ½É€„ô€ˆˆì($$$%ÕÍ•ÉÁ…ÍÌ€èôÈ¹UÍ•É¹…µ”€¬€ˆèˆ€¬È¹A…ÍÍÝ½É($$$%É•Ä¹!•…‘•È¹M•Ð ‰ÕÑ¡½É¥é…Ñ¥½¸ˆ°€‰	…Í¥Œ€ˆ­‰…Í¥ÕÑ ¡ÕÍ•ÉÁ…ÍÌ¤¤($$%ô(($$$¼¼ÑÑ… ½½­¥•Ì™½È™½É´…ÕÑ ($$$¼¼½Õ‰±”µ¡•¬©…È¥ÌÙ…±¥Ñ¼ÁÉ•Ù•¹ÐÉ…”½¹‘¥Ñ¥½¹Ì($$%¥˜…ÁÑÕÉ•‘)…È€„ô¹¥°€˜˜Ñ…É•Ð€„ô¹¥°ì($$$$¼¼M…™•±ä•Ð½½­¥•ÌÝ¥Ñ ¹¥°¡•¬($$$%™Õ¹Œ ¤ì($$$$%‘•™•È™Õ¹Œ ¤ì($$$$$%¥˜È€èôÉ•½Ù•È ¤ìÈ€„ô¹¥°ì($$$$$$%…ÁÁ1½•È¹]…É¸ ‰AÉ½áäèÁ…¹¥Œ•ÑÑ¥¹œ½½­¥•Ìˆ°€‰•ÉÉ½Èˆ°™µÐ¹MÁÉ¥¹Ñ˜ ˆ•Øˆ°È¤¤($$$$$%ô($$$$%ô ¤($$$$%¥˜½½­¥•Ì€èô…ÁÑÕÉ•‘)…È¹½½­¥•Ì¡Ñ…É•Ð¤ì±•¸¡½½­¥•Ì¤€ø€Àì($$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäI•ÝÉ¥Ñ”è…ÑÑ…¡¥¹œ½½­¥•Ìˆ°€‰Á…Ñ ˆ°É•Ä¹UI0¹A…Ñ °€‰½½­¥•}½Õ¹Ðˆ°±•¸¡½½­¥•Ì¤¤($$$$$%™½È|°Œ€èôÉ…¹”½½­¥•Ìì($$$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäI•ÝÉ¥Ñ”è…‘‘¥¹œ½½­¥”ˆ°€‰¹…µ”ˆ°Œ¹9…µ”°€‰Ù…±Õ•}±•¹Ñ ˆ°±•¸¡Œ¹Y…±Õ”¤¤($$$$$$%É•Ä¹‘‘½½­¥”¡Œ¤($$$$$%ô($$$$%ô•±Í”ì($$$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäI•ÝÉ¥Ñ”è¹¼½½­¥•ÌÑ¼…ÑÑ… ˆ°€‰Á…Ñ ˆ°É•Ä¹UI0¹A…Ñ °€‰¡…Í}©…Èˆ°…ÁÑÕÉ•‘)…È€„ô¹¥°¤($$$$%ô($$$%ô ¤($$%ô•±Í”ì($$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäI•ÝÉ¥Ñ”èÍ­¥ÁÁ¥¹œ½½­¥•Ìˆ°€‰¡…Í}©…Èˆ°…ÁÑÕÉ•‘)…È€„ô¹¥°°€‰¡…Í}Ñ…É•Ðˆ°Ñ…É•Ð€„ô¹¥°°€‰Á…Ñ ˆ°É•Ä¹UI0¹A…Ñ ¤($$%ô($%ô(($$¼¼½¹™¥ÕÉ”ÑÉ…¹ÍÁ½ÉÐ€´ÕÍ”UMÑÉ…¹ÍÁ½ÉÐ™½ÈUM‘•Ù¥•Ì°!QQ@ÑÉ…¹ÍÁ½ÉÐ™½È¹•ÑÝ½É¬($%¥˜ÕÍ‰QÉ…¹ÍÁ½ÉÐ€„ô¹¥°ì($$%ÉÁÉ½áä¹QÉ…¹ÍÁ½ÉÐ€ôÕÍ‰QÉ…¹ÍÁ½ÉÐ($%ô•±Í”ì($$%ÉÁÉ½áä¹QÉ…¹ÍÁ½ÉÐ€ô€™¡ÑÑÀ¹QÉ…¹ÍÁ½ÉÑì($$$%Q1M±¥•¹Ñ½¹™¥œè€™Ñ±Ì¹½¹™¥ì($$$$$¼¼AÉ¥¹Ñ•È•ÉÑ¥™¥…Ñ•ÌµÕÍÐ‰”Ù…±¥‘…Ñ•……¥¹ÍÐÑ¡”ÍåÍÑ•´ÑÉÕÍÐ($$$$$¼¼ÍÑ½É”€¡½È…¸•áÁ±¥¥Ñ±ä½¹™¥ÕÉ•¤¸€•ÁÑ¥¹œ…¹ä•ÉÑ¥™¥…Ñ”($$$$$¼¼Ý½Õ±…±±½Ü„18…ÑÑ…­•ÈÑ¼…ÁÑÕÉ”ÁÉ¥¹Ñ•ÈÉ•‘•¹Ñ¥…±Ì½½½­¥•Ì¸($$$$%5¥¹Y•ÉÍ¥½¸èÑ±Ì¹Y•ÉÍ¥½¹Q1LÄÈ°($$$%ô°($$$%5…á%‘±•½¹¹Ìè€€€€€€€€€€ÄÀ°($$$%%‘±•½¹¹Q¥µ•½ÕÐè€€€€€€€ØÀ€¨Ñ¥µ”¹M•½¹°($$$%¥Í…‰±•½µÁÉ•ÍÍ¥½¸è€€€™…±Í”°($$$%¥Í…‰±•-••Á±¥Ù•Ìè€€€€™…±Í”°($$$%I•ÍÁ½¹Í•!•…‘•ÉQ¥µ•½ÕÐè€ÌÀ€¨Ñ¥µ”¹M•½¹°($$$%¥…±½¹Ñ•áÐè€ ™¹•Ð¹¥…±•Éì($$$$%Q¥µ•½ÕÐè€€€ÄÔ€¨Ñ¥µ”¹M•½¹°($$$$%-••Á±¥Ù”è€ÌÀ€¨Ñ¥µ”¹M•½¹°($$$%ô¤¹¥…±½¹Ñ•áÐ°($$%ô($%ô(($%…ÁÁ1½•È¹QÉ…•Q…œ ‰ÁÉ½áå}É•ÅÕ•ÍÐˆ°€‰AÉ½áäÉ•ÅÕ•ÍÐˆ°€‰µ•Ñ¡½ˆ°È¹5•Ñ¡½°€‰Á…Ñ ˆ°½É¥¥¹…±A…Ñ °€‰ÁÉ•™¥àˆ°ÁÉ½áåAÉ•™¥à°€‰Ñ…É•Ðˆ°Ñ…É•Ð¹MÑÉ¥¹œ ¤°€‰Ñ…É•Ñ}Á…Ñ ˆ°Ñ…É•ÑA…Ñ ¤(($$¼¼5½‘¥™äÉ•ÍÁ½¹Í”Ñ¼É•ÝÉ¥Ñ”UI1Ì¥¸½¹Ñ•¹Ð…¹¡•…‘•ÉÌ($%ÉÁÉ½áä¹5½‘¥™åI•ÍÁ½¹Í”€ô™Õ¹Œ¡É•ÍÀ€©¡ÑÑÀ¹I•ÍÁ½¹Í”¤•ÉÉ½Èì($$%¥˜É•ÍÀ€ôô¹¥°ñðÉ•ÍÀ¹	½‘ä€ôô¹¥°ì($$$%É•ÑÕÉ¸¹¥°($$%ô($$%¥˜É•ÍÀ¹½¹Ñ•¹Ñ1•¹Ñ €øµ…á•¹ÑAÉ½áåI•ÍÁ½¹Í•	½‘åM¥é”ì($$$%É•ÑÕÉ¸™µÐ¹ÉÉ½É˜ ‰ÁÉ½áäÉ•ÍÁ½¹Í”‰½‘ä•á••‘Ì€•‰åÑ•Ìˆ°µ…á•¹ÑAÉ½áåI•ÍÁ½¹Í•	½‘åM¥é”¤($$%ô($$$¼¼I•ÝÉ¥Ñ”M•Ðµ½½­¥”¡•…‘•ÉÌÑ¼¥¹±Õ‘”Ñ¡”ÁÉ½áäÁ…Ñ ($$$¼¼Q¡¥Ì•¹ÍÕÉ•ÌÑ¡”‰É½ÝÍ•ÈÍÑ½É•Ì½½­¥•Ì…¹¥¹±Õ‘•ÌÑ¡•´¥¸¥™É…µ”É•ÅÕ•ÍÑÌ($$%¥˜½½­¥•Ì€èôÉ•ÍÀ¹½½­¥•Ì ¤ì±•¸¡½½­¥•Ì¤€ø€Àì($$$%É•ÍÀ¹!•…‘•È¹•° ‰M•Ðµ½½­¥”ˆ¤($$$$¼¼•Ð!QQALÍÑ…ÑÕÌ™É½´½¹Ñ•áÐ($$$%¥Í!QQAL€èô™…±Í”($$$%¥˜É•ÍÀ¹I•ÅÕ•ÍÐ€„ô¹¥°€˜˜É•ÍÀ¹I•ÅÕ•ÍÐ¹½¹Ñ•áÐ ¤€„ô¹¥°ì($$$$%¥˜Ø€èôÉ•ÍÀ¹I•ÅÕ•ÍÐ¹½¹Ñ•áÐ ¤¹Y…±Õ”¡¥Í!QQAM½¹Ñ•áÑ-•ä¤ìØ€„ô¹¥°ì($$$$$%¥Í!QQAL€ôØ¸¡‰½½°¤($$$$%ô($$$%ô($$$%™½È|°½½­¥”€èôÉ…¹”½½­¥•Ìì($$$$$¼¼I•ÝÉ¥Ñ”½½­¥”Á…Ñ Ñ¼‰”É•±…Ñ¥Ù”Ñ¼ÁÉ½áäÁÉ•™¥à($$$$%¥˜½½­¥”¹A…Ñ €ôô€ˆˆñð½½­¥”¹A…Ñ €ôô€ˆ¼ˆì($$$$$%½½­¥”¹A…Ñ €ôÁÉ½áåAÉ•™¥à€¬€ˆ¼ˆ($$$$%ô•±Í”¥˜€…ÍÑÉ¥¹Ì¹!…ÍAÉ•™¥à¡½½­¥”¹A…Ñ °ÁÉ½áåAÉ•™¥à¤ì($$$$$%½½­¥”¹A…Ñ €ôÁÉ½áåAÉ•™¥à€¬½½­¥”¹A…Ñ ($$$$%ô($$$$$¼¼±•…È‘½µ…¥¸Í¥¹”Ý”É”ÁÉ½áå¥¹œÑ¼„‘¥™™•É•¹Ð¡½ÍÐ($$$$%½½­¥”¹½µ…¥¸€ô€ˆˆ($$$$$¼¼M•ÐM•ÕÉ”™±…œ‰…Í•½¸½¹¹•Ñ¥½¸ÑåÁ”($$$$$¼¼%˜…•¹Ð¥Ì…•ÍÍ•Ù¥„!QQAL°­••ÀM•ÕÉ”õÑÉÕ”ì¥˜!QQ@°±•…È¥Ð($$$$%½½­¥”¹M•ÕÉ”€ô¥Í!QQAL($$$$$¼¼M•ÐM…µ•M¥Ñ”Ñ¼1…àÑ¼…±±½Ü¥™É…µ”É•ÅÕ•ÍÑÌ($$$$%¥˜½½­¥”¹M…µ•M¥Ñ”€ôô€Àì($$$$$%½½­¥”¹M…µ•M¥Ñ”€ô¡ÑÑÀ¹M…µ•M¥Ñ•1…á5½‘”($$$$%ô($$$$%É•ÍÀ¹!•…‘•È¹‘ ‰M•Ðµ½½­¥”ˆ°½½­¥”¹MÑÉ¥¹œ ¤¤($$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäèÉ•ÝÉ¥Ñ¥¹œM•Ðµ½½­¥”™½È‰É½ÝÍ•Èˆ°€‰¹…µ”ˆ°½½­¥”¹9…µ”°€‰Á…Ñ ˆ°½½­¥”¹A…Ñ °€‰Í•ÕÉ”ˆ°½½­¥”¹M•ÕÉ”¤($$$%ô($$%ô(($$$¼¼I•ÝÉ¥Ñ”1½…Ñ¥½¸¡•…‘•È™½ÈÉ•‘¥É•ÑÌÑ¼ÍÑ…äÝ¥Ñ¡¥¸ÁÉ½áäÁ…Ñ ($$%¥˜±½Œ€èôÉ•ÍÀ¹!•…‘•È¹•Ð ‰1½…Ñ¥½¸ˆ¤ì±½Œ€„ô€ˆˆì($$$%¥˜±½UI0°•ÉÈ€èôÕÉ°¹A…ÉÍ”¡±½Œ¤ì•ÉÈ€ôô¹¥°ì($$$$$¼¼I•ÝÉ¥Ñ”É•±…Ñ¥Ù”½ÈÍ…µ”µ¡½ÍÐ…‰Í½±ÕÑ”UI1Ì($$$$%¥˜±½UI0¹!½ÍÐ€ôô€ˆˆñð±½UI0¹!½ÍÐ€ôôÑ…É•Ð¹!½ÍÐì($$$$$%¹•ÝA…Ñ €èô±½UI0¹A…Ñ ($$$$$%¥˜¹•ÝA…Ñ €ôô€ˆˆì($$$$$$%¹•ÝA…Ñ €ô€ˆ¼ˆ($$$$$%ô($$$$$%¹•Ý1½Œ€èôÁÉ½áåAÉ•™¥à€¬¹•ÝA…Ñ ($$$$$%¥˜±½UI0¹I…ÝEÕ•Éä€„ô€ˆˆì($$$$$$%¹•Ý1½Œ€¬ô€ˆüˆ€¬±½UI0¹I…ÝEÕ•Éä($$$$$%ô($$$$$%¥˜±½UI0¹É…µ•¹Ð€„ô€ˆˆì($$$$$$%¹•Ý1½Œ€¬ô€ˆŒˆ€¬±½UI0¹É…µ•¹Ð($$$$$%ô($$$$$%É•ÍÀ¹!•…‘•È¹M•Ð ‰1½…Ñ¥½¸ˆ°¹•Ý1½Œ¤($$$$%ô($$$%ô($$%ô(($$$¼¼MÑÉ¥À¡•…‘•ÉÌÑ¡…ÐÁÉ•Ù•¹Ð¥™É…µ”•µ‰•‘‘¥¹œ($$%É•ÍÀ¹!•…‘•È¹•° ‰`µÉ…µ”µ=ÁÑ¥½¹Ìˆ¤($$%É•ÍÀ¹!•…‘•È¹•° ‰½¹Ñ•¹ÐµM•ÕÉ¥ÑäµA½±¥äˆ¤(($$$¼¼I•ÝÉ¥Ñ”!Q50½ML½)L½¹Ñ•¹ÐÑ¼™¥àÉ•±…Ñ¥Ù”UI1Ì($$%½¹Ñ•¹ÑQåÁ”€èôÉ•ÍÀ¹!•…‘•È¹•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ¤($$%Í¡½Õ±‘I•ÝÉ¥Ñ”€èôÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰Ñ•áÐ½¡Ñµ°ˆ¤ñð($$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰Ñ•áÐ½ÍÌˆ¤ñð($$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰…ÁÁ±¥…Ñ¥½¸½©…Ù…ÍÉ¥ÁÐˆ¤ñð($$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰Ñ•áÐ½©…Ù…ÍÉ¥ÁÐˆ¤ñð($$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰…ÁÁ±¥…Ñ¥½¸½àµ©…Ù…ÍÉ¥ÁÐˆ¤(($$%¥˜Í¡½Õ±‘I•ÝÉ¥Ñ”ì($$$%‰½‘ä°•ÉÈ€èôÉ•…‘	½Õ¹‘•‘AÉ½áåI•ÍÁ½¹Í”¡É•ÍÀ¹	½‘ä¤($$$%¥˜•ÉÈ€„ô¹¥°ì($$$$%É•ÑÕÉ¸•ÉÈ($$$%ô(($$$%½¹Ñ•¹Ð€èôÍÑÉ¥¹œ¡‰½‘ä¤($$$%…ÁÁ1½•È¹QÉ…•Q…œ ‰ÁÉ½áå}‰½‘å}É•ÝÉ¥Ñ”ˆ°€‰I•ÝÉ¥Ñ¥¹œÉ•ÍÁ½¹Í”‰½‘äˆ°€‰½¹Ñ•¹Ñ}ÑåÁ”ˆ°½¹Ñ•¹ÑQåÁ”°€‰½É¥¥¹…±}Í¥é”ˆ°±•¸¡‰½‘ä¤°€‰Á…Ñ ˆ°Ñ…É•ÑA…Ñ ¤($$$%¥Í!Q50€èôÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰Ñ•áÐ½¡Ñµ°ˆ¤($$$%¥ÍML€èôÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹ÑQåÁ”°€‰Ñ•áÐ½ÍÌˆ¤(($$$$¼¼I•ÝÉ¥Ñ”½µµ½¸UI0Á…ÑÑ•É¹Ì¥¸!Q50½ML½)L($$$$¼¼¥à…‰Í½±ÕÑ”Á…Ñ¡Ìè¡É•˜ôˆ½Á…Ñ ˆ€´ø¡É•˜ôˆ½ÁÉ½áä½MI%0½Á…Ñ ˆ($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°¡É•˜ôˆ¼‰€°¡É•˜ô‰€­ÁÉ½áåAÉ•™¥à­€¼‰€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°¡É•˜ôœ¼€°¡É•˜ô€­ÁÉ½áåAÉ•™¥à­€¼€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÍÉŒôˆ¼‰€°ÍÉŒô‰€­ÁÉ½áåAÉ•™¥à­€¼‰€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÍÉŒôœ¼€°ÍÉŒô€­ÁÉ½áåAÉ•™¥à­€¼€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°…Ñ¥½¸ôˆ¼‰€°…Ñ¥½¸ô‰€­ÁÉ½áåAÉ•™¥à­€¼‰€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°…Ñ¥½¸ôœ¼€°…Ñ¥½¸ô€­ÁÉ½áåAÉ•™¥à­€¼€¤(($$$$¼¼I•ÝÉ¥Ñ”…‰Í½±ÕÑ”µÁ…Ñ …ÑÑÉ¥‰ÕÑ•ÌÑ¼ÍÑ…äÕ¹‘•È€½ÁÉ½áä¼ñÍ•É¥…°ø($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°¡É•˜ôˆ½€°¡É•˜ô‰€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°¡É•˜ôœ½€°¡É•˜ô€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÍÉŒôˆ½€°ÍÉŒô‰€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÍÉŒôœ½€°ÍÉŒô€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°…Ñ¥½¸ôˆ½€°…Ñ¥½¸ô‰€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°…Ñ¥½¸ôœ½€°…Ñ¥½¸ô€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°‘…Ñ„µÍÉŒôˆ½€°‘…Ñ„µÍÉŒô‰€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°‘…Ñ„µÍÉŒôœ½€°‘…Ñ„µÍÉŒô€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°‘…Ñ„µ¡É•˜ôˆ½€°‘…Ñ„µ¡É•˜ô‰€­ÁÉ½áåAÉ•™¥à­€½€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°‘…Ñ„µ¡É•˜ôœ½€°‘…Ñ„µ¡É•˜ô€­ÁÉ½áåAÉ•™¥à­€½€¤(($$$$¼¼¥àMLÕÉ° ¤É•™•É•¹•ÌèÕÉ° ½Á…Ñ ¤…¹ÕÉ° ˆ½Á…Ñ ˆ¤…¹ÕÉ° œ½Á…Ñ œ¤($$$%¥˜¥ÍMLñð¥Í!Q50ì($$$$$¼¼MLÕÉ° ¤É•™•É•¹•Ì($$$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÕÉ° ½€°ÕÉ°¡€­ÁÉ½áåAÉ•™¥à­€½€¤($$$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÕÉ° ˆ½€°ÕÉ° ‰€­ÁÉ½áåAÉ•™¥à­€½€¤($$$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°ÕÉ° œ½€°ÕÉ° €­ÁÉ½áåAÉ•™¥à­€½€¤($$$%ô(($$$$¼¼¥à)…Ù…MÉ¥ÁÐ±½…Ñ¥½¸É•‘¥É•ÑÌ($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°±½…Ñ¥½¸¹¡É•˜ôˆ¼‰€°±½…Ñ¥½¸¹¡É•˜ô‰€­ÁÉ½áåAÉ•™¥à­€¼‰€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°±½…Ñ¥½¸¹¡É•˜ôœ¼€°±½…Ñ¥½¸¹¡É•˜ô€­ÁÉ½áåAÉ•™¥à­€¼€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°Ý¥¹‘½Ü¹±½…Ñ¥½¸ôˆ¼‰€°Ý¥¹‘½Ü¹±½…Ñ¥½¸ô‰€­ÁÉ½áåAÉ•™¥à­€¼‰€¤($$$%½¹Ñ•¹Ð€ôÍÑÉ¥¹Ì¹I•Á±…•±°¡½¹Ñ•¹Ð°Ý¥¹‘½Ü¹±½…Ñ¥½¸ôœ¼€°Ý¥¹‘½Ü¹±½…Ñ¥½¸ô€­ÁÉ½áåAÉ•™¥à­€¼€¤(($$$$¼¼‘‰…Í”Ñ…œÑ¼!Q50Ñ¼¡•±ÀÉ•Í½±Ù”É•±…Ñ¥Ù”UI1Ì($$$$¼¼%5A=IQ9Pè‰…Í”µÕÍÐÉ•™±•ÐÑ¡”‘¥É•Ñ½Éä½˜Ñ¡”UAMQI4É•ÅÕ•ÍÐÁ…Ñ ($$$$¼¼€¡¹½Ð½ÕÈ¥¹½µ¥¹œ€½ÁÉ½áä¼ñÍ•É¥…°ø¼¸¸¸Á…Ñ ¤Ñ¼…Ù½¥‘ÕÁ±¥…Ñ¥¹œÑ¡”ÁÉ½áäÁÉ•™¥à¸($$$%¥˜¥Í!Q50ì($$$$%¥˜É•ÝÉ¥ÑÑ•¸°½¬€èôÉ•ÝÉ¥Ñ•á¥ÍÑ¥¹	…Í•Q…œ¡½¹Ñ•¹Ð°ÁÉ½áåAÉ•™¥à°Ñ…É•Ð¹!½ÍÐ¤ì½¬ì($$$$$%½¹Ñ•¹Ð€ôÉ•ÝÉ¥ÑÑ•¸($$$$%ô•±Í”¥˜€…ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡ÍÑÉ¥¹Ì¹Q½1½Ý•È¡½¹Ñ•¹Ð¤°€ˆñ‰…Í”ˆ¤ì($$$$$$¼¼UÍ”Ñ¡”ÕÁÍÑÉ•…´É•ÅÕ•ÍÐÁ…Ñ ™É½´Ñ¡”É•Ù•ÉÍ”ÁÉ½áäÉ•ÍÁ½¹Í”($$$$$%ÕÁÍÑÉ•…µA…Ñ €èô€ˆ¼ˆ($$$$$%¥˜É•ÍÀ€„ô¹¥°€˜˜É•ÍÀ¹I•ÅÕ•ÍÐ€„ô¹¥°€˜˜É•ÍÀ¹I•ÅÕ•ÍÐ¹UI0€„ô¹¥°ì($$$$$$%ÕÁÍÑÉ•…µA…Ñ €ôÉ•ÍÀ¹I•ÅÕ•ÍÐ¹UI0¹A…Ñ ($$$$$%ô($$$$$%‘¥È€èôÁ…Ñ ¹¥È¡ÕÁÍÑÉ•…µA…Ñ ¤($$$$$%¥˜€…ÍÑÉ¥¹Ì¹!…ÍMÕ™™¥à¡‘¥È°€ˆ¼ˆ¤ì($$$$$$%‘¥È€¬ô€ˆ¼ˆ($$$$$%ô($$$$$%‰…Í•!É•˜€èôÁÉ½áåAÉ•™¥à€¬‘¥È($$$$$%‰…Í•Q…œ€èô€ˆñ‰…Í”¡É•˜õpˆˆ€¬‰…Í•!É•˜€¬€‰pˆøˆ($$$$$%½¹Ñ•¹Ñ1½Ý•È€èôÍÑÉ¥¹Ì¹Q½1½Ý•È¡½¹Ñ•¹Ð¤($$$$$%¥˜¥‘à€èôÍÑÉ¥¹Ì¹%¹‘•à¡½¹Ñ•¹Ñ1½Ý•È°€ˆñ¡•…øˆ¤ì¥‘à€„ô€´Äì($$$$$$%½¹Ñ•¹Ð€ô½¹Ñ•¹Ñlé¥‘à¬Ùt€¬‰…Í•Q…œ€¬½¹Ñ•¹Ñm¥‘à¬Øét($$$$$%ô•±Í”¥˜¥‘à€èôÍÑÉ¥¹Ì¹%¹‘•à¡½¹Ñ•¹Ñ1½Ý•È°€ˆñ¡•…€ˆ¤ì¥‘à€„ô€´Äì($$$$$$$¼¼¥¹•¹½˜€ñ¡•…€¸¸¸øÑ…œ($$$$$$%¥˜•¹‘%‘à€èôÍÑÉ¥¹Ì¹%¹‘•à¡½¹Ñ•¹Ñm¥‘àét°€ˆøˆ¤ì•¹‘%‘à€„ô€´Äì($$$$$$$%¥¹Í•ÉÑA½Ì€èô¥‘à€¬•¹‘%‘à€¬€Ä($$$$$$$%½¹Ñ•¹Ð€ô½¹Ñ•¹Ñlé¥¹Í•ÉÑA½Ít€¬‰…Í•Q…œ€¬½¹Ñ•¹Ñm¥¹Í•ÉÑA½Ìét($$$$$$%ô($$$$$%ô($$$$%ô($$$%ô(($$$%¹•Ý	½‘ä€èômu‰åÑ”¡½¹Ñ•¹Ð¤(($$$$¼¼•Ñ•Ð¥˜Ý”½Ð„±½¥¸Á…”‘•ÍÁ¥Ñ”¡…Ù¥¹œ…¡•Í•ÍÍ¥½¸($$$$¼¼Q¡¥Ìµ•…¹ÌÑ¡”Í•ÍÍ¥½¸Ý…Ì¥¹Ù…±¥‘…Ñ•€¡ÕÍ•È±½•½ÕÐ¤($$$%¥˜¥Í!Q50€˜˜…ÁÑÕÉ•‘)…È€„ô¹¥°ì($$$$%½¹Ñ•¹Ñ1½Ý•È€èôÍÑÉ¥¹Ì¹Q½1½Ý•È¡½¹Ñ•¹Ð¤($$$$$¼¼¡•¬™½È½µµ½¸±½¥¸Á…”¥¹‘¥…Ñ½ÉÌ($$$$%¡…Í1½¥¹½É´€èôÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹Ñ1½Ý•È°€‰ÑåÁ”õp‰Á…ÍÍÝ½É‘pˆˆ¤ñð($$$$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹Ñ1½Ý•È°€‰ÑåÁ”ôÁ…ÍÍÝ½Éœˆ¤($$$$%¡…Í1½¥¹-•åÝ½É‘Ì€èôÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹Ñ1½Ý•È°€‰±½¥¸ˆ¤ñð($$$$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹Ñ1½Ý•È°€‰Á…ÍÍÝ½Éˆ¤ñð($$$$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹Ñ1½Ý•È°€‰ÕÍ•É¹…µ”ˆ¤ñð($$$$$%ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡½¹Ñ•¹Ñ1½Ý•È°€‰Í¥¸¥¸ˆ¤(($$$$$¼¼%˜Ñ¡¥Ì±½½­Ì±¥­”„±½¥¸Á…”°±•…ÈÑ¡”…¡•Í•ÍÍ¥½¸($$$$%¥˜¡…Í1½¥¹½É´€˜˜¡…Í1½¥¹-•åÝ½É‘Ìì($$$$$%…ÁÁ1½•È¹%¹™¼ ‰AÉ½áäè‘•Ñ•Ñ•±½¥¸Á…”€´±•…É¥¹œ…¡•Í•ÍÍ¥½¸€¡±¥­•±ä±½•½ÕÐ¤ˆ°€‰Í•É¥…°ˆ°Í•É¥…°¤($$$$$%ÁÉ½áåM•ÍÍ¥½¹…¡”¹±•…È¡Í•É¥…°¤($$$$%ô($$$%ô(($$$%É•ÍÀ¹	½‘ä€ô¥¼¹9½Á±½Í•È¡‰åÑ•Ì¹9•ÝI•…‘•È¡¹•Ý	½‘ä¤¤($$$$¼¼]”Ù”É•ÝÉ¥ÑÑ•¸Ñ¡”‰½‘äì•¹ÍÕÉ”½¹Ñ•¹Ðµ¹½‘¥¹œ¥Ì±•…É•…¹±•¹Ñ µ…Ñ¡•Ì($$$%É•ÍÀ¹!•…‘•È¹•° ‰½¹Ñ•¹Ðµ¹½‘¥¹œˆ¤($$$%É•ÍÀ¹½¹Ñ•¹Ñ1•¹Ñ €ô¥¹ÐØÐ¡±•¸¡¹•Ý	½‘ä¤¤($$$%É•ÍÀ¹!•…‘•È¹M•Ð ‰½¹Ñ•¹Ðµ1•¹Ñ ˆ°™µÐ¹MÁÉ¥¹Ñ˜ ˆ•ˆ°±•¸¡¹•Ý	½‘ä¤¤¤($$%ô(($$$¼¼…¡”ÍÑ…Ñ¥ŒÉ•Í½ÕÉ•Ì™½ÈÁ•É™½Éµ…¹”€¡ÁÉ¥¹Ñ•ÉÌ…É”Ù•ÉäÍ±½Ü¤($$%¥˜¥ÍMÑ…Ñ¥I•Í½ÕÉ”€˜˜É•ÍÀ¹MÑ…ÑÕÍ½‘”€ôô¡ÑÑÀ¹MÑ…ÑÕÍ=,ì($$$$¼¼I•…Ñ¡”‰½‘äÑ¼…¡”¥Ð($$$%‰½‘ä°•ÉÈ€èôÉ•…‘	½Õ¹‘•‘AÉ½áåI•ÍÁ½¹Í”¡É•ÍÀ¹	½‘ä¤($$$%¥˜•ÉÈ€ôô¹¥°ì($$$$$¼¼…¡”™½È€ÄÔµ¥¹ÕÑ•Ì($$$$%…¡•-•ä€èôÍ•É¥…°€¬€ˆèˆ€¬Ñ…É•ÑA…Ñ ($$$$%ÍÑ…Ñ¥…¡”¹M•Ð¡…¡•-•ä°‰½‘ä°É•ÍÀ¹!•…‘•È¹•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ¤°É•ÍÀ¹!•…‘•È¹±½¹” ¤°€ÄÔ©Ñ¥µ”¹5¥¹ÕÑ”¤($$$$%…ÁÁ1½•È¹•‰Õœ ‰AÉ½áäè…¡•ÍÑ…Ñ¥ŒÉ•Í½ÕÉ”ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰Á…Ñ ˆ°Ñ…É•ÑA…Ñ °€‰Í¥é”ˆ°±•¸¡‰½‘ä¤¤($$$$$¼¼I•ÍÑ½É”Ñ¡”‰½‘ä™½ÈÑ¡”É•ÍÁ½¹Í”($$$$%É•ÍÀ¹	½‘ä€ô¥¼¹9½Á±½Í•È¡‰åÑ•Ì¹9•ÝI•…‘•È¡‰½‘ä¤¤($$$$%É•ÍÀ¹½¹Ñ•¹Ñ1•¹Ñ €ô¥¹ÐØÐ¡±•¸¡‰½‘ä¤¤($$$%ô•±Í”ì($$$$%É•ÑÕÉ¸•ÉÈ($$$%ô($$%ô(($$$¼¼I•ÍÁ½¹Í•ÌÑ¡…Ð…É”¹½ÐÉ•ÝÉ¥ÑÑ•¸½È…¡•…É”ÍÑÉ•…µ•‘¥É•Ñ±ä‰ä($$$¼¼I•Ù•ÉÍ•AÉ½áä¸	½Õ¹Õ¹­¹½Ý¸µ±•¹Ñ ‰½‘¥•ÌÍ¼„µ…±¥¥½ÕÌÁÉ¥¹Ñ•È…¹¹½Ð($$$¼¼­••ÀÑ¡”…•¹Ð½È¥ÑÌ]•‰M½­•ÐÁ••È‰ÕÍä¥¹‘•™¥¹¥Ñ•±ä¸($$%¥˜É•ÍÀ¹	½‘ä€„ô¹¥°€˜˜É•ÍÀ¹½¹Ñ•¹Ñ1•¹Ñ €ð€Àì($$$%É•ÍÀ¹	½‘ä€ô€™‰½Õ¹‘•‘AÉ½áå	½‘åíI•…‘±½Í•ÈèÉ•ÍÀ¹	½‘ä°É•µ…¥¹¥¹œèµ…á•¹ÑAÉ½áåI•ÍÁ½¹Í•	½‘åM¥é•ô($$$%É•ÍÀ¹!•…‘•È¹•° ‰½¹Ñ•¹Ðµ1•¹Ñ ˆ¤($$%ô(($$%É•ÑÕÉ¸¹¥°($%ô(($$¼¼‘•ÉÉ½È¡…¹‘±•È™½ÈÁÉ½áä™…¥±ÕÉ•Ì($%ÉÁÉ½áä¹ÉÉ½É!…¹‘±•È€ô™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ°•ÉÈ•ÉÉ½È¤ì($$%…ÁÁ1½•È¹]…É¹I…Ñ•1¥µ¥Ñ• ‰ÁÉ½áå}•ÉÉ½É|ˆ­Í•É¥…°°€Ä©Ñ¥µ”¹5¥¹ÕÑ”°€‰AÉ½áä•ÉÉ½Èˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$%¥˜•ÉÈ€ôô½¹Ñ•áÐ¹•…‘±¥¹•á••‘•ñðÈ¹½¹Ñ•áÐ ¤¹ÉÈ ¤€ôô½¹Ñ•áÐ¹•…‘±¥¹•á••‘•ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰AÉ¥¹Ñ•È‘¥¹½ÐÉ•ÍÁ½¹Ý¥Ñ¡¥¸€ÐÔÍ•½¹‘Ì¸Q¡”‘•Ù¥”µ…ä‰”‰ÕÍä°ÑÕÉ¹•½™˜°½È¥ÑÌÝ•ˆ¥¹Ñ•É™…”µ…ä‰”‘¥Í…‰±•¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ…Ñ•Ý…åQ¥µ•½ÕÐ¤($$%ô•±Í”ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°™µÐ¹MÁÉ¥¹Ñ˜ ‰AÉ½áä½¹¹•Ñ¥½¸™…¥±•è€•Øˆ°•ÉÈ¤°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘…Ñ•Ý…ä¤($$%ô($%ô(($$¼¼M•ÉÙ”Ñ¡”ÁÉ½á¥•É•ÅÕ•ÍÐÝ¥Ñ É•ÍÁ½¹Í”‘¥…¹½ÍÑ¥Ì($%±ÉÜ€èô€™±½¥¹I•ÍÁ½¹Í•]É¥Ñ•ÉíI•ÍÁ½¹Í•]É¥Ñ•ÈèÜ°ÍÑ…ÑÕÌè¡ÑÑÀ¹MÑ…ÑÕÍ=-ô($%ÍÑ…ÉÐ€èôÑ¥µ”¹9½Ü ¤(($$¼¼¹ÍÕÉ”Ý”…±Ý…åÌ±½œ½µÁ±•Ñ¥½¸½Ñ¥µ•½ÕÐÙ¥„‘•™•È($%‘•™•È™Õ¹Œ ¤ì($$%‘ÕÈ€èôÑ¥µ”¹M¥¹”¡ÍÑ…ÉÐ¤($$%¥˜‘ÕÈ€ø€ÌÀ©Ñ¥µ”¹M•½¹ì($$$%…ÁÁ1½•È¹]…É¸ ‰AÉ½áäÍ±½Ü½Ñ¥µ•½ÕÐˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰ÍÑ…ÑÕÌˆ°±ÉÜ¹ÍÑ…ÑÕÌ°€‰‰åÑ•Ìˆ°±ÉÜ¹‰åÑ•Ì°€‰‘ÕÉ…Ñ¥½¹}µÌˆ°‘ÕÈ¹5¥±±¥Í•½¹‘Ì ¤°€‰Á…Ñ ˆ°½É¥¥¹…±A…Ñ ¤($$%ô•±Í”¥˜±ÉÜ¹ÍÑ…ÑÕÌ€øô€ÔÀÀì($$$%…ÁÁ1½•È¹]…É¹I…Ñ•1¥µ¥Ñ• ‰ÁÉ½áå}ÕÁÍÑÉ•…µ|ˆ­Í•É¥…°°€Ä©Ñ¥µ”¹5¥¹ÕÑ”°€‰AÉ½áäÕÁÍÑÉ•…´•ÉÉ½Èˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰ÍÑ…ÑÕÌˆ°±ÉÜ¹ÍÑ…ÑÕÌ°€‰‰åÑ•Ìˆ°±ÉÜ¹‰åÑ•Ì°€‰‘ÕÉ…Ñ¥½¹}µÌˆ°‘ÕÈ¹5¥±±¥Í•½¹‘Ì ¤°€‰Á…Ñ ˆ°½É¥¥¹…±A…Ñ ¤($$%ô•±Í”ì($$$%…ÁÁ1½•È¹QÉ…•Q…œ ‰ÁÉ½áå}É•ÍÁ½¹Í”ˆ°€‰AÉ½áä½µÁ±•Ñ•ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰ÍÑ…ÑÕÌˆ°±ÉÜ¹ÍÑ…ÑÕÌ°€‰‰åÑ•Ìˆ°±ÉÜ¹‰åÑ•Ì°€‰‘ÕÉ…Ñ¥½¹}µÌˆ°‘ÕÈ¹5¥±±¥Í•½¹‘Ì ¤°€‰Á…Ñ ˆ°½É¥¥¹…±A…Ñ ¤($$%ô($%ô ¤(($%ÉÁÉ½áä¹M•ÉÙ•!QQ@¡±ÉÜ°È¤(%ô¤(($¼¼1¥ÍÐµ•É•‘•Ù¥”ÁÉ½™¥±•Ì€¡ÕÍ¥¹œÍÑ½É…”¥¹Ñ•É™…”¤(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½‘•Ù¥•Ì½±¥ÍÐˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($$¼¼1¥ÍÐ½¹±äÍ…Ù•‘•Ù¥•Ì€¡¥Í}Í…Ù•õÑÉÕ”¤($%Í…Ù•€èôÑÉÕ”($%‘•Ù¥•Ì°•ÉÈ€èô‘•Ù¥•MÑ½É”¹1¥ÍÐ¡½¹Ñ•áÐ¹	…­É½Õ¹ ¤°ÍÑ½É…”¹•Ù¥•¥±Ñ•Éí%ÍM…Ù•è€™Í…Ù•‘ô¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼±¥ÍÐ‘•Ù¥•Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($$¼¼½Éµ…Ð™½È½µÁ…Ñ¥‰¥±¥ÑäÝ¥Ñ •á¥ÍÑ¥¹œ™É½¹Ñ•¹($%½ÕÐ€èômuµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõíô($%™½È|°‘•Ù¥”€èôÉ…¹”‘•Ù¥•Ìì($$$¼¼½¹Ù•ÉÐÑ¼AÉ¥¹Ñ•É%¹™¼™½È½µÁ…Ñ¥‰¥±¥Ñä($$%Á¤€èôÍÑ½É…”¹•Ù¥•Q½AÉ¥¹Ñ•É%¹™¼¡‘•Ù¥”¤($$%½ÕÐ€ô…ÁÁ•¹¡½ÕÐ°µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰Í•É¥…°ˆè€€€€€€‘•Ù¥”¹M•É¥…°°($$$$‰Á…Ñ ˆè€€€€€€€€‘•Ù¥”¹M•É¥…°€¬€ˆ¹©Í½¸ˆ°€¼¼½È½µÁ…Ñ¥‰¥±¥Ñä($$$$‰ÁÉ¥¹Ñ•É}¥¹™¼ˆèÁ¤°($$$$‰¥¹™¼ˆè€€€€€€€€Á¤°€¼¼±¥…Ì™½È½µÁ…Ñ¥‰¥±¥Ñä($$$$‰…ÍÍ•Ñ}¹Õµ‰•Èˆè‘•Ù¥”¹ÍÍ•Ñ9Õµ‰•È°($$$$‰±½…Ñ¥½¸ˆè€€€€‘•Ù¥”¹1½…Ñ¥½¸°($$$$‰Ý•‰}Õ¥}ÕÉ°ˆè€€‘•Ù¥”¹]•‰U%UI0°($$$$¼¼9•ÜÕ¹¥™¥•‘•Ù¥”ÑåÁ”™¥•±‘Ì($$$$‰‘•Ù¥•}ÑåÁ”ˆè€€€€€€€‘•Ù¥”¹•Ù¥•QåÁ”°($$$$‰Í½ÕÉ•}ÑåÁ”ˆè€€€€€€€‘•Ù¥”¹M½ÕÉ•QåÁ”°($$$$‰¥Í}ÕÍˆˆè€€€€€€€€€€€€‘•Ù¥”¹%ÍUM°($$$$‰¥¹¥Ñ¥…±}Á…•}½Õ¹Ðˆè‘•Ù¥”¹%¹¥Ñ¥…±A…•½Õ¹Ð°($$$$‰Á½ÉÑ}¹…µ”ˆè€€€€€€€€€‘•Ù¥”¹A½ÉÑ9…µ”°($$$$‰‘É¥Ù•É}¹…µ”ˆè€€€€€€€‘•Ù¥”¹É¥Ù•É9…µ”°($$$$‰¥Í}‘•™…Õ±Ðˆè€€€€€€€€‘•Ù¥”¹%Í•™…Õ±Ð°($$$$‰¥Í}Í¡…É•ˆè€€€€€€€€€‘•Ù¥”¹%ÍM¡…É•°($$$$‰ÍÁ½½±•É}ÍÑ…ÑÕÌˆè€€€€‘•Ù¥”¹MÁ½½±•ÉMÑ…ÑÕÌ°($$%ô¤($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡½ÕÐ¤(%ô¤(($¼¼•Ð„µ•É•‘•Ù¥”ÁÉ½™¥±”‰äÍ•É¥…°¸€½‘•Ù¥•Ì½•ÐýÍ•É¥…°õMI%0(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½‘•Ù¥•Ì½•Ðˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼QÉä‘…Ñ…‰…Í”™¥ÉÍÐ($%Ñà€èô½¹Ñ•áÐ¹	…­É½Õ¹ ¤($%‘•Ù¥”°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•Ð¡Ñà°Í•É¥…°¤($%¥˜•ÉÈ€ôô¹¥°ì($$$¼¼½¹Ù•ÉÐ™¥•±‘Ì‘¥É•Ñ±ä™½ÈÉ•ÍÁ½¹Í”(($$$¼¼•Ñ ±…Ñ•ÍÐµ•ÑÉ¥Ì™½ÈÑ¡¥Ì‘•Ù¥”($$%Ù…ÈÁ…•½Õ¹Ð¥¹Ð($$%Ù…ÈÑ½¹•É1•Ù•±Ìµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô($$%¥˜Í¹…ÁÍ¡½Ð°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•Ñ1…Ñ•ÍÑ5•ÑÉ¥Ì¡Ñà°‘•Ù¥”¹M•É¥…°¤ì•ÉÈ€ôô¹¥°€˜˜Í¹…ÁÍ¡½Ð€„ô¹¥°ì($$$%Á…•½Õ¹Ð€ôÍ¹…ÁÍ¡½Ð¹A…•½Õ¹Ð($$$%Ñ½¹•É1•Ù•±Ì€ôÍ¹…ÁÍ¡½Ð¹Q½¹•É1•Ù•±Ì($$%ô(($$$¼¼%˜µ•ÑÉ¥Ì‘¼¹½Ð½¹Ñ…¥¸Ñ½¹•É}±•Ù•±Ì°ÑÉäÑ¼Íå¹Ñ¡•Í¥é”™É½´I…Ý…Ñ„($$%¥˜±•¸¡Ñ½¹•É1•Ù•±Ì¤€ôô€À€˜˜‘•Ù¥”¹I…Ý…Ñ„€„ô¹¥°ì($$$$¼¼%˜É…Ý}‘…Ñ„…±É•…‘ä½¹Ñ…¥¹Ì„ÍÑÉÕÑÕÉ•Ñ½¹•É}±•Ù•±Ìµ…À°ÕÍ”¥Ð($$$%¥˜Ñ°°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±Ì‰t¸¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô¤ì½¬€˜˜±•¸¡Ñ°¤€ø€Àì($$$$%Ñ½¹•É1•Ù•±Ì€ôÑ°($$$%ô•±Í”ì($$$$$¼¼=Ñ¡•ÉÝ¥Í”°±½½¬™½ÈÁ•Èµ½±½È­•åÌ…¹‰Õ¥±„µ…À($$$$%Ñ°€èôµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõíô($$$$%¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}‰±…¬‰t¸¡™±½…ÐØÐ¤ì½¬ì($$$$$%Ñ±l‰	±…¬‰t€ô¥¹Ð¡Ø¤($$$$%ô•±Í”¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}‰±…¬‰t¸¡¥¹Ð¤ì½¬ì($$$$$%Ñ±l‰	±…¬‰t€ôØ($$$$%ô($$$$%¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}å…¸‰t¸¡™±½…ÐØÐ¤ì½¬ì($$$$$%Ñ±l‰å…¸‰t€ô¥¹Ð¡Ø¤($$$$%ô•±Í”¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}å…¸‰t¸¡¥¹Ð¤ì½¬ì($$$$$%Ñ±l‰å…¸‰t€ôØ($$$$%ô($$$$%¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}µ…•¹Ñ„‰t¸¡™±½…ÐØÐ¤ì½¬ì($$$$$%Ñ±l‰5…•¹Ñ„‰t€ô¥¹Ð¡Ø¤($$$$%ô•±Í”¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}µ…•¹Ñ„‰t¸¡¥¹Ð¤ì½¬ì($$$$$%Ñ±l‰5…•¹Ñ„‰t€ôØ($$$$%ô($$$$%¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}å•±±½Ü‰t¸¡™±½…ÐØÐ¤ì½¬ì($$$$$%Ñ±l‰e•±±½Ü‰t€ô¥¹Ð¡Ø¤($$$$%ô•±Í”¥˜Ø°½¬€èô‘•Ù¥”¹I…Ý…Ñ…l‰Ñ½¹•É}±•Ù•±}å•±±½Ü‰t¸¡¥¹Ð¤ì½¬ì($$$$$%Ñ±l‰e•±±½Ü‰t€ôØ($$$$%ô($$$$%¥˜±•¸¡Ñ°¤€ø€Àì($$$$$%Ñ½¹•É1•Ù•±Ì€ôÑ°($$$$%ô($$$%ô($$%ô(($$$¼¼É•…Ñ”É•ÍÁ½¹Í”Ý¥Ñ …±°‘•Ù¥”™¥•±‘Ì€¬ÁÉ¥¹Ñ•É}¥¹™¼™½È½µÁ…Ñ¥‰¥±¥Ñä($$%É•ÍÁ½¹Í”€èôµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰Í•É¥…°ˆè€€€€€€€€€‘•Ù¥”¹M•É¥…°°($$$$‰¥Àˆè€€€€€€€€€€€€€‘•Ù¥”¹%@°($$$$‰µ…¹Õ™…ÑÕÉ•Èˆè€€€‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È°($$$$‰µ½‘•°ˆè€€€€€€€€€€‘•Ù¥”¹5½‘•°°($$$$‰¡½ÍÑ¹…µ”ˆè€€€€€€€‘•Ù¥”¹!½ÍÑ¹…µ”°($$$$‰™¥ÉµÝ…É”ˆè€€€€€€€‘•Ù¥”¹¥ÉµÝ…É”°($$$$‰µ…}…‘‘É•ÍÌˆè€€€€‘•Ù¥”¹5‘‘É•ÍÌ°($$$$‰ÍÕ‰¹•Ñ}µ…Í¬ˆè€€€€‘•Ù¥”¹MÕ‰¹•Ñ5…Í¬°($$$$‰…Ñ•Ý…äˆè€€€€€€€€‘•Ù¥”¹…Ñ•Ý…ä°($$$$‰‘¹Í}Í•ÉÙ•ÉÌˆè€€€€‘•Ù¥”¹9MM•ÉÙ•ÉÌ°($$$$‰‘¡Á}Í•ÉÙ•Èˆè€€€€‘•Ù¥”¹!AM•ÉÙ•È°($$$$‰Á…•}½Õ¹Ðˆè€€€€€Á…•½Õ¹Ð°($$$$‰Ñ½¹•É}±•Ù•±Ìˆè€€€Ñ½¹•É1•Ù•±Ì°($$$$‰½¹ÍÕµ…‰±•Ìˆè€€€€‘•Ù¥”¹½¹ÍÕµ…‰±•Ì°($$$$‰ÍÑ…ÑÕÍ}µ•ÍÍ…•Ìˆè‘•Ù¥”¹MÑ…ÑÕÍ5•ÍÍ…•Ì°($$$$‰…ÍÍ•Ñ}¹Õµ‰•Èˆè€€€‘•Ù¥”¹ÍÍ•Ñ9Õµ‰•È°($$$$‰±½…Ñ¥½¸ˆè€€€€€€€‘•Ù¥”¹1½…Ñ¥½¸°($$$$‰Ý•‰}Õ¥}ÕÉ°ˆè€€€€€‘•Ù¥”¹]•‰U%UI0°($$$$‰±…ÍÑ}Í••¸ˆè€€€€€€‘•Ù¥”¹1…ÍÑM••¸°($$$$‰É•…Ñ•‘}…Ðˆè€€€€€‘•Ù¥”¹É•…Ñ•‘Ð°($$$$‰™¥ÉÍÑ}Í••¸ˆè€€€€€‘•Ù¥”¹¥ÉÍÑM••¸°($$$$‰¥Í}Í…Ù•ˆè€€€€€€€‘•Ù¥”¹%ÍM…Ù•°(($$$$¼¼9•ÜÕ¹¥™¥•‘•Ù¥”ÑåÁ”™¥•±‘Ì($$$$‰‘•Ù¥•}ÑåÁ”ˆè€€€€€€€‘•Ù¥”¹•Ù¥•QåÁ”°($$$$‰Í½ÕÉ•}ÑåÁ”ˆè€€€€€€€‘•Ù¥”¹M½ÕÉ•QåÁ”°($$$$‰¥Í}ÕÍˆˆè€€€€€€€€€€€€‘•Ù¥”¹%ÍUM°($$$$‰¥¹¥Ñ¥…±}Á…•}½Õ¹Ðˆè‘•Ù¥”¹%¹¥Ñ¥…±A…•½Õ¹Ð°($$$$‰Á½ÉÑ}¹…µ”ˆè€€€€€€€€€‘•Ù¥”¹A½ÉÑ9…µ”°($$$$‰‘É¥Ù•É}¹…µ”ˆè€€€€€€€‘•Ù¥”¹É¥Ù•É9…µ”°($$$$‰¥Í}‘•™…Õ±Ðˆè€€€€€€€€‘•Ù¥”¹%Í•™…Õ±Ð°($$$$‰¥Í}Í¡…É•ˆè€€€€€€€€€‘•Ù¥”¹%ÍM¡…É•°($$$$‰ÍÁ½½±•É}ÍÑ…ÑÕÌˆè€€€€‘•Ù¥”¹MÁ½½±•ÉMÑ…ÑÕÌ°(($$$$¼¼%¹±Õ‘”I…Ý…Ñ„¥˜ÁÉ•Í•¹Ð™½È•áÑ•¹‘•™¥•±‘Ì($$$$‰É…Ý}‘…Ñ„ˆè‘•Ù¥”¹I…Ý…Ñ„°($$%ô(($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡É•ÍÁ½¹Í”¤($$%É•ÑÕÉ¸($%ô($$¼¼9½Ð™½Õ¹¥¸‘…Ñ…‰…Í”($%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¹½Ð™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤(%ô¤(($¼¼…¹½¹¥…°‘•Ù¥”ÁÉ½™¥±”•¹‘Á½¥¹Ð€¡‘•Ù¥”µ•Ñ…‘…Ñ„€¬±…Ñ•ÍÐµ•ÑÉ¥Ì¤¸($¼¼P€½…Á¤½‘•Ù¥•Ì½ÁÉ½™¥±”ýÍ•É¥…°õMI%0($¼¼Q¡¥Ì…Ù½¥‘Ì½µÁ…Ñ¥‰¥±¥Ñä½µ•É•™¥•±‘Ì¥¸±•…ä€½‘•Ù¥•Ì½•Ð¸(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½ÁÉ½™¥±”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°Á…É…µ•Ñ•ÈÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤(($%‘•Ù¥”°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•Ð¡Ñà°Í•É¥…°¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¥˜•ÉÈ€ôôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¹½Ð™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$$%É•ÑÕÉ¸($$%ô($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ð‘•Ù¥”è€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ù…ÈÍ¹…ÁÍ¡½Ð€©ÍÑ½É…”¹5•ÑÉ¥ÍM¹…ÁÍ¡½Ð($%¥˜Ì°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•Ñ1…Ñ•ÍÑ5•ÑÉ¥Ì¡Ñà°Í•É¥…°¤ì•ÉÈ€ôô¹¥°ì($$%Í¹…ÁÍ¡½Ð€ôÌ($%ô•±Í”¥˜•ÉÈ€„ôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ð±…Ñ•ÍÐµ•ÑÉ¥Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰‘•Ù¥”ˆè€€€€€€€€‘•Ù¥”°($$$‰±…Ñ•ÍÑ}µ•ÑÉ¥ÌˆèÍ¹…ÁÍ¡½Ð°($%ô¤(%ô¤(($¼¼A=MP€½…Á¤½‘•Ù¥•Ì½¥¹¥Ñ¥…°µÁ…”µ½Õ¹Ð€´M•Ð¥¹¥Ñ¥…°Á…”½Õ¹Ð‰…Í•±¥¹”™½È…Õ‘¥ÐÑÉ…¥°(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½¥¹¥Ñ¥…°µÁ…”µ½Õ¹Ðˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Ù…ÈÉ•ÄÍÑÉÕÐì($$%M•É¥…°€€ÍÑÉ¥¹œ©Í½¸è‰Í•É¥…°‰€($$%½Õ¹Ð€€€¥¹Ð€€€©Í½¸è‰½Õ¹Ð‰€($$%I•…Í½¸€€ÍÑÉ¥¹œ©Í½¸è‰É•…Í½¸±½µ¥Ñ•µÁÑä‰€($$%UÍ•É¹…µ”ÍÑÉ¥¹œ©Í½¸è‰ÕÍ•É¹…µ”±½µ¥Ñ•µÁÑä‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‰…©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô($%¥˜É•Ä¹M•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô($%¥˜É•Ä¹½Õ¹Ð€ð€Àì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰½Õ¹ÐµÕÍÐ‰”¹½¸µ¹•…Ñ¥Ù”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼•™…Õ±ÐÕÍ•É¹…µ”¥˜¹½ÐÁÉ½Ù¥‘•($%¥˜É•Ä¹UÍ•É¹…µ”€ôô€ˆˆì($$%É•Ä¹UÍ•É¹…µ”€ô€‰ÍåÍÑ•´ˆ($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤(($%¥˜•ÉÈ€èô‘•Ù¥•MÑ½É”¹M•Ñ%¹¥Ñ¥…±A…•½Õ¹Ð¡Ñà°É•Ä¹M•É¥…°°É•Ä¹½Õ¹Ð°É•Ä¹UÍ•É¹…µ”°É•Ä¹I•…Í½¸¤ì•ÉÈ€„ô¹¥°ì($$%¥˜•ÉÈ€ôôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‘•Ù¥”¹½Ð™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$$%É•ÑÕÉ¸($$%ô($$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼Í•Ð¥¹¥Ñ¥…°Á…”½Õ¹Ðˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í•Ð¥¹¥Ñ¥…°Á…”½Õ¹Ðè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%…ÁÁ1½•È¹%¹™¼ ‰%¹¥Ñ¥…°Á…”½Õ¹ÐÍ•Ðˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰½Õ¹Ðˆ°É•Ä¹½Õ¹Ð°€‰‰äˆ°É•Ä¹UÍ•É¹…µ”¤($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÕ•ÍÌˆèÑÉÕ”°($$$‰Í•É¥…°ˆè€É•Ä¹M•É¥…°°($$$‰½Õ¹Ðˆè€€É•Ä¹½Õ¹Ð°($%ô¤(%ô¤(($¼¼P€½…Á¤½‘•Ù¥•Ì½…Õ‘¥Ð€´•ÐÁ…”½Õ¹Ð…Õ‘¥Ð¡¥ÍÑ½Éä™½È„‘•Ù¥”(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½…Õ‘¥Ðˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°Á…É…µ•Ñ•ÈÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼=ÁÑ¥½¹…°±¥µ¥ÐÁ…É…µ•Ñ•È€¡‘•™…Õ±Ðè€ÄÀÀ¤($%±¥µ¥Ð€èô€ÄÀÀ($%¥˜°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰±¥µ¥Ðˆ¤ì°€„ô€ˆˆì($$%¥˜Á…ÉÍ•°•ÉÈ€èôÍÑÉ½¹Ø¹Ñ½¤¡°¤ì•ÉÈ€ôô¹¥°€˜˜Á…ÉÍ•€ø€Àì($$$%±¥µ¥Ð€ôÁ…ÉÍ•($$%ô($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤(($%…Õ‘¥ÑÌ°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•ÑA…•½Õ¹ÑÕ‘¥Ð¡Ñà°Í•É¥…°°±¥µ¥Ð¤($%¥˜•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼•ÐÁ…”½Õ¹Ð…Õ‘¥Ðˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ð…Õ‘¥Ð¡¥ÍÑ½Éäè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰Í•É¥…°ˆèÍ•É¥…°°($$$‰…Õ‘¥ÑÌˆè…Õ‘¥ÑÌ°($$$‰½Õ¹Ðˆè€±•¸¡…Õ‘¥ÑÌ¤°($%ô¤(%ô¤(($¼¼P€½…Á¤½‘•Ù¥•Ì½ÕÍ…”€´•ÐÁ…”½Õ¹ÐÕÍ…”Í¥¹”¥¹¥Ñ¥…°‰…Í•±¥¹”(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½ÕÍ…”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°Á…É…µ•Ñ•ÈÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤(($%ÕÍ…”°¥¹¥Ñ¥…°°ÕÉÉ•¹Ð°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•ÑA…•½Õ¹ÑUÍ…”¡Ñà°Í•É¥…°¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¥˜•ÉÈ€ôôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‘•Ù¥”¹½Ð™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$$%É•ÑÕÉ¸($$%ô($$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼•ÐÁ…”½Õ¹ÐÕÍ…”ˆ°€‰Í•É¥…°ˆ°Í•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•ÐÕÍ…”è€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰Í•É¥…°ˆè€€€€€€€€€€€€Í•É¥…°°($$$‰ÕÍ…”ˆè€€€€€€€€€€€€€ÕÍ…”°($$$‰¥¹¥Ñ¥…±}Á…•}½Õ¹Ðˆè¥¹¥Ñ¥…°°($$$‰ÕÉÉ•¹Ñ}Á…•}½Õ¹ÐˆèÕÉÉ•¹Ð°($%ô¤(%ô¤(($¼¼M…Ù”„‘•Ù¥”‰äµ…É­¥¹œ¥Ð…ÌÍ…Ù•¸A=MPìÍ•É¥…°è€‰MI%0ˆô(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½‘•Ù¥•Ì½Í…Ù”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%Ù…ÈÉ•ÄÍÑÉÕÐì($$%M•É¥…°ÍÑÉ¥¹œ©Í½¸è‰Í•É¥…°‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‰…©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô($%¥˜É•Ä¹M•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%Ñà€èô½¹Ñ•áÐ¹	…­É½Õ¹ ¤($%¥˜•ÉÈ€èô‘•Ù¥•MÑ½É”¹5…É­M…Ù•¡Ñà°É•Ä¹M•É¥…°¤ì•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼Í…Ù”‘•Ù¥”ˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”‘•Ù¥”è€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%…ÁÁ1½•È¹%¹™¼ ‰•Ù¥”µ…É­•…ÌÍ…Ù•ˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°¤($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÑ…ÑÕÌˆè€‰Í…Ù•ˆ°($$$‰Í•É¥…°ˆèÉ•Ä¹M•É¥…°°($%ô¤(%ô¤(($¼¼M…Ù”…±°‘¥Í½Ù•É•‘•Ù¥•Ì€¡µ…É­Ì…±°Ù¥Í¥‰±”Õ¹Í…Ù•‘•Ù¥•Ì…ÌÍ…Ù•¤(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½‘•Ù¥•Ì½Í…Ù”½…±°ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Ñà€èô½¹Ñ•áÐ¹	…­É½Õ¹ ¤($%½Õ¹Ð°•ÉÈ€èô‘•Ù¥•MÑ½É”¹5…É­±±M…Ù•¡Ñà¤($%¥˜•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼Í…Ù”…±°‘•Ù¥•Ìˆ°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”…±°‘•Ù¥•Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%…ÁÁ1½•È¹%¹™¼ ‰5…É­•‘•Ù¥•Ì…ÌÍ…Ù•ˆ°€‰½Õ¹Ðˆ°½Õ¹Ð¤($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÑ…ÑÕÌˆè€‰Í…Ù•ˆ°($$$‰½Õ¹Ðˆè€½Õ¹Ð°($%ô¤(%ô¤(($¼¼•±•Ñ”„‘•Ù¥”ÁÉ½™¥±”‰äÍ•É¥…°¸A=MPìÍ•É¥…°è€‰MI%0ˆô(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½‘•Ù¥•Ì½‘•±•Ñ”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%Ù…ÈÉ•ÄÍÑÉÕÐì($$%M•É¥…°ÍÑÉ¥¹œ©Í½¸è‰Í•É¥…°‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‰…©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô($%¥˜É•Ä¹M•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼M…¹¥Ñ¥é”Í•É¥…°Ñ¼ÁÉ•Ù•¹ÐÁ…Ñ ÑÉ…Ù•ÉÍ…°…ÑÑ…­Ì($%Í…™•M•É¥…°€èô™¥±•Á…Ñ ¹	…Í”¡É•Ä¹M•É¥…°¤($%¥˜Í…™•M•É¥…°€ôô€ˆ¸ˆñðÍ…™•M•É¥…°€ôô€ˆ¸¸ˆñðÍ…™•M•É¥…°€„ôÉ•Ä¹M•É¥…°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥Í•É¥…°¹Õµ‰•Èˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼QÉä‘…Ñ…‰…Í”™¥ÉÍÐ($%Ñà€èô½¹Ñ•áÐ¹	…­É½Õ¹ ¤($%‘•±•Ñ•‘É½µ€èô™…±Í”(($%•ÉÈ€èô‘•Ù¥•MÑ½É”¹•±•Ñ”¡Ñà°Í…™•M•É¥…°¤($%¥˜•ÉÈ€ôô¹¥°ì($$%‘•±•Ñ•‘É½µ€ôÑÉÕ”($$%…ÁÁ1½•È¹%¹™¼ ‰•±•Ñ•‘•Ù¥”™É½´‘…Ñ…‰…Í”ˆ°€‰Í•É¥…°ˆ°Í…™•M•É¥…°¤($%ô•±Í”¥˜•ÉÈ€„ôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$%…ÁÁ1½•È¹ÉÉ½È ‰…Ñ…‰…Í”‘•±•Ñ”•ÉÉ½Èˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$$¼¼½¹Ñ¥¹Õ”Ñ¼™¥±”‘•±•Ñ”…Ì™…±±‰…¬($%ô(($$¼¼…±±‰…¬è‘•±•Ñ”)M=8™¥±”€¡ÕÍ¥¹œÍ…¹¥Ñ¥é•Í•É¥…°¤¥˜‘•±•Ñ”™…¥±•($%¥˜€…‘•±•Ñ•‘É½µì($$%À€èô™¥±•Á…Ñ ¹)½¥¸ ˆ¸ˆ°€‰±½Ìˆ°€‰‘•Ù¥•Ìˆ°Í…™•M•É¥…°¬ˆ¹©Í½¸ˆ¤($$%¥˜•ÉÈ€èô½Ì¹I•µ½Ù”¡À¤ì•ÉÈ€„ô¹¥°ì($$$%¥˜½Ì¹%Í9½Ñá¥ÍÐ¡•ÉÈ¤ì($$$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¹½Ð™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$$$%É•ÑÕÉ¸($$$%ô($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‘•±•Ñ”™…¥±•è€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$%É•ÑÕÉ¸($$%ô($%ô(($$¼¼9½Ñ¥™äÑ¡”Í•ÉÙ•È…‰½ÕÐ‘•Ù¥”‘•±•Ñ¥½¸Ù¥„]•‰M½­•Ð€¡¥˜½¹¹•Ñ•¤($$¼¼M­¥À¹½Ñ¥™¥…Ñ¥½¸¥˜Ñ¡¥Ì‘•±•Ñ”Ý…Ì¥¹¥Ñ¥…Ñ•‰äÑ¡”Í•ÉÙ•È€¡Ù¥„ÁÉ½áä¤($$¼¼Ñ¼…Ù½¥„É…”½¹‘¥Ñ¥½¸Ý¡•É”‰½Ñ Ñ¡”!QQ@¡…¹‘±•È…¹]•‰M½­•Ð¡…¹‘±•È($$¼¼ÑÉäÑ¼‘•±•Ñ”™É½´Í•ÉÙ•ÈÍÑ½É…”Í¥µÕ±Ñ…¹•½ÕÍ±ä¸($%¥˜È¹!•…‘•È¹•Ð ‰`µAÉ¥¹Ñ5…ÍÑ•ÈµM•ÉÙ•ÈµI•ÅÕ•ÍÐˆ¤€ôô€ˆˆì($$%¼¹½Ñ¥™åM•ÉÙ•É•Ù¥••±•Ñ•¡Í…™•M•É¥…°¤($%ô(($$¼¼9½Ñ”è•Ù¥”Ý¥±°¹…ÑÕÉ…±±ä‰”É”µ‘¥Í½Ù•É•‘ÕÉ¥¹œ¹•áÐÍ…¸¥˜ÍÑ¥±°½¸¹•ÑÝ½É¬($$¼¼9¼¹••Ñ¼¥µµ•‘¥…Ñ•±äÉ”µÍ…¸…ÌÑ¡¥Ì‘•™•…ÑÌÑ¡”ÁÕÉÁ½Í”½˜‘•±•Ñ¥½¸(($%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ=,¤(%ô¤(($¼¼ÕÑ •¹‘Á½¥¹ÑÌ±•Ù•É…”…•¹ÑÕÑ µ…¹…•È™½È±½…°Í•ÍÍ¥½¸•¹™½É•µ•¹Ð(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½ØÄ½…ÕÑ ½µ”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜…•¹ÑÕÑ €ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰…ÕÑ¡•¹Ñ¥…Ñ¥½¸Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô($%…•¹ÑÕÑ ¹¡…¹‘±•ÕÑ¡5”¡Ü°È¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½ØÄ½…ÕÑ ½±½½ÕÐˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜…•¹ÑÕÑ €ôô¹¥°ì($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u‰½½±ì‰ÍÕ•ÍÌˆèÑÉÕ•ô¤($$%É•ÑÕÉ¸($%ô($%…•¹ÑÕÑ ¹¡…¹‘±•ÕÑ¡1½½ÕÐ¡Ü°È¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½ØÄ½…ÕÑ ½…±±‰…¬ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜…•¹ÑÕÑ €ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰…ÕÑ¡•¹Ñ¥…Ñ¥½¸Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô($%…•¹ÑÕÑ ¹¡…¹‘±•ÕÑ¡…±±‰…¬¡Ü°È¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½ØÄ½…ÕÑ ½±½¥¸ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜…•¹ÑÕÑ €ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰…ÕÑ¡•¹Ñ¥…Ñ¥½¸Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô($%…•¹ÑÕÑ ¹¡…¹‘±•ÕÑ¡1½¥¸¡Ü°È¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½ØÄ½…ÕÑ ½½ÁÑ¥½¹Ìˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%¥˜…•¹ÑÕÑ €ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰…ÕÑ¡•¹Ñ¥…Ñ¥½¸Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡…•¹ÑÕÑ ¹½ÁÑ¥½¹ÍA…å±½… ¤¤(%ô¤(($¼¼Y•ÉÍ¥½¸•¹‘Á½¥¹Ð(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½Ù•ÉÍ¥½¸ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$‰Ù•ÉÍ¥½¸ˆè€€€Y•ÉÍ¥½¸°($$$‰‰Õ¥±‘}Ñ¥µ”ˆè	Õ¥±‘Q¥µ”°($$$‰¥Ñ}½µµ¥Ðˆè¥Ñ½µµ¥Ð°($$$‰‰Õ¥±‘}ÑåÁ”ˆè	Õ¥±‘QåÁ”°($$$‰½}Ù•ÉÍ¥½¸ˆèÉÕ¹Ñ¥µ”¹Y•ÉÍ¥½¸ ¤°($$$‰½Ìˆè€€€€€€€€ÉÕ¹Ñ¥µ”¹==L°($$$‰…É ˆè€€€€€€ÉÕ¹Ñ¥µ”¹=I °($%ô¤(%ô¤(($¼¼P€½…Á¤½©½‰Ì¼é¥€´•ÐÍÑ…ÑÕÌ½˜„‰…­É½Õ¹©½ˆ(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½©½‰Ì¼ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($$¼¼áÑÉ…Ð©½ˆ%™É½´Á…Ñ ($%©½‰%€èôÍÑÉ¥¹Ì¹QÉ¥µAÉ•™¥à¡È¹UI0¹A…Ñ °€ˆ½…Á¤½©½‰Ì¼ˆ¤($%¥˜©½‰%€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰©½‰}¥É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%©½ˆ€èô•Ñ)½ˆ¡©½‰%¤($%¥˜©½ˆ€ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰©½ˆ¹½Ð™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡©½ˆ¤(%ô¤(($¼¼ÕÑ¼µÕÁ‘…Ñ”ÍÑ…ÑÕÌ…¹½¹ÑÉ½°•¹‘Á½¥¹Ð(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½…ÕÑ½ÕÁ‘…Ñ”½ÍÑ…ÑÕÌˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹I1½¬ ¤($%µ…¹…•È€èô…ÕÑ½UÁ‘…Ñ•5…¹…•È($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹IU¹±½¬ ¤(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤(($%¥˜µ…¹…•È€ôô¹¥°ì($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰•¹…‰±•ˆè€™…±Í”°($$$$‰É•…Í½¸ˆè€€€‰¹½Ð¥¹¥Ñ¥…±¥é•€¡¹¼Í•ÉÙ•È½¹¹•Ñ¥½¸¤ˆ°($$$$‰ÍÑ…ÑÕÌˆè€€€‰‘¥Í…‰±•ˆ°($$$$‰Á±…Ñ™½É´ˆè…•¹Ð¹•ÑA±…Ñ™½Éµ%¹™¼ ¤°($$$$‰…É ˆè€€€€ÉÕ¹Ñ¥µ”¹=I °($$%ô¤($$%É•ÑÕÉ¸($%ô(($%ÍÑ…ÑÕÌ€èôµ…¹…•È¹MÑ…ÑÕÌ ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡ÍÑ…ÑÕÌ¤(%ô¤(($¼¼QÉ¥•È…¸¥µµ•‘¥…Ñ”ÕÁ‘…Ñ”¡•¬(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½…ÕÑ½ÕÁ‘…Ñ”½¡•¬ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹I1½¬ ¤($%µ…¹…•È€èô…ÕÑ½UÁ‘…Ñ•5…¹…•È($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹IU¹±½¬ ¤(($%¥˜µ…¹…•È€ôô¹¥°ì($$%¥˜…ÁÁ1½•È€„ô¹¥°ì($$$%…ÁÁ1½•È¹%¹™¼ ‰UÁ‘…Ñ”¡•¬É•ÅÕ•ÍÑ•‰ÕÐ…ÕÑ¼µÕÁ‘…Ñ”µ…¹…•È¹½Ð¥¹¥Ñ¥…±¥é•€¡¡•¬Í•ÉÙ•È½¹¹•Ñ¥½¸¤ˆ¤($$%ô($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$$‰•ÉÉ½Èˆè€€€‰…ÕÑ¼µÕÁ‘…Ñ”¹½Ð…Ù…¥±…‰±”ˆ°($$$$‰µ•ÍÍ…”ˆè€‰•¹ÐµÕÍÐ‰”½¹¹•Ñ•Ñ¼„Í•ÉÙ•È™½ÈÕÁ‘…Ñ•Ì¸¡•¬Í•ÉÙ•È½¹™¥ÕÉ…Ñ¥½¸¸ˆ°($$%ô¤($$%É•ÑÕÉ¸($%ô(($%¥˜…ÁÁ1½•È€„ô¹¥°ì($$%…ÁÁ1½•È¹%¹™¼ ‰5…¹Õ…°ÕÁ‘…Ñ”¡•¬ÑÉ¥•É•Ù¥„A$ˆ¤($%ô(($$¼¼IÕ¸¡•¬¥¸‰…­É½Õ¹Ý¥Ñ „É•…Í½¹…‰±”Ñ¥µ•½ÕÐ($%¼™Õ¹Œ ¤ì($$%¡•­Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡½¹Ñ•áÐ¹	…­É½Õ¹ ¤°€È©Ñ¥µ”¹5¥¹ÕÑ”¤($$%‘•™•È…¹•° ¤($$%¥˜•ÉÈ€èôµ…¹…•È¹¡•­9½Ü¡¡•­Ñà¤ì•ÉÈ€„ô¹¥°€˜˜…ÁÁ1½•È€„ô¹¥°ì($$$%…ÁÁ1½•È¹]…É¸ ‰5…¹Õ…°ÕÁ‘…Ñ”¡•¬™…¥±•ˆ°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%ô•±Í”¥˜…ÁÁ1½•È€„ô¹¥°ì($$$%…ÁÁ1½•È¹%¹™¼ ‰5…¹Õ…°ÕÁ‘…Ñ”¡•¬½µÁ±•Ñ•ˆ¤($$%ô($%ô ¤(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$‰ÍÑ…ÑÕÌˆè€€‰¡•­}ÑÉ¥•É•ˆ°($$$‰µ•ÍÍ…”ˆè€‰UÁ‘…Ñ”¡•¬¡…Ì‰••¸Í¡•‘Õ±•ˆ°($%ô¤(%ô¤(($¼¼½É”É•¥¹ÍÑ…±°Ñ¡”±…Ñ•ÍÐ‰Õ¥±É•…É‘±•ÍÌ½˜ÕÉÉ•¹ÐÙ•ÉÍ¥½¸(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½…ÕÑ½ÕÁ‘…Ñ”½™½É”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹I1½¬ ¤($%µ…¹…•È€èô…ÕÑ½UÁ‘…Ñ•5…¹…•È($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹IU¹±½¬ ¤(($%¥˜µ…¹…•È€ôô¹¥°ì($$%¥˜…ÁÁ1½•È€„ô¹¥°ì($$$%…ÁÁ1½•È¹%¹™¼ ‰½É”ÕÁ‘…Ñ”É•ÅÕ•ÍÑ•‰ÕÐ…ÕÑ¼µÕÁ‘…Ñ”µ…¹…•È¹½Ð¥¹¥Ñ¥…±¥é•€¡¡•¬Í•ÉÙ•È½¹¹•Ñ¥½¸¤ˆ¤($$%ô($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$$‰•ÉÉ½Èˆè€€€‰…ÕÑ¼µÕÁ‘…Ñ”¹½Ð…Ù…¥±…‰±”ˆ°($$$$‰µ•ÍÍ…”ˆè€‰•¹ÐµÕÍÐ‰”½¹¹•Ñ•Ñ¼„Í•ÉÙ•È™½ÈÕÁ‘…Ñ•Ì¸¡•¬Í•ÉÙ•È½¹™¥ÕÉ…Ñ¥½¸¸ˆ°($$%ô¤($$%É•ÑÕÉ¸($%ô(($%Ù…ÈÁ…å±½…ÍÑÉÕÐì($$%I•…Í½¸ÍÑÉ¥¹œ©Í½¸è‰É•…Í½¸‰€($%ô($%¥˜È¹	½‘ä€„ô¹¥°ì($$%‘•™•ÈÈ¹	½‘ä¹±½Í” ¤($$%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™Á…å±½…¤ì•ÉÈ€„ô¹¥°€˜˜•ÉÈ€„ô¥¼¹=ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥)M=8Á…å±½…ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%É•ÑÕÉ¸($$%ô($%ô(($%É•…Í½¸€èôÍÑÉ¥¹Ì¹QÉ¥µMÁ…”¡Á…å±½…¹I•…Í½¸¤($%¥˜É•…Í½¸€ôô€ˆˆì($$%É•…Í½¸€ô€‰…•¹Ñ}Õ¥}™½É•}É•¥¹ÍÑ…±°ˆ($%ô(($%¥˜…ÁÁ1½•È€„ô¹¥°ì($$%…ÁÁ1½•È¹%¹™¼ ‰½É”É•¥¹ÍÑ…±°É•ÅÕ•ÍÑ•Ù¥„A$ˆ°€‰É•…Í½¸ˆ°É•…Í½¸¤($%ô(($%¼™Õ¹Œ¡É•…Í½¸ÍÑÉ¥¹œ¤ì($$%ÉÕ¹Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡½¹Ñ•áÐ¹	…­É½Õ¹ ¤°€ÄÔ©Ñ¥µ”¹5¥¹ÕÑ”¤($$%‘•™•È…¹•° ¤($$%¥˜•ÉÈ€èôµ…¹…•È¹½É•%¹ÍÑ…±±1…Ñ•ÍÐ¡ÉÕ¹Ñà°É•…Í½¸¤ì•ÉÈ€„ô¹¥°ì($$$%¥˜…ÁÁ1½•È€„ô¹¥°ì($$$$%…ÁÁ1½•È¹]…É¸ ‰½É”É•¥¹ÍÑ…±°™…¥±•ˆ°€‰•ÉÉ½Èˆ°•ÉÈ°€‰É•…Í½¸ˆ°É•…Í½¸¤($$$%ô($$%ô•±Í”¥˜…ÁÁ1½•È€„ô¹¥°ì($$$%…ÁÁ1½•È¹%¹™¼ ‰½É”É•¥¹ÍÑ…±°½µÁ±•Ñ•ÍÕ•ÍÍ™Õ±±äˆ°€‰É•…Í½¸ˆ°É•…Í½¸¤($$%ô($%ô¡É•…Í½¸¤(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$‰ÍÑ…ÑÕÌˆè€€‰™½É•}ÑÉ¥•É•ˆ°($$$‰µ•ÍÍ…”ˆè€‰½É•É•¥¹ÍÑ…±°¡…Ì‰••¸Í¡•‘Õ±•ˆ°($%ô¤(%ô¤(($¼¼…¹•°…¸¥¸µÁÉ½É•ÍÌÕÁ‘…Ñ”(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½…ÕÑ½ÕÁ‘…Ñ”½…¹•°ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹I1½¬ ¤($%µ…¹…•È€èô…ÕÑ½UÁ‘…Ñ•5…¹…•È($%…ÕÑ½UÁ‘…Ñ•5…¹…•É5Ô¹IU¹±½¬ ¤(($%¥˜µ…¹…•È€ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰…ÕÑ¼µÕÁ‘…Ñ”¹½Ð…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô(($%¥˜€…µ…¹…•È¹…¹•° ¤ì($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ½¹™±¥Ð¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$$‰•ÉÉ½Èˆè€‰…¹¹½Ð…¹•°ÕÁ‘…Ñ”…ÐÑ¡¥ÌÍÑ…”€¡µ…ä…±É•…‘ä‰”É•ÍÑ…ÉÑ¥¹œ½È¹½Ð¥¸ÁÉ½É•ÍÌ¤ˆ°($$%ô¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì($$$‰ÍÑ…ÑÕÌˆè€€‰…¹•±±•ˆ°($$$‰µ•ÍÍ…”ˆè€‰UÁ‘…Ñ”…¹•±±…Ñ¥½¸É•ÅÕ•ÍÑ•ˆ°($%ô¤(%ô¤(($¼¼5•ÑÉ¥Ì¡¥ÍÑ½Éä•¹‘Á½¥¹ÑÌ(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½±…Ñ•ÍÐˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°Á…É…µ•Ñ•ÈÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤($%Í¹…ÁÍ¡½Ð°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•Ñ1…Ñ•ÍÑ5•ÑÉ¥Ì¡Ñà°Í•É¥…°¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¥˜•ÉÈ€ôôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¹¼µ•ÑÉ¥Ì™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$%ô•±Í”ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ðµ•ÑÉ¥Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%ô($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡Í¹…ÁÍ¡½Ð¤(%ô¤(($¼¼P€½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½‰½Õ¹‘ÌýÍ•É¥…°õMI%0($¼¼I•ÑÕÉ¹Ìµ¥¸½µ…àÑ¥µ•ÍÑ…µÁÌ€¡…É½ÍÌ…±°Ñ¥•ÉÌ¤Ý¥Ñ¡½ÕÐ™•Ñ¡¥¹œÑ¡”™Õ±°Í•É¥•Ì¸(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½‰½Õ¹‘Ìˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°Á…É…µ•Ñ•ÈÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%ÍÑ½É”°½¬€èô‘•Ù¥•MÑ½É”¸ ©ÍÑ½É…”¹ME1¥Ñ•MÑ½É”¤($%¥˜€…½¬ñðÍÑ½É”€ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰ÍÑ½É…”Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤(($%µ¥¹QL°µ…áQL°Ñ½Ñ…°°•ÉÈ€èôÍÑ½É”¹•ÑQ¥•É•‘5•ÑÉ¥Í	½Õ¹‘Ì¡Ñà°Í•É¥…°¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¥˜•ÉÈ€ôôÍÑ½É…”¹ÉÉ9½Ñ½Õ¹ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¹¼µ•ÑÉ¥Ì™½Õ¹ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ9½Ñ½Õ¹¤($$$%É•ÑÕÉ¸($$%ô($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ðµ•ÑÉ¥Ì‰½Õ¹‘Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰Í•É¥…°ˆè€€€€€€€Í•É¥…°°($$$‰µ¥¹}Ñ¥µ•ÍÑ…µÀˆèµ¥¹QL¹UQ ¤¹½Éµ…Ð¡Ñ¥µ”¹IÌÌÌå9…¹¼¤°($$$‰µ…á}Ñ¥µ•ÍÑ…µÀˆèµ…áQL¹UQ ¤¹½Éµ…Ð¡Ñ¥µ”¹IÌÌÌå9…¹¼¤°($$$‰Á½¥¹ÑÌˆè€€€€€€€Ñ½Ñ…°°($%ô¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½¡¥ÍÑ½Éäˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰P½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Í•É¥…°€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í•É¥…°ˆ¤($%¥˜Í•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°Á…É…µ•Ñ•ÈÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼A…ÉÍ”µ…áA½¥¹ÑÌ€¡‘•™…Õ±Ð€ÈÀÀ°É•…Í½¹…‰±”™½È¡…ÉÐ‘¥ÍÁ±…ä¤($%µ…áA½¥¹ÑÌ€èô€ÈÀÀ($%¥˜µÀ€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰µ…áA½¥¹ÑÌˆ¤ìµÀ€„ô€ˆˆì($$%¥˜¸°•ÉÈ€èôÍÑÉ½¹Ø¹Ñ½¤¡µÀ¤ì•ÉÈ€ôô¹¥°€˜˜¸€ø€Àì($$$%µ…áA½¥¹ÑÌ€ô¸($$$%¥˜µ…áA½¥¹ÑÌ€ø€ÄÀÀÀÀì€¼¼…À…Ð€ÄÁ¬Ñ¼ÁÉ•Ù•¹Ðµ•µ½Éä¥ÍÍÕ•Ì($$$$%µ…áA½¥¹ÑÌ€ô€ÄÀÀÀÀ($$$%ô($$%ô($%ô(($$¼¼I…Üµ½‘”‘¥Í…‰±•Ì‘½Ý¹Í…µÁ±¥¹œ($%É…Ý5½‘”€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰É…Üˆ¤€ôô€‰ÑÉÕ”ˆ(($$¼¼MÕÁÁ½ÉÐ‰½Ñ Á•É¥½µ‰…Í•…¹ÕÍÑ½´‘…Ñ”É…¹”ÅÕ•É¥•Ì($%Ù…ÈÍ¥¹”°Õ¹Ñ¥°Ñ¥µ”¹Q¥µ”($%¹½Ü€èôÑ¥µ”¹9½Ü ¤(($$¼¼¡•¬™½ÈÕÍÑ½´‘…Ñ”É…¹”™¥ÉÍÐ($%Í¥¹•MÑÈ€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Í¥¹”ˆ¤($%Õ¹Ñ¥±MÑÈ€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Õ¹Ñ¥°ˆ¤(($%¥˜Í¥¹•MÑÈ€„ô€ˆˆ€˜˜Õ¹Ñ¥±MÑÈ€„ô€ˆˆì($$$¼¼ÕÍÑ½´‘…Ñ”É…¹”($$%Ù…È•ÉÈ•ÉÉ½È($$%Í¥¹”°•ÉÈ€ôÑ¥µ”¹A…ÉÍ”¡Ñ¥µ”¹IÌÌÌä°Í¥¹•MÑÈ¤($$%¥˜•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥Í¥¹”Á…É…µ•Ñ•È€¡ÕÍ”IÌÌÌä™½Éµ…Ð¤ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%É•ÑÕÉ¸($$%ô($$%Õ¹Ñ¥°°•ÉÈ€ôÑ¥µ”¹A…ÉÍ”¡Ñ¥µ”¹IÌÌÌä°Õ¹Ñ¥±MÑÈ¤($$%¥˜•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥Õ¹Ñ¥°Á…É…µ•Ñ•È€¡ÕÍ”IÌÌÌä™½Éµ…Ð¤ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%É•ÑÕÉ¸($$%ô($%ô•±Í”ì($$$¼¼A•É¥½µ‰…Í•É…¹”($$%Á•É¥½€èôÈ¹UI0¹EÕ•Éä ¤¹•Ð ‰Á•É¥½ˆ¤($$%¥˜Á•É¥½€ôô€ˆˆì($$$%Á•É¥½€ô€‰Ý••¬ˆ€¼¼‘•™…Õ±Ð($$%ô(($$%Õ¹Ñ¥°€ô¹½Ü($$%ÍÝ¥Ñ Á•É¥½ì($$%…Í”€‰‘…äˆè($$$%Í¥¹”€ô¹½Ü¹‘ ´ÈÐ€¨Ñ¥µ”¹!½ÕÈ¤($$%…Í”€‰Ý••¬ˆè($$$%Í¥¹”€ô¹½Ü¹‘ ´Ü€¨€ÈÐ€¨Ñ¥µ”¹!½ÕÈ¤($$%…Í”€‰µ½¹Ñ ˆè($$$%Í¥¹”€ô¹½Ü¹‘ ´ÌÀ€¨€ÈÐ€¨Ñ¥µ”¹!½ÕÈ¤($$%…Í”€‰å•…Èˆè($$$%Í¥¹”€ô¹½Ü¹‘ ´ÌØÔ€¨€ÈÐ€¨Ñ¥µ”¹!½ÕÈ¤($$%‘•™…Õ±Ðè($$$%Í¥¹”€ô¹½Ü¹‘ ´Ü€¨€ÈÐ€¨Ñ¥µ”¹!½ÕÈ¤€¼¼‘•™…Õ±ÐÑ¼Ý••¬($$%ô($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÈÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤($$¼¼UÍ”Ñ¥•É•µ•ÑÉ¥ÌÉ•ÑÉ¥•Ù…°Í¼Ñ¡”ÍÑ½É”É•ÑÕÉ¹ÌÑ¡”‰•ÍÐµÉ•Í½±ÕÑ¥½¸($$¼¼‘…Ñ„™½ÈÑ¡”É•ÅÕ•ÍÑ•Ñ¥µ”É…¹”€¡É…Ü½¡½ÕÉ±ä½‘…¥±ä½µ½¹Ñ¡±ä¤¸($%Í¹…ÁÍ¡½ÑÌ°•ÉÈ€èô‘•Ù¥•MÑ½É”¹•ÑQ¥•É•‘5•ÑÉ¥Í!¥ÍÑ½Éä¡Ñà°Í•É¥…°°Í¥¹”°Õ¹Ñ¥°¤($%¥˜•ÉÈ€„ô¹¥°ì($$$¼¼1½œÑ¡”•ÉÉ½ÈÍ•ÉÙ•ÈµÍ¥‘”Ñ¼…¥‘•‰Õ¥¹œ€¡Ý¥±°…ÁÁ•…È¥¸…•¹Ð±½Ì¤($$%…•¹Ð¹ÉÉ½È¡™µÐ¹MÁÉ¥¹Ñ˜ ‰…¥±•Ñ¼•Ðµ•ÑÉ¥Ì¡¥ÍÑ½ÉäèÍ•É¥…°ô•Ì•ÉÉ½Èô•Øˆ°Í•É¥…°°•ÉÈ¤¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ðµ•ÑÉ¥Ì¡¥ÍÑ½Éäè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($$¼¼½Ý¹Í…µÁ±”¥˜¹••‘•…¹¹½Ð¥¸É…Üµ½‘”($%¥˜€…É…Ý5½‘”€˜˜±•¸¡Í¹…ÁÍ¡½ÑÌ¤€øµ…áA½¥¹ÑÌì($$%Í¹…ÁÍ¡½ÑÌ€ô‘½Ý¹Í…µÁ±••¹Ñ5•ÑÉ¥Ì¡Í¹…ÁÍ¡½ÑÌ°µ…áA½¥¹ÑÌ¤($%ô(($%¥˜…•¹Ð¹•‰Õ¹…‰±•ì($$%…•¹Ð¹•‰Õœ¡™µÐ¹MÁÉ¥¹Ñ˜ ‰P€½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½¡¥ÍÑ½Éä€´Í•É¥…°ô•Ì°Í¥¹”ô•Ì°Õ¹Ñ¥°ô•Ì°™½Õ¹ô•Í¹…ÁÍ¡½ÑÌ°É…Üô•Øˆ°($$$%Í•É¥…°°Í¥¹”¹½Éµ…Ð¡Ñ¥µ”¹IÌÌÌä¤°Õ¹Ñ¥°¹½Éµ…Ð¡Ñ¥µ”¹IÌÌÌä¤°±•¸¡Í¹…ÁÍ¡½ÑÌ¤°É…Ý5½‘”¤¤($$%¥˜±•¸¡Í¹…ÁÍ¡½ÑÌ¤€ø€Àì($$$%™¥ÉÍÐ€èôÍ¹…ÁÍ¡½ÑÍlÁt($$$%±…ÍÐ€èôÍ¹…ÁÍ¡½ÑÍm±•¸¡Í¹…ÁÍ¡½ÑÌ¤´Åt($$$%…•¹Ð¹•‰Õœ¡™µÐ¹MÁÉ¥¹Ñ˜ ˆ€¥ÉÍÐèÑ¥µ•ÍÑ…µÀô•Ì°Á…•}½Õ¹Ðô•ˆ°™¥ÉÍÐ¹Q¥µ•ÍÑ…µÀ¹½Éµ…Ð¡Ñ¥µ”¹IÌÌÌä¤°™¥ÉÍÐ¹A…•½Õ¹Ð¤¤($$$%…•¹Ð¹•‰Õœ¡™µÐ¹MÁÉ¥¹Ñ˜ ˆ€1…ÍÐèÑ¥µ•ÍÑ…µÀô•Ì°Á…•}½Õ¹Ðô•ˆ°±…ÍÐ¹Q¥µ•ÍÑ…µÀ¹½Éµ…Ð¡Ñ¥µ”¹IÌÌÌä¤°±…ÍÐ¹A…•½Õ¹Ð¤¤($$%ô($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡Í¹…ÁÍ¡½ÑÌ¤(%ô¤(($¼¼A=MP€½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½‘•±•Ñ”€´‘•±•Ñ”„Í¥¹±”µ•ÑÉ¥ÌÉ½Ü‰ä¥€¡Ñ¥•È½ÁÑ¥½¹…°¤(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½‘•Ù¥•Ì½µ•ÑÉ¥Ì½‘•±•Ñ”ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Ù…ÈÉ•ÄÍÑÉÕÐì($$%%€€¥¹ÐØÐ€©Í½¸è‰¥‰€($$%Q¥•ÈÍÑÉ¥¹œ©Í½¸è‰Ñ¥•È±½µ¥Ñ•µÁÑä‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‰…©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%¥˜É•Ä¹%€ôô€Àì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤($%¥˜‘•Ù¥•MÑ½É”€ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰ÍÑ½É…”Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%¥˜•ÉÈ€èô‘•Ù¥•MÑ½É”¹•±•Ñ•5•ÑÉ¥	å%¡Ñà°É•Ä¹Q¥•È°É•Ä¹%¤ì•ÉÈ€„ô¹¥°ì($$%…•¹Ð¹ÉÉ½È¡™µÐ¹MÁÉ¥¹Ñ˜ ‰…¥±•Ñ¼‘•±•Ñ”µ•ÑÉ¥ÌÉ½Üè¥ô•Ñ¥•Èô•Ì•ÉÉ½Èô•Øˆ°É•Ä¹%°É•Ä¹Q¥•È°•ÉÈ¤¤($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼‘•±•Ñ”µ•ÑÉ¥ÌÉ½Üè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ9½½¹Ñ•¹Ð¤(%ô¤(($¼¼A=MP€½‘•Ù¥•Ì½µ•ÑÉ¥Ì½½±±•Ð€´5…¹Õ…±±ä½±±•Ðµ•ÑÉ¥Ì™½È„‘•Ù¥”($¼¼MÕÁÁ½ÉÑÌ…Íå¹Œµ½‘”Ù¥„€ý…Íå¹ŒõÑÉÕ”ÅÕ•ÉäÁ…É…´°É•ÑÕÉ¹Ì©½‰}¥™½ÈÁÉ½É•ÍÌÑÉ…­¥¹œ(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½‘•Ù¥•Ì½µ•ÑÉ¥Ì½½±±•Ðˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Ù…ÈÉ•ÄÍÑÉÕÐì($$%M•É¥…°ÍÑÉ¥¹œ©Í½¸è‰Í•É¥…°‰€($$%%@€€€€ÍÑÉ¥¹œ©Í½¸è‰¥À‰€($$%Íå¹Œ€‰½½°€€©Í½¸è‰…Íå¹Œ‰€€¼¼%˜ÑÉÕ”°ÉÕ¸¥¸‰…­É½Õ¹…¹É•ÑÕÉ¸©½‰}¥($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰‰…©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼±Í¼¡•¬ÅÕ•ÉäÁ…É…´™½È…Íå¹Œµ½‘”($%¥˜È¹UI0¹EÕ•Éä ¤¹•Ð ‰…Íå¹Œˆ¤€ôô€‰ÑÉÕ”ˆì($$%É•Ä¹Íå¹Œ€ôÑÉÕ”($%ô(($%¥˜É•Ä¹M•É¥…°€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•É¥…°É•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼¡•¬¥˜Ñ¡¥Ì¥Ì„UM‘•Ù¥”€´¥˜Í¼°ÕÍ”UMµ•ÑÉ¥Ì½±±•Ñ¥½¸($%Ù…È‘•Ù¥”€©ÍÑ½É…”¹•Ù¥”($%¥˜‘•Ù¥•MÑ½É”€„ô¹¥°ì($$%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€Ô©Ñ¥µ”¹M•½¹¤($$%‘•™•È…¹•° ¤($$%Ù…È•ÉÈ•ÉÉ½È($$%‘•Ù¥”°•ÉÈ€ô‘•Ù¥•MÑ½É”¹•Ð¡Ñà°É•Ä¹M•É¥…°¤($$%¥˜•ÉÈ€ôô¹¥°€˜˜‘•Ù¥”€„ô¹¥°ì($$$%¥˜É•Ä¹%@€ôô€ˆˆì($$$$%É•Ä¹%@€ô‘•Ù¥”¹%@($$$%ô($$%ô($%ô(($$¼¼½È…Íå¹Œµ½‘”°ÉÕ¸½±±•Ñ¥½¸¥¸‰…­É½Õ¹($%¥˜É•Ä¹Íå¹Œì($$%©½‰%€èôÉ•¥ÍÑ•É)½ˆ ‰µ•ÑÉ¥Í}½±±•Ðˆ¤(($$$¼¼I•ÑÕÉ¸©½ˆ%¥µµ•‘¥…Ñ•±ä($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰©½‰}¥ˆè€©½‰%°($$$$‰ÍÑ…ÑÕÌˆè€€‰Á•¹‘¥¹œˆ°($$$$‰µ•ÍÍ…”ˆè€‰5•ÑÉ¥Ì½±±•Ñ¥½¸ÍÑ…ÉÑ•ˆ°($$%ô¤(($$$¼¼IÕ¸½±±•Ñ¥½¸¥¸‰…­É½Õ¹($$%¼½±±•Ñ5•ÑÉ¥ÍÍå¹Œ¡©½‰%°É•Ä¹M•É¥…°°É•Ä¹%@°‘•Ù¥”¤($$%É•ÑÕÉ¸($%ô(($$¼¼Må¹¡É½¹½ÕÌµ½‘”€¡½É¥¥¹…°‰•¡…Ù¥½È¤($$¼¼¡•¬™½ÈUM‘•Ù¥”ÑåÁ”($%¥˜‘•Ù¥”€„ô¹¥°€˜˜€¡‘•Ù¥”¹•Ù¥•QåÁ”€ôô€‰ÕÍˆˆñð‘•Ù¥”¹%ÍUM¤€˜˜ÕÍ‰AÉ½áåMÕÁÁ½ÉÑ• ¤ì($$$¼¼UM‘•Ù¥”€´ÕÍ”UMÁÉ½áäµ•ÑÉ¥Ì½±±•Ñ¥½¸($$%…ÁÁ1½•È¹%¹™¼ ‰½±±•Ñ¥¹œUMµ•ÑÉ¥Ìˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°¤(($$%ÍÑ½É…•M¹…ÁÍ¡½Ð°½¬€èôÕÍ‰AÉ½áå5•ÑÉ¥ÍM¹…ÁÍ¡½Ð¡È¹½¹Ñ•áÐ ¤°É•Ä¹M•É¥…°¤($$%¥˜€…½¬ì($$$%…ÁÁ1½•È¹]…É¸ ‰UMµ•ÑÉ¥Ì½±±•Ñ¥½¸™…¥±•ˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°¤($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰UMµ•ÑÉ¥Ì½±±•Ñ¥½¸™…¥±•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$%É•ÑÕÉ¸($$%ô(($$$¼¼M…Ù”Ñ¼‘…Ñ…‰…Í”($$%Í…Ù•Ñà°Í…Ù•…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($$%‘•™•ÈÍ…Ù•…¹•° ¤($$%¥˜•ÉÈ€èô‘•Ù¥•MÑ½É”¹M…Ù•5•ÑÉ¥ÍM¹…ÁÍ¡½Ð¡Í…Ù•Ñà°ÍÑ½É…•M¹…ÁÍ¡½Ð¤ì•ÉÈ€„ô¹¥°ì($$$%…ÁÁ1½•È¹]…É¸ ‰…¥±•Ñ¼Í…Ù”UMµ•ÑÉ¥Ìˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”UMµ•ÑÉ¥Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$%É•ÑÕÉ¸($$%ô(($$%…ÁÁ1½•È¹%¹™¼ ‰UMµ•ÑÉ¥Ì½±±•Ñ•…¹Í…Ù•ˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰Ñ½Ñ…±}Á…•Ìˆ°ÍÑ½É…•M¹…ÁÍ¡½Ð¹A…•½Õ¹Ð¤($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰Í•É¥…°ˆè€€€€€É•Ä¹M•É¥…°°($$$$‰Ñ½Ñ…±}Á…•ÌˆèÍÑ½É…•M¹…ÁÍ¡½Ð¹A…•½Õ¹Ð°($$$$‰Í½ÕÉ”ˆè€€€€€€‰ÕÍˆˆ°($$$$‰Í…Ù•ˆè€€€€€€ÑÉÕ”°($$%ô¤($$%É•ÑÕÉ¸($%ô(($$¼¼9•ÑÝ½É¬‘•Ù¥”€´ÕÍ”M95@µ•ÑÉ¥Ì½±±•Ñ¥½¸€¡½É¥¥¹…°½‘”¤($%¥˜É•Ä¹%@€ôô€ˆˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥ÀÉ•ÅÕ¥É•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô(($$¼¼½±±•Ðµ•ÑÉ¥ÌÍ¹…ÁÍ¡½ÐÕÍ¥¹œ¹•ÜÍ…¹¹•È($%µ•ÑÉ¥ÍÑà°…¹•±5•ÑÉ¥Ì€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÌÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•±5•ÑÉ¥Ì ¤($%Ù•¹‘½É!¥¹Ð€èô€ˆˆ($$¼¼•ÐÙ•¹‘½È¡¥¹Ð™É½´‘…Ñ…‰…Í”¥˜Á½ÍÍ¥‰±”($%¥˜‘•Ù¥•MÑ½É”€„ô¹¥°ì($$%‘•Ù¥”°•ÑÉÈ€èô‘•Ù¥•MÑ½É”¹•Ð¡µ•ÑÉ¥ÍÑà°É•Ä¹M•É¥…°¤($$%¥˜•ÑÉÈ€ôô¹¥°€˜˜‘•Ù¥”€„ô¹¥°ì($$$%Ù•¹‘½É!¥¹Ð€ô‘•Ù¥”¹5…¹Õ™…ÑÕÉ•È($$%ô($%ô(($$¼¼UÍ”¹•ÜÍ…¹¹•È™½Èµ•ÑÉ¥Ì½±±•Ñ¥½¸($%…ÁÁ1½•È¹%¹™¼ ‰½±±•Ñ¥¹œµ•ÑÉ¥Ìˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰¥Àˆ°É•Ä¹%@°€‰Ù•¹‘½É}¡¥¹Ðˆ°Ù•¹‘½É!¥¹Ð¤($%…•¹ÑM¹…ÁÍ¡½Ð°•ÉÈ€èô½±±•Ñ5•ÑÉ¥Ì¡µ•ÑÉ¥ÍÑà°É•Ä¹%@°É•Ä¹M•É¥…°°Ù•¹‘½É!¥¹Ð°€ÄÀ¤($%¥˜•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹]…É¸ ‰5•ÑÉ¥Ì½±±•Ñ¥½¸™…¥±•ˆ°€‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°€‰¥Àˆ°É•Ä¹%@°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$%¥˜…•¹Ð¹•‰Õ¹…‰±•ì($$$%…•¹Ð¹•‰Õœ¡™µÐ¹MÁÉ¥¹Ñ˜ ‰A=MP€½‘•Ù¥•Ì½µ•ÑÉ¥Ì½½±±•Ð€´%1™½È€•Ì€ •Ì¤è€•Ìˆ°É•Ä¹M•É¥…°°É•Ä¹%@°•ÉÈ¹ÉÉ½È ¤¤¤($$%ô($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼½±±•Ðµ•ÑÉ¥Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($$¼¼½¹Ù•ÉÐÑ¼ÍÑ½É…”ÑåÁ”($%ÍÑ½É…•M¹…ÁÍ¡½Ð€èô€™ÍÑ½É…”¹5•ÑÉ¥ÍM¹…ÁÍ¡½Ñíô($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹M•É¥…°€ô…•¹ÑM¹…ÁÍ¡½Ð¹M•É¥…°($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹A…•½Õ¹Ð€ô…•¹ÑM¹…ÁÍ¡½Ð¹A…•½Õ¹Ð($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹½±½ÉA…•Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹½±½ÉA…•Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹5½¹½A…•Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹5½¹½A…•Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹M…¹½Õ¹Ð€ô…•¹ÑM¹…ÁÍ¡½Ð¹M…¹½Õ¹Ð($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹Q½¹•É1•Ù•±Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹Q½¹•É1•Ù•±Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹…áA…•Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹…áA…•Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹½ÁåA…•Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹½ÁåA…•Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹=Ñ¡•ÉA…•Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹=Ñ¡•ÉA…•Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹½Áå5½¹½A…•Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹½Áå5½¹½A…•Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹½Áå±…Ñ‰•‘M…¹Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹½Áå±…Ñ‰•‘M…¹Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹½ÁåM…¹Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹½ÁåM…¹Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹…á±…Ñ‰•‘M…¹Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹…á±…Ñ‰•‘M…¹Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹…áM…¹Ì€ô…•¹ÑM¹…ÁÍ¡½Ð¹…áM…¹Ì($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹M…¹Q½!½ÍÑ±…Ñ‰•€ô…•¹ÑM¹…ÁÍ¡½Ð¹M…¹Q½!½ÍÑ±…Ñ‰•($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹M…¹Q½!½ÍÑ€ô…•¹ÑM¹…ÁÍ¡½Ð¹M…¹Q½!½ÍÑ($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹ÕÁ±•áM¡••ÑÌ€ô…•¹ÑM¹…ÁÍ¡½Ð¹ÕÁ±•áM¡••ÑÌ($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹)…µÙ•¹ÑÌ€ô…•¹ÑM¹…ÁÍ¡½Ð¹)…µÙ•¹ÑÌ($%ÍÑ½É…•M¹…ÁÍ¡½Ð¹M…¹¹•É)…µÙ•¹ÑÌ€ô…•¹ÑM¹…ÁÍ¡½Ð¹M…¹¹•É)…µÙ•¹ÑÌ(($$¼¼M…Ù”Ñ¼‘…Ñ…‰…Í”($%Í…Ù•Ñà°…¹•±M…Ù”€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÀ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•±M…Ù” ¤($%¥˜•ÉÈ€èô‘•Ù¥•MÑ½É”¹M…Ù•5•ÑÉ¥ÍM¹…ÁÍ¡½Ð¡Í…Ù•Ñà°ÍÑ½É…•M¹…ÁÍ¡½Ð¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”µ•ÑÉ¥Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%…ÁÁ1½•È¹%¹™¼ ‰5•ÑÉ¥Ì½±±•Ñ•ÍÕ•ÍÍ™Õ±±äˆ°($$$‰Í•É¥…°ˆ°É•Ä¹M•É¥…°°($$$‰¥Àˆ°É•Ä¹%@°($$$‰Á…•}½Õ¹Ðˆ°…•¹ÑM¹…ÁÍ¡½Ð¹A…•½Õ¹Ð°($$$‰½±½É}Á…•Ìˆ°…•¹ÑM¹…ÁÍ¡½Ð¹½±½ÉA…•Ì°($$$‰µ½¹½}Á…•Ìˆ°…•¹ÑM¹…ÁÍ¡½Ð¹5½¹½A…•Ì°($$$‰Í…¹}½Õ¹Ðˆ°…•¹ÑM¹…ÁÍ¡½Ð¹M…¹½Õ¹Ð°($$$‰™…á}Á…•Ìˆ°…•¹ÑM¹…ÁÍ¡½Ð¹…áA…•Ì°($$$‰½Áå}Á…•Ìˆ°…•¹ÑM¹…ÁÍ¡½Ð¹½ÁåA…•Ì°($$$‰‘ÕÁ±•á}Í¡••ÑÌˆ°…•¹ÑM¹…ÁÍ¡½Ð¹ÕÁ±•áM¡••ÑÌ°($$$‰©…µ}•Ù•¹ÑÌˆ°…•¹ÑM¹…ÁÍ¡½Ð¹)…µÙ•¹ÑÌ¤(($%¥˜…•¹Ð¹•‰Õ¹…‰±•ì($$%…•¹Ð¹•‰Õœ¡™µÐ¹MÁÉ¥¹Ñ˜ ‰A=MP€½‘•Ù¥•Ì½µ•ÑÉ¥Ì½½±±•Ð€´MUML™½È€•Ì€ •Ì¤èA…•½Õ¹Ðô•°½±½ÉA…•Ìô•°5½¹½A…•Ìô•°M…¹½Õ¹Ðô•ˆ°($$$%É•Ä¹M•É¥…°°É•Ä¹%@°…•¹ÑM¹…ÁÍ¡½Ð¹A…•½Õ¹Ð°…•¹ÑM¹…ÁÍ¡½Ð¹½±½ÉA…•Ì°…•¹ÑM¹…ÁÍ¡½Ð¹5½¹½A…•Ì°…•¹ÑM¹…ÁÍ¡½Ð¹M…¹½Õ¹Ð¤¤($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÑ…ÑÕÌˆè€€€€€€‰½¬ˆ°($$$‰Í•É¥…°ˆè€€€€€É•Ä¹M•É¥…°°($$$‰Á…•}½Õ¹Ðˆè€…•¹ÑM¹…ÁÍ¡½Ð¹A…•½Õ¹Ð°($$$‰½±½É}Á…•Ìˆè…•¹ÑM¹…ÁÍ¡½Ð¹½±½ÉA…•Ì°($$$‰µ½¹½}Á…•Ìˆè€…•¹ÑM¹…ÁÍ¡½Ð¹5½¹½A…•Ì°($$$‰Í…¹}½Õ¹Ðˆè€…•¹ÑM¹…ÁÍ¡½Ð¹M…¹½Õ¹Ð°($%ô¤(%ô¤(($¼¼Ù•¹‘½È…‘¡…¹‘±•Èµ½Ù•Ñ¼µ¥‰}ÍÕ•ÍÑ¥½¹Í}…Á¤¹¼Ñ¼•¹ÑÉ…±¥é”…¹‘¥‘…Ñ”A%Ì(($¼¼áÁ½Í”ÑÉ…”Ñ…ÌÕ¹‘•È€½Í•ÑÑ¥¹Ì½ÑÉ…•}Ñ…Ì€¡µ½Ù•™É½´±•…ä€½‘•Ù}Í•ÑÑ¥¹Ì¤(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½ÑÉ…•}Ñ…Ìˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€ôô¡ÑÑÀ¹5•Ñ¡½‘•Ðì($$%Ñ…Ì€èô…ÁÁ1½•È¹•ÑQÉ…•Q…Ì ¤($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì‰Ñ…ÌˆèÑ…Íô¤($$%É•ÑÕÉ¸($%ô(($%¥˜È¹5•Ñ¡½€ôô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%Ù…ÈÉ•ÄÍÑÉÕÐì($$$%Q…Ìµ…ÁmÍÑÉ¥¹u‰½½°©Í½¸è‰Ñ…Ì‰€($$%ô($$%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%É•ÑÕÉ¸($$%ô(($$%…ÁÁ1½•È¹M•ÑQÉ…•Q…Ì¡É•Ä¹Q…Ì¤(($$$¼¼A•ÉÍ¥ÍÐÑ¼½¹™¥œÍÑ½É”™½ÈÉ•ÍÑ…ÉÑÌ($$%¥˜…•¹Ñ½¹™¥MÑ½É”€„ô¹¥°ì($$$%|€ô…•¹Ñ½¹™¥MÑ½É”¹M•Ñ½¹™¥Y…±Õ” ‰ÑÉ…•}Ñ…Ìˆ°É•Ä¹Q…Ì¤($$%ô(($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì‰ÍÑ…ÑÕÌˆè€‰½¬‰ô¤($$%É•ÑÕÉ¸($%ô(($%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤(%ô¤(($¼¼I•ÅÕ•ÍÐÑ¡”ÕÉÉ•¹ÐÍ•ÉÙ•Èµµ…¹…•Í•ÑÑ¥¹Ì¥µµ•‘¥…Ñ•±ä¸(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½É•±½…µÍ•ÉÙ•Èˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰A=MP½¹±äˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%ÕÁ±½…‘]½É­•É5Ô¹I1½¬ ¤($%Ý½É­•È€èôÕÁ±½…‘]½É­•È($%ÕÁ±½…‘]½É­•É5Ô¹IU¹±½¬ ¤($%¥˜Ý½É­•È€ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Í•ÉÙ•È½¹¹•Ñ¥½¸Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍM•ÉÙ¥•U¹…Ù…¥±…‰±”¤($$%É•ÑÕÉ¸($%ô($%Ñà°…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡È¹½¹Ñ•áÐ ¤°€ÄÔ©Ñ¥µ”¹M•½¹¤($%‘•™•È…¹•° ¤($%¥˜•ÉÈ€èôÝ½É­•È¹I•±½…‘M•ÑÑ¥¹Ì¡Ñà¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼É•±½…Í•ÉÙ•ÈÍ•ÑÑ¥¹Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘…Ñ•Ý…ä¤($$%É•ÑÕÉ¸($%ô($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì‰ÍÑ…ÑÕÌˆè€‰É•±½…‘•‰ô¤(%ô¤(($¼¼U¹¥™¥•Í•ÑÑ¥¹Ì•¹‘Á½¥¹ÐÑ¼•Ð½Í…Ù”…±°Í•ÑÑ¥¹Ì…Ð½¹”(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ìˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜…•¹Ñ½¹™¥MÑ½É”€ôô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰½¹™¥œÍÑ½É”Õ¹…Ù…¥±…‰±”ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%ÍÝ¥Ñ È¹5•Ñ¡½ì($%…Í”¡ÑÑÀ¹5•Ñ¡½‘•Ðè($$%Í¹…ÁÍ¡½Ð€èô±½…‘U¹¥™¥•‘M•ÑÑ¥¹Ì¡…•¹Ñ½¹™¥MÑ½É”¤($$$¼¼	Õ¥±É•ÍÁ½¹Í”Ý¥Ñ Í•ÉÙ•Èµµ…¹…•µ•Ñ…‘…Ñ„($$%¥ÍM•ÉÙ•É5…¹…•€èôÍ•ÑÑ¥¹Í5…¹…•È€„ô¹¥°€˜˜Í•ÑÑ¥¹Í5…¹…•È¹!…Í5…¹…•‘M¹…ÁÍ¡½Ð ¤($$%É•ÍÀ€èôµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰‘¥Í½Ù•Éäˆè€€€€€€€Í¹…ÁÍ¡½Ð¹¥Í½Ù•Éä°($$$$‰Í¹µÀˆè€€€€€€€€€€€€Í¹…ÁÍ¡½Ð¹M95@°($$$$‰™•…ÑÕÉ•Ìˆè€€€€€€€€Í¹…ÁÍ¡½Ð¹•…ÑÕÉ•Ì°($$$$‰ÍÁ½½±•Èˆè€€€€€€€€€Í¹…ÁÍ¡½Ð¹MÁ½½±•È°($$$$‰±½¥¹œˆè€€€€€€€€€Í¹…ÁÍ¡½Ð¹1½¥¹œ°($$$$‰Ý•ˆˆè€€€€€€€€€€€€€Í¹…ÁÍ¡½Ð¹]•ˆ°($$$$‰Í•ÉÙ•É}µ…¹…•ˆè€€¥ÍM•ÉÙ•É5…¹…•°($$$$‰µ…¹…•‘}Í•Ñ¥½¹ÌˆèmuÍÑÉ¥¹íô°($$%ô($$%¥˜¥ÍM•ÉÙ•É5…¹…•ì($$$$¼¼]¡•¸Í•ÉÙ•Èµµ…¹…•°‘¥Í½Ù•Éä½Í¹µÀ½™•…ÑÕÉ•Ì½ÍÁ½½±•È…É”±½­•€¡±½¥¹œ½Ý•ˆ…É”±½…°¤($$$%É•ÍÁl‰µ…¹…•‘}Í•Ñ¥½¹Ì‰t€ôÍ•ÑÑ¥¹Í5…¹…•È¹5…¹…•‘M•Ñ¥½¹Ì ¤($$%ô($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡É•ÍÀ¤($$%É•ÑÕÉ¸(($%…Í”¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐè($$%Ù…ÈÉ•ÄÍÑÉÕÐì($$$%¥Í½Ù•Éäµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô©Í½¸è‰‘¥Í½Ù•Éä‰€($$$%M95@€€€€€µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô©Í½¸è‰Í¹µÀ‰€($$$%•…ÑÕÉ•Ì€µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô©Í½¸è‰™•…ÑÕÉ•Ì‰€($$$%MÁ½½±•È€€µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô©Í½¸è‰ÍÁ½½±•È‰€($$$%1½¥¹œ€€µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô©Í½¸è‰±½¥¹œ‰€($$$%]•ˆ€€€€€€µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô©Í½¸è‰Ý•ˆ‰€($$$%I•Í•Ð€€€€‰½½°€€€€€€€€€€€€€€€€€€©Í½¸è‰É•Í•Ð‰€($$%ô($$%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%É•ÑÕÉ¸($$%ô(($$$¼¼¥Í½Ù•Éä½M95@½•…ÑÕÉ•Ì½MÁ½½±•È…É”™±••Ðµµ…¹…•Í•Ñ¥½¹Ì¸]¡•¸Ñ¡”($$$¼¼…•¹Ð¡…Ì…¸…Ñ¥Ù”Í•ÉÙ•Èµµ…¹…•Í•ÑÑ¥¹ÌÍ¹…ÁÍ¡½Ð°É•©•Ð…ÑÑ•µÁÑÌ($$$¼¼Ñ¼¡…¹”Ñ¡•´¡•É”¥¹ÍÑ•…½˜Í¥±•¹Ñ±äÁ•ÉÍ¥ÍÑ¥¹œÙ…±Õ•ÌÑ¡…Ð($$$¼¼±½…‘U¹¥™¥•‘M•ÑÑ¥¹Ì ¤Ý¥±°¥¹½É”½¸Ñ¡”¹•áÐÉ•…€¡Ý¡¥ ÁÉ•Ù¥½ÕÍ±ä($$$¼¼µ…‘”Í…Ù•Ì±½½¬ÍÕ•ÍÍ™Õ°‰ÕÐ¡…Ù”¹¼±…ÍÑ¥¹œ•™™•Ð¤¸($$%¥˜Í•ÑÑ¥¹Í5…¹…•È€„ô¹¥°€˜˜Í•ÑÑ¥¹Í5…¹…•È¹!…Í5…¹…•‘M¹…ÁÍ¡½Ð ¤ì($$$%µ…¹…•‘M•Ñ¥½¹Ì€èôµ…­”¡µ…ÁmÍÑÉ¥¹u‰½½°¤($$$%™½È|°Í•Ñ¥½¸€èôÉ…¹”Í•ÑÑ¥¹Í5…¹…•È¹5…¹…•‘M•Ñ¥½¹Ì ¤ì($$$$%µ…¹…•‘M•Ñ¥½¹ÍmÍ•Ñ¥½¹t€ôÑÉÕ”($$$%ô($$$%Ù…È±½­•‘M•Ñ¥½¹ÌmuÍÑÉ¥¹œ($$$%¥˜É•Ä¹¥Í½Ù•Éä€„ô¹¥°€˜˜µ…¹…•‘M•Ñ¥½¹Íl‰‘¥Í½Ù•Éä‰tì($$$$%±½­•‘M•Ñ¥½¹Ì€ô…ÁÁ•¹¡±½­•‘M•Ñ¥½¹Ì°€‰‘¥Í½Ù•Éäˆ¤($$$%ô($$$%¥˜É•Ä¹M95@€„ô¹¥°€˜˜µ…¹…•‘M•Ñ¥½¹Íl‰Í¹µÀ‰tì($$$$%±½­•‘M•Ñ¥½¹Ì€ô…ÁÁ•¹¡±½­•‘M•Ñ¥½¹Ì°€‰Í¹µÀˆ¤($$$%ô($$$%¥˜É•Ä¹•…ÑÕÉ•Ì€„ô¹¥°€˜˜µ…¹…•‘M•Ñ¥½¹Íl‰™•…ÑÕÉ•Ì‰tì($$$$%±½­•‘M•Ñ¥½¹Ì€ô…ÁÁ•¹¡±½­•‘M•Ñ¥½¹Ì°€‰™•…ÑÕÉ•Ìˆ¤($$$%ô($$$%¥˜É•Ä¹MÁ½½±•È€„ô¹¥°€˜˜µ…¹…•‘M•Ñ¥½¹Íl‰ÍÁ½½±•È‰tì($$$$%±½­•‘M•Ñ¥½¹Ì€ô…ÁÁ•¹¡±½­•‘M•Ñ¥½¹Ì°€‰ÍÁ½½±•Èˆ¤($$$%ô($$$%¥˜±•¸¡±½­•‘M•Ñ¥½¹Ì¤€ø€Àì($$$$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ½¹™±¥Ð¤($$$$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$$$‰•ÉÉ½Èˆè€€€€€€€‰…¹¹½Ðµ½‘¥™äÍ•ÉÙ•Èµµ…¹…•Í•ÑÑ¥¹Ìˆ°($$$$$$‰±½­•‘}­•åÌˆè±½­•‘M•Ñ¥½¹Ì°($$$$$$‰É•…Í½¸ˆè€€€€€€‰Q¡•Í”Í•Ñ¥½¹Ì…É”µ…¹…•‰äÑ¡”½¹¹•Ñ•Í•ÉÙ•È…¹…¹¹½Ð‰”•‘¥Ñ•±½…±±äˆ°($$$$%ô¤($$$$%É•ÑÕÉ¸($$$%ô($$%ô(($$%¥˜É•Ä¹I•Í•Ðì($$$%|€ô…•¹Ñ½¹™¥MÑ½É”¹M•Ñ½¹™¥Y…±Õ” ‰‘¥Í½Ù•Éå}Í•ÑÑ¥¹Ìˆ°µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõíô¤($$$%|€ô…•¹Ñ½¹™¥MÑ½É”¹M•Ñ½¹™¥Y…±Õ” ‰Í•ÑÑ¥¹Ìˆ°µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõíô¤($$$%ÍÑ½ÁÕÑ½¥Í½Ù•È ¤($$$%ÍÑ½Á1¥Ù•59L ¤($$$%ÍÑ½Á1¥Ù•]M¥Í½Ù•Éä ¤($$$%ÍÑ½Á1¥Ù•MM@ ¤($$$%ÍÑ½ÁM95AQÉ…À ¤($$$%ÍÑ½Á1159H ¤($$$%ÍÑ½Á5•ÑÉ¥ÍI•Í…¸ ¤($$$%…•¹Ð¹M•Ñ•‰Õ¹…‰±•¡™…±Í”¤($$$%…•¹Ð¹M•ÑÕµÁA…ÉÍ••‰Õœ¡™…±Í”¤($$$%‘•™…Õ±ÑÌ€èôÁµÍ•ÑÑ¥¹Ì¹•™…Õ±ÑM•ÑÑ¥¹Ì ¤($$$%¥˜ÑáÐ°•ÉÈ€èô…•¹Ñ½¹™¥MÑ½É”¹•ÑI…¹•Ì ¤ì•ÉÈ€ôô¹¥°ì($$$$%‘•™…Õ±ÑÌ¹¥Í½Ù•Éä¹I…¹•ÍQ•áÐ€ôÑáÐ($$$%ô($$$%¥˜¥Á¹•ÑÌ°•ÉÈ€èô…•¹Ð¹•Ñ1½…±MÕ‰¹•ÑÌ ¤ì•ÉÈ€ôô¹¥°€˜˜±•¸¡¥Á¹•ÑÌ¤€ø€Àì($$$$%‘•™…Õ±ÑÌ¹¥Í½Ù•Éä¹•Ñ•Ñ•‘MÕ‰¹•Ð€ô¥Á¹•ÑÍlÁt¹MÑÉ¥¹œ ¤($$$%ô($$$%…ÁÁ±å•…ÑÕÉ•ÍM•ÑÑ¥¹Í™™•ÑÌ ™‘•™…Õ±ÑÌ¹•…ÑÕÉ•Ì¤($$$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡‘•™…Õ±ÑÌ¤($$$%É•ÑÕÉ¸($$%ô(($$%ÕÉÉ•¹Ð€èô±½…‘U¹¥™¥•‘M•ÑÑ¥¹Ì¡…•¹Ñ½¹™¥MÑ½É”¤(($$%¥˜É•Ä¹¥Í½Ù•Éä€„ô¹¥°ì($$$%ÕÁ‘…Ñ•€èôÕÉÉ•¹Ð¹¥Í½Ù•Éä($$$%µ…Á%¹Ñ½MÑÉÕÐ¡É•Ä¹¥Í½Ù•Éä°€™ÕÁ‘…Ñ•¤($$$%¥˜|°½¬€èôÉ•Ä¹¥Í½Ù•Éål‰É…¹•Í}Ñ•áÐ‰tì½¬ì($$$$%µ…á‘‘ÉÌ€èô€ÐÀäØ($$$$%É•Ì°•ÉÈ€èô…•¹Ð¹A…ÉÍ•I…¹•Q•áÐ¡ÕÁ‘…Ñ•¹I…¹•ÍQ•áÐ°µ…á‘‘ÉÌ¤($$$$%¥˜•ÉÈ€„ô¹¥°ì($$$$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰Ù…±¥‘…Ñ¥½¸•ÉÉ½Èè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$$$%É•ÑÕÉ¸($$$$%ô($$$$%¥˜±•¸¡É•Ì¹ÉÉ½ÉÌ¤€ø€Àì($$$$$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$$$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$$$%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡É•Ì¤($$$$$%É•ÑÕÉ¸($$$$%ô($$$$%¥˜•ÉÈ€èô…•¹Ñ½¹™¥MÑ½É”¹M•ÑI…¹•Ì¡ÕÁ‘…Ñ•¹I…¹•ÍQ•áÐ¤ì•ÉÈ€„ô¹¥°ì($$$$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”É…¹•Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$$$%É•ÑÕÉ¸($$$$%ô($$$%ô($$$%‘¥Í5…À€èôÍÑÉÕÑQ½5…À¡ÕÁ‘…Ñ•¤($$$%‘•±•Ñ”¡‘¥Í5…À°€‰É…¹•Í}Ñ•áÐˆ¤($$$%‘•±•Ñ”¡‘¥Í5…À°€‰‘•Ñ•Ñ•‘}ÍÕ‰¹•Ðˆ¤($$$%¥˜•ÉÈ€èô…•¹Ñ½¹™¥MÑ½É”¹M•Ñ½¹™¥Y…±Õ” ‰‘¥Í½Ù•Éå}Í•ÑÑ¥¹Ìˆ°‘¥Í5…À¤ì•ÉÈ€„ô¹¥°ì($$$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”‘¥Í½Ù•ÉäÍ•ÑÑ¥¹Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$$%É•ÑÕÉ¸($$$%ô($$$%…ÁÁ±å¥Í½Ù•Éå™™•ÑÌ¡‘¥Í5…À¤($$$%ÕÉÉ•¹Ð¹¥Í½Ù•Éä€ôÕÁ‘…Ñ•($$%ô(($$$¼¼M…Ù”…±°Í•ÑÑ¥¹ÌÑ¼Õ¹¥™¥••¹Ù•±½Á”($$%Ù…È•¹Ù•±½Á”µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô($$%|€ô…•¹Ñ½¹™¥MÑ½É”¹•Ñ½¹™¥Y…±Õ” ‰Í•ÑÑ¥¹Ìˆ°€™•¹Ù•±½Á”¤($$%¥˜•¹Ù•±½Á”€ôô¹¥°ì($$$%•¹Ù•±½Á”€ôµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõíô($$%ô(($$%¥˜É•Ä¹M95@€„ô¹¥°ì($$$%ÕÁ‘…Ñ•€èôÕÉÉ•¹Ð¹M95@($$$%µ…Á%¹Ñ½MÑÉÕÐ¡É•Ä¹M95@°€™ÕÁ‘…Ñ•¤($$$%•¹Ù•±½Á•l‰Í¹µÀ‰t€ôÍÑÉÕÑQ½5…À¡ÕÁ‘…Ñ•¤($$$%ÕÉÉ•¹Ð¹M95@€ôÕÁ‘…Ñ•($$%ô(($$%¥˜É•Ä¹•…ÑÕÉ•Ì€„ô¹¥°ì($$$%ÕÁ‘…Ñ•€èôÕÉÉ•¹Ð¹•…ÑÕÉ•Ì($$$%µ…Á%¹Ñ½MÑÉÕÐ¡É•Ä¹•…ÑÕÉ•Ì°€™ÕÁ‘…Ñ•¤($$$%•¹Ù•±½Á•l‰™•…ÑÕÉ•Ì‰t€ôÍÑÉÕÑQ½5…À¡ÕÁ‘…Ñ•¤($$$%ÕÉÉ•¹Ð¹•…ÑÕÉ•Ì€ôÕÁ‘…Ñ•($$%ô(($$%¥˜É•Ä¹MÁ½½±•È€„ô¹¥°ì($$$%ÕÁ‘…Ñ•€èôÕÉÉ•¹Ð¹MÁ½½±•È($$$%µ…Á%¹Ñ½MÑÉÕÐ¡É•Ä¹MÁ½½±•È°€™ÕÁ‘…Ñ•¤($$$%•¹Ù•±½Á•l‰ÍÁ½½±•È‰t€ôÍÑÉÕÑQ½5…À¡ÕÁ‘…Ñ•¤($$$%ÕÉÉ•¹Ð¹MÁ½½±•È€ôÕÁ‘…Ñ•($$$$¼¼ÁÁ±äÍÁ½½±•ÈÍ•ÑÑ¥¹Ì¥µµ•‘¥…Ñ•±ä€¡É•ÍÑ…ÉÐÝ½É­•È¥˜¹••‘•¤($$$%…ÁÁ±åMÁ½½±•ÉM•ÑÑ¥¹Ì ™ÕÉÉ•¹Ð¹MÁ½½±•È¤($$%ô(($$%¥˜É•Ä¹1½¥¹œ€„ô¹¥°ì($$$%ÕÁ‘…Ñ•€èôÕÉÉ•¹Ð¹1½¥¹œ($$$%µ…Á%¹Ñ½MÑÉÕÐ¡É•Ä¹1½¥¹œ°€™ÕÁ‘…Ñ•¤($$$%•¹Ù•±½Á•l‰±½¥¹œ‰t€ôÍÑÉÕÑQ½5…À¡ÕÁ‘…Ñ•¤($$$%ÕÉÉ•¹Ð¹1½¥¹œ€ôÕÁ‘…Ñ•($$$$¼¼ÁÁ±ä±½œ±•Ù•°¥µµ•‘¥…Ñ•±ä($$$%¥˜…ÁÁ1½•È€„ô¹¥°€˜˜ÕÁ‘…Ñ•¹1•Ù•°€„ô€ˆˆì($$$$%¥˜±Ù°€èô±½•È¹1•Ù•±É½µMÑÉ¥¹œ¡ÕÁ‘…Ñ•¹1•Ù•°¤ì±Ù°€øô€Àì($$$$$%…ÁÁ1½•È¹M•Ñ1•Ù•°¡±Ù°¤($$$$$%…ÁÁ1½•È¹%¹™¼ ‰1½œ±•Ù•°¡…¹•ˆ°€‰±•Ù•°ˆ°ÕÁ‘…Ñ•¹1•Ù•°¤($$$$%ô($$$%ô($$$$¼¼ÁÁ±ä‘•‰Õœ™±…Ì($$$%…•¹Ð¹M•Ñ•‰Õ¹…‰±•¡ÕÁ‘…Ñ•¹1•Ù•°€ôô€‰‘•‰Õœˆ¤($$$%…•¹Ð¹M•ÑÕµÁA…ÉÍ••‰Õœ¡ÕÁ‘…Ñ•¹ÕµÁA…ÉÍ••‰Õœ¤($$%ô(($$%¥˜É•Ä¹]•ˆ€„ô¹¥°ì($$$%ÕÁ‘…Ñ•€èôÕÉÉ•¹Ð¹]•ˆ($$$%µ…Á%¹Ñ½MÑÉÕÐ¡É•Ä¹]•ˆ°€™ÕÁ‘…Ñ•¤($$$%•¹Ù•±½Á•l‰Ý•ˆ‰t€ôÍÑÉÕÑQ½5…À¡ÕÁ‘…Ñ•¤($$$%ÕÉÉ•¹Ð¹]•ˆ€ôÕÁ‘…Ñ•($$%ô(($$%¥˜•ÉÈ€èô…•¹Ñ½¹™¥MÑ½É”¹M•Ñ½¹™¥Y…±Õ” ‰Í•ÑÑ¥¹Ìˆ°•¹Ù•±½Á”¤ì•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”Í•ÑÑ¥¹Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$%É•ÑÕÉ¸($$%ô(($$%ÁµÍ•ÑÑ¥¹Ì¹M…¹¥Ñ¥é” ™ÕÉÉ•¹Ð¤($$%…ÁÁ±å•…ÑÕÉ•ÍM•ÑÑ¥¹Í™™•ÑÌ ™ÕÉÉ•¹Ð¹•…ÑÕÉ•Ì¤($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡ÕÉÉ•¹Ð¤($$%É•ÑÕÉ¸($%ô(($%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½Í•ÉÙ•Èˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%‘…Ñ…¥È°•ÉÈ€èô½¹™¥œ¹•Ñ…Ñ…¥É•Ñ½Éä ‰…•¹Ðˆ°¥ÍM•ÉÙ¥”¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼‘•Ñ•Éµ¥¹”‘…Ñ„‘¥É•Ñ½Éäˆ°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%ÍÝ¥Ñ È¹5•Ñ¡½ì($%…Í”¡ÑÑÀ¹5•Ñ¡½‘•Ðè($$%ÍÑ…ÑÕÌ€èôÍ¹…ÁÍ¡½ÑM•ÉÙ•É½¹¹•Ñ¥½¹MÑ…ÑÕÌ¡…•¹Ñ½¹™¥œ°‘…Ñ…¥È¤($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡ÍÑ…ÑÕÌ¤($$%É•ÑÕÉ¸($%…Í”¡ÑÑÀ¹5•Ñ¡½‘•±•Ñ”è($$%¥˜•ÉÈ€èô‘¥Í½¹¹•ÑÉ½µM•ÉÙ•È¡…•¹Ñ½¹™¥œ°‘…Ñ…¥È¤ì•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$%É•ÑÕÉ¸($$%ô($$%ÍÑ…ÑÕÌ€èôÍ¹…ÁÍ¡½ÑM•ÉÙ•É½¹¹•Ñ¥½¹MÑ…ÑÕÌ¡…•¹Ñ½¹™¥œ°‘…Ñ…¥È¤($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$$‰ÍÕ•ÍÌˆèÑÉÕ”°($$$$‰ÍÑ…ÑÕÌˆè€ÍÑ…ÑÕÌ°($$%ô¤($$%É•ÑÕÉ¸($%‘•™…Õ±Ðè($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(%ô¤(($¼¼)½¥¸Ñ¡”•¹ÑÉ…°Í•ÉÙ•ÈÕÍ¥¹œ„©½¥¸Ñ½­•¸¥ÍÍÕ•‰äÑ¡”Í•ÉÙ•È¸($¼¼	½‘äèì‰Í•ÉÙ•É}ÕÉ°ˆè‰¡ÑÑÁÌè¼½•¹ÑÉ…°èäÐÐÌˆ°‰Ñ½­•¸ˆèˆñÉ…Ü©½¥¸Ñ½­•¸øˆ°‰…}Á…Ñ ˆèˆ½Á…Ñ ½Ñ¼½„¹Á•´ˆ°‰¥¹Í•ÕÉ”ˆé™…±Í•ô(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½ÁÉ½‰”µÍ•ÉÙ•Èˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%Ù…È¥¸ÍÑÉÕÐì($$%M•ÉÙ•ÉUI0ÍÑÉ¥¹œ©Í½¸è‰Í•ÉÙ•É}ÕÉ°‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™¥¸¤ì•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°ì‰•ÉÉ½Èˆè‰¥¹Ù…±¥©Í½¸‰õ€°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%É•ÑÕÉ¸($%ô($%É•ÍÕ±Ð°•ÉÈ€èôÁÉ½‰•M•ÉÙ•È¡È¹½¹Ñ•áÐ ¤°¥¸¹M•ÉÙ•ÉUI0¤($%¥˜•ÉÈ€„ô¹¥°ì($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹uÍÑÉ¥¹ì‰•ÉÉ½Èˆè•ÉÈ¹ÉÉ½È ¥ô¤($$%É•ÑÕÉ¸($%ô($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%|€ô©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡É•ÍÕ±Ð¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½©½¥¸ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($%Ù…È¥¸ÍÑÉÕÐì($$%M•ÉÙ•ÉUI0ÍÑÉ¥¹œ©Í½¸è‰Í•ÉÙ•É}ÕÉ°‰€($$%Q½­•¸€€€€ÍÑÉ¥¹œ©Í½¸è‰Ñ½­•¸‰€($$%A…Ñ €€€ÍÑÉ¥¹œ©Í½¸è‰…}Á…Ñ ±½µ¥Ñ•µÁÑä‰€($$%%¹Í•ÕÉ”€‰½½°€€©Í½¸è‰¥¹Í•ÕÉ”±½µ¥Ñ•µÁÑä‰€($$%•¹Ñ9…µ”ÍÑÉ¥¹œ©Í½¸è‰…•¹Ñ}¹…µ”±½µ¥Ñ•µÁÑä‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™¥¸¤ì•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰¥¹Ù…±¥©Í½¸‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%¥˜¥¸¹M•ÉÙ•ÉUI0€ôô€ˆˆñð¥¸¹Q½­•¸€ôô€ˆˆì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰Í•ÉÙ•É}ÕÉ°…¹Ñ½­•¸É•ÅÕ¥É•‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%¥˜¥¸¹%¹Í•ÕÉ”ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ°€‰¥¹Í•ÕÉ”Q1LÙ•É¥™¥…Ñ¥½¸¥Ì¹½ÐÁ•Éµ¥ÑÑ•ˆ¤($$%É•ÑÕÉ¸($%ô(($%É•ÍÕ±Ð°•ÉÈ€èôÁ•É™½ÉµM•ÉÙ•É)½¥¸ ($$%È¹½¹Ñ•áÐ ¤°($$%Ñà°($$%Í•ÉÙ•É)½¥¹A…É…µÍì($$$%M•ÉÙ•ÉUI0è¥¸¹M•ÉÙ•ÉUI0°($$$%Q½­•¸è€€€€¥¸¹Q½­•¸°($$$%A…Ñ è€€€¥¸¹A…Ñ °($$$%%¹Í•ÕÉ”è€¥¸¹%¹Í•ÕÉ”°($$$%•¹Ñ9…µ”è¥¸¹•¹Ñ9…µ”°($$%ô°($$%…•¹Ñ½¹™¥œ°($$%…•¹Ñ½¹™¥MÑ½É”°($$%‘•Ù¥•MÑ½É”°($$%Í•ÑÑ¥¹Í5…¹…•È°($$%…ÁÁ1½•È°($$%¥ÍM•ÉÙ¥”°($$¤($%¥˜•ÉÈ€„ô¹¥°ì($$%ÍÑ…ÑÕÌ€èô©½¥¹ÉÉ½ÉMÑ…ÑÕÌ¡•ÉÈ¤($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°ÍÑ…ÑÕÌ°•ÉÈ¹ÉÉ½È ¤¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÕ•ÍÌˆè€€€€ÑÉÕ”°($$$‰Ñ•¹…¹Ñ}¥ˆè€€É•ÍÕ±Ð¹Q•¹…¹Ñ%°($$$‰…•¹Ñ}Ñ½­•¸ˆèÉ•ÍÕ±Ð¹•¹ÑQ½­•¸°($%ô¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½‘•Ù¥”µ…ÕÑ ½ÍÑ…ÉÐˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%Ù…È¥¸ÍÑÉÕÐì($$%M•ÉÙ•ÉUI0ÍÑÉ¥¹œ©Í½¸è‰Í•ÉÙ•É}ÕÉ°‰€($$%A…Ñ €€€ÍÑÉ¥¹œ©Í½¸è‰…}Á…Ñ ±½µ¥Ñ•µÁÑä‰€($$%%¹Í•ÕÉ”€‰½½°€€©Í½¸è‰¥¹Í•ÕÉ”±½µ¥Ñ•µÁÑä‰€($$%•¹Ñ9…µ”ÍÑÉ¥¹œ©Í½¸è‰…•¹Ñ}¹…µ”±½µ¥Ñ•µÁÑä‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™¥¸¤ì•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰¥¹Ù…±¥©Í½¸‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%Í•ÉÙ•ÉUI0€èôÍÑÉ¥¹Ì¹QÉ¥µMÁ…”¡¥¸¹M•ÉÙ•ÉUI0¤($%¥˜Í•ÉÙ•ÉUI0€ôô€ˆˆì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰Í•ÉÙ•É}ÕÉ°É•ÅÕ¥É•‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%Ù…±¥‘…Ñ•‘M•ÉÙ•ÉUI0°•ÉÈ€èôÙ…±¥‘…Ñ•=¹‰½…É‘¥¹M•ÉÙ•ÉUI0¡Í•ÉÙ•ÉUI0¤($%¥˜•ÉÈ€„ô¹¥°ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ°•ÉÈ¹ÉÉ½È ¤¤($$%É•ÑÕÉ¸($%ô($%Í•ÉÙ•ÉUI0€ôÙ…±¥‘…Ñ•‘M•ÉÙ•ÉUI0($%¥˜¥¸¹%¹Í•ÕÉ”ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ°€‰¥¹Í•ÕÉ”Q1LÙ•É¥™¥…Ñ¥½¸¥Ì¹½ÐÁ•Éµ¥ÑÑ•ˆ¤($$%É•ÑÕÉ¸($%ô($$¼¼Y…±¥‘…Ñ”Á…Ñ Ñ¼ÁÉ•Ù•¹ÐÁ…Ñ ÑÉ…Ù•ÉÍ…°…ÑÑ…­Ì($%…A…Ñ €èôÍÑÉ¥¹Ì¹QÉ¥µMÁ…”¡¥¸¹A…Ñ ¤($%¥˜…A…Ñ €„ô€ˆˆì($$$¼¼=¹±ä…±±½Ü€¹Á•´°€¹ÉÐ°€¹•È•áÑ•¹Í¥½¹Ì™½È•ÉÑ¥™¥…Ñ•Ì($$%•áÐ€èôÍÑÉ¥¹Ì¹Q½1½Ý•È¡™¥±•Á…Ñ ¹áÐ¡…A…Ñ ¤¤($$%¥˜•áÐ€„ô€ˆ¹Á•´ˆ€˜˜•áÐ€„ô€ˆ¹ÉÐˆ€˜˜•áÐ€„ô€ˆ¹•Èˆì($$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰…}Á…Ñ µÕÍÐ‰”„€¹Á•´°€¹ÉÐ°½È€¹•È™¥±”‰õ€¤¤($$$%É•ÑÕÉ¸($$%ô($$$¼¼Y•É¥™äÑ¡”™¥±”•á¥ÍÑÌ€¡‰ÕÐ‘½¸Ð…±±½ÜÁ…Ñ ÑÉ…Ù•ÉÍ…°½ÕÑÍ¥‘”‘…Ñ„‘¥È¤($$%¥˜ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡…A…Ñ °€ˆ¸¸ˆ¤ì($$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰…}Á…Ñ …¹¹½Ð½¹Ñ…¥¸Á…Ñ ÑÉ…Ù•ÉÍ…°¡…É…Ñ•ÉÌ‰õ€¤¤($$$%É•ÑÕÉ¸($$%ô($%ô($%‘…Ñ…¥È°•ÉÈ€èô½¹™¥œ¹•Ñ…Ñ…¥É•Ñ½Éä ‰…•¹Ðˆ°¥ÍM•ÉÙ¥”¤($%¥˜•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰™…¥±•Ñ¼‘•Ñ•Éµ¥¹”‘…Ñ„‘¥É•Ñ½Éä‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%…•¹Ñ%°•ÉÈ€èô1½…‘=É•¹•É…Ñ••¹Ñ%¡‘…Ñ…¥È¤($%¥˜•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰™…¥±•Ñ¼±½…½È•¹•É…Ñ”…•¹Ð¥‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%…•¹Ñ9…µ”€èôÉ•Í½±Ù••¹Ñ¥ÍÁ±…å9…µ”¡…•¹Ñ½¹™¥œ°¥¸¹•¹Ñ9…µ”¤($%¡½ÍÑ¹…µ”°|€èô½Ì¹!½ÍÑ¹…µ” ¤($%É•Å	½‘ä€èô…•¹Ð¹•Ù¥•ÕÑ¡MÑ…ÉÑI•ÅÕ•ÍÑì($$%•¹Ñ%è€€€€€…•¹Ñ%°($$%•¹Ñ9…µ”è€€€…•¹Ñ9…µ”°($$%•¹ÑY•ÉÍ¥½¸èY•ÉÍ¥½¸°($$%!½ÍÑ¹…µ”è€€€€¡½ÍÑ¹…µ”°($$%A±…Ñ™½É´è€€€€…•¹Ð¹•ÑA±…Ñ™½Éµ%¹™¼ ¤°($%ô($%±¥•¹Ð€èô…•¹Ð¹9•ÝM•ÉÙ•É±¥•¹Ñ]¥Ñ¡9…µ”¡Í•ÉÙ•ÉUI0°…•¹Ñ%°…•¹Ñ9…µ”°€ˆˆ°…A…Ñ °¥¸¹%¹Í•ÕÉ”¤($%É•ÍÁ	½‘ä°•ÉÈ€èô±¥•¹Ð¹•Ù¥•ÕÑ¡MÑ…ÉÐ¡È¹½¹Ñ•áÐ ¤°É•Å	½‘ä¤($%¥˜•ÉÈ€„ô¹¥°ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘…Ñ•Ý…ä°•ÉÈ¹ÉÉ½È ¤¤($$%É•ÑÕÉ¸($%ô($%¥˜É•ÍÁ	½‘ä€ôô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘…Ñ•Ý…ä¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰Í•ÉÙ•ÈÉ•ÑÕÉ¹••µÁÑäÉ•ÍÁ½¹Í”‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÕ•ÍÌˆè€€€€€€ÑÉÕ”°($$$‰½‘”ˆè€€€€€€€€€É•ÍÁ	½‘ä¹½‘”°($$$‰Á½±±}Ñ½­•¸ˆè€€€É•ÍÁ	½‘ä¹A½±±Q½­•¸°($$$‰•áÁ¥É•Í}…Ðˆè€€€É•ÍÁ	½‘ä¹áÁ¥É•ÍÐ°($$$‰…ÕÑ¡½É¥é•}ÕÉ°ˆèÉ•ÍÁ	½‘ä¹ÕÑ¡½É¥é•UI0°($$$‰…•¹Ñ}¥ˆè€€€€€…•¹Ñ%°($$$‰…•¹Ñ}¹…µ”ˆè€€€…•¹Ñ9…µ”°($%ô¤(%ô¤((%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½‘•Ù¥”µ…ÕÑ ½Á½±°ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô¡ÑÑÀ¹5•Ñ¡½‘A½ÍÐì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô($%Ù…È¥¸ÍÑÉÕÐì($$%M•ÉÙ•ÉUI0ÍÑÉ¥¹œ©Í½¸è‰Í•ÉÙ•É}ÕÉ°‰€($$%A½±±Q½­•¸ÍÑÉ¥¹œ©Í½¸è‰Á½±±}Ñ½­•¸‰€($$%A…Ñ €€€ÍÑÉ¥¹œ©Í½¸è‰…}Á…Ñ ±½µ¥Ñ•µÁÑä‰€($$%%¹Í•ÕÉ”€‰½½°€€©Í½¸è‰¥¹Í•ÕÉ”±½µ¥Ñ•µÁÑä‰€($%ô($%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™¥¸¤ì•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰¥¹Ù…±¥©Í½¸‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%Í•ÉÙ•ÉUI0€èôÍÑÉ¥¹Ì¹QÉ¥µMÁ…”¡¥¸¹M•ÉÙ•ÉUI0¤($%Á½±±Q½­•¸€èôÍÑÉ¥¹Ì¹QÉ¥µMÁ…”¡¥¸¹A½±±Q½­•¸¤($%¥˜Í•ÉÙ•ÉUI0€ôô€ˆˆñðÁ½±±Q½­•¸€ôô€ˆˆì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰Í•ÉÙ•É}ÕÉ°…¹Á½±±}Ñ½­•¸É•ÅÕ¥É•‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%Ù…±¥‘…Ñ•‘M•ÉÙ•ÉUI0°•ÉÈ€èôÙ…±¥‘…Ñ•=¹‰½…É‘¥¹M•ÉÙ•ÉUI0¡Í•ÉÙ•ÉUI0¤($%¥˜•ÉÈ€„ô¹¥°ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ°•ÉÈ¹ÉÉ½È ¤¤($$%É•ÑÕÉ¸($%ô($%Í•ÉÙ•ÉUI0€ôÙ…±¥‘…Ñ•‘M•ÉÙ•ÉUI0($%¥˜¥¸¹%¹Í•ÕÉ”ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ°€‰¥¹Í•ÕÉ”Q1LÙ•É¥™¥…Ñ¥½¸¥Ì¹½ÐÁ•Éµ¥ÑÑ•ˆ¤($$%É•ÑÕÉ¸($%ô($$¼¼Y…±¥‘…Ñ”Á…Ñ Ñ¼ÁÉ•Ù•¹ÐÁ…Ñ ÑÉ…Ù•ÉÍ…°…ÑÑ…­Ì($%…A…Ñ €èôÍÑÉ¥¹Ì¹QÉ¥µMÁ…”¡¥¸¹A…Ñ ¤($%¥˜…A…Ñ €„ô€ˆˆì($$%•áÐ€èôÍÑÉ¥¹Ì¹Q½1½Ý•È¡™¥±•Á…Ñ ¹áÐ¡…A…Ñ ¤¤($$%¥˜•áÐ€„ô€ˆ¹Á•´ˆ€˜˜•áÐ€„ô€ˆ¹ÉÐˆ€˜˜•áÐ€„ô€ˆ¹•Èˆì($$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰…}Á…Ñ µÕÍÐ‰”„€¹Á•´°€¹ÉÐ°½È€¹•È™¥±”‰õ€¤¤($$$%É•ÑÕÉ¸($$%ô($$%¥˜ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡…A…Ñ °€ˆ¸¸ˆ¤ì($$$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰…}Á…Ñ …¹¹½Ð½¹Ñ…¥¸Á…Ñ ÑÉ…Ù•ÉÍ…°¡…É…Ñ•ÉÌ‰õ€¤¤($$$%É•ÑÕÉ¸($$%ô($%ô($%‘…Ñ…¥È°•ÉÈ€èô½¹™¥œ¹•Ñ…Ñ…¥É•Ñ½Éä ‰…•¹Ðˆ°¥ÍM•ÉÙ¥”¤($%¥˜•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰™…¥±•Ñ¼‘•Ñ•Éµ¥¹”‘…Ñ„‘¥É•Ñ½Éä‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%…•¹Ñ%°•ÉÈ€èô1½…‘=É•¹•É…Ñ••¹Ñ%¡‘…Ñ…¥È¤($%¥˜•ÉÈ€„ô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰™…¥±•Ñ¼±½…½È•¹•É…Ñ”…•¹Ð¥‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%…•¹Ñ9…µ”€èôÉ•Í½±Ù••¹Ñ¥ÍÁ±…å9…µ”¡…•¹Ñ½¹™¥œ°€ˆˆ¤($%±¥•¹Ð€èô…•¹Ð¹9•ÝM•ÉÙ•É±¥•¹Ñ]¥Ñ¡9…µ”¡Í•ÉÙ•ÉUI0°…•¹Ñ%°…•¹Ñ9…µ”°€ˆˆ°…A…Ñ °¥¸¹%¹Í•ÕÉ”¤($%É•ÍÁ	½‘ä°•ÉÈ€èô±¥•¹Ð¹•Ù¥•ÕÑ¡A½±°¡È¹½¹Ñ•áÐ ¤°Á½±±Q½­•¸¤($%¥˜•ÉÈ€„ô¹¥°ì($$%ÝÉ¥Ñ••¹Ñ)M=9ÉÉ½È¡Ü°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘…Ñ•Ý…ä°•ÉÈ¹ÉÉ½È ¤¤($$%É•ÑÕÉ¸($%ô($%¥˜É•ÍÁ	½‘ä€ôô¹¥°ì($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ	…‘…Ñ•Ý…ä¤($$%Ü¹]É¥Ñ”¡mu‰åÑ”¡ì‰•ÉÉ½Èˆè‰Í•ÉÙ•ÈÉ•ÑÕÉ¹••µÁÑäÉ•ÍÁ½¹Í”‰õ€¤¤($$%É•ÑÕÉ¸($%ô($%½ÕÐ€èôµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÕ•ÍÌˆèÉ•ÍÁ	½‘ä¹MÕ•ÍÌ°($$$‰ÍÑ…ÑÕÌˆè€É•ÍÁ	½‘ä¹MÑ…ÑÕÌ°($$$‰½‘”ˆè€€€É•ÍÁ	½‘ä¹½‘”°($$$‰µ•ÍÍ…”ˆèÉ•ÍÁ	½‘ä¹5•ÍÍ…”°($%ô($%¥˜É•ÍÁ	½‘ä¹)½¥¹Q½­•¸€„ô€ˆˆì($$%½ÕÑl‰©½¥¹}Ñ½­•¸‰t€ôÉ•ÍÁ	½‘ä¹)½¥¹Q½­•¸($%ô($%¥˜É•ÍÁ	½‘ä¹Q•¹…¹Ñ%€„ô€ˆˆì($$%½ÕÑl‰Ñ•¹…¹Ñ}¥‰t€ôÉ•ÍÁ	½‘ä¹Q•¹…¹Ñ%($%ô($%¥˜É•ÍÁ	½‘ä¹•¹Ñ9…µ”€„ô€ˆˆì($$%½ÕÑl‰…•¹Ñ}¹…µ”‰t€ôÉ•ÍÁ	½‘ä¹•¹Ñ9…µ”($%ô($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡½ÕÐ¤(%ô¤(($¼¼1•…äÍÕ‰¹•ÐÍ…¸•¹‘Á½¥¹Ð€¡‘•ÁÉ•…Ñ•°ÕÍ”€½Í•ÑÑ¥¹Ì½‘¥Í½Ù•Éä¤(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½Í•ÑÑ¥¹Ì½ÍÕ‰¹•Ñ}Í…¸ˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€ôô€‰Pˆì($$%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($$%•¹…‰±•€èôÑÉÕ”€¼¼‘•™…Õ±ÐÑ¼ÑÉÕ”($$%¥˜…•¹Ñ½¹™¥MÑ½É”€„ô¹¥°ì($$$%Ù…ÈÍ•ÑÑ¥¹œÍÑÉÕÐì($$$$%¹…‰±•‰½½°©Í½¸è‰•¹…‰±•‰€($$$%ô($$$%Í•ÑÑ¥¹œ¹¹…‰±•€ôÑÉÕ”€¼¼‘•™…Õ±Ð($$$%|€ô…•¹Ñ½¹™¥MÑ½É”¹•Ñ½¹™¥Y…±Õ” ‰ÍÕ‰¹•Ñ}Í…¹}•¹…‰±•ˆ°€™Í•ÑÑ¥¹œ¤($$$%•¹…‰±•€ôÍ•ÑÑ¥¹œ¹¹…‰±•($$%ô($$%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì‰•¹…‰±•ˆè•¹…‰±•‘ô¤($$%É•ÑÕÉ¸($%ô($%¥˜È¹5•Ñ¡½€ôô€‰A=MPˆì($$%Ù…ÈÉ•ÄÍÑÉÕÐì($$$%¹…‰±•‰½½°©Í½¸è‰•¹…‰±•‰€($$%ô($$%¥˜•ÉÈ€èô©Í½¸¹9•Ý•½‘•È¡È¹	½‘ä¤¹•½‘” ™É•Ä¤ì•ÉÈ€„ô¹¥°ì($$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰¥¹Ù…±¥©Í½¸ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ	…‘I•ÅÕ•ÍÐ¤($$$%É•ÑÕÉ¸($$%ô($$%¥˜…•¹Ñ½¹™¥MÑ½É”€„ô¹¥°ì($$$%¥˜•ÉÈ€èô…•¹Ñ½¹™¥MÑ½É”¹M•Ñ½¹™¥Y…±Õ” ‰ÍÕ‰¹•Ñ}Í…¹}•¹…‰±•ˆ°µ…ÁmÍÑÉ¥¹u‰½½±ì‰•¹…‰±•ˆèÉ•Ä¹¹…‰±•‘ô¤ì•ÉÈ€„ô¹¥°ì($$$$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼Í…Ù”Í•ÑÑ¥¹œè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$$$%É•ÑÕÉ¸($$$%ô($$%ô($$%Ü¹]É¥Ñ•!•…‘•È¡¡ÑÑÀ¹MÑ…ÑÕÍ=,¤($$%É•ÑÕÉ¸($%ô($%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤(%ô¤(($¼¼A$•¹‘Á½¥¹ÐÑ¼É••¹•É…Ñ”Q1L•ÉÑ¥™¥…Ñ•Ì(%¡ÑÑÀ¹!…¹‘±•Õ¹Œ ˆ½…Á¤½É••¹•É…Ñ”µ•ÉÑÌˆ°™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($%¥˜È¹5•Ñ¡½€„ô€‰A=MPˆì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰µ•Ñ¡½¹½Ð…±±½Ý•ˆ°¡ÑÑÀ¹MÑ…ÑÕÍ5•Ñ¡½‘9½Ñ±±½Ý•¤($$%É•ÑÕÉ¸($%ô(($$¼¼•Ð‘…Ñ„‘¥É•Ñ½Éä($%‘…Ñ…¥È°•ÉÈ€èôÍÑ½É…”¹•Ñ…Ñ…¥È ‰AÉ¥¹Ñ5…ÍÑ•Èˆ¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•Ð‘…Ñ„‘¥É•Ñ½Éäè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%•ÉÑ¥±”€èô™¥±•Á…Ñ ¹)½¥¸¡‘…Ñ…¥È°€‰Í•ÉÙ•È¹ÉÐˆ¤($%­•å¥±”€èô™¥±•Á…Ñ ¹)½¥¸¡‘…Ñ…¥È°€‰Í•ÉÙ•È¹­•äˆ¤(($$¼¼•±•Ñ”•á¥ÍÑ¥¹œ•ÉÑ¥™¥…Ñ•Ì($%½Ì¹I•µ½Ù”¡•ÉÑ¥±”¤($%½Ì¹I•µ½Ù”¡­•å¥±”¤(($$¼¼•¹•É…Ñ”¹•Ü•ÉÑ¥™¥…Ñ•Ì($%¹•Ý•ÉÑ¥±”°¹•Ý-•å¥±”°•ÉÈ€èô•¹ÍÕÉ•Q1M•ÉÑ¥™¥…Ñ•Ì ˆˆ°€ˆˆ¤($%¥˜•ÉÈ€„ô¹¥°ì($$%¡ÑÑÀ¹ÉÉ½È¡Ü°€‰™…¥±•Ñ¼•¹•É…Ñ”•ÉÑ¥™¥…Ñ•Ìè€ˆ­•ÉÈ¹ÉÉ½È ¤°¡ÑÑÀ¹MÑ…ÑÕÍ%¹Ñ•É¹…±M•ÉÙ•ÉÉÉ½È¤($$%É•ÑÕÉ¸($%ô(($%Ü¹!•…‘•È ¤¹M•Ð ‰½¹Ñ•¹ÐµQåÁ”ˆ°€‰…ÁÁ±¥…Ñ¥½¸½©Í½¸ˆ¤($%©Í½¸¹9•Ý¹½‘•È¡Ü¤¹¹½‘”¡µ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íõì($$$‰ÍÕ•ÍÌˆèÑÉÕ”°($$$‰µ•ÍÍ…”ˆè€‰•ÉÑ¥™¥…Ñ•ÌÉ••¹•É…Ñ•ÍÕ•ÍÍ™Õ±±ä¸I•ÍÑ…ÉÐ…•¹ÐÑ¼ÕÍ”¹•Ü•ÉÑ¥™¥…Ñ•Ì¸ˆ°($$$‰•ÉÐˆè€€€¹•Ý•ÉÑ¥±”°($$$‰­•äˆè€€€€¹•Ý-•å¥±”°($%ô¤(%ô¤(($¼¼I•¥ÍÑ•È±½…°ÁÉ¥¹Ñ•È€¡ÍÁ½½±•È¤A$¡…¹‘±•ÉÌ($¼¼QåÁ”…ÍÍ•ÉÐÑ¼•Ð1½…±AÉ¥¹Ñ•ÉMÑ½É”¥¹Ñ•É™…”€¡ME1¥Ñ•MÑ½É”¥µÁ±•µ•¹ÑÌ‰½Ñ •Ù¥•MÑ½É”…¹1½…±AÉ¥¹Ñ•ÉMÑ½É”¤(%¥˜±½…±AÉ¥¹Ñ•ÉMÑ½É”°½¬€èô‘•Ù¥•MÑ½É”¸¡ÍÑ½É…”¹1½…±AÉ¥¹Ñ•ÉMÑ½É”¤ì½¬ì($$¼¼MÑ½É”±½‰…±±ä™½ÈÉÕ¹Ñ¥µ”Í•ÑÑ¥¹Ì¡…¹•Ì($%±½‰…±1½…±AÉ¥¹Ñ•ÉMÑ½É”€ô±½…±AÉ¥¹Ñ•ÉMÑ½É”($%I•¥ÍÑ•ÉMÁ½½±•É!…¹‘±•ÉÌ¡±½…±AÉ¥¹Ñ•ÉMÑ½É”¤(($$¼¼MÑ…ÉÐÍÁ½½±•ÈÝ½É­•È™½ÈUM½±½…°ÁÉ¥¹Ñ•ÈÑÉ…­¥¹œ€¡]¥¹‘½ÝÌ½µ…=L½1¥¹ÕàÙ¥„UAL¤($$¼¼¡•¬¥˜ÍÁ½½±•ÈÑÉ…­¥¹œ¥Ì•¹…‰±•Ù¥„Õ¹¥™¥•Í•ÑÑ¥¹Ì($%Õ¹¥™¥•€èô±½…‘U¹¥™¥•‘M•ÑÑ¥¹Ì¡…•¹Ñ½¹™¥MÑ½É”¤($%¥˜Õ¹¥™¥•¹MÁ½½±•È¹¹…‰±•ì($$%Á½±±%¹Ñ•ÉÙ…°€èôÑ¥µ”¹ÕÉ…Ñ¥½¸¡Õ¹¥™¥•¹MÁ½½±•È¹A½±±%¹Ñ•ÉÙ…±M•½¹‘Ì¤€¨Ñ¥µ”¹M•½¹($$%¥˜Á½±±%¹Ñ•ÉÙ…°€ð€Ô©Ñ¥µ”¹M•½¹ì($$$%Á½±±%¹Ñ•ÉÙ…°€ô€Ô€¨Ñ¥µ”¹M•½¹($$%ô($$%½¹™¥œ€èôMÁ½½±•É]½É­•É½¹™¥ì($$$%A½±±%¹Ñ•ÉÙ…°è€€€€€€€€€€Á½±±%¹Ñ•ÉÙ…°°($$$%%¹±Õ‘•9•ÑÝ½É­AÉ¥¹Ñ•ÉÌèÕ¹¥™¥•¹MÁ½½±•È¹%¹±Õ‘•9•ÑÝ½É­AÉ¥¹Ñ•ÉÌ°($$$%%¹±Õ‘•Y¥ÉÑÕ…±AÉ¥¹Ñ•ÉÌèÕ¹¥™¥•¹MÁ½½±•È¹%¹±Õ‘•Y¥ÉÑÕ…±AÉ¥¹Ñ•ÉÌ°($$$%ÕÑ½QÉ…­UMè€€€€€€€€€€ÑÉÕ”°($$$%ÕÑ½QÉ…­1½…°è€€€€€€€€™…±Í”°($$%ô($$%¥˜•ÉÈ€èôMÑ…ÉÑMÁ½½±•É]½É­•È¡±½…±AÉ¥¹Ñ•ÉMÑ½É”°½¹™¥œ°…ÁÁ1½•È¤ì•ÉÈ€„ô¹¥°ì($$$%…ÁÁ1½•È¹]…É¸ ‰…¥±•Ñ¼ÍÑ…ÉÐÍÁ½½±•ÈÝ½É­•Èˆ°€‰•ÉÉ½Èˆ°•ÉÈ¤($$%ô($%ô($$¼¼¹ÍÕÉ”ÍÁ½½±•ÈÝ½É­•È¥ÌÍÑ½ÁÁ•½¸Í¡ÕÑ‘½Ý¸($%‘•™•ÈMÑ½ÁMÁ½½±•É]½É­•È ¤(%ô•±Í”ì($%…ÁÁ1½•È¹]…É¸ ‰•Ù¥”ÍÑ½É”‘½•Ì¹½ÐÍÕÁÁ½ÉÐ±½…°ÁÉ¥¹Ñ•È½Á•É…Ñ¥½¹Ì°ÍÁ½½±•ÈÑÉ…­¥¹œ‘¥Í…‰±•ˆ¤(%ô(($¼¼%¹¥Ñ¥…±¥é”UMÁÉ½áä™½È%A@µUMÁÉ¥¹Ñ•ÉÌ€¡]¥¹‘½ÝÌ½¹±ä¤($¼¼Q¡¥Ì•¹…‰±•ÌÝ•ˆU$…•ÍÌ™½ÈUMµ½¹¹•Ñ•ÁÉ¥¹Ñ•ÉÌÙ¥„Ñ¡”Í…µ”€½ÁÉ½áä¼•¹‘Á½¥¹Ð(%I•¥ÍÑ•ÉUM	AÉ½áå!…¹‘±•ÉÌ ¤(%¥˜•ÉÈ€èô%¹¥ÑUM	AÉ½áä¡…ÁÁ1½•È¤ì•ÉÈ€„ô¹¥°ì($%…ÁÁ1½•È¹]…É¸ ‰…¥±•Ñ¼¥¹¥Ñ¥…±¥é”UMÁÉ½áäˆ°€‰•ÉÉ½Èˆ°•ÉÈ¤(%ô•±Í”ì($%…ÁÁ1½•È¹%¹™¼ ‰UMÁÉ½áä¥¹¥Ñ¥…±¥é•ˆ¤(%ô(%‘•™•ÈMÑ½ÁUM	AÉ½áä ¤(($¼¼•Ð!QQ@½!QQALÍ•ÑÑ¥¹Ì(%‰¥¹‘‘‘É•ÍÌ€èô€ˆÄÈÜ¸À¸À¸Äˆ(%¥˜…•¹Ñ½¹™¥œ€„ô¹¥°€˜˜…•¹Ñ½¹™¥œ¹]•ˆ¹	¥¹‘‘‘É•ÍÌ€„ô€ˆˆì($%‰¥¹‘‘‘É•ÍÌ€ô…•¹Ñ½¹™¥œ¹]•ˆ¹	¥¹‘‘‘É•ÍÌ(%ô(%•¹…‰±•!QQ@€èôÑÉÕ”(%•¹…‰±•!QQAL€èôÑÉÕ”(%¡ÑÑÁA½ÉÐ€èô€ˆàÀàÀˆ(%¡ÑÑÁÍA½ÉÐ€èô€ˆàÐÐÌˆ(%É•‘¥É•Ñ!QQAQ½!QQAL€èô™…±Í”(%ÕÍÑ½µ•ÉÑA…Ñ €èô€ˆˆ(%ÕÍÑ½µ-•åA…Ñ €èô€ˆˆ(($¼¼QÉäÑ¼±½…Í•ÑÑ¥¹Ì™É½´Õ¹¥™¥•‘}Í•ÑÑ¥¹Ì€¡¹•Ü™½Éµ…Ð¤™¥ÉÍÐ°Ñ¡•¸™…±°‰…¬Ñ¼±•…ä(%¥˜…•¹Ñ½¹™¥MÑ½É”€„ô¹¥°ì($$¼¼¥ÉÍÐÑÉä¹•ÜÕ¹¥™¥•Í•ÑÑ¥¹Ì€¡ØÈÍ¡•µ„¤($%Õ¹¥™¥•€èô±½…‘U¹¥™¥•‘M•ÑÑ¥¹Ì¡…•¹Ñ½¹™¥MÑ½É”¤($$¼¼¡•¬¥˜Ý•ˆÍ•ÑÑ¥¹Ì¡…Ù”‰••¸±½…‘•€¡!QQAA½ÉÐ¥Ì…±Ý…åÌÍ•ÐÝ¥Ñ ‘•™…Õ±ÑÌ¤($%¥˜Õ¹¥™¥•¹]•ˆ¹!QQAA½ÉÐ€„ô€ˆˆì($$%•¹…‰±•!QQ@€ôÕ¹¥™¥•¹]•ˆ¹¹…‰±•!QQ@($$%•¹…‰±•!QQAL€ôÕ¹¥™¥•¹]•ˆ¹¹…‰±•!QQAL($$%¡ÑÑÁA½ÉÐ€ôÕ¹¥™¥•¹]•ˆ¹!QQAA½ÉÐ($$%¥˜Õ¹¥™¥•¹]•ˆ¹!QQAMA½ÉÐ€„ô€ˆˆì($$$%¡ÑÑÁÍA½ÉÐ€ôÕ¹¥™¥•¹]•ˆ¹!QQAMA½ÉÐ($$%ô($$%É•‘¥É•Ñ!QQAQ½!QQAL€ôÕ¹¥™¥•¹]•ˆ¹I•‘¥É•Ñ!QQAQ½!QQAL($$%ÕÍÑ½µ•ÉÑA…Ñ €ôÕ¹¥™¥•¹]•ˆ¹ÕÍÑ½µ•ÉÑA…Ñ ($$%ÕÍÑ½µ-•åA…Ñ €ôÕ¹¥™¥•¹]•ˆ¹ÕÍÑ½µ-•åA…Ñ ($%ô•±Í”ì($$$¼¼1•…ä™…±±‰…¬èÉ•…™É½´½±Í•ÕÉ¥Ñå}Í•ÑÑ¥¹Ì­•ä($$%Ù…ÈÍ•ÕÉ¥ÑåM•ÑÑ¥¹Ìµ…ÁmÍÑÉ¥¹u¥¹Ñ•É™…•íô($$%¥˜•ÉÈ€èô…•¹Ñ½¹™¥MÑ½É”¹•Ñ½¹™¥Y…±Õ” ‰Í•ÕÉ¥Ñå}Í•ÑÑ¥¹Ìˆ°€™Í•ÕÉ¥ÑåM•ÑÑ¥¹Ì¤ì•ÉÈ€ôô¹¥°ì($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰•¹…‰±•}¡ÑÑÀ‰t¸¡‰½½°¤ì½¬ì($$$$%•¹…‰±•!QQ@€ôÙ…°($$$%ô($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰•¹…‰±•}¡ÑÑÁÌ‰t¸¡‰½½°¤ì½¬ì($$$$%•¹…‰±•!QQAL€ôÙ…°($$$%ô($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰¡ÑÑÁ}Á½ÉÐ‰t¸¡ÍÑÉ¥¹œ¤ì½¬€˜˜Ù…°€„ô€ˆˆì($$$$%¡ÑÑÁA½ÉÐ€ôÙ…°($$$%ô($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰¡ÑÑÁÍ}Á½ÉÐ‰t¸¡ÍÑÉ¥¹œ¤ì½¬€˜˜Ù…°€„ô€ˆˆì($$$$%¡ÑÑÁÍA½ÉÐ€ôÙ…°($$$%ô($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰É•‘¥É•Ñ}¡ÑÑÁ}Ñ½}¡ÑÑÁÌ‰t¸¡‰½½°¤ì½¬ì($$$$%É•‘¥É•Ñ!QQAQ½!QQAL€ôÙ…°($$$%ô($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰ÕÍÑ½µ}•ÉÑ}Á…Ñ ‰t¸¡ÍÑÉ¥¹œ¤ì½¬ì($$$$%ÕÍÑ½µ•ÉÑA…Ñ €ôÙ…°($$$%ô($$$%¥˜Ù…°°½¬€èôÍ•ÕÉ¥ÑåM•ÑÑ¥¹Íl‰ÕÍÑ½µ}­•å}Á…Ñ ‰t¸¡ÍÑÉ¥¹œ¤ì½¬ì($$$$%ÕÍÑ½µ-•åA…Ñ €ôÙ…°($$$%ô($$%ô($%ô(%ô(($¼¼1½…½È•¹•É…Ñ”Q1L•ÉÑ¥™¥…Ñ•Ì™½È!QQAL(%•ÉÑ¥±”°­•å¥±”°•ÉÈ€èô•¹ÍÕÉ•Q1M•ÉÑ¥™¥…Ñ•Ì¡ÕÍÑ½µ•ÉÑA…Ñ °ÕÍÑ½µ-•åA…Ñ ¤(%¥˜•ÉÈ€„ô¹¥°ì($%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼Í•ÑÕÀQ1L•ÉÑ¥™¥…Ñ•Ìˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($%•ÉÑ¥±”€ô€ˆˆ($%­•å¥±”€ô€ˆˆ(%ô(($¼¼•™…Õ±ÐÑ¼!QQAL¥˜•ÉÑ¥™¥…Ñ•Ì…É”…Ù…¥±…‰±”(%¥˜•ÉÑ¥±”€ôô€ˆˆñð­•å¥±”€ôô€ˆˆì($%•¹…‰±•!QQAL€ô™…±Í”($%…ÁÁ1½•È¹]…É¸ ‰!QQAL‘¥Í…‰±•èQ1L•ÉÑ¥™¥…Ñ•Ì¹½Ð…Ù…¥±…‰±”ˆ¤(%ô(($¼¼¹ÍÕÉ”…Ð±•…ÍÐ½¹”Í•ÉÙ•È¥Ì•¹…‰±•(%¥˜€…•¹…‰±•!QQ@€˜˜€…•¹…‰±•!QQALì($%¥˜¥Í1½½Á‰…­!½ÍÐ¡‰¥¹‘‘‘É•ÍÌ¤ì($$$¼¼A±…¥¸!QQ@É•µ…¥¹ÌÕÍ•™Õ°™½È…¸•áÁ±¥¥Ñ±ä±½…°‘•Ù•±½Áµ•¹Ð($$$¼¼¥¹ÍÑ…¹”Ý¡•¸¹¼•ÉÑ¥™¥…Ñ”¥Ì…Ù…¥±…‰±”¸($$%•¹…‰±•!QQ@€ôÑÉÕ”($$%…ÁÁ1½•È¹]…É¸ ‰	½Ñ !QQ@…¹!QQAL‘¥Í…‰±•¥¸Í•ÑÑ¥¹Ì°•¹…‰±¥¹œ±½½Á‰…¬!QQ@™½È±½…°‘•Ù•±½Áµ•¹Ðˆ¤($%ô•±Í”ì($$$¼¼9•Ù•Èµ…­”„™…¥±•Q1LÍ•ÑÕÀÍ¥±•¹Ñ±ä•áÁ½Í”…¸¥¹Ñ•É¹•Ðµ™…¥¹œ($$$¼¼±¥ÍÑ•¹•È¸Q¡”½Á•É…Ñ½ÈµÕÍÐÉ•Á…¥È•ÉÑ¥™¥…Ñ•Ì½½¹™¥ÕÉ…Ñ¥½¸™¥ÉÍÐ¸($$%…ÁÁ1½•È¹ÉÉ½È ‰	½Ñ !QQ@…¹!QQAL‘¥Í…‰±•ìÉ•™ÕÍ¥¹œÑ¼ÍÑ…ÉÐ½¸„¹½¸µ±½½Á‰…¬‰¥¹…‘‘É•ÍÌˆ°€‰‰¥¹‘}…‘‘É•ÍÌˆ°‰¥¹‘‘‘É•ÍÌ¤($$%É•ÑÕÉ¸($%ô(%ô(%¥˜•¹…‰±•!QQ@€˜˜€…¥Í1½½Á‰…­!½ÍÐ¡‰¥¹‘‘‘É•ÍÌ¤ì($$¼¼É•‘•¹Ñ¥…±Ì°…±±‰…¬Ñ½­•¹Ì°…¹ÁÉ¥¹Ñ•È‘…Ñ„µÕÍÐ¹½ÐÑÉ…Ù•ÉÍ”($$¼¼Á±…¥¹Ñ•áÐ!QQ@½¸„É•µ½Ñ•±äÉ•…¡…‰±”¥¹Ñ•É™…”¸UÍ”!QQAL‘¥É•Ñ±ä($$¼¼€¡½ÈÁÕÐ„Q1LÉ•Ù•ÉÍ”ÁÉ½áä¥¸™É½¹Ð½˜„±½½Á‰…¬µ‰½Õ¹…•¹Ð¤¸($%•¹…‰±•!QQ@€ô™…±Í”($%…ÁÁ1½•È¹]…É¸ ‰A±…¥¸!QQ@‘¥Í…‰±•½¸¹½¸µ±½½Á‰…¬‰¥¹…‘‘É•ÍÌì!QQAL¥ÌÉ•ÅÕ¥É•ˆ°€‰‰¥¹‘}…‘‘É•ÍÌˆ°‰¥¹‘‘‘É•ÍÌ¤($%¥˜€…•¹…‰±•!QQALì($$%…ÁÁ1½•È¹ÉÉ½È ‰!QQAL¥ÌÕ¹…Ù…¥±…‰±”ì…•¹Ð±¥ÍÑ•¹•ÈÝ¥±°¹½ÐÍÑ…ÉÐˆ°€‰‰¥¹‘}…‘‘É•ÍÌˆ°‰¥¹‘‘‘É•ÍÌ¤($$%É•ÑÕÉ¸($%ô(%ô((%É½½Ñ!…¹‘±•È€èô¡ÑÑÀ¹!…¹‘±•È¡¡ÑÑÀ¹•™…Õ±ÑM•ÉÙ•5Õà¤(%¥˜…•¹ÑÕÑ €„ô¹¥°ì($%É½½Ñ!…¹‘±•È€ô…•¹ÑÕÑ ¹]É…À¡É½½Ñ!…¹‘±•È¤(%ô(($¼¼I•¥ÍÑ•È±½…°¡…¹‘±•È±½‰…±±ä™½È‘¥É•ÐÁÉ½áä¥¹Ù½…Ñ¥½¸($¼¼Q¡¥Ì…±±½ÝÌÑ¡”Í•ÉÙ•ÈÑ¼ÁÉ½áäÑ¼Ñ¡”…•¹ÐÌÝ•ˆU$Ý¥Ñ¡½ÕÐ!QQ@É½Õ¹µÑÉ¥À($¼¼Q¡”¡…¹‘±•È¥ÌÍ•Ð±½‰…±±äÍ¼¥ÐÌ…Ù…¥±…‰±”•Ù•¸¥˜ÕÁ±½…Ý½É­•ÈÍÑ…ÉÑÌ±…Ñ•È(%Í•Ñ1½…±AÉ½áå!…¹‘±•È¡É½½Ñ!…¹‘±•È¤(($¼¼É•…Ñ”Í•ÉÙ•È¥¹ÍÑ…¹•Ì™½ÈÉ…•™Õ°Í¡ÕÑ‘½Ý¸(%Ù…È¡ÑÑÁM•ÉÙ•È€©¡ÑÑÀ¹M•ÉÙ•È(%Ù…È¡ÑÑÁÍM•ÉÙ•È€©¡ÑÑÀ¹M•ÉÙ•È(%Ù…ÈÝœÍå¹Œ¹]…¥ÑÉ½ÕÀ(($¼¼MÑ…ÉÐ!QQ@Í•ÉÙ•È(%¥˜•¹…‰±•!QQ@ì($$¼¼É•…Ñ”!QQ@Í•ÉÙ•ÈÝ¥Ñ ½ÁÑ¥½¹…°É•‘¥É•ÐÑ¼!QQAL($%Ù…È¡ÑÑÁ!…¹‘±•È¡ÑÑÀ¹!…¹‘±•È($%¥˜É•‘¥É•Ñ!QQAQ½!QQAL€˜˜•¹…‰±•!QQALì($$$¼¼I•‘¥É•Ð¡…¹‘±•ÈÕÍ¥¹œ€ÌÀÈ€¡Ñ•µÁ½É…ÉäÉ•‘¥É•Ð¤($$%¡ÑÑÁ!…¹‘±•È€ô¡ÑÑÀ¹!…¹‘±•ÉÕ¹Œ¡™Õ¹Œ¡Ü¡ÑÑÀ¹I•ÍÁ½¹Í•]É¥Ñ•È°È€©¡ÑÑÀ¹I•ÅÕ•ÍÐ¤ì($$$$¼¼	Õ¥±!QQALUI0($$$%¡½ÍÐ€èôÈ¹!½ÍÐ($$$$¼¼I•Á±…”Á½ÉÐ¥˜¥ÐÌÑ¡”!QQ@Á½ÉÐ($$$%¥˜ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡¡½ÍÐ°€ˆèˆ­¡ÑÑÁA½ÉÐ¤ì($$$$%¡½ÍÐ€ôÍÑÉ¥¹Ì¹I•Á±…”¡¡½ÍÐ°€ˆèˆ­¡ÑÑÁA½ÉÐ°€ˆèˆ­¡ÑÑÁÍA½ÉÐ°€Ä¤($$$%ô•±Í”¥˜€…ÍÑÉ¥¹Ì¹½¹Ñ…¥¹Ì¡¡½ÍÐ°€ˆèˆ¤ì($$$$$¼¼9¼Á½ÉÐÍÁ•¥™¥•°…‘!QQALÁ½ÉÐ($$$$%¡½ÍÐ€ô¡½ÍÐ€¬€ˆèˆ€¬¡ÑÑÁÍA½ÉÐ($$$%ô(($$$%¡ÑÑÁÍUI0€èô€‰¡ÑÑÁÌè¼¼ˆ€¬¡½ÍÐ€¬È¹I•ÅÕ•ÍÑUI$($$$$¼¼UÍ”€ÌÀÈ€¡½Õ¹¤™½ÈÑ•µÁ½É…ÉäÉ•‘¥É•Ð°¹½Ð€ÌÀÄ€¡Á•Éµ…¹•¹Ð¤($$$%¡ÑÑÀ¹I•‘¥É•Ð¡Ü°È°¡ÑÑÁÍUI0°¡ÑÑÀ¹MÑ…ÑÕÍ½Õ¹¤($$%ô¤($$%…ÁÁ1½•È¹%¹™¼ ‰!QQ@Í•ÉÙ•ÈÝ¥±°É•‘¥É•ÐÑ¼!QQALˆ°€‰¡ÑÑÁA½ÉÐˆ°¡ÑÑÁA½ÉÐ°€‰¡ÑÑÁÍA½ÉÐˆ°¡ÑÑÁÍA½ÉÐ¤($%ô•±Í”ì($$$¼¼UÍ”‘•™…Õ±Ð¡…¹‘±•È€¡¡ÑÑÀ¹•™…Õ±ÑM•ÉÙ•5ÕàÝ¥Ñ …±°É•¥ÍÑ•É•É½ÕÑ•Ì¤($$%¡ÑÑÁ!…¹‘±•È€ôÉ½½Ñ!…¹‘±•È($%ô(($%¡ÑÑÁM•ÉÙ•È€ô€™¡ÑÑÀ¹M•ÉÙ•Éì($$%‘‘Èè€€€€€€€€€€€€€¹•Ð¹)½¥¹!½ÍÑA½ÉÐ¡‰¥¹‘‘‘É•ÍÌ°¡ÑÑÁA½ÉÐ¤°($$%!…¹‘±•Èè€€€€€€€€€€¡ÑÑÁ!…¹‘±•È°($$%I•…‘Q¥µ•½ÕÐè€€€€€€€ÌÀ€¨Ñ¥µ”¹M•½¹°($$%I•…‘!•…‘•ÉQ¥µ•½ÕÐè€ÄÀ€¨Ñ¥µ”¹M•½¹°($$%]É¥Ñ•Q¥µ•½ÕÐè€€€€€€ÌÀ€¨Ñ¥µ”¹M•½¹°($$%%‘±•Q¥µ•½ÕÐè€€€€€€€ÄÈÀ€¨Ñ¥µ”¹M•½¹°($$%5…á!•…‘•É	åÑ•Ìè€€€€ÄØ€ðð€ÄÀ°($%ô(($%Ýœ¹‘ Ä¤($%¼™Õ¹Œ ¤ì($$%‘•™•ÈÝœ¹½¹” ¤($$%…ÁÁ1½•È¹%¹™¼ ‰MÑ…ÉÑ¥¹œ!QQ@Í•ÉÙ•Èˆ°€‰Á½ÉÐˆ°¡ÑÑÁA½ÉÐ¤($$%¥˜•ÉÈ€èô¡ÑÑÁM•ÉÙ•È¹1¥ÍÑ•¹¹‘M•ÉÙ” ¤ì•ÉÈ€„ô¹¥°€˜˜•ÉÈ€„ô¡ÑÑÀ¹ÉÉM•ÉÙ•É±½Í•ì($$$%…ÁÁ1½•È¹ÉÉ½È ‰!QQ@Í•ÉÙ•È™…¥±•ˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$%ô($%ô ¤(%ô(($¼¼MÑ…ÉÐ!QQALÍ•ÉÙ•È(%¥˜•¹…‰±•!QQAL€˜˜•ÉÑ¥±”€„ô€ˆˆ€˜˜­•å¥±”€„ô€ˆˆì($$¼¼1½…Q1L•ÉÑ¥™¥…Ñ”($%•ÉÐ°•ÉÈ€èôÑ±Ì¹1½…‘`ÔÀå-•åA…¥È¡•ÉÑ¥±”°­•å¥±”¤($%¥˜•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼±½…Q1L•ÉÑ¥™¥…Ñ”ˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($%ô•±Í”ì($$%Ñ±Í™œ€èô€™Ñ±Ì¹½¹™¥ì($$$%•ÉÑ¥™¥…Ñ•ÌèmuÑ±Ì¹•ÉÑ¥™¥…Ñ•í•ÉÑô°($$$%5¥¹Y•ÉÍ¥½¸è€€Ñ±Ì¹Y•ÉÍ¥½¹Q1LÄÈ°($$%ô(($$%¡ÑÑÁÍM•ÉÙ•È€ô€™¡ÑÑÀ¹M•ÉÙ•Éì($$$%!…¹‘±•Èè€€€€€€€€€€É½½Ñ!…¹‘±•È°($$$%I•…‘Q¥µ•½ÕÐè€€€€€€€ÌÀ€¨Ñ¥µ”¹M•½¹°($$$%I•…‘!•…‘•ÉQ¥µ•½ÕÐè€ÄÀ€¨Ñ¥µ”¹M•½¹°($$$%]É¥Ñ•Q¥µ•½ÕÐè€€€€€€ÄÈÀ€¨Ñ¥µ”¹M•½¹°€¼¼UMÁÉ½áä…¸‰”Ù•ÉäÍ±½Ü€ Ô´ÄÁÌÁ•ÈÁ…”¤($$$%%‘±•Q¥µ•½ÕÐè€€€€€€€ÄÈÀ€¨Ñ¥µ”¹M•½¹°($$$%5…á!•…‘•É	åÑ•Ìè€€€€ÄØ€ðð€ÄÀ°($$%ô(($$%Ýœ¹‘ Ä¤($$%¼™Õ¹Œ ¤ì($$$%‘•™•ÈÝœ¹½¹” ¤(($$$$¼¼É•…Ñ”‰…Í”Q@±¥ÍÑ•¹•È($$$%‰…Í•1¥ÍÑ•¹•È°•ÉÈ€èô¹•Ð¹1¥ÍÑ•¸ ‰ÑÀˆ°¹•Ð¹)½¥¹!½ÍÑA½ÉÐ¡‰¥¹‘‘‘É•ÍÌ°¡ÑÑÁÍA½ÉÐ¤¤($$$%¥˜•ÉÈ€„ô¹¥°ì($$$$%…ÁÁ1½•È¹ÉÉ½È ‰…¥±•Ñ¼É•…Ñ”!QQAL±¥ÍÑ•¹•Èˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$$$%É•ÑÕÉ¸($$$%ô(($$$$¼¼]É…ÀÝ¥Ñ !QQ@É•‘¥É•Ð‘•Ñ•Ñ¥½¸€¡¡…¹‘±•Ì¡ÑÑÀè¼¼É•ÅÕ•ÍÑÌÑ¼!QQALÁ½ÉÐ¤($$$%É•‘¥É•Ñ1¥ÍÑ•¹•È€èô¹•Ý!QQAI•‘¥É•Ñ1¥ÍÑ•¹•È¡‰…Í•1¥ÍÑ•¹•È°¡ÑÑÁÍA½ÉÐ¤(($$$$¼¼]É…ÀÝ¥Ñ Q1L($$$%Ñ±Í1¥ÍÑ•¹•È€èôÑ±Ì¹9•Ý1¥ÍÑ•¹•È¡É•‘¥É•Ñ1¥ÍÑ•¹•È°Ñ±Í™œ¤(($$$%…ÁÁ1½•È¹%¹™¼ ‰MÑ…ÉÑ¥¹œ!QQALÍ•ÉÙ•Èˆ°€‰Á½ÉÐˆ°¡ÑÑÁÍA½ÉÐ¤($$$%…ÁÁ1½•È¹%¹™¼ ‰!QQCŠI!QQALÉ•‘¥É•Ð•¹…‰±•½¸!QQALÁ½ÉÐˆ¤(($$$%¥˜•ÉÈ€èô¡ÑÑÁÍM•ÉÙ•È¹M•ÉÙ”¡Ñ±Í1¥ÍÑ•¹•È¤ì•ÉÈ€„ô¹¥°€˜˜•ÉÈ€„ô¡ÑÑÀ¹ÉÉM•ÉÙ•É±½Í•ì($$$$%…ÁÁ1½•È¹ÉÉ½È ‰!QQALÍ•ÉÙ•È™…¥±•ˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($$$%ô($$%ô ¤($%ô(%ô(($¼¼]…¥Ð™½ÈÍ¡ÕÑ‘½Ý¸Í¥¹…°($ðµÑà¹½¹” ¤(%…ÁÁ1½•È¹%¹™¼ ‰M¡ÕÑ‘½Ý¸Í¥¹…°É••¥Ù•°ÍÑ½ÁÁ¥¹œÍ•ÉÙ•ÉÌ¸¸¸ˆ¤(($¼¼MÑ½À‰…­É½Õ¹Í•ÉÙ¥•Ì™¥ÉÍÐ€¡ÅÕ¥¬½Á•É…Ñ¥½¹Ì¤(%ÕÁ±½…‘]½É­•É5Ô¹1½¬ ¤(%¥˜ÕÁ±½…‘]½É­•È€„ô¹¥°ì($%ÕÁ±½…‘]½É­•È¹MÑ½À ¤($%ÕÁ±½…‘]½É­•È€ô¹¥°(%ô(%ÕÁ±½…‘]½É­•É5Ô¹U¹±½¬ ¤(%¥˜ÍÍ•!Õˆ€„ô¹¥°ì($%ÍÍ•!Õˆ¹MÑ½À ¤(%ô(($¼¼É…•™Õ°Í¡ÕÑ‘½Ý¸Ý¥Ñ €ÈÀÍ•½¹Ñ¥µ•½ÕÐ€¡Ý•±°‰•™½É”Í•ÉÙ¥”€ÌÁÌÑ¥µ•½ÕÐ¤(%Í¡ÕÑ‘½Ý¹Ñà°Í¡ÕÑ‘½Ý¹…¹•°€èô½¹Ñ•áÐ¹]¥Ñ¡Q¥µ•½ÕÐ¡½¹Ñ•áÐ¹	…­É½Õ¹ ¤°€ÈÀ©Ñ¥µ”¹M•½¹¤(%‘•™•ÈÍ¡ÕÑ‘½Ý¹…¹•° ¤((%¥˜¡ÑÑÁM•ÉÙ•È€„ô¹¥°ì($%¥˜•ÉÈ€èô¡ÑÑÁM•ÉÙ•È¹M¡ÕÑ‘½Ý¸¡Í¡ÕÑ‘½Ý¹Ñà¤ì•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹ÉÉ½È ‰!QQ@Í•ÉÙ•ÈÍ¡ÕÑ‘½Ý¸•ÉÉ½Èˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($%ô•±Í”ì($$%…ÁÁ1½•È¹%¹™¼ ‰!QQ@Í•ÉÙ•ÈÍÑ½ÁÁ•É…•™Õ±±äˆ¤($%ô(%ô((%¥˜¡ÑÑÁÍM•ÉÙ•È€„ô¹¥°ì($%¥˜•ÉÈ€èô¡ÑÑÁÍM•ÉÙ•È¹M¡ÕÑ‘½Ý¸¡Í¡ÕÑ‘½Ý¹Ñà¤ì•ÉÈ€„ô¹¥°ì($$%…ÁÁ1½•È¹ÉÉ½È ‰!QQALÍ•ÉÙ•ÈÍ¡ÕÑ‘½Ý¸•ÉÉ½Èˆ°€‰•ÉÉ½Èˆ°•ÉÈ¹ÉÉ½È ¤¤($%ô•±Í”ì($$%…ÁÁ1½•È¹%¹™¼ ‰!QQALÍ•ÉÙ•ÈÍÑ½ÁÁ•É…•™Õ±±äˆ¤($%ô(%ô(($¼¼]…¥Ð™½ÈÍ•ÉÙ•ÉÌÑ¼™¥¹¥Í (%Ýœ¹]…¥Ð ¤(%…ÁÁ1½•È¹%¹™¼ ‰±°Í•ÉÙ•ÉÌÍÑ½ÁÁ•ˆ¤)ô

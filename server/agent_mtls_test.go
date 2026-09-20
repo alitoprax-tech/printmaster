@@ -300,11 +300,78 @@ func TestP001DatabaseDoesNotStoreReusableAgentBearer(t *testing.T) {
 	if tokenHash != hex.EncodeToString(expected[:]) || tokenHash == "legacy-secret" {
 		t.Fatalf("legacy bearer was not stored as a one-way hash")
 	}
-	var privateKeyColumns int
-	if err := f.store.DB().QueryRow("SELECT COUNT(*) FROM pragma_table_info('agent_credentials') WHERE lower(name) LIKE '%private%'").Scan(&privateKeyColumns); err != nil {
+	for _, table := range []string{"agent_credentials", "agent_enrollment_attempts"} {
+		var privateKeyColumns int
+		query := "SELECT COUNT(*) FROM pragma_table_info('" + table + "') WHERE lower(name) LIKE '%private%' OR lower(name) LIKE '%key_pem%'"
+		if err := f.store.DB().QueryRow(query).Scan(&privateKeyColumns); err != nil {
+			t.Fatal(err)
+		}
+		if privateKeyColumns != 0 {
+			t.Fatalf("%s schema exposes private-key columns", table)
+		}
+	}
+}
+
+func TestP001FreshEnrollmentResponseLossRecoversSameCertificate(t *testing.T) {
+	f := newAgentMTLSTestFixture(t, "agent-response-loss", "tenant-a", "")
+	defer f.store.Close()
+	oldConfig, oldStore, oldManager := serverConfig, serverStore, agentMTLSManager
+	defer func() { serverConfig, serverStore, agentMTLSManager = oldConfig, oldStore, oldManager }()
+	serverConfig, serverStore, agentMTLSManager = &Config{Security: SecurityConfig{AgentAuthMode: agentAuthModeMigration}}, f.store, f.manager
+	_, joinToken, err := f.store.CreateJoinToken(context.Background(), "tenant-a", 30, true)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if privateKeyColumns != 0 {
-		t.Fatalf("agent credential schema exposes private-key columns")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "response-loss"}}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+	body := func() *bytes.Reader {
+		payload, _ := json.Marshal(map[string]string{
+			"token":                 joinToken,
+			"agent_id":              f.agent.AgentID,
+			"csr":                   csr,
+			"enrollment_attempt_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		})
+		return bytes.NewReader(payload)
+	}
+	first := httptest.NewRecorder()
+	handleAgentMTLSRegister(first, httptest.NewRequest(http.MethodPost, "/api/v1/agents/register-mtls", body()))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first enrollment failed: %d %s", first.Code, first.Body.String())
+	}
+	// Simulate a response dropped after the server transaction committed.
+	second := httptest.NewRecorder()
+	handleAgentMTLSRegister(second, httptest.NewRequest(http.MethodPost, "/api/v1/agents/register-mtls", body()))
+	if second.Code != http.StatusOK {
+		t.Fatalf("response-loss retry failed: %d %s", second.Code, second.Body.String())
+	}
+	var firstResponse, secondResponse struct {
+		CredentialID      string `json:"credential_id"`
+		ClientCertificate string `json:"client_certificate"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstResponse); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondResponse); err != nil {
+		t.Fatal(err)
+	}
+	if firstResponse.CredentialID == "" || firstResponse.CredentialID != secondResponse.CredentialID || firstResponse.ClientCertificate != secondResponse.ClientCertificate {
+		t.Fatal("response-loss retry returned a different certificate identity")
+	}
+	var credentialCount, attemptCount int
+	if err := f.store.DB().QueryRow("SELECT COUNT(*) FROM agent_credentials").Scan(&credentialCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.DB().QueryRow("SELECT COUNT(*) FROM agent_enrollment_attempts").Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if credentialCount != 1 || attemptCount != 1 {
+		t.Fatalf("response-loss retry issued duplicate credentials: credentials=%d attempts=%d", credentialCount, attemptCount)
 	}
 }

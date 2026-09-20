@@ -394,6 +394,12 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 		} else if pending != nil {
 			cancel()
 			return fmt.Errorf("mTLS enrollment is awaiting activation: %w", mtlsErr)
+		} else if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+			cancel()
+			return fmt.Errorf("load pre-enrollment attempt after enrollment: %w", attemptErr)
+		} else if attempt != nil {
+			cancel()
+			return fmt.Errorf("mTLS enrollment will be retried with the persisted attempt: %w", mtlsErr)
 		}
 		agentToken, tenantID, err := w.client.RegisterWithToken(regCtx, joinToken, version)
 		cancel()
@@ -443,6 +449,12 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 	} else if pending != nil {
 		cancel()
 		return fmt.Errorf("mTLS enrollment is awaiting activation: %w", mtlsErr)
+	} else if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+		cancel()
+		return fmt.Errorf("load pre-enrollment attempt after enrollment: %w", attemptErr)
+	} else if attempt != nil {
+		cancel()
+		return fmt.Errorf("mTLS enrollment will be retried with the persisted attempt: %w", mtlsErr)
 	}
 	defer cancel()
 
@@ -467,11 +479,11 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 }
 
 func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string) (string, error) {
-	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	pending, err := agent.LoadOrCreateEnrollmentAttempt(w.dataDir, w.client.AgentID)
 	if err != nil {
 		return "", err
 	}
-	registration, err := w.client.RegisterWithMTLS(ctx, joinToken, string(pending.CSRPEM), version)
+	registration, err := w.client.RegisterWithMTLS(ctx, joinToken, string(pending.CSRPEM), version, pending.EnrollmentAttemptID)
 	if err != nil {
 		return "", err
 	}
@@ -483,7 +495,7 @@ func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string
 	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
 		return "", err
 	}
-	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
+	if activated, err := w.activatePendingMTLS(ctx, identity, pending.EnrollmentAttemptID); !activated {
 		return "", err
 	}
 	return registration.TenantID, nil
@@ -539,7 +551,7 @@ func (w *UploadWorker) renewMTLS(ctx context.Context) error {
 // idempotent server activation, and promotes the identity only after the
 // server confirms success. On failure the previous in-memory identity is
 // restored, while the pending files remain for a later retry.
-func (w *UploadWorker) activatePendingMTLS(ctx context.Context, pending *agent.ClientIdentity) (bool, error) {
+func (w *UploadWorker) activatePendingMTLS(ctx context.Context, pending *agent.ClientIdentity, enrollmentAttemptID ...string) (bool, error) {
 	if pending == nil {
 		return false, fmt.Errorf("pending Agent identity required")
 	}
@@ -561,6 +573,22 @@ func (w *UploadWorker) activatePendingMTLS(ctx context.Context, pending *agent.C
 		// The server may already have revoked the old credential. Keep the new
 		// in-memory identity and the pending files so promotion can be retried.
 		return false, fmt.Errorf("promote activated Agent identity: %w", err)
+	}
+	attemptID := ""
+	if len(enrollmentAttemptID) > 0 {
+		attemptID = strings.TrimSpace(enrollmentAttemptID[0])
+	}
+	if attemptID == "" {
+		if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+			return false, fmt.Errorf("load completed enrollment attempt: %w", attemptErr)
+		} else if attempt != nil {
+			attemptID = attempt.EnrollmentAttemptID
+		}
+	}
+	if attemptID != "" {
+		if err := agent.CompleteEnrollmentAttempt(w.dataDir, attemptID); err != nil {
+			return false, fmt.Errorf("complete enrollment attempt: %w", err)
+		}
 	}
 	w.client.SetToken("")
 	_ = DeleteServerToken(w.dataDir)

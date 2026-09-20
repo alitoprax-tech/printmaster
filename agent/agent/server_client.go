@@ -390,15 +390,19 @@ func (c *ServerClient) RegisterWithToken(ctx context.Context, joinToken string, 
 
 // RegisterWithMTLS enrolls the Agent using a join token and CSR. It never
 // sends or persists the private key; callers must save the returned certificate
-// together with the PendingIdentity key before activating it.
-func (c *ServerClient) RegisterWithMTLS(ctx context.Context, joinToken, csrPEM, version string) (*MTLSRegistration, error) {
+// together with the PendingIdentity key before activating it. The optional
+// enrollment attempt ID makes fresh enrollment idempotent across response-loss
+// and process-restart boundaries while preserving compatibility with callers
+// that use this method for older bootstrap flows.
+func (c *ServerClient) RegisterWithMTLS(ctx context.Context, joinToken, csrPEM, version string, enrollmentAttemptID ...string) (*MTLSRegistration, error) {
 	type joinRequest struct {
-		Token           string `json:"token"`
-		AgentID         string `json:"agent_id"`
-		Name            string `json:"name,omitempty"`
-		AgentVersion    string `json:"agent_version,omitempty"`
-		ProtocolVersion string `json:"protocol_version,omitempty"`
-		CSR             string `json:"csr"`
+		Token               string `json:"token"`
+		AgentID             string `json:"agent_id"`
+		Name                string `json:"name,omitempty"`
+		AgentVersion        string `json:"agent_version,omitempty"`
+		ProtocolVersion     string `json:"protocol_version,omitempty"`
+		CSR                 string `json:"csr"`
+		EnrollmentAttemptID string `json:"enrollment_attempt_id,omitempty"`
 	}
 	var resp MTLSRegistration
 	var envelope struct {
@@ -410,7 +414,11 @@ func (c *ServerClient) RegisterWithMTLS(ctx context.Context, joinToken, csrPEM, 
 		ExpiresAt         time.Time `json:"expires_at"`
 		Message           string    `json:"message,omitempty"`
 	}
-	req := joinRequest{Token: joinToken, AgentID: c.AgentID, Name: c.AgentName, AgentVersion: version, ProtocolVersion: "1", CSR: csrPEM}
+	var attemptID string
+	if len(enrollmentAttemptID) > 0 {
+		attemptID = enrollmentAttemptID[0]
+	}
+	req := joinRequest{Token: joinToken, AgentID: c.AgentID, Name: c.AgentName, AgentVersion: version, ProtocolVersion: "1", CSR: csrPEM, EnrollmentAttemptID: attemptID}
 	var requestErr error
 	requestErr = c.withClientIdentitySuppressed(func() error {
 		return c.doRequest(ctx, http.MethodPost, "/api/v1/agents/register-mtls", req, &envelope, false)
