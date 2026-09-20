@@ -159,17 +159,11 @@ func (c *ServerClient) SetClientIdentity(identity *ClientIdentity) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.identity = identity
-	if transport, ok := c.HTTPClient.Transport.(*http.Transport); ok {
-		cfg := transport.TLSClientConfig
-		if cfg == nil {
-			cfg = &tls.Config{MinVersion: tls.VersionTLS12}
-		} else {
-			cfg = cfg.Clone()
-		}
-		cfg.Certificates = []tls.Certificate{identity.Certificate}
-		transport.TLSClientConfig = cfg
+	if err := c.swapHTTPTransportLocked(&identity.Certificate); err != nil {
+		return err
 	}
+	identityCopy := *identity
+	c.identity = &identityCopy
 	return nil
 }
 
@@ -193,16 +187,65 @@ func (c *ServerClient) ClearClientIdentity() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.identity = nil
-	if transport, ok := c.HTTPClient.Transport.(*http.Transport); ok {
-		cfg := transport.TLSClientConfig
-		if cfg == nil {
-			cfg = &tls.Config{MinVersion: tls.VersionTLS12}
-		} else {
-			cfg = cfg.Clone()
-		}
-		cfg.Certificates = nil
-		transport.TLSClientConfig = cfg
+	_ = c.swapHTTPTransportLocked(nil)
+}
+
+// TLSConfig returns a private TLS configuration snapshot for the WebSocket
+// client. Callers must never mutate the live HTTP transport configuration.
+func (c *ServerClient) TLSConfig() *tls.Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.HTTPClient == nil {
+		return &tls.Config{MinVersion: tls.VersionTLS12}
 	}
+	transport, ok := c.HTTPClient.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil {
+		return &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	return transport.TLSClientConfig.Clone()
+}
+
+// swapHTTPTransportLocked installs a fresh transport/client pair. A
+// http.Transport must not have TLSClientConfig mutated after first use: an
+// existing keep-alive connection can otherwise continue using the old TLS
+// session and concurrent requests race with the mutation. Closing idle
+// connections and replacing the transport makes the new identity effective
+// for every request started after this method returns.
+func (c *ServerClient) swapHTTPTransportLocked(identity *tls.Certificate) error {
+	if c.HTTPClient == nil {
+		return fmt.Errorf("HTTP client unavailable")
+	}
+	var oldTransport *http.Transport
+	if existing, ok := c.HTTPClient.Transport.(*http.Transport); ok {
+		oldTransport = existing
+	}
+	var nextTransport *http.Transport
+	if oldTransport != nil {
+		nextTransport = oldTransport.Clone()
+	} else if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok {
+		nextTransport = defaultTransport.Clone()
+	} else {
+		nextTransport = &http.Transport{}
+	}
+	cfg := nextTransport.TLSClientConfig
+	if cfg == nil {
+		cfg = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		cfg = cfg.Clone()
+	}
+	if identity == nil {
+		cfg.Certificates = nil
+	} else {
+		cfg.Certificates = []tls.Certificate{*identity}
+	}
+	nextTransport.TLSClientConfig = cfg
+	if oldTransport != nil {
+		oldTransport.CloseIdleConnections()
+	}
+	nextClient := *c.HTTPClient
+	nextClient.Transport = nextTransport
+	c.HTTPClient = &nextClient
+	return nil
 }
 
 // withClientIdentitySuppressed runs a bootstrap request without presenting a
@@ -754,7 +797,13 @@ func (c *ServerClient) doRequest(ctx context.Context, method, path string, reqBo
 	Debug(fmt.Sprintf("HTTP request: method=%s url=%s requireAuth=%v tokenPresent=%v mtls=%v", method, url, requireAuth, tokenPresent, c.HasClientIdentity()))
 
 	// Perform request
-	httpResp, err := c.HTTPClient.Do(httpReq)
+	c.mu.RLock()
+	httpClient := c.HTTPClient
+	c.mu.RUnlock()
+	if httpClient == nil {
+		return fmt.Errorf("HTTP client unavailable")
+	}
+	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		Error(fmt.Sprintf("HTTP request failed: %v", err))
 		return fmt.Errorf("request failed: %w", err)
@@ -954,7 +1003,13 @@ func (c *ServerClient) DownloadArtifactWithProgress(ctx context.Context, manifes
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 	}
 
-	downloadClient := *c.HTTPClient
+	c.mu.RLock()
+	httpClient := c.HTTPClient
+	c.mu.RUnlock()
+	if httpClient == nil {
+		return 0, fmt.Errorf("HTTP client unavailable")
+	}
+	downloadClient := *httpClient
 	downloadClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return fmt.Errorf("update download redirects are disabled")
 	}

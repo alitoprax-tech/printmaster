@@ -2377,25 +2377,47 @@ func performServerJoin(
 	client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, params.Insecure)
 	var agentToken, tenantID string
 	var mtlsEnrolled bool
-	if pending, csrErr := agent.GenerateClientCSR(agentID); csrErr == nil {
-		if registration, mtlsErr := client.RegisterWithMTLS(reqCtx, joinToken, string(pending.CSRPEM), Version); mtlsErr == nil {
-			identity, buildErr := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
-			if buildErr != nil {
-				return nil, newJoinError(http.StatusBadGateway, buildErr)
+	// A previous onboarding attempt may have consumed the one-time join token
+	// and persisted a certificate before the activation response was lost.
+	// Retry that activation before attempting another enrollment.
+	if pendingIdentity, pendingErr := agent.LoadPendingClientIdentity(dataDir); pendingErr != nil {
+		return nil, newJoinError(http.StatusInternalServerError, pendingErr)
+	} else if pendingIdentity != nil {
+		if setErr := client.SetClientIdentity(pendingIdentity); setErr != nil {
+			return nil, newJoinError(http.StatusInternalServerError, setErr)
+		}
+		if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
+			client.ClearClientIdentity()
+			return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("pending mTLS activation: %w", activateErr))
+		}
+		if promoteErr := agent.PromotePendingClientIdentity(dataDir); promoteErr != nil {
+			return nil, newJoinError(http.StatusInternalServerError, promoteErr)
+		}
+		tenantID, mtlsEnrolled = pendingIdentity.TenantID, true
+	}
+	if !mtlsEnrolled {
+		if pending, csrErr := agent.GenerateClientCSR(agentID); csrErr == nil {
+			if registration, mtlsErr := client.RegisterWithMTLS(reqCtx, joinToken, string(pending.CSRPEM), Version); mtlsErr == nil {
+				identity, buildErr := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+				if buildErr != nil {
+					return nil, newJoinError(http.StatusBadGateway, buildErr)
+				}
+				identity.TenantID = registration.TenantID
+				if saveErr := agent.SavePendingClientIdentity(dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); saveErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, saveErr)
+				}
+				if setErr := client.SetClientIdentity(identity); setErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, setErr)
+				}
+				if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
+					client.ClearClientIdentity()
+					return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("mTLS activation: %w", activateErr))
+				}
+				if promoteErr := agent.PromotePendingClientIdentity(dataDir); promoteErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, promoteErr)
+				}
+				tenantID, mtlsEnrolled = registration.TenantID, true
 			}
-			if saveErr := agent.SaveClientIdentity(dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); saveErr != nil {
-				return nil, newJoinError(http.StatusInternalServerError, saveErr)
-			}
-			if setErr := client.SetClientIdentity(identity); setErr != nil {
-				_ = agent.DeleteClientIdentity(dataDir)
-				return nil, newJoinError(http.StatusInternalServerError, setErr)
-			}
-			if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
-				client.ClearClientIdentity()
-				_ = agent.DeleteClientIdentity(dataDir)
-				return nil, newJoinError(http.StatusBadGateway, activateErr)
-			}
-			tenantID, mtlsEnrolled = registration.TenantID, true
 		}
 	}
 	if !mtlsEnrolled {
@@ -2459,13 +2481,11 @@ func performServerJoin(
 		if mtlsEnrolled {
 			if identity, identityErr := agent.LoadClientIdentity(dataDir); identityErr == nil && identity != nil {
 				if setErr := existingWorker.client.SetClientIdentity(identity); setErr == nil {
-					if transport, ok := existingWorker.client.HTTPClient.Transport.(*http.Transport); ok {
-						existingWorker.wsClientMu.RLock()
-						wsClient := existingWorker.wsClient
-						existingWorker.wsClientMu.RUnlock()
-						if wsClient != nil {
-							wsClient.SetTLSConfig(transport.TLSClientConfig)
-						}
+					existingWorker.wsClientMu.RLock()
+					wsClient := existingWorker.wsClient
+					existingWorker.wsClientMu.RUnlock()
+					if wsClient != nil {
+						wsClient.SetTLSConfig(existingWorker.client.TLSConfig())
 					}
 				}
 			}

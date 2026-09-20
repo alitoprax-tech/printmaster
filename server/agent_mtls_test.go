@@ -235,6 +235,13 @@ func TestP001LegacyBearerMigrationAndActivation(t *testing.T) {
 	if _, err := f.store.GetAgentByToken(context.Background(), "legacy-secret"); err == nil {
 		t.Fatal("legacy bearer remained usable after activation")
 	}
+	// Activation is safe to retry when the first response was lost after the
+	// server committed the credential transition.
+	retry := httptest.NewRecorder()
+	handleAgentIdentityActivate(retry, activate)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("idempotent mTLS activation failed: %d %s", retry.Code, retry.Body.String())
+	}
 }
 
 func TestP001MigrationDoesNotFallBackFromPresentedCertificateToBearer(t *testing.T) {

@@ -236,9 +236,7 @@ func (w *UploadWorker) StartWithVersionInfo(ctx context.Context, version string,
 
 		w.wsClientMu.Lock()
 		w.wsClient = agent.NewWSClient(serverURL, token, w.client.IsInsecureSkipVerify())
-		if transport, ok := w.client.HTTPClient.Transport.(*http.Transport); ok {
-			w.wsClient.SetTLSConfig(transport.TLSClientConfig)
-		}
+		w.wsClient.SetTLSConfig(w.client.TLSConfig())
 		w.wsClientMu.Unlock()
 
 		// Apply pending local handler if one was set before wsClient existed
@@ -302,6 +300,17 @@ func (w *UploadWorker) Stop() {
 
 // ensureRegistered checks if agent has a token, registers if not
 func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) error {
+	// A certificate may have been issued and activation may have completed on
+	// the server while the response was lost. Always retry a persisted pending
+	// identity before consuming another join token or falling back to bearer.
+	if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+		return fmt.Errorf("load pending Agent identity: %w", pendingErr)
+	} else if pending != nil {
+		if activated, activateErr := w.activatePendingMTLS(ctx, pending); !activated {
+			return fmt.Errorf("pending mTLS activation requires retry: %w", activateErr)
+		}
+		return nil
+	}
 	token := w.client.GetToken()
 
 	if w.client.HasClientIdentity() {
@@ -328,6 +337,11 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 			if migrated, migrateErr := w.migrateMTLS(ctx); migrated {
 				return nil
 			} else if migrateErr != nil {
+				if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+					return fmt.Errorf("load pending Agent identity after migration: %w", pendingErr)
+				} else if pending != nil {
+					return fmt.Errorf("mTLS migration is awaiting activation: %w", migrateErr)
+				}
 				w.logger.Debug("Agent mTLS migration not available; retaining legacy bearer", "error", migrateErr)
 			}
 			w.logger.Info("Using existing authentication token")
@@ -374,6 +388,12 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 			}
 			w.logger.Info("Agent enrolled with mTLS using INIT_SECRET", "tenant_id", tenantID)
 			return nil
+		} else if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+			cancel()
+			return fmt.Errorf("load pending Agent identity after enrollment: %w", pendingErr)
+		} else if pending != nil {
+			cancel()
+			return fmt.Errorf("mTLS enrollment is awaiting activation: %w", mtlsErr)
 		}
 		agentToken, tenantID, err := w.client.RegisterWithToken(regCtx, joinToken, version)
 		cancel()
@@ -417,6 +437,12 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 		cancel()
 		w.logger.Info("Agent enrolled with mTLS", "tenant_id", tenantID)
 		return nil
+	} else if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+		cancel()
+		return fmt.Errorf("load pending Agent identity after enrollment: %w", pendingErr)
+	} else if pending != nil {
+		cancel()
+		return fmt.Errorf("mTLS enrollment is awaiting activation: %w", mtlsErr)
 	}
 	defer cancel()
 
@@ -453,21 +479,13 @@ func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string
 	if err != nil {
 		return "", err
 	}
-	if err := agent.SaveClientIdentity(w.dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+	identity.TenantID = registration.TenantID
+	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
 		return "", err
 	}
-	if err := w.client.SetClientIdentity(identity); err != nil {
-		_ = agent.DeleteClientIdentity(w.dataDir)
+	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
 		return "", err
 	}
-	if err := w.client.ActivateMTLS(ctx); err != nil {
-		w.client.ClearClientIdentity()
-		_ = agent.DeleteClientIdentity(w.dataDir)
-		return "", err
-	}
-	w.client.SetToken("")
-	_ = DeleteServerToken(w.dataDir)
-	_ = SaveServerJoinToken(w.dataDir, "")
 	return registration.TenantID, nil
 }
 
@@ -484,21 +502,13 @@ func (w *UploadWorker) migrateMTLS(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := agent.SaveClientIdentity(w.dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+	identity.TenantID = registration.TenantID
+	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
 		return false, err
 	}
-	if err := w.client.SetClientIdentity(identity); err != nil {
-		_ = agent.DeleteClientIdentity(w.dataDir)
+	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
 		return false, err
 	}
-	if err := w.client.ActivateMTLS(ctx); err != nil {
-		w.client.ClearClientIdentity()
-		_ = agent.DeleteClientIdentity(w.dataDir)
-		return false, err
-	}
-	w.client.SetToken("")
-	_ = DeleteServerToken(w.dataDir)
-	_ = SaveServerJoinToken(w.dataDir, "")
 	return true, nil
 }
 
@@ -515,21 +525,55 @@ func (w *UploadWorker) renewMTLS(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := agent.SaveClientIdentity(w.dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+	identity.TenantID = registration.TenantID
+	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
 		return err
 	}
-	if err := w.client.SetClientIdentity(identity); err != nil {
-		_ = agent.DeleteClientIdentity(w.dataDir)
+	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
 		return err
 	}
-	if transport, ok := w.client.HTTPClient.Transport.(*http.Transport); ok {
-		w.wsClientMu.Lock()
-		if w.wsClient != nil {
-			w.wsClient.SetTLSConfig(transport.TLSClientConfig)
+	return nil
+}
+
+// activatePendingMTLS installs a persisted pending identity, retries the
+// idempotent server activation, and promotes the identity only after the
+// server confirms success. On failure the previous in-memory identity is
+// restored, while the pending files remain for a later retry.
+func (w *UploadWorker) activatePendingMTLS(ctx context.Context, pending *agent.ClientIdentity) (bool, error) {
+	if pending == nil {
+		return false, fmt.Errorf("pending Agent identity required")
+	}
+	previous := w.client.GetClientIdentity()
+	if err := w.client.SetClientIdentity(pending); err != nil {
+		return false, err
+	}
+	w.syncWebSocketTLSConfig()
+	if err := w.client.ActivateMTLS(ctx); err != nil {
+		if previous != nil {
+			_ = w.client.SetClientIdentity(previous)
+		} else {
+			w.client.ClearClientIdentity()
 		}
-		w.wsClientMu.Unlock()
+		w.syncWebSocketTLSConfig()
+		return false, err
 	}
-	return w.client.ActivateMTLS(ctx)
+	if err := agent.PromotePendingClientIdentity(w.dataDir); err != nil {
+		// The server may already have revoked the old credential. Keep the new
+		// in-memory identity and the pending files so promotion can be retried.
+		return false, fmt.Errorf("promote activated Agent identity: %w", err)
+	}
+	w.client.SetToken("")
+	_ = DeleteServerToken(w.dataDir)
+	_ = SaveServerJoinToken(w.dataDir, "")
+	return true, nil
+}
+
+func (w *UploadWorker) syncWebSocketTLSConfig() {
+	w.wsClientMu.Lock()
+	defer w.wsClientMu.Unlock()
+	if w.wsClient != nil {
+		w.wsClient.SetTLSConfig(w.client.TLSConfig())
+	}
 }
 
 // heartbeatLoop sends periodic heartbeats to the server
