@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,6 +76,9 @@ func TestPendingActivationIsRetriedWithoutDeletingIdentity(t *testing.T) {
 	}
 	clientIdentity.TenantID = "tenant-1"
 	if err := agent.SavePendingClientIdentity(dataDir, clientIdentity, certPEM, keyPEM); err != nil {
+		if runtime.GOOS == "windows" && strings.Contains(err.Error(), "service-scoped DPAPI") {
+			t.Skip("Windows DPAPI persistence requires the installed PrintMasterAgent service identity")
+		}
 		t.Fatalf("save pending identity: %v", err)
 	}
 

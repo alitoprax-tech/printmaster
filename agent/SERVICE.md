@@ -165,8 +165,11 @@ P-256 non-exportable key. If hardware CNG is unavailable, the Microsoft
 Software Key Storage Provider is attempted with the same non-exportable policy
 and service ACL. The identity generation stores only the CNG provider/key
 reference and certificate; no raw private-key PEM is written to disk. If CNG
-is unavailable, the Agent uses user-scoped DPAPI under the service account,
-with the same protected data-directory ACL. A legacy plaintext generation is
+is unavailable, the Agent uses user-scoped DPAPI only after verifying that the
+current process token is the installed `NT SERVICE\PrintMasterAgent` identity.
+Encryption and decryption must therefore both run under that service account;
+an interactive or administrator process fails closed and does not write a
+plaintext or machine-scoped fallback key. A legacy plaintext generation is
 copied to protected storage, reopened and verified before the old generation
 is removed; if migration cannot be completed, the old identity is retained
 and the service refuses to continue with an unprotected replacement.

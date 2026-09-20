@@ -14,6 +14,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -27,16 +28,17 @@ import (
 )
 
 const (
-	dpapiEnvelopePrefix        = "PM-DPAPI-USER-V1\x00"
-	ncryptMachineKeyFlag       = 0x00000020
-	ncryptPersistFlag          = 0x80000000
-	ncryptExportPolicyProperty = "Export Policy"
-	ncryptAllowPlaintextExport = 0x00000001
-	ncryptSecurityDescriptor   = "Security Descr"
-	ncryptECCPublicBlob        = "ECCPUBLICBLOB"
-	ncryptECDSAP256Algorithm   = "ECDSA_P256"
-	ncryptPlatformProvider     = "Microsoft Platform Crypto Provider"
-	ncryptSoftwareProvider     = "Microsoft Software Key Storage Provider"
+	dpapiEnvelopePrefix                   = "PM-DPAPI-USER-V1\x00"
+	ncryptMachineKeyFlag          uintptr = 0x00000020 // NCRYPT_MACHINE_KEY_FLAG
+	ncryptPersistFlag             uintptr = 0x80000000 // NCRYPT_PERSIST_FLAG
+	ncryptSecurityDescriptorFlags         = ncryptPersistFlag | uintptr(windows.DACL_SECURITY_INFORMATION)
+	ncryptExportPolicyProperty            = "Export Policy"
+	ncryptAllowPlaintextExport            = 0x00000001
+	ncryptSecurityDescriptor              = "Security Descr"
+	ncryptECCPublicBlob                   = "ECCPUBLICBLOB"
+	ncryptECDSAP256Algorithm              = "ECDSA_P256"
+	ncryptPlatformProvider                = "Microsoft Platform Crypto Provider"
+	ncryptSoftwareProvider                = "Microsoft Software Key Storage Provider"
 )
 
 var ncrypt = windows.NewLazySystemDLL("ncrypt.dll")
@@ -46,6 +48,7 @@ var (
 	procNCryptCreatePersistedKey  = ncrypt.NewProc("NCryptCreatePersistedKey")
 	procNCryptOpenKey             = ncrypt.NewProc("NCryptOpenKey")
 	procNCryptSetProperty         = ncrypt.NewProc("NCryptSetProperty")
+	procNCryptGetProperty         = ncrypt.NewProc("NCryptGetProperty")
 	procNCryptFinalizeKey         = ncrypt.NewProc("NCryptFinalizeKey")
 	procNCryptExportKey           = ncrypt.NewProc("NCryptExportKey")
 	procNCryptDeleteKey           = ncrypt.NewProc("NCryptDeleteKey")
@@ -109,6 +112,39 @@ func ncryptUTF16(value string) (*uint16, error) {
 	return windows.UTF16PtrFromString(value)
 }
 
+// readCNGProperty reads a bounded persisted CNG property. Security descriptor
+// callers must pass the SECURITY_INFORMATION selector required by NCrypt for
+// that property (for example, DACL_SECURITY_INFORMATION).
+func readCNGProperty(key windows.Handle, propertyName string, flags uintptr) ([]byte, error) {
+	property, err := ncryptUTF16(propertyName)
+	if err != nil {
+		return nil, err
+	}
+	var size uint32
+	status, _, _ := procNCryptGetProperty.Call(
+		uintptr(key), uintptr(unsafe.Pointer(property)), 0, 0,
+		uintptr(unsafe.Pointer(&size)), flags,
+	)
+	if err := ncryptStatus(status); err != nil {
+		return nil, fmt.Errorf("read CNG property %q size: %w", propertyName, err)
+	}
+	if size == 0 || size > 1<<20 {
+		return nil, fmt.Errorf("invalid CNG property %q size %d", propertyName, size)
+	}
+	value := make([]byte, size)
+	status, _, _ = procNCryptGetProperty.Call(
+		uintptr(key), uintptr(unsafe.Pointer(property)), uintptr(unsafe.Pointer(&value[0])), uintptr(len(value)),
+		uintptr(unsafe.Pointer(&size)), flags,
+	)
+	if err := ncryptStatus(status); err != nil {
+		return nil, fmt.Errorf("read CNG property %q: %w", propertyName, err)
+	}
+	if size > uint32(len(value)) {
+		return nil, fmt.Errorf("CNG property %q grew unexpectedly", propertyName)
+	}
+	return value[:size], nil
+}
+
 func openCNGProvider(name string) (windows.Handle, error) {
 	providerName, err := ncryptUTF16(name)
 	if err != nil {
@@ -123,6 +159,10 @@ func openCNGProvider(name string) (windows.Handle, error) {
 }
 
 func createCNGKey(provider windows.Handle, keyName string) (windows.Handle, error) {
+	return createCNGKeyWithACL(provider, keyName, setCNGKeyServiceACL)
+}
+
+func createCNGKeyWithACL(provider windows.Handle, keyName string, applyACL func(windows.Handle) error) (windows.Handle, error) {
 	algorithm, err := ncryptUTF16(ncryptECDSAP256Algorithm)
 	if err != nil {
 		return 0, err
@@ -149,10 +189,10 @@ func createCNGKey(provider windows.Handle, keyName string) (windows.Handle, erro
 		_, _, _ = procNCryptFreeObject.Call(uintptr(key))
 		return 0, err
 	}
-	if err := setCNGKeyServiceACL(key); err != nil {
+	if err := applyACL(key); err != nil {
 		_, _, _ = procNCryptDeleteKey.Call(uintptr(key), 0)
 		_, _, _ = procNCryptFreeObject.Call(uintptr(key))
-		return 0, err
+		return 0, fmt.Errorf("apply CNG key ACL: %w", err)
 	}
 	status, _, _ = procNCryptFinalizeKey.Call(uintptr(key), 0)
 	if err := ncryptStatus(status); err != nil {
@@ -164,14 +204,20 @@ func createCNGKey(provider windows.Handle, keyName string) (windows.Handle, erro
 }
 
 func setCNGKeyServiceACL(key windows.Handle) error {
-	serviceSID, _, _, err := windows.LookupSID("", `NT SERVICE\PrintMasterAgent`)
+	serviceSID, _, _, err := windows.LookupSID("", windowsPrintMasterServiceAccount)
 	if err != nil {
 		return fmt.Errorf("resolve Agent service SID for CNG key: %w", err)
 	}
-	sddl := fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", serviceSID.String())
-	sd, err := windows.SecurityDescriptorFromString(sddl)
+	return setCNGKeyACL(key, serviceSID)
+}
+
+func setCNGKeyACL(key windows.Handle, serviceSID *windows.SID) error {
+	if serviceSID == nil {
+		return fmt.Errorf("CNG key ACL service SID is nil")
+	}
+	sd, err := cngKeySecurityDescriptor(serviceSID)
 	if err != nil {
-		return fmt.Errorf("build CNG key ACL: %w", err)
+		return err
 	}
 	length := sd.Length()
 	if length == 0 {
@@ -182,11 +228,23 @@ func setCNGKeyServiceACL(key windows.Handle) error {
 	if err != nil {
 		return err
 	}
-	status, _, _ := procNCryptSetProperty.Call(uintptr(key), uintptr(unsafe.Pointer(property)), uintptr(unsafe.Pointer(&descriptor[0])), uintptr(length), ncryptPersistFlag)
+	status, _, _ := procNCryptSetProperty.Call(uintptr(key), uintptr(unsafe.Pointer(property)), uintptr(unsafe.Pointer(&descriptor[0])), uintptr(length), ncryptSecurityDescriptorFlags)
 	if err := ncryptStatus(status); err != nil {
-		return fmt.Errorf("set CNG key ACL: %w", err)
+		return fmt.Errorf("set CNG key DACL: %w", err)
 	}
 	return nil
+}
+
+func cngKeySecurityDescriptor(serviceSID *windows.SID) (*windows.SECURITY_DESCRIPTOR, error) {
+	if serviceSID == nil {
+		return nil, fmt.Errorf("CNG key ACL service SID is nil")
+	}
+	sddl := fmt.Sprintf("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)", serviceSID.String())
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return nil, fmt.Errorf("build CNG key ACL: %w", err)
+	}
+	return sd, nil
 }
 
 func openCNGKey(provider windows.Handle, keyName string) (windows.Handle, error) {
@@ -260,6 +318,7 @@ func generateProtectedClientCSR(dataDir, agentID, keyID string) (*PendingIdentit
 		return nil, fmt.Errorf("agent id required")
 	}
 	keyName := "PrintMaster-Agent-" + keyID
+	var cngFailures []error
 	// Prefer a hardware-backed key. If the platform provider is unavailable,
 	// use the Microsoft software CNG provider with the same non-exportable
 	// policy and service ACL before falling back to user-scoped DPAPI.
@@ -270,18 +329,28 @@ func generateProtectedClientCSR(dataDir, agentID, keyID string) (*PendingIdentit
 		{provider: ncryptPlatformProvider, backend: keyBackendTPM},
 		{provider: ncryptSoftwareProvider, backend: keyBackendCNG},
 	} {
-		if signer, err := newCNGSignerWithProvider(candidate.provider, keyName, true); err == nil {
-			csrDER, csrErr := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "PrintMaster Agent"}}, signer)
-			if csrErr == nil {
-				return &PendingIdentity{CSRPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}), AgentID: agentID, KeyBackend: candidate.backend, KeyReference: keyName, signer: signer}, nil
-			}
-			_, _, _ = procNCryptDeleteKey.Call(uintptr(signer.key), 0)
-			signer.close()
+		signer, err := newCNGSignerWithProvider(candidate.provider, keyName, true)
+		if err != nil {
+			cngFailures = append(cngFailures, fmt.Errorf("%s: %w", candidate.provider, err))
+			continue
 		}
+		csrDER, csrErr := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "PrintMaster Agent"}}, signer)
+		if csrErr == nil {
+			return &PendingIdentity{CSRPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}), AgentID: agentID, KeyBackend: candidate.backend, KeyReference: keyName, signer: signer}, nil
+		}
+		cngFailures = append(cngFailures, fmt.Errorf("%s CSR: %w", candidate.provider, csrErr))
+		_, _, _ = procNCryptDeleteKey.Call(uintptr(signer.key), 0)
+		signer.close()
 	}
 	// A TPM/CNG failure is not silently downgraded to machine-wide DPAPI. The
 	// user-scoped DPAPI fallback is bound to the service account and still keeps
 	// plaintext key bytes out of the identity generations.
+	if err := requirePrintMasterServiceIdentity(); err != nil {
+		if len(cngFailures) > 0 {
+			return nil, fmt.Errorf("CNG providers unavailable (%v); refusing DPAPI fallback: %w", errors.Join(cngFailures...), err)
+		}
+		return nil, fmt.Errorf("refusing DPAPI fallback: %w", err)
+	}
 	pending, err := generateSoftwareClientCSR(agentID)
 	if err != nil {
 		return nil, err
@@ -345,6 +414,9 @@ func unprotectPrivateKeyPlatform(_ string, stored []byte, ref keyReference) ([]b
 func protectWithDPAPI(plain []byte) ([]byte, error) {
 	if len(plain) == 0 {
 		return nil, fmt.Errorf("empty secret")
+	}
+	if err := requirePrintMasterServiceIdentity(); err != nil {
+		return nil, err
 	}
 	in := windows.DataBlob{Size: uint32(len(plain)), Data: &plain[0]}
 	entropyBytes := sha256.Sum256([]byte("PrintMaster Agent DPAPI service identity v1"))
@@ -604,6 +676,9 @@ func isLegacyKeyBackend(backend string) bool {
 func unprotectWithDPAPI(protected []byte) ([]byte, error) {
 	if len(protected) == 0 {
 		return nil, fmt.Errorf("empty protected secret")
+	}
+	if err := requirePrintMasterServiceIdentity(); err != nil {
+		return nil, err
 	}
 	in := windows.DataBlob{Size: uint32(len(protected)), Data: &protected[0]}
 	entropyBytes := sha256.Sum256([]byte("PrintMaster Agent DPAPI service identity v1"))
