@@ -241,7 +241,7 @@ func TestWindowsSoftwareKSPNonExportablePersistedKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read persisted CNG export policy: %v", err)
 	}
-	if len(exportPolicy) < 4 || binary.LittleEndian.Uint32(exportPolicy[:4])&ncryptAllowPlaintextExport != 0 {
+	if len(exportPolicy) < 4 || binary.LittleEndian.Uint32(exportPolicy[:4])&(ncryptAllowExportFlag|ncryptAllowPlaintextExport) != 0 {
 		t.Fatalf("CNG export policy permits plaintext export: %#v", exportPolicy)
 	}
 

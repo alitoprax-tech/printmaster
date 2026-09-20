@@ -33,7 +33,8 @@ const (
 	ncryptPersistFlag             uintptr = 0x80000000 // NCRYPT_PERSIST_FLAG
 	ncryptSecurityDescriptorFlags         = ncryptPersistFlag | uintptr(windows.DACL_SECURITY_INFORMATION)
 	ncryptExportPolicyProperty            = "Export Policy"
-	ncryptAllowPlaintextExport            = 0x00000001
+	ncryptAllowExportFlag                 = 0x00000001 // NCRYPT_ALLOW_EXPORT_FLAG
+	ncryptAllowPlaintextExport            = 0x00000002 // NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG
 	ncryptSecurityDescriptor              = "Security Descr"
 	ncryptECCPublicBlob                   = "ECCPUBLICBLOB"
 	ncryptECDSAP256Algorithm              = "ECDSA_P256"
