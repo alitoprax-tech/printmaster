@@ -260,8 +260,13 @@ func (ws *WSClient) connect() error {
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 
-	// Connect using shared ws wrapper
-	conn, resp, err := wscommon.Dial(u.String(), http.Header{"Authorization": {"Bearer " + ws.token}}, tlsConfig.Clone(), ws.handshakeTimeout)
+	// Use mTLS when the HTTP client supplied a client certificate. A bearer
+	// header is sent only for legacy/migration connections.
+	headers := make(http.Header)
+	if strings.TrimSpace(ws.token) != "" {
+		headers.Set("Authorization", "Bearer "+ws.token)
+	}
+	conn, resp, err := wscommon.Dial(u.String(), headers, tlsConfig.Clone(), ws.handshakeTimeout)
 	if err != nil {
 		// Try to include HTTP response body and headers from the upgrade attempt for easier debugging
 		if resp != nil {

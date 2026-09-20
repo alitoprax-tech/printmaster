@@ -30,6 +30,7 @@ type ServerClient struct {
 	AgentID            string
 	AgentName          string // User-friendly agent name
 	Token              string
+	identity           *ClientIdentity
 	HTTPClient         *http.Client
 	InsecureSkipVerify bool
 	tlsConfigError     error
@@ -37,6 +38,17 @@ type ServerClient struct {
 	lastHeartbeat      time.Time
 	lastDeviceUpload   time.Time
 	lastMetricsUpload  time.Time
+}
+
+// MTLSRegistration is the public portion of a server-issued Agent identity.
+// The caller supplies the matching private key from PendingIdentity when
+// persisting it locally.
+type MTLSRegistration struct {
+	CredentialID      string    `json:"credential_id"`
+	TenantID          string    `json:"tenant_id"`
+	AgentID           string    `json:"agent_id"`
+	ClientCertificate []byte    `json:"client_certificate"`
+	ExpiresAt         time.Time `json:"expires_at"`
 }
 
 const maxServerResponseBytes = 2 << 20
@@ -139,6 +151,76 @@ func (c *ServerClient) GetToken() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Token
+}
+
+func (c *ServerClient) SetClientIdentity(identity *ClientIdentity) error {
+	if identity == nil || len(identity.Certificate.Certificate) == 0 {
+		return fmt.Errorf("client identity required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.identity = identity
+	if transport, ok := c.HTTPClient.Transport.(*http.Transport); ok {
+		cfg := transport.TLSClientConfig
+		if cfg == nil {
+			cfg = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			cfg = cfg.Clone()
+		}
+		cfg.Certificates = []tls.Certificate{identity.Certificate}
+		transport.TLSClientConfig = cfg
+	}
+	return nil
+}
+
+func (c *ServerClient) GetClientIdentity() *ClientIdentity {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.identity == nil {
+		return nil
+	}
+	copy := *c.identity
+	return &copy
+}
+
+func (c *ServerClient) HasClientIdentity() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.identity != nil && len(c.identity.Certificate.Certificate) > 0
+}
+
+func (c *ServerClient) ClearClientIdentity() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.identity = nil
+	if transport, ok := c.HTTPClient.Transport.(*http.Transport); ok {
+		cfg := transport.TLSClientConfig
+		if cfg == nil {
+			cfg = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			cfg = cfg.Clone()
+		}
+		cfg.Certificates = nil
+		transport.TLSClientConfig = cfg
+	}
+}
+
+// withClientIdentitySuppressed runs a bootstrap request without presenting a
+// possibly stale client certificate. This is needed when a previously stored
+// identity is expired/revoked but a join token or legacy bearer is still
+// available for controlled recovery.
+func (c *ServerClient) withClientIdentitySuppressed(fn func() error) error {
+	previous := c.GetClientIdentity()
+	if previous == nil {
+		return fn()
+	}
+	c.ClearClientIdentity()
+	defer func() {
+		if c.GetClientIdentity() == nil {
+			_ = c.SetClientIdentity(previous)
+		}
+	}()
+	return fn()
 }
 
 // GetServerURL retrieves the base server URL
@@ -261,6 +343,97 @@ func (c *ServerClient) RegisterWithToken(ctx context.Context, joinToken string, 
 	}
 
 	return resp.AgentToken, resp.TenantID, nil
+}
+
+// RegisterWithMTLS enrolls the Agent using a join token and CSR. It never
+// sends or persists the private key; callers must save the returned certificate
+// together with the PendingIdentity key before activating it.
+func (c *ServerClient) RegisterWithMTLS(ctx context.Context, joinToken, csrPEM, version string) (*MTLSRegistration, error) {
+	type joinRequest struct {
+		Token           string `json:"token"`
+		AgentID         string `json:"agent_id"`
+		Name            string `json:"name,omitempty"`
+		AgentVersion    string `json:"agent_version,omitempty"`
+		ProtocolVersion string `json:"protocol_version,omitempty"`
+		CSR             string `json:"csr"`
+	}
+	var resp MTLSRegistration
+	var envelope struct {
+		Success           bool      `json:"success"`
+		CredentialID      string    `json:"credential_id"`
+		TenantID          string    `json:"tenant_id"`
+		AgentID           string    `json:"agent_id"`
+		ClientCertificate string    `json:"client_certificate"`
+		ExpiresAt         time.Time `json:"expires_at"`
+		Message           string    `json:"message,omitempty"`
+	}
+	req := joinRequest{Token: joinToken, AgentID: c.AgentID, Name: c.AgentName, AgentVersion: version, ProtocolVersion: "1", CSR: csrPEM}
+	var requestErr error
+	requestErr = c.withClientIdentitySuppressed(func() error {
+		return c.doRequest(ctx, http.MethodPost, "/api/v1/agents/register-mtls", req, &envelope, false)
+	})
+	if requestErr != nil {
+		return nil, fmt.Errorf("register-mtls failed: %w", requestErr)
+	}
+	if !envelope.Success || envelope.CredentialID == "" || envelope.ClientCertificate == "" {
+		return nil, fmt.Errorf("register-mtls failed: %s", envelope.Message)
+	}
+	resp.CredentialID, resp.TenantID, resp.AgentID = envelope.CredentialID, envelope.TenantID, envelope.AgentID
+	resp.ClientCertificate, resp.ExpiresAt = []byte(envelope.ClientCertificate), envelope.ExpiresAt
+	return &resp, nil
+}
+
+func (c *ServerClient) MigrateToMTLS(ctx context.Context, csrPEM []byte) (*MTLSRegistration, error) {
+	var envelope struct {
+		Success           bool      `json:"success"`
+		CredentialID      string    `json:"credential_id"`
+		TenantID          string    `json:"tenant_id"`
+		AgentID           string    `json:"agent_id"`
+		ClientCertificate string    `json:"client_certificate"`
+		ExpiresAt         time.Time `json:"expires_at"`
+	}
+	payload := map[string]string{"csr": string(csrPEM)}
+	if err := c.withClientIdentitySuppressed(func() error {
+		return c.doRequest(ctx, http.MethodPost, "/api/v1/agents/identity/migrate", payload, &envelope, true)
+	}); err != nil {
+		return nil, fmt.Errorf("mTLS migration failed: %w", err)
+	}
+	if envelope.CredentialID == "" || envelope.ClientCertificate == "" {
+		return nil, fmt.Errorf("mTLS migration returned incomplete identity")
+	}
+	return &MTLSRegistration{CredentialID: envelope.CredentialID, TenantID: envelope.TenantID, AgentID: envelope.AgentID, ClientCertificate: []byte(envelope.ClientCertificate), ExpiresAt: envelope.ExpiresAt}, nil
+}
+
+func (c *ServerClient) RenewMTLS(ctx context.Context, csrPEM []byte) (*MTLSRegistration, error) {
+	var envelope struct {
+		Success           bool      `json:"success"`
+		CredentialID      string    `json:"credential_id"`
+		TenantID          string    `json:"tenant_id"`
+		AgentID           string    `json:"agent_id"`
+		ClientCertificate string    `json:"client_certificate"`
+		ExpiresAt         time.Time `json:"expires_at"`
+	}
+	payload := map[string]string{"csr": string(csrPEM)}
+	if err := c.doRequest(ctx, http.MethodPost, "/api/v1/agents/identity/renew", payload, &envelope, true); err != nil {
+		return nil, fmt.Errorf("mTLS renewal failed: %w", err)
+	}
+	if envelope.CredentialID == "" || envelope.ClientCertificate == "" {
+		return nil, fmt.Errorf("mTLS renewal returned incomplete identity")
+	}
+	return &MTLSRegistration{CredentialID: envelope.CredentialID, TenantID: envelope.TenantID, AgentID: envelope.AgentID, ClientCertificate: []byte(envelope.ClientCertificate), ExpiresAt: envelope.ExpiresAt}, nil
+}
+
+func (c *ServerClient) ActivateMTLS(ctx context.Context) error {
+	var resp struct {
+		Success bool `json:"success"`
+	}
+	if err := c.doRequest(ctx, http.MethodPost, "/api/v1/agents/identity/activate", map[string]bool{}, &resp, true); err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("mTLS activation rejected")
+	}
+	return nil
 }
 
 // DeviceAuthStartRequest captures the metadata sent to the server when initiating
@@ -561,13 +734,15 @@ func (c *ServerClient) doRequest(ctx context.Context, method, path string, reqBo
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("User-Agent", "PrintMaster-Agent/1.0")
 
-	// Add authentication if required and token available
+	// mTLS is the primary authentication transport when a client identity has
+	// been installed. Bearer is retained only for the migration fallback.
 	if requireAuth {
-		token := c.GetToken()
-		if token == "" {
+		if !c.HasClientIdentity() && c.GetToken() == "" {
 			return fmt.Errorf("authentication required but no token available")
 		}
-		httpReq.Header.Set("Authorization", "Bearer "+token)
+		if !c.HasClientIdentity() {
+			httpReq.Header.Set("Authorization", "Bearer "+c.GetToken())
+		}
 	}
 
 	// Perform request (log for debugging)
@@ -576,7 +751,7 @@ func (c *ServerClient) doRequest(ctx context.Context, method, path string, reqBo
 		token := c.GetToken()
 		tokenPresent = token != ""
 	}
-	Debug(fmt.Sprintf("HTTP request: method=%s url=%s requireAuth=%v tokenPresent=%v", method, url, requireAuth, tokenPresent))
+	Debug(fmt.Sprintf("HTTP request: method=%s url=%s requireAuth=%v tokenPresent=%v mtls=%v", method, url, requireAuth, tokenPresent, c.HasClientIdentity()))
 
 	// Perform request
 	httpResp, err := c.HTTPClient.Do(httpReq)

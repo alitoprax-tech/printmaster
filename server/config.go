@@ -79,6 +79,12 @@ type SecurityConfig struct {
 	PasswordRequireLower   bool `toml:"password_require_lower"`    // Require lowercase letter (default: false)
 	PasswordRequireNumber  bool `toml:"password_require_number"`   // Require number (default: false)
 	PasswordRequireSpecial bool `toml:"password_require_special"`  // Require special character (default: false)
+	// AgentAuthMode is legacy, migration, or mtls. Migration accepts both
+	// identities; mtls rejects bearer authentication entirely.
+	AgentAuthMode            string `toml:"agent_auth_mode"`
+	AgentCACertPath          string `toml:"agent_ca_cert_path"`
+	AgentCAKeyPath           string `toml:"agent_ca_key_path"`
+	AgentCertificateTTLHours int    `toml:"agent_certificate_ttl_hours"`
 }
 
 const maxPasswordLength = 4096
@@ -134,15 +140,17 @@ func DefaultConfig() *Config {
 			BrowserProxyEnabled: false,
 		},
 		Security: SecurityConfig{
-			RateLimitEnabled:       true, // Enable rate limiting by default
-			RateLimitMaxAttempts:   5,    // 5 failed attempts
-			RateLimitBlockMinutes:  5,    // Block for 5 minutes
-			RateLimitWindowMinutes: 2,    // Within a 2 minute window
-			PasswordMinLength:      8,    // Minimum 8 characters
-			PasswordRequireUpper:   false,
-			PasswordRequireLower:   false,
-			PasswordRequireNumber:  false,
-			PasswordRequireSpecial: false,
+			RateLimitEnabled:         true, // Enable rate limiting by default
+			RateLimitMaxAttempts:     5,    // 5 failed attempts
+			RateLimitBlockMinutes:    5,    // Block for 5 minutes
+			RateLimitWindowMinutes:   2,    // Within a 2 minute window
+			PasswordMinLength:        8,    // Minimum 8 characters
+			PasswordRequireUpper:     false,
+			PasswordRequireLower:     false,
+			PasswordRequireNumber:    false,
+			PasswordRequireSpecial:   false,
+			AgentAuthMode:            agentAuthModeLegacy,
+			AgentCertificateTTLHours: 24 * 90,
 		},
 		TLS: TLSConfigTOML{
 			Mode:   "self-signed",
@@ -307,6 +315,25 @@ func applyEnvOverrides(cfg *Config, tracker *ConfigSourceTracker) {
 	if val := os.Getenv("TLS_MODE"); val != "" {
 		cfg.TLS.Mode = val
 		tracker.EnvKeys["tls.mode"] = true
+	}
+	if val := os.Getenv("AGENT_AUTH_MODE"); val != "" {
+		cfg.Security.AgentAuthMode = strings.ToLower(strings.TrimSpace(val))
+		tracker.EnvKeys["security.agent_auth_mode"] = true
+	}
+	if val := os.Getenv("AGENT_CA_CERT_PATH"); val != "" {
+		cfg.Security.AgentCACertPath = val
+		tracker.EnvKeys["security.agent_ca_cert_path"] = true
+	}
+	if val := os.Getenv("AGENT_CA_KEY_PATH"); val != "" {
+		cfg.Security.AgentCAKeyPath = val
+		tracker.EnvKeys["security.agent_ca_key_path"] = true
+	}
+	if val := os.Getenv("AGENT_CERTIFICATE_TTL_HOURS"); val != "" {
+		var v int
+		if _, err := fmt.Sscanf(val, "%d", &v); err == nil {
+			cfg.Security.AgentCertificateTTLHours = v
+			tracker.EnvKeys["security.agent_certificate_ttl_hours"] = true
+		}
 	}
 	if val := os.Getenv("TLS_CERT_PATH"); val != "" {
 		cfg.TLS.CertPath = val

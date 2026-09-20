@@ -163,6 +163,7 @@ func (s *PostgresStore) initSchema() error {
 		version TEXT NOT NULL,
 		protocol_version TEXT NOT NULL,
 		token TEXT NOT NULL,
+		legacy_token_hash TEXT NOT NULL DEFAULT '',
 		registered_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		last_seen TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		status TEXT NOT NULL DEFAULT 'active',
@@ -183,6 +184,23 @@ func (s *PostgresStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_agents_agent_id ON agents(agent_id);
 	CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen);
 	CREATE INDEX IF NOT EXISTS idx_agents_token ON agents(token);
+	CREATE INDEX IF NOT EXISTS idx_agents_legacy_token_hash ON agents(legacy_token_hash);
+
+	-- Per-Agent mTLS identities. Private keys are never stored here.
+	CREATE TABLE IF NOT EXISTS agent_credentials (
+		credential_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		certificate_serial TEXT NOT NULL UNIQUE,
+		public_key_sha256 TEXT NOT NULL,
+		issued_at TIMESTAMPTZ NOT NULL,
+		expires_at TIMESTAMPTZ NOT NULL,
+		revoked_at TIMESTAMPTZ,
+		revoke_reason TEXT,
+		CONSTRAINT fk_agent_credentials_agent FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON agent_credentials(agent_id);
+	CREATE INDEX IF NOT EXISTS idx_agent_credentials_active ON agent_credentials(agent_id, revoked_at, expires_at);
 
 	-- Devices discovered by agents
 	CREATE TABLE IF NOT EXISTS devices (
@@ -925,6 +943,37 @@ func (s *PostgresStore) initSchema() error {
 
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
+	}
+	// Existing PostgreSQL installations do not re-run CREATE TABLE definitions
+	// when a column is added in a later release.
+	if _, err := s.db.Exec(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS legacy_token_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("failed to add legacy agent token hash: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agents_legacy_token_hash ON agents(legacy_token_hash)`); err != nil {
+		return fmt.Errorf("failed to create legacy agent token index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS agent_credentials (
+		credential_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		certificate_serial TEXT NOT NULL UNIQUE,
+		public_key_sha256 TEXT NOT NULL,
+		issued_at TIMESTAMPTZ NOT NULL,
+		expires_at TIMESTAMPTZ NOT NULL,
+		revoked_at TIMESTAMPTZ,
+		revoke_reason TEXT,
+		CONSTRAINT fk_agent_credentials_agent FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("failed to create agent credentials table: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON agent_credentials(agent_id)`); err != nil {
+		return fmt.Errorf("failed to create agent credentials agent index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_credentials_active ON agent_credentials(agent_id, revoked_at, expires_at)`); err != nil {
+		return fmt.Errorf("failed to create agent credentials active index: %w", err)
+	}
+	if err := s.migrateLegacyAgentTokens(); err != nil {
+		return err
 	}
 
 	// Fix up settings_agent_override FK for upgraded databases.

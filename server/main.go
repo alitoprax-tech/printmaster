@@ -690,6 +690,9 @@ func runServer(ctx context.Context, configFlag string) {
 
 	// Save loaded config globally for handlers
 	serverConfig = cfg
+	if err := configureAgentAuth(cfg); err != nil {
+		logFatal("Failed to configure Agent authentication", "error", err)
+	}
 
 	// Initialize database
 	dbLogFields := []interface{}{"driver", dbDriver}
@@ -1279,6 +1282,7 @@ func startReverseProxyMode(ctx context.Context, tlsConfig *TLSConfig) {
 		if err != nil {
 			logFatal("Failed to setup TLS for reverse proxy mode", "error", err)
 		}
+		configureAgentClientAuth(tlsCfg)
 
 		logInfo("Starting in reverse proxy mode with HTTPS (end-to-end encryption)",
 			"bind", addr,
@@ -1385,6 +1389,7 @@ func startStandaloneMode(ctx context.Context, tlsConfig *TLSConfig) {
 	if err != nil {
 		logFatal("Failed to setup TLS", "error", err, "mode", tlsConfig.Mode)
 	}
+	configureAgentClientAuth(tlsCfg)
 
 	// Use configured bind address, default to loopback if not set
 	bindAddr := tlsConfig.BindAddress
@@ -1580,6 +1585,29 @@ func generateToken() (string, error) {
 // requireAuth is middleware that validates Bearer token authentication
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// In migration/mtls modes a client certificate, when supplied, is the
+		// authoritative transport identity. An invalid certificate must never
+		// fall back to a bearer header from the same request.
+		mode := currentAgentAuthMode()
+		if mode != agentAuthModeLegacy && r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			if agentMTLSManager == nil {
+				http.Error(w, "mTLS is not configured", http.StatusUnauthorized)
+				return
+			}
+			principal, err := agentMTLSManager.authenticate(r.Context(), r, serverStore)
+			if err != nil {
+				http.Error(w, "invalid client certificate", http.StatusUnauthorized)
+				return
+			}
+			ctx := context.WithValue(r.Context(), agentContextKey, principal.Agent)
+			ctx = context.WithValue(ctx, agentCredentialContextKey, principal.Credential)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		if mode == agentAuthModeMTLS {
+			http.Error(w, "client certificate required", http.StatusUnauthorized)
+			return
+		}
 		// Extract client IP address (respects X-Forwarded-For when behind proxy)
 		clientIP := getRealIP(r)
 
@@ -3695,6 +3723,11 @@ func setupRoutes(cfg *Config) {
 
 	// Agent API (v1)
 	http.HandleFunc("/api/v1/agents/register", handleAgentRegister) // No auth - this generates token
+	http.HandleFunc("/api/v1/agents/register-mtls", handleAgentMTLSRegister)
+	http.HandleFunc("/api/v1/agents/identity/migrate", handleAgentIdentityMigrate)
+	http.HandleFunc("/api/v1/agents/identity/renew", handleAgentIdentityRenew)
+	http.HandleFunc("/api/v1/agents/identity/activate", handleAgentIdentityActivate)
+	http.HandleFunc("/api/v1/agents/credentials/revoke", requireWebAuth(handleAgentCredentialRevoke))
 	http.HandleFunc("/api/v1/agents/heartbeat", requireAuth(handleAgentHeartbeat))
 	http.HandleFunc("/api/v1/agents/device-credentials", requireAuth(handleAgentDeviceCredentials)) // Agent requests device credentials
 	http.HandleFunc("/api/v1/agents/device-auth/start", handleAgentDeviceAuthStart)
@@ -3726,6 +3759,7 @@ func setupRoutes(cfg *Config) {
 	tenancy.SetServerVersion(Version)
 	tenancy.SetLogger(serverLogger)
 	tenancy.SetEnabled(featureEnabled)
+	tenancy.SetAgentBearerEnrollmentEnabled(currentAgentAuthMode() != agentAuthModeMTLS)
 	tenancy.SetAgentEventSink(func(eventType string, data map[string]interface{}) {
 		sseHub.Broadcast(SSEEvent{Type: eventType, Data: data})
 	})

@@ -47,7 +47,7 @@ func TestHTTPEnrollmentDoesNotConsumeTokenOnFailedRegistration(t *testing.T) {
 	if rw := request("replay"); rw.Code == http.StatusOK {
 		t.Fatal("token replay accepted")
 	}
-	if agent, err := s.GetAgent(ctx, "existing"); err != nil || agent.Token != "original" {
+	if agent, err := s.GetAgent(ctx, "existing"); err != nil || agent.Token != "" {
 		t.Fatal("original credential changed")
 	}
 }

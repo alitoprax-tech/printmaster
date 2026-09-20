@@ -26,8 +26,9 @@ const (
 
 var (
 	// Per-connection map and locks
-	wsConnections     = make(map[string]*wscommon.Conn)
-	wsConnectionsLock sync.RWMutex
+	wsConnections           = make(map[string]*wscommon.Conn)
+	wsConnectionCredentials = make(map[string]string)
+	wsConnectionsLock       sync.RWMutex
 
 	// (global counters removed - using per-agent diagnostics maps below)
 	// Per-agent diagnostics
@@ -46,6 +47,12 @@ var (
 func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore storage.Store) {
 	// Extract client IP address (respects X-Forwarded-For when behind proxy)
 	clientIP := getRealIP(r)
+	mode := currentAgentAuthMode()
+	isMTLS := mode != agentAuthModeLegacy && r.TLS != nil && len(r.TLS.PeerCertificates) > 0
+	if mode == agentAuthModeMTLS && !isMTLS {
+		http.Error(w, "client certificate required", http.StatusUnauthorized)
+		return
+	}
 
 	// Native agents authenticate with a bearer header. URL tokens are rejected.
 	authorization := strings.Fields(r.Header.Get("Authorization"))
@@ -53,7 +60,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 	if len(authorization) == 2 && strings.EqualFold(authorization[0], "Bearer") {
 		token = authorization[1]
 	}
-	if token == "" {
+	if token == "" && !isMTLS {
 		http.Error(w, "Missing authentication token", http.StatusUnauthorized)
 		return
 	}
@@ -71,7 +78,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		"user_agent", r.Header.Get("User-Agent"))
 
 	// Check if this IP+token is currently blocked
-	if authRateLimiter != nil {
+	if !isMTLS && authRateLimiter != nil {
 		if isBlocked, blockedUntil := authRateLimiter.IsBlocked(clientIP, tokenPrefix); isBlocked {
 			logWarn("Blocked WebSocket connection attempt",
 				"ip", clientIP,
@@ -84,9 +91,25 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		}
 	}
 
-	// Authenticate agent
-	logDebug("Authenticating WebSocket token", "token_prefix", tokenLogPrefix+"...", "ip", clientIP)
-	agent, err := serverStore.GetAgentByToken(r.Context(), token)
+	// Authenticate agent. A presented certificate is transport-authoritative;
+	// invalid mTLS must not fall back to a bearer header.
+	logDebug("Authenticating WebSocket agent identity", "token_prefix", tokenLogPrefix+"...", "ip", clientIP, "mtls", isMTLS)
+	var agent *storage.Agent
+	var credential *storage.AgentCredential
+	var err error
+	if isMTLS {
+		if agentMTLSManager == nil {
+			err = fmt.Errorf("mTLS is not configured")
+		} else {
+			principal, authErr := agentMTLSManager.authenticate(r.Context(), r, serverStore)
+			err = authErr
+			if principal != nil {
+				agent, credential = principal.Agent, principal.Credential
+			}
+		}
+	} else {
+		agent, err = serverStore.GetAgentByToken(r.Context(), token)
+	}
 	if err != nil {
 		// Record failed attempt and check if we should log
 		var isBlocked, shouldLog bool
@@ -191,7 +214,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 	}
 
 	// Success - clear any failure records for this IP+token
-	if authRateLimiter != nil {
+	if !isMTLS && authRateLimiter != nil {
 		authRateLimiter.RecordSuccess(clientIP, tokenPrefix)
 	}
 
@@ -213,16 +236,25 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		"hostname", agent.Hostname,
 		"ip", clientIP,
 		"remote_addr", r.RemoteAddr)
-	logDebug("Agent WebSocket connect details", "user_agent", r.Header.Get("User-Agent"), "headers", r.Header)
+	// Never serialize the request header map here: it may contain a legacy
+	// bearer token or other browser credentials. Keep diagnostics non-secret.
+	logDebug("Agent WebSocket connect details", "user_agent", r.Header.Get("User-Agent"))
 
 	// Register connection
 	wsConnectionsLock.Lock()
 	// Close existing connection if any (agent reconnecting)
 	if existingConn, exists := wsConnections[agent.AgentID]; exists {
 		logInfo("Closing existing WebSocket for reconnection", "agent_id", agent.AgentID)
-		existingConn.Close()
+		if existingConn != nil {
+			_ = existingConn.Close()
+		}
 	}
 	wsConnections[agent.AgentID] = conn
+	if credential != nil {
+		wsConnectionCredentials[agent.AgentID] = credential.CredentialID
+	} else {
+		delete(wsConnectionCredentials, agent.AgentID)
+	}
 	wsConnectionsLock.Unlock()
 
 	logDebug("Registered WebSocket connection for agent", "agent_id", agent.AgentID)
@@ -246,6 +278,17 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		for {
 			select {
 			case <-pingTicker.C:
+				if credential != nil {
+					if credentialStore, ok := serverStore.(storage.AgentCredentialStore); !ok {
+						logWarn("Agent credential storage unavailable during WebSocket revalidation", "agent_id", agent.AgentID)
+						conn.Close()
+						return
+					} else if current, checkErr := credentialStore.GetAgentCredential(context.Background(), credential.CredentialID); checkErr != nil || current.RevokedAt != nil || !time.Now().UTC().Before(current.ExpiresAt) {
+						logWarn("Closing WebSocket after Agent credential revocation or expiry", "agent_id", agent.AgentID, "credential_id", credential.CredentialID, "error", checkErr)
+						conn.Close()
+						return
+					}
+				}
 				// send ping
 				if err := conn.WritePing(10 * time.Second); err != nil {
 					logWarn("WebSocket ping failed, closing connection", "agent_id", agent.AgentID, "error", err)
@@ -280,6 +323,7 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		wsConnectionsLock.Lock()
 		if wsConnections[agent.AgentID] == conn {
 			delete(wsConnections, agent.AgentID)
+			delete(wsConnectionCredentials, agent.AgentID)
 			logInfo("Agent WebSocket disconnected", "agent_id", agent.AgentID)
 
 			// Broadcast agent_disconnected event to UI via SSE
@@ -512,9 +556,32 @@ func closeAgentWebSocket(agentID string) {
 	defer wsConnectionsLock.Unlock()
 
 	if conn, exists := wsConnections[agentID]; exists {
-		conn.Close()
+		if conn != nil {
+			_ = conn.Close()
+		}
 		delete(wsConnections, agentID)
+		delete(wsConnectionCredentials, agentID)
 		logInfo("Closed WebSocket connection for deleted agent", "agent_id", agentID)
+	}
+}
+
+// closeAgentWebSocketForCredential immediately terminates connections using a
+// revoked certificate. This complements the periodic ping revalidation.
+func closeAgentWebSocketForCredential(credentialID string) {
+	wsConnectionsLock.Lock()
+	defer wsConnectionsLock.Unlock()
+	for agentID, activeCredentialID := range wsConnectionCredentials {
+		if activeCredentialID != credentialID {
+			continue
+		}
+		if conn, exists := wsConnections[agentID]; exists {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			delete(wsConnections, agentID)
+		}
+		delete(wsConnectionCredentials, agentID)
+		logInfo("Closed WebSocket connection for revoked Agent credential", "agent_id", agentID, "credential_id", credentialID)
 	}
 }
 

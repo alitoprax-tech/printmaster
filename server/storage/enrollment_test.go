@@ -40,7 +40,7 @@ func checkEnrollmentAtomicity(t *testing.T, s Store) {
 		t.Fatal("existing agent taken over")
 	}
 	stored, err := s.GetAgent(ctx, original.AgentID)
-	if err != nil || stored.Token != original.Token || stored.TenantID != original.TenantID {
+	if err != nil || stored.Token != "" || stored.TenantID != original.TenantID {
 		t.Fatal("failed enrollment changed original identity")
 	}
 	// The failed write must not burn the one-time token.

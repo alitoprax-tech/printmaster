@@ -304,12 +304,32 @@ func (w *UploadWorker) Stop() {
 func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) error {
 	token := w.client.GetToken()
 
+	if w.client.HasClientIdentity() {
+		hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, heartbeatErr := w.client.Heartbeat(hbCtx, w.currentSettingsVersion())
+		cancel()
+		if heartbeatErr == nil {
+			if identity := w.client.GetClientIdentity(); identity != nil && time.Until(identity.ExpiresAt) < 14*24*time.Hour {
+				if err := w.renewMTLS(ctx); err != nil {
+					w.logger.Warn("Agent mTLS renewal failed; current certificate remains in use", "error", err)
+				}
+			}
+			return nil
+		}
+		w.logger.Warn("Stored Agent mTLS identity was rejected", "error", heartbeatErr)
+	}
+
 	if token != "" {
 		// Already have token, validate it with a heartbeat
 		hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
 		if _, err := w.client.Heartbeat(hbCtx, w.currentSettingsVersion()); err == nil {
+			if migrated, migrateErr := w.migrateMTLS(ctx); migrated {
+				return nil
+			} else if migrateErr != nil {
+				w.logger.Debug("Agent mTLS migration not available; retaining legacy bearer", "error", migrateErr)
+			}
 			w.logger.Info("Using existing authentication token")
 			return nil // Token is valid
 		}
@@ -347,6 +367,14 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 
 		// Try registration with init secret
 		regCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if tenantID, mtlsErr := w.enrollMTLS(regCtx, joinToken, version); mtlsErr == nil {
+			cancel()
+			if err := os.WriteFile(secretUsedFile, []byte(time.Now().UTC().Format(time.RFC3339)), 0600); err != nil {
+				w.logger.Warn("Failed to mark init secret as used", "error", err)
+			}
+			w.logger.Info("Agent enrolled with mTLS using INIT_SECRET", "tenant_id", tenantID)
+			return nil
+		}
 		agentToken, tenantID, err := w.client.RegisterWithToken(regCtx, joinToken, version)
 		cancel()
 
@@ -385,6 +413,11 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 
 	w.logger.Info("Registering agent with server using join token")
 	regCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if tenantID, mtlsErr := w.enrollMTLS(regCtx, joinToken, version); mtlsErr == nil {
+		cancel()
+		w.logger.Info("Agent enrolled with mTLS", "tenant_id", tenantID)
+		return nil
+	}
 	defer cancel()
 
 	agentToken, tenantID, err := w.client.RegisterWithToken(regCtx, joinToken, version)
@@ -405,6 +438,98 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 
 	w.logger.Info("Agent registered successfully", "token", masked, "tenant_id", tenantID)
 	return nil
+}
+
+func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string) (string, error) {
+	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	if err != nil {
+		return "", err
+	}
+	registration, err := w.client.RegisterWithMTLS(ctx, joinToken, string(pending.CSRPEM), version)
+	if err != nil {
+		return "", err
+	}
+	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	if err != nil {
+		return "", err
+	}
+	if err := agent.SaveClientIdentity(w.dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+		return "", err
+	}
+	if err := w.client.SetClientIdentity(identity); err != nil {
+		_ = agent.DeleteClientIdentity(w.dataDir)
+		return "", err
+	}
+	if err := w.client.ActivateMTLS(ctx); err != nil {
+		w.client.ClearClientIdentity()
+		_ = agent.DeleteClientIdentity(w.dataDir)
+		return "", err
+	}
+	w.client.SetToken("")
+	_ = DeleteServerToken(w.dataDir)
+	_ = SaveServerJoinToken(w.dataDir, "")
+	return registration.TenantID, nil
+}
+
+func (w *UploadWorker) migrateMTLS(ctx context.Context) (bool, error) {
+	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	if err != nil {
+		return false, err
+	}
+	registration, err := w.client.MigrateToMTLS(ctx, pending.CSRPEM)
+	if err != nil {
+		return false, err
+	}
+	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	if err != nil {
+		return false, err
+	}
+	if err := agent.SaveClientIdentity(w.dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+		return false, err
+	}
+	if err := w.client.SetClientIdentity(identity); err != nil {
+		_ = agent.DeleteClientIdentity(w.dataDir)
+		return false, err
+	}
+	if err := w.client.ActivateMTLS(ctx); err != nil {
+		w.client.ClearClientIdentity()
+		_ = agent.DeleteClientIdentity(w.dataDir)
+		return false, err
+	}
+	w.client.SetToken("")
+	_ = DeleteServerToken(w.dataDir)
+	_ = SaveServerJoinToken(w.dataDir, "")
+	return true, nil
+}
+
+func (w *UploadWorker) renewMTLS(ctx context.Context) error {
+	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	if err != nil {
+		return err
+	}
+	registration, err := w.client.RenewMTLS(ctx, pending.CSRPEM)
+	if err != nil {
+		return err
+	}
+	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	if err != nil {
+		return err
+	}
+	if err := agent.SaveClientIdentity(w.dataDir, registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+		return err
+	}
+	if err := w.client.SetClientIdentity(identity); err != nil {
+		_ = agent.DeleteClientIdentity(w.dataDir)
+		return err
+	}
+	if transport, ok := w.client.HTTPClient.Transport.(*http.Transport); ok {
+		w.wsClientMu.Lock()
+		if w.wsClient != nil {
+			w.wsClient.SetTLSConfig(transport.TLSClientConfig)
+		}
+		w.wsClientMu.Unlock()
+	}
+	return w.client.ActivateMTLS(ctx)
 }
 
 // heartbeatLoop sends periodic heartbeats to the server
