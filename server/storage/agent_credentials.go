@@ -92,7 +92,7 @@ func (s *BaseStore) EnrollAgentWithCredentialAttempt(ctx context.Context, rawTok
 	csrSHA256 = strings.ToLower(strings.TrimSpace(csrSHA256))
 	publicKeySHA256 = strings.ToLower(strings.TrimSpace(publicKeySHA256))
 	requestedTenantID = strings.TrimSpace(requestedTenantID)
-	if !validEnrollmentHex(attemptID) || !validEnrollmentHex(csrSHA256) || !validEnrollmentHex(publicKeySHA256) {
+	if !validEnrollmentAttemptID(attemptID) || !validEnrollmentHex(csrSHA256) || !validEnrollmentHex(publicKeySHA256) {
 		return nil, nil, nil, fmt.Errorf("enrollment attempt, CSR and public key bindings required")
 	}
 	if issuer == nil {
@@ -213,6 +213,18 @@ func validEnrollmentHex(value string) bool {
 	}
 	for _, r := range value {
 		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validEnrollmentAttemptID(value string) bool {
+	if len(value) < 8 || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '-' && r != '_' && r != '.' && r != '~' {
 			return false
 		}
 	}
