@@ -481,18 +481,28 @@ func readGeneration(root, generation string) (*storedIdentity, error) {
 		return nil, fmt.Errorf("invalid identity generation name")
 	}
 	path := filepath.Join(root, generation)
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("identity generation is not a directory")
 	}
-	identity, cert, key, err := readIdentityFiles(identityFileSet{
+	paths := identityFileSet{
 		key:  filepath.Join(path, "key"),
 		cert: filepath.Join(path, "cert"),
 		meta: filepath.Join(path, "meta.json"),
-	})
+	}
+	for _, filePath := range []string{paths.key, paths.cert, paths.meta} {
+		fileInfo, statErr := os.Lstat(filePath)
+		if statErr != nil {
+			return nil, statErr
+		}
+		if fileInfo.Mode()&os.ModeSymlink != 0 || !fileInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("identity generation contains a non-regular file")
+		}
+	}
+	identity, cert, key, err := readIdentityFiles(paths)
 	if err != nil {
 		return nil, err
 	}
