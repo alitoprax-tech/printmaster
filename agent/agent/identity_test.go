@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -163,6 +164,17 @@ func TestIdentityPointerCorruptionFallsBackToCompleteGeneration(t *testing.T) {
 	if err != nil || loaded == nil {
 		t.Fatalf("load after incomplete pointer: identity=%#v err=%v", loaded, err)
 	}
+	partial := filepath.Join(root, "gen-9999999999999998-deadbeef")
+	if err := os.MkdirAll(partial, 0700); err != nil {
+		t.Fatalf("create incomplete generation: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, identityCurrentFile), []byte("gen-9999999999999998-deadbeef\n"), 0600); err != nil {
+		t.Fatalf("point at partial generation: %v", err)
+	}
+	loaded, err = LoadClientIdentity(dataDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("load after partial generation: identity=%#v err=%v", loaded, err)
+	}
 }
 
 func TestPendingClientIdentityPromotesAfterActivation(t *testing.T) {
@@ -196,6 +208,37 @@ func TestPendingClientIdentityPromotesAfterActivation(t *testing.T) {
 	}
 	if pending, err := LoadPendingClientIdentity(dataDir); err != nil || pending != nil {
 		t.Fatalf("pending identity was not cleared: identity=%#v err=%v", pending, err)
+	}
+}
+
+func TestLegacyIdentityRemainsReadableAndPromotable(t *testing.T) {
+	dataDir := t.TempDir()
+	certPEM, keyPEM := testIdentityMaterial(t, "legacy")
+	meta := identityMetadata{CredentialID: "legacy-credential", TenantID: "legacy-tenant", ExpiresAt: time.Now().Add(24 * time.Hour)}
+	metaPEM, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal legacy metadata: %v", err)
+	}
+	paths := identityPaths(dataDir, clientIdentityPendingSuffix)
+	if err := os.WriteFile(paths.key, keyPEM, 0600); err != nil {
+		t.Fatalf("write legacy key: %v", err)
+	}
+	if err := os.WriteFile(paths.cert, certPEM, 0600); err != nil {
+		t.Fatalf("write legacy certificate: %v", err)
+	}
+	if err := os.WriteFile(paths.meta, metaPEM, 0600); err != nil {
+		t.Fatalf("write legacy metadata: %v", err)
+	}
+	loaded, err := LoadPendingClientIdentity(dataDir)
+	if err != nil || loaded == nil || loaded.CredentialID != meta.CredentialID {
+		t.Fatalf("legacy identity was not readable: identity=%#v err=%v", loaded, err)
+	}
+	if err := PromotePendingClientIdentity(dataDir); err != nil {
+		t.Fatalf("promote legacy identity: %v", err)
+	}
+	active, err := LoadClientIdentity(dataDir)
+	if err != nil || active == nil || active.CredentialID != meta.CredentialID || active.TenantID != meta.TenantID {
+		t.Fatalf("legacy identity was not migrated: identity=%#v err=%v", active, err)
 	}
 }
 

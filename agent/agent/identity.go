@@ -334,7 +334,7 @@ func identityStoreRoot(dataDir string, pending bool) string {
 func loadStoredIdentity(dataDir string, pending bool) (*storedIdentity, identityStoreState, error) {
 	root := identityStoreRoot(dataDir, pending)
 	stored, state, err := loadIdentityStore(root)
-	if stored != nil || state != identityStoreAbsent || err != nil {
+	if stored != nil || state == identityStoreTombstone || err != nil {
 		return stored, state, err
 	}
 	// Legacy pending/active files are considered only when there is no new store
