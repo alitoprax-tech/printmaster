@@ -236,9 +236,7 @@ func (w *UploadWorker) StartWithVersionInfo(ctx context.Context, version string,
 
 		w.wsClientMu.Lock()
 		w.wsClient = agent.NewWSClient(serverURL, token, w.client.IsInsecureSkipVerify())
-		if transport, ok := w.client.HTTPClient.Transport.(*http.Transport); ok {
-			w.wsClient.SetTLSConfig(transport.TLSClientConfig)
-		}
+		w.wsClient.SetTLSConfig(w.client.TLSConfig())
 		w.wsClientMu.Unlock()
 
 		// Apply pending local handler if one was set before wsClient existed
@@ -302,7 +300,39 @@ func (w *UploadWorker) Stop() {
 
 // ensureRegistered checks if agent has a token, registers if not
 func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) error {
+	// A certificate may have been issued and activation may have completed on
+	// the server while the response was lost. Always retry a persisted pending
+	// identity before consuming another join token or falling back to bearer.
+	if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+		return fmt.Errorf("load pending Agent identity: %w", pendingErr)
+	} else if pending != nil {
+		attemptID := ""
+		if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+			return fmt.Errorf("load pre-enrollment attempt: %w", attemptErr)
+		} else if attempt != nil {
+			attemptID = attempt.EnrollmentAttemptID
+		}
+		if activated, activateErr := w.activatePendingMTLS(ctx, pending, attemptID); !activated {
+			return fmt.Errorf("pending mTLS activation requires retry: %w", activateErr)
+		}
+		return nil
+	}
 	token := w.client.GetToken()
+
+	if w.client.HasClientIdentity() {
+		hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, heartbeatErr := w.client.Heartbeat(hbCtx, w.currentSettingsVersion())
+		cancel()
+		if heartbeatErr == nil {
+			if identity := w.client.GetClientIdentity(); identity != nil && time.Until(identity.ExpiresAt) < 14*24*time.Hour {
+				if err := w.renewMTLS(ctx); err != nil {
+					w.logger.Warn("Agent mTLS renewal failed; current certificate remains in use", "error", err)
+				}
+			}
+			return nil
+		}
+		w.logger.Warn("Stored Agent mTLS identity was rejected", "error", heartbeatErr)
+	}
 
 	if token != "" {
 		// Already have token, validate it with a heartbeat
@@ -310,6 +340,16 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 		defer cancel()
 
 		if _, err := w.client.Heartbeat(hbCtx, w.currentSettingsVersion()); err == nil {
+			if migrated, migrateErr := w.migrateMTLS(ctx); migrated {
+				return nil
+			} else if migrateErr != nil {
+				if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+					return fmt.Errorf("load pending Agent identity after migration: %w", pendingErr)
+				} else if pending != nil {
+					return fmt.Errorf("mTLS migration is awaiting activation: %w", migrateErr)
+				}
+				w.logger.Debug("Agent mTLS migration not available; retaining legacy bearer", "error", migrateErr)
+			}
 			w.logger.Info("Using existing authentication token")
 			return nil // Token is valid
 		}
@@ -347,6 +387,26 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 
 		// Try registration with init secret
 		regCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if tenantID, mtlsErr := w.enrollMTLS(regCtx, joinToken, version); mtlsErr == nil {
+			cancel()
+			if err := os.WriteFile(secretUsedFile, []byte(time.Now().UTC().Format(time.RFC3339)), 0600); err != nil {
+				w.logger.Warn("Failed to mark init secret as used", "error", err)
+			}
+			w.logger.Info("Agent enrolled with mTLS using INIT_SECRET", "tenant_id", tenantID)
+			return nil
+		} else if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+			cancel()
+			return fmt.Errorf("load pending Agent identity after enrollment: %w", pendingErr)
+		} else if pending != nil {
+			cancel()
+			return fmt.Errorf("mTLS enrollment is awaiting activation: %w", mtlsErr)
+		} else if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+			cancel()
+			return fmt.Errorf("load pre-enrollment attempt after enrollment: %w", attemptErr)
+		} else if attempt != nil {
+			cancel()
+			return fmt.Errorf("mTLS enrollment will be retried with the persisted attempt: %w", mtlsErr)
+		}
 		agentToken, tenantID, err := w.client.RegisterWithToken(regCtx, joinToken, version)
 		cancel()
 
@@ -385,6 +445,23 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 
 	w.logger.Info("Registering agent with server using join token")
 	regCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if tenantID, mtlsErr := w.enrollMTLS(regCtx, joinToken, version); mtlsErr == nil {
+		cancel()
+		w.logger.Info("Agent enrolled with mTLS", "tenant_id", tenantID)
+		return nil
+	} else if pending, pendingErr := agent.LoadPendingClientIdentity(w.dataDir); pendingErr != nil {
+		cancel()
+		return fmt.Errorf("load pending Agent identity after enrollment: %w", pendingErr)
+	} else if pending != nil {
+		cancel()
+		return fmt.Errorf("mTLS enrollment is awaiting activation: %w", mtlsErr)
+	} else if attempt, attemptErr := agent.LoadEnrollmentAttempt(w.dataDir, w.client.AgentID); attemptErr != nil {
+		cancel()
+		return fmt.Errorf("load pre-enrollment attempt after enrollment: %w", attemptErr)
+	} else if attempt != nil {
+		cancel()
+		return fmt.Errorf("mTLS enrollment will be retried with the persisted attempt: %w", mtlsErr)
+	}
 	defer cancel()
 
 	agentToken, tenantID, err := w.client.RegisterWithToken(regCtx, joinToken, version)
@@ -405,6 +482,125 @@ func (w *UploadWorker) ensureRegistered(ctx context.Context, version string) err
 
 	w.logger.Info("Agent registered successfully", "token", masked, "tenant_id", tenantID)
 	return nil
+}
+
+func (w *UploadWorker) enrollMTLS(ctx context.Context, joinToken, version string) (string, error) {
+	pending, err := agent.LoadOrCreateEnrollmentAttempt(w.dataDir, w.client.AgentID)
+	if err != nil {
+		return "", err
+	}
+	registration, err := w.client.RegisterWithMTLS(ctx, joinToken, string(pending.CSRPEM), version, pending.EnrollmentAttemptID)
+	if err != nil {
+		return "", err
+	}
+	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	if err != nil {
+		return "", err
+	}
+	identity.TenantID = registration.TenantID
+	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+		return "", err
+	}
+	if activated, err := w.activatePendingMTLS(ctx, identity, pending.EnrollmentAttemptID); !activated {
+		return "", err
+	}
+	return registration.TenantID, nil
+}
+
+func (w *UploadWorker) migrateMTLS(ctx context.Context) (bool, error) {
+	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	if err != nil {
+		return false, err
+	}
+	registration, err := w.client.MigrateToMTLS(ctx, pending.CSRPEM)
+	if err != nil {
+		return false, err
+	}
+	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	if err != nil {
+		return false, err
+	}
+	identity.TenantID = registration.TenantID
+	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+		return false, err
+	}
+	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
+		return false, err
+	}
+	return true, nil
+}
+
+func (w *UploadWorker) renewMTLS(ctx context.Context) error {
+	pending, err := agent.GenerateClientCSR(w.client.AgentID)
+	if err != nil {
+		return err
+	}
+	registration, err := w.client.RenewMTLS(ctx, pending.CSRPEM)
+	if err != nil {
+		return err
+	}
+	identity, err := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+	if err != nil {
+		return err
+	}
+	identity.TenantID = registration.TenantID
+	if err := agent.SavePendingClientIdentity(w.dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); err != nil {
+		return err
+	}
+	if activated, err := w.activatePendingMTLS(ctx, identity); !activated {
+		return err
+	}
+	return nil
+}
+
+// activatePendingMTLS installs a persisted pending identity, retries the
+// idempotent server activation, and promotes the identity only after the
+// server confirms success. On failure the previous in-memory identity is
+// restored, while the pending files remain for a later retry.
+func (w *UploadWorker) activatePendingMTLS(ctx context.Context, pending *agent.ClientIdentity, enrollmentAttemptID ...string) (bool, error) {
+	if pending == nil {
+		return false, fmt.Errorf("pending Agent identity required")
+	}
+	previous := w.client.GetClientIdentity()
+	if err := w.client.SetClientIdentity(pending); err != nil {
+		return false, err
+	}
+	w.syncWebSocketTLSConfig()
+	if err := w.client.ActivateMTLS(ctx); err != nil {
+		if previous != nil {
+			_ = w.client.SetClientIdentity(previous)
+		} else {
+			w.client.ClearClientIdentity()
+		}
+		w.syncWebSocketTLSConfig()
+		return false, err
+	}
+	if err := agent.PromotePendingClientIdentity(w.dataDir); err != nil {
+		// The server may already have revoked the old credential. Keep the new
+		// in-memory identity and the pending files so promotion can be retried.
+		return false, fmt.Errorf("promote activated Agent identity: %w", err)
+	}
+	attemptID := ""
+	if len(enrollmentAttemptID) > 0 {
+		attemptID = strings.TrimSpace(enrollmentAttemptID[0])
+	}
+	if attemptID != "" {
+		if err := agent.CompleteEnrollmentAttempt(w.dataDir, attemptID); err != nil {
+			return false, fmt.Errorf("complete enrollment attempt: %w", err)
+		}
+	}
+	w.client.SetToken("")
+	_ = DeleteServerToken(w.dataDir)
+	_ = SaveServerJoinToken(w.dataDir, "")
+	return true, nil
+}
+
+func (w *UploadWorker) syncWebSocketTLSConfig() {
+	w.wsClientMu.Lock()
+	defer w.wsClientMu.Unlock()
+	if w.wsClient != nil {
+		w.wsClient.SetTLSConfig(w.client.TLSConfig())
+	}
 }
 
 // heartbeatLoop sends periodic heartbeats to the server

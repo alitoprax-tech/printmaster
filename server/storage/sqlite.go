@@ -103,6 +103,7 @@ func (s *SQLiteStore) initSchema() error {
 		version TEXT NOT NULL,
 		protocol_version TEXT NOT NULL,
 		token TEXT NOT NULL,
+		legacy_token_hash TEXT NOT NULL DEFAULT '',
 		registered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		status TEXT NOT NULL DEFAULT 'active',
@@ -123,7 +124,41 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_agents_agent_id ON agents(agent_id);
 	CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen);
 	CREATE INDEX IF NOT EXISTS idx_agents_token ON agents(token);
+	CREATE INDEX IF NOT EXISTS idx_agents_legacy_token_hash ON agents(legacy_token_hash);
+
+	-- Per-Agent mTLS identities. Private keys are never stored here.
+	CREATE TABLE IF NOT EXISTS agent_credentials (
+		credential_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		certificate_serial TEXT NOT NULL UNIQUE,
+		public_key_sha256 TEXT NOT NULL,
+		issued_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL,
+		revoked_at DATETIME,
+		revoke_reason TEXT,
+		FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON agent_credentials(agent_id);
+	CREATE INDEX IF NOT EXISTS idx_agent_credentials_active ON agent_credentials(agent_id, revoked_at, expires_at);
 	CREATE INDEX IF NOT EXISTS idx_agents_tenant_id ON agents(tenant_id);
+
+	-- Durable first-enrollment replay bindings. Certificate material is public;
+	-- private keys are never stored in this table.
+	CREATE TABLE IF NOT EXISTS agent_enrollment_attempts (
+		attempt_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		csr_sha256 TEXT NOT NULL,
+		public_key_sha256 TEXT NOT NULL,
+		credential_id TEXT NOT NULL UNIQUE,
+		certificate_pem TEXT NOT NULL,
+		created_at DATETIME NOT NULL,
+		FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE,
+		FOREIGN KEY(credential_id) REFERENCES agent_credentials(credential_id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_agent ON agent_enrollment_attempts(agent_id);
+	CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_tenant ON agent_enrollment_attempts(tenant_id);
 
 	-- Devices discovered by agents
 	CREATE TABLE IF NOT EXISTS devices (
@@ -835,6 +870,9 @@ func (s *SQLiteStore) runMigrations() error {
 	// We've consolidated all columns in the schema above, but keep this
 	// for databases that were upgraded from older versions
 	altStmts := []string{
+		// P0-01: hash-only legacy bearer storage. Existing raw values are
+		// migrated and cleared by migrateLegacyAgentTokens below.
+		"ALTER TABLE agents ADD COLUMN legacy_token_hash TEXT NOT NULL DEFAULT ''",
 		// tenancy tenant_id support
 		"ALTER TABLE agents ADD COLUMN tenant_id TEXT",
 		"ALTER TABLE devices ADD COLUMN tenant_id TEXT",
@@ -882,6 +920,56 @@ func (s *SQLiteStore) runMigrations() error {
 		} else {
 			logDebug("SQLite migration statement applied (or already present)", "stmt", stmt)
 		}
+	}
+
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agents_legacy_token_hash ON agents(legacy_token_hash)`); err != nil {
+		return fmt.Errorf("failed to create legacy agent token index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS agent_credentials (
+		credential_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		certificate_serial TEXT NOT NULL UNIQUE,
+		public_key_sha256 TEXT NOT NULL,
+		issued_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL,
+		revoked_at DATETIME,
+		revoke_reason TEXT,
+		FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("failed to create agent credentials table: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON agent_credentials(agent_id)`); err != nil {
+		return fmt.Errorf("failed to create agent credentials agent index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_credentials_active ON agent_credentials(agent_id, revoked_at, expires_at)`); err != nil {
+		return fmt.Errorf("failed to create agent credentials active index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS agent_enrollment_attempts (
+		attempt_id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		tenant_id TEXT NOT NULL,
+		csr_sha256 TEXT NOT NULL,
+		public_key_sha256 TEXT NOT NULL,
+		credential_id TEXT NOT NULL UNIQUE,
+		certificate_pem TEXT NOT NULL,
+		created_at DATETIME NOT NULL,
+		FOREIGN KEY(agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE,
+		FOREIGN KEY(credential_id) REFERENCES agent_credentials(credential_id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("failed to create agent enrollment attempts table: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE agent_enrollment_attempts ADD COLUMN csr_sha256 TEXT NOT NULL DEFAULT ''`); err != nil && !isSQLiteDuplicateColumnErr(err) {
+		return fmt.Errorf("failed to add enrollment CSR binding: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_agent ON agent_enrollment_attempts(agent_id)`); err != nil {
+		return fmt.Errorf("failed to create agent enrollment attempts agent index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_enrollment_attempts_tenant ON agent_enrollment_attempts(tenant_id)`); err != nil {
+		return fmt.Errorf("failed to create agent enrollment attempts tenant index: %w", err)
+	}
+	if err := s.migrateLegacyAgentTokens(); err != nil {
+		return err
 	}
 
 	// Create unique index for tenant login domains

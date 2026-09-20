@@ -34,7 +34,7 @@ func TestAgentAndDeviceOwnershipCannotBeReassigned(t *testing.T) {
 		t.Fatal("agent takeover accepted")
 	}
 	got, err := s.GetAgent(ctx, "a")
-	if err != nil || got.Token != "secret-a" || got.TenantID != "tenant-a" {
+	if err != nil || got.Token != "" || got.TenantID != "tenant-a" {
 		t.Fatal("agent identity changed")
 	}
 	if err := s.UpsertDevice(ctx, &Device{Serial: "shared-serial", AgentID: "a", Model: "original"}); err != nil {

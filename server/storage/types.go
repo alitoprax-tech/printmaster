@@ -141,12 +141,16 @@ type Agent struct {
 	Platform        string `json:"platform"`         // windows, linux, darwin
 	Version         string `json:"version"`          // Agent version
 	ProtocolVersion string `json:"protocol_version"` // Protocol compatibility
-	// Token is a bearer credential used only internally for agent authentication.
-	// Never serialize it as part of an Agent API response.
-	Token        string    `json:"-"`
-	RegisteredAt time.Time `json:"registered_at"`
-	LastSeen     time.Time `json:"last_seen"`
-	Status       string    `json:"status"` // active, inactive, offline
+	// Token is accepted only as an enrollment/legacy authentication input. It is
+	// never persisted in clear text and is never populated when an agent is read
+	// from storage.
+	Token string `json:"-"`
+	// LegacyTokenHash is the one-way digest used while a deployment is in
+	// migration mode. It is intentionally never serialized or returned to callers.
+	LegacyTokenHash string    `json:"-"`
+	RegisteredAt    time.Time `json:"registered_at"`
+	LastSeen        time.Time `json:"last_seen"`
+	Status          string    `json:"status"` // active, inactive, offline
 
 	// Additional metadata
 	OSVersion       string    `json:"os_version,omitempty"`        // Detailed OS version
@@ -162,6 +166,59 @@ type Agent struct {
 	LastMetricsSync time.Time `json:"last_metrics_sync,omitempty"` // Last metrics upload
 	TenantID        string    `json:"tenant_id,omitempty"`
 	SiteIDs         []string  `json:"site_ids,omitempty"` // Sites this agent belongs to (can serve multiple sites)
+}
+
+// AgentCredential represents one server-issued client certificate identity.
+// The private key is never sent to or stored by the server.
+type AgentCredential struct {
+	CredentialID      string     `json:"credential_id"`
+	AgentID           string     `json:"agent_id"`
+	TenantID          string     `json:"tenant_id"`
+	CertificateSerial string     `json:"certificate_serial"`
+	PublicKeySHA256   string     `json:"public_key_sha256"`
+	IssuedAt          time.Time  `json:"issued_at"`
+	ExpiresAt         time.Time  `json:"expires_at"`
+	RevokedAt         *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason      string     `json:"revoke_reason,omitempty"`
+}
+
+// AgentCredentialIssuer is called inside the enrollment transaction after the
+// join token has been checked and before it is consumed. Implementations must
+// return a credential whose certificate identity is bound to join.TenantID and
+// agent.AgentID; the storage layer overwrites those fields defensively.
+type AgentCredentialIssuer func(join *JoinToken, agent *Agent) (*AgentCredential, error)
+
+// AgentEnrollmentIssuer is the certificate-producing variant used by fresh
+// mTLS enrollment. The returned certificate is public material and is stored
+// with the durable enrollment attempt so a response-loss retry can return the
+// same result. Private keys are never part of this callback or the database.
+type AgentEnrollmentIssuer func(join *JoinToken, agent *Agent) (*AgentCredential, []byte, error)
+
+// AgentEnrollmentAttempt records the server-side replay binding for one
+// durable first-enrollment attempt. CertificatePEM is public; no private key
+// field is intentionally present.
+type AgentEnrollmentAttempt struct {
+	AttemptID       string
+	AgentID         string
+	TenantID        string
+	CSRSHA256       string
+	PublicKeySHA256 string
+	CredentialID    string
+	CertificatePEM  []byte
+	CreatedAt       time.Time
+}
+
+// AgentCredentialStore is implemented by persistent stores that support P0-01.
+// It is kept separate from Store so test doubles and legacy integrations do not
+// have to implement mTLS methods before opting into the new mode.
+type AgentCredentialStore interface {
+	EnrollAgentWithCredential(ctx context.Context, token string, agent *Agent, issuer AgentCredentialIssuer) (*JoinToken, *AgentCredential, error)
+	EnrollAgentWithCredentialAttempt(ctx context.Context, token string, agent *Agent, attemptID, csrSHA256, publicKeySHA256, requestedTenantID string, issuer AgentEnrollmentIssuer) (*JoinToken, *AgentCredential, []byte, error)
+	CreateAgentCredential(ctx context.Context, credential *AgentCredential) error
+	GetAgentCredential(ctx context.Context, credentialID string) (*AgentCredential, error)
+	RevokeAgentCredential(ctx context.Context, credentialID, reason string) error
+	RevokeOtherAgentCredentials(ctx context.Context, agentID, keepCredentialID, reason string) error
+	ClearLegacyAgentToken(ctx context.Context, agentID string) error
 }
 
 // HeartbeatData contains fields that can be sent with an agent heartbeat.

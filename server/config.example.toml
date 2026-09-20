@@ -38,6 +38,15 @@
   browser_proxy_enabled = false
 
 [security]
+  # Agent identity rollout: legacy, migration, or mtls. Keep legacy until
+  # every Agent has enrolled a certificate, then switch to mtls.
+  # migration/mtls requires an end-to-end TLS connection to the Agent API;
+  # when using a reverse proxy, set server.proxy_use_https=true and preserve
+  # the client certificate through the proxy/TCP path.
+  agent_auth_mode = "legacy"
+  agent_ca_cert_path = ""
+  agent_ca_key_path = ""
+  agent_certificate_ttl_hours = 2160
   # Enable authentication rate limiting to block brute force attacks
   rate_limit_enabled = true
   

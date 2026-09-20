@@ -59,6 +59,18 @@ type TLSConfig struct {
 	BindAddress   string // Address to bind to (e.g., "0.0.0.0", "127.0.0.1")
 }
 
+// configureAgentClientAuth adds the Agent CA to the server transport without
+// requiring certificates for browser/UI traffic. Route middleware remains the
+// authority for Agent endpoints, while the TLS layer verifies any supplied
+// client certificate before the request reaches HTTP.
+func configureAgentClientAuth(tlsCfg *tls.Config) {
+	if tlsCfg == nil || agentMTLSManager == nil || currentAgentAuthMode() == agentAuthModeLegacy {
+		return
+	}
+	tlsCfg.ClientCAs = agentMTLSManager.caPool
+	tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
+}
+
 // GetTLSConfig returns a configured *tls.Config based on the mode
 func (cfg *TLSConfig) GetTLSConfig() (*tls.Config, error) {
 	switch cfg.Mode {

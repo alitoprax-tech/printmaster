@@ -2223,6 +2223,15 @@ func startServerUploadWorker(
 		agentCfg.Server.CAPath,
 		agentCfg.Server.InsecureSkipVerify,
 	)
+	if identity, identityErr := agent.LoadClientIdentity(dataDir); identityErr != nil {
+		workerLogger.Warn("Stored Agent mTLS identity could not be loaded", "error", identityErr)
+	} else if identity != nil {
+		if err := serverClient.SetClientIdentity(identity); err != nil {
+			workerLogger.Warn("Stored Agent mTLS identity could not be installed", "error", err)
+		} else {
+			workerLogger.Info("Loaded Agent mTLS identity", "credential_id", identity.CredentialID, "expires_at", identity.ExpiresAt)
+		}
+	}
 
 	workerConfig := UploadWorkerConfig{
 		HeartbeatInterval: time.Duration(agentCfg.Server.HeartbeatInterval) * time.Second,
@@ -2366,9 +2375,72 @@ func performServerJoin(
 	caPath := strings.TrimSpace(params.CAPath)
 	agentName := resolveAgentDisplayName(agentCfg, params.AgentName)
 	client := agent.NewServerClientWithName(serverURL, agentID, agentName, "", caPath, params.Insecure)
-	agentToken, tenantID, err := client.RegisterWithToken(reqCtx, joinToken, Version)
-	if err != nil {
-		return nil, newJoinError(http.StatusBadGateway, err)
+	var agentToken, tenantID string
+	var mtlsEnrolled bool
+	// A previous onboarding attempt may have consumed the one-time join token
+	// and persisted a certificate before the activation response was lost.
+	// Retry that activation before attempting another enrollment.
+	if pendingIdentity, pendingErr := agent.LoadPendingClientIdentity(dataDir); pendingErr != nil {
+		return nil, newJoinError(http.StatusInternalServerError, pendingErr)
+	} else if pendingIdentity != nil {
+		if setErr := client.SetClientIdentity(pendingIdentity); setErr != nil {
+			return nil, newJoinError(http.StatusInternalServerError, setErr)
+		}
+		if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
+			client.ClearClientIdentity()
+			return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("pending mTLS activation: %w", activateErr))
+		}
+		if promoteErr := agent.PromotePendingClientIdentity(dataDir); promoteErr != nil {
+			return nil, newJoinError(http.StatusInternalServerError, promoteErr)
+		}
+		if attempt, attemptErr := agent.LoadEnrollmentAttempt(dataDir, agentID); attemptErr != nil {
+			return nil, newJoinError(http.StatusInternalServerError, attemptErr)
+		} else if attempt != nil {
+			if completeErr := agent.CompleteEnrollmentAttempt(dataDir, attempt.EnrollmentAttemptID); completeErr != nil {
+				return nil, newJoinError(http.StatusInternalServerError, completeErr)
+			}
+		}
+		tenantID, mtlsEnrolled = pendingIdentity.TenantID, true
+	}
+	if !mtlsEnrolled {
+		if pending, csrErr := agent.LoadOrCreateEnrollmentAttempt(dataDir, agentID); csrErr == nil {
+			if registration, mtlsErr := client.RegisterWithMTLS(reqCtx, joinToken, string(pending.CSRPEM), Version, pending.EnrollmentAttemptID); mtlsErr == nil {
+				identity, buildErr := agent.BuildClientIdentity(registration.CredentialID, registration.ExpiresAt, registration.ClientCertificate, pending.PrivateKeyPEM)
+				if buildErr != nil {
+					return nil, newJoinError(http.StatusBadGateway, buildErr)
+				}
+				identity.TenantID = registration.TenantID
+				if saveErr := agent.SavePendingClientIdentity(dataDir, identity, registration.ClientCertificate, pending.PrivateKeyPEM); saveErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, saveErr)
+				}
+				if setErr := client.SetClientIdentity(identity); setErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, setErr)
+				}
+				if activateErr := client.ActivateMTLS(reqCtx); activateErr != nil {
+					client.ClearClientIdentity()
+					return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("mTLS activation: %w", activateErr))
+				}
+				if promoteErr := agent.PromotePendingClientIdentity(dataDir); promoteErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, promoteErr)
+				}
+				if completeErr := agent.CompleteEnrollmentAttempt(dataDir, pending.EnrollmentAttemptID); completeErr != nil {
+					return nil, newJoinError(http.StatusInternalServerError, completeErr)
+				}
+				tenantID, mtlsEnrolled = registration.TenantID, true
+			} else if attempt, attemptErr := agent.LoadEnrollmentAttempt(dataDir, agentID); attemptErr != nil {
+				return nil, newJoinError(http.StatusInternalServerError, attemptErr)
+			} else if attempt != nil {
+				return nil, newJoinError(http.StatusBadGateway, fmt.Errorf("mTLS enrollment will be retried with persisted attempt: %w", mtlsErr))
+			}
+		} else {
+			return nil, newJoinError(http.StatusInternalServerError, csrErr)
+		}
+	}
+	if !mtlsEnrolled {
+		agentToken, tenantID, err = client.RegisterWithToken(reqCtx, joinToken, Version)
+		if err != nil {
+			return nil, newJoinError(http.StatusBadGateway, err)
+		}
 	}
 	if agentCfg != nil {
 		agentCfg.Server.Enabled = true
@@ -2401,11 +2473,20 @@ func performServerJoin(
 			}
 		}
 	}
-	if err := SaveServerToken(dataDir, agentToken); err != nil {
-		return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to save server token: %w", err))
-	}
-	if err := SaveServerJoinToken(dataDir, joinToken); err != nil {
-		return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to save join token: %w", err))
+	if mtlsEnrolled {
+		if err := DeleteServerToken(dataDir); err != nil {
+			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to clear legacy server token: %w", err))
+		}
+		if err := SaveServerJoinToken(dataDir, ""); err != nil {
+			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to clear join token: %w", err))
+		}
+	} else {
+		if err := SaveServerToken(dataDir, agentToken); err != nil {
+			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to save server token: %w", err))
+		}
+		if err := SaveServerJoinToken(dataDir, joinToken); err != nil {
+			return nil, newJoinError(http.StatusInternalServerError, fmt.Errorf("failed to save join token: %w", err))
+		}
 	}
 	uploadWorkerMu.RLock()
 	existingWorker := uploadWorker
@@ -2413,6 +2494,18 @@ func performServerJoin(
 	if existingWorker != nil && existingWorker.client != nil {
 		existingWorker.client.SetToken(agentToken)
 		existingWorker.client.BaseURL = serverURL
+		if mtlsEnrolled {
+			if identity, identityErr := agent.LoadClientIdentity(dataDir); identityErr == nil && identity != nil {
+				if setErr := existingWorker.client.SetClientIdentity(identity); setErr == nil {
+					existingWorker.wsClientMu.RLock()
+					wsClient := existingWorker.wsClient
+					existingWorker.wsClientMu.RUnlock()
+					if wsClient != nil {
+						wsClient.SetTLSConfig(existingWorker.client.TLSConfig())
+					}
+				}
+			}
+		}
 		maybeStartAutoUpdateWorker(appCtx, agentCfg, dataDir, isSvc, logger)
 	} else {
 		go func() {

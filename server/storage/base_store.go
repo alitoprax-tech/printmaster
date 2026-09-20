@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -142,21 +143,41 @@ func (s *BaseStore) upsertReturningID(ctx context.Context, query string, args ..
 // Note: On conflict, the 'name' field is only updated if the existing name is empty,
 // to preserve user-set display names.
 func (s *BaseStore) RegisterAgent(ctx context.Context, agent *Agent) error {
-	return s.registerAgent(ctx, agent, s.upsertReturningID)
+	// RegisterAgent is an internal/admin metadata upsert.  Enrollment paths
+	// use the strict credential-match policy below so a join token can never
+	// take over an existing agent identity.  Keeping the two policies separate
+	// preserves the existing metadata refresh behavior without weakening auth.
+	return s.registerAgentWithPolicy(ctx, agent, s.upsertReturningID, false)
 }
 
 func (s *BaseStore) registerAgent(ctx context.Context, agent *Agent, upsert func(context.Context, string, ...interface{}) (int64, error)) error {
+	return s.registerAgentWithPolicy(ctx, agent, upsert, true)
+}
+
+func (s *BaseStore) registerAgentWithPolicy(ctx context.Context, agent *Agent, upsert func(context.Context, string, ...interface{}) (int64, error), strictCredentialMatch bool) error {
 	if agent == nil {
 		return fmt.Errorf("agent required")
 	}
+	legacyTokenHash := strings.TrimSpace(agent.LegacyTokenHash)
+	if legacyTokenHash == "" && strings.TrimSpace(agent.Token) != "" {
+		legacyTokenHash = hashLegacyAgentToken(agent.Token)
+	}
+	conflictWhere := `
+		WHERE COALESCE(agents.tenant_id, '') = COALESCE(excluded.tenant_id, '')
+	`
+	if strictCredentialMatch {
+		conflictWhere = `
+		WHERE excluded.legacy_token_hash <> '' AND agents.legacy_token_hash = excluded.legacy_token_hash AND COALESCE(agents.tenant_id, '') = COALESCE(excluded.tenant_id, '')
+	`
+	}
 	query := `
 		INSERT INTO agents (
-			agent_id, name, hostname, ip, platform, version, protocol_version, token, tenant_id,
+			agent_id, name, hostname, ip, platform, version, protocol_version, token, legacy_token_hash, tenant_id,
 			registered_at, last_seen, status,
 			os_version, go_version, architecture, num_cpu, total_memory_mb,
 			build_type, git_commit, last_heartbeat
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_id) DO UPDATE SET
 			name = CASE WHEN COALESCE(agents.name, '') = '' THEN excluded.name ELSE agents.name END,
 			hostname = excluded.hostname,
@@ -164,7 +185,8 @@ func (s *BaseStore) registerAgent(ctx context.Context, agent *Agent, upsert func
 			platform = excluded.platform,
 			version = excluded.version,
 			protocol_version = excluded.protocol_version,
-			token = excluded.token,
+			token = '',
+			legacy_token_hash = excluded.legacy_token_hash,
 			tenant_id = excluded.tenant_id,
 			last_seen = excluded.last_seen,
 			status = excluded.status,
@@ -176,13 +198,12 @@ func (s *BaseStore) registerAgent(ctx context.Context, agent *Agent, upsert func
 			build_type = excluded.build_type,
 			git_commit = excluded.git_commit,
 			last_heartbeat = excluded.last_heartbeat
-		WHERE agents.token = excluded.token AND COALESCE(agents.tenant_id, '') = COALESCE(excluded.tenant_id, '')
-	`
+	` + conflictWhere
 
 	// Use upsertReturningID which handles both Postgres RETURNING and SQLite LastInsertId
 	id, err := upsert(ctx, query,
 		agent.AgentID, agent.Name, agent.Hostname, agent.IP, agent.Platform,
-		agent.Version, agent.ProtocolVersion, agent.Token, agent.TenantID, agent.RegisteredAt,
+		agent.Version, agent.ProtocolVersion, legacyTokenHash, agent.TenantID, agent.RegisteredAt,
 		agent.LastSeen, agent.Status,
 		agent.OSVersion, agent.GoVersion, agent.Architecture, agent.NumCPU,
 		agent.TotalMemoryMB, agent.BuildType, agent.GitCommit, agent.LastHeartbeat)
@@ -196,6 +217,13 @@ func (s *BaseStore) registerAgent(ctx context.Context, agent *Agent, upsert func
 	}
 
 	return nil
+}
+
+// hashLegacyAgentToken returns a deterministic digest for a high-entropy
+// legacy bearer token. The raw token is deliberately never written to agents.
+func hashLegacyAgentToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // GetAgent retrieves an agent by ID
@@ -272,7 +300,7 @@ func (s *BaseStore) GetAgentByToken(ctx context.Context, token string) (*Agent, 
 		       build_type, git_commit, last_heartbeat, device_count,
 		       last_device_sync, last_metrics_sync
 		FROM agents
-		WHERE token = ?
+		WHERE legacy_token_hash = ?
 	`
 
 	var agent Agent
@@ -282,7 +310,7 @@ func (s *BaseStore) GetAgentByToken(ctx context.Context, token string) (*Agent, 
 	var lastHeartbeat, lastDeviceSync, lastMetricsSync sql.NullTime
 	var tenantID sql.NullString
 
-	err := s.queryRowContext(ctx, query, token).Scan(
+	err := s.queryRowContext(ctx, query, hashLegacyAgentToken(token)).Scan(
 		&agent.ID, &agent.AgentID, &name, &agent.Hostname, &agent.IP,
 		&agent.Platform, &agent.Version, &agent.ProtocolVersion,
 		&agent.Token, &tenantID, &agent.RegisteredAt, &agent.LastSeen, &agent.Status,

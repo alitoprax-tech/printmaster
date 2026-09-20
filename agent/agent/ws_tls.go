@@ -4,6 +4,8 @@ import "crypto/tls"
 
 // SetTLSConfig must be called before Start; the client owns a private clone.
 func (ws *WSClient) SetTLSConfig(config *tls.Config) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
 	if config != nil {
 		clone := config.Clone()
 		// Never inherit a caller's insecure override. Private PKI deployments

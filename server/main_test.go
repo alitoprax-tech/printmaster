@@ -357,8 +357,8 @@ func TestAgentRegistration(t *testing.T) {
 	if agent.AgentID != "test-agent-01" {
 		t.Errorf("Expected AgentID=test-agent-01, got %s", agent.AgentID)
 	}
-	if agent.Token != agentToken {
-		t.Errorf("Token mismatch: response=%s, db=%s", agentToken, agent.Token)
+	if agent.Token != "" {
+		t.Errorf("raw bearer token was returned from storage")
 	}
 	if agent.Status != "active" {
 		t.Errorf("Expected status=active, got %s", agent.Status)

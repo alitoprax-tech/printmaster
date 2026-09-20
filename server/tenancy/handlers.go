@@ -57,6 +57,11 @@ var dbStore storage.Store
 // agents can always onboard via the new flow.
 var tenancyEnabled bool
 
+// agentBearerEnrollmentEnabled is controlled by the server's P0-01 rollout
+// mode. Existing installs keep it enabled; mtls mode rejects new bearer
+// enrollment even though the legacy route remains registered for compatibility.
+var agentBearerEnrollmentEnabled = true
+
 // pkgLogger provides structured logging for the tenancy package.
 var pkgLogger *logger.Logger
 
@@ -93,6 +98,10 @@ func logError(msg string, kv ...interface{}) {
 // runtime (typically at startup based on configuration).
 func SetEnabled(enabled bool) {
 	tenancyEnabled = enabled
+}
+
+func SetAgentBearerEnrollmentEnabled(enabled bool) {
+	agentBearerEnrollmentEnabled = enabled
 }
 
 // IsEnabled returns whether tenancy features are currently enabled.
@@ -1318,6 +1327,10 @@ func handlePendingRegistrationByID(w http.ResponseWriter, r *http.Request) {
 func handleRegisterWithToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !agentBearerEnrollmentEnabled {
+		http.Error(w, "legacy bearer enrollment is disabled; use mTLS enrollment", http.StatusGone)
 		return
 	}
 	if !allowPublicEnrollment(r) {
