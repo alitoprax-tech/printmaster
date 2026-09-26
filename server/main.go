@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"printmaster/common/config"
 	"printmaster/common/logger"
-	"printmaster/common/requestauth"
 	commonutil "printmaster/common/util"
 	sharedweb "printmaster/common/web"
 	wscommon "printmaster/common/ws"
@@ -690,6 +689,9 @@ func runServer(ctx context.Context, configFlag string) {
 
 	// Save loaded config globally for handlers
 	serverConfig = cfg
+	if err := validateTrustDomainConfig(cfg); err != nil {
+		logFatal("Invalid trust-domain configuration", "error", err)
+	}
 	if err := configureAgentAuth(cfg); err != nil {
 		logFatal("Failed to configure Agent authentication", "error", err)
 	}
@@ -1270,7 +1272,7 @@ func startReverseProxyMode(ctx context.Context, tlsConfig *TLSConfig) {
 	}
 
 	// Add reverse proxy middleware
-	handler := loggingMiddleware(reverseProxyMiddleware(http.DefaultServeMux))
+	handler := loggingMiddleware(trustDomainMiddleware(serverConfig, reverseProxyMiddleware(http.DefaultServeMux)))
 
 	// Determine if we're using HTTPS for end-to-end encryption
 	if tlsConfig.ProxyUseHTTPS {
@@ -1434,7 +1436,7 @@ func startStandaloneMode(ctx context.Context, tlsConfig *TLSConfig) {
 
 	// Create HTTPS server with security headers and timeouts to prevent slowloris attacks
 	httpsServer := &http.Server{
-		Handler:           loggingMiddleware(securityHeadersMiddleware(http.DefaultServeMux)),
+		Handler:           loggingMiddleware(trustDomainMiddleware(serverConfig, securityHeadersMiddleware(http.DefaultServeMux))),
 		ReadHeaderTimeout: httpReadHeaderTimeout,
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
@@ -1724,7 +1726,7 @@ func sessionTokenFromRequest(r *http.Request) string {
 			return parts[1]
 		}
 	}
-	if c, err := r.Cookie("pm_session"); err == nil {
+	if c, err := r.Cookie(adminSessionCookieName()); err == nil {
 		return c.Value
 	}
 	return ""
@@ -1749,7 +1751,7 @@ func loadUserForSessionToken(token string) (*storage.User, error) {
 // requireWebAuth validates a session token from cookie or Authorization header
 func requireWebAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requestauth.BrowserRequestAllowed(r) {
+		if !browserRequestAllowed(r) {
 			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 			return
 		}
@@ -1801,9 +1803,9 @@ func redirectToLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
-	secure := requestIsHTTPS(r)
+	secure := secureAdminCookie(r)
 	http.SetCookie(w, &http.Cookie{
-		Name:     "pm_session",
+		Name:     adminSessionCookieName(),
 		Value:    "",
 		Path:     "/",
 		Expires:  time.Unix(0, 0),
@@ -1848,7 +1850,7 @@ func validatePasswordInput(password string) error {
 
 // handleAuthLogin handles local username/password login and returns a session token
 func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
-	if !requestauth.BrowserRequestAllowed(r) {
+	if !browserRequestAllowed(r) {
 		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 		return
 	}
@@ -1945,9 +1947,9 @@ func createSessionCookie(w http.ResponseWriter, r *http.Request, userID int64) (
 	if err != nil {
 		return nil, err
 	}
-	secure := requestIsHTTPS(r)
+	secure := secureAdminCookie(r)
 	cookie := &http.Cookie{
-		Name:     "pm_session",
+		Name:     adminSessionCookieName(),
 		Value:    ses.Token,
 		Path:     "/",
 		HttpOnly: true,
@@ -2183,7 +2185,7 @@ func handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if token == "" {
-		if c, err := r.Cookie("pm_session"); err == nil {
+		if c, err := r.Cookie(adminSessionCookieName()); err == nil {
 			token = c.Value
 		}
 	}
@@ -2209,12 +2211,12 @@ func handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	})
 	// expire cookie
 	cookie := &http.Cookie{
-		Name:     "pm_session",
+		Name:     adminSessionCookieName(),
 		Value:    "",
 		Path:     "/",
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
+		Secure:   secureAdminCookie(r),
 		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, cookie)
@@ -2990,7 +2992,7 @@ func getEmailTheme() string {
 
 // handlePasswordResetRequest accepts {email} and sends a reset token by email (if configured)
 func handlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
-	if !requestauth.BrowserRequestAllowed(r) {
+	if !browserRequestAllowed(r) {
 		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 		return
 	}
@@ -3094,7 +3096,7 @@ func allowPublicTokenFlow(w http.ResponseWriter, r *http.Request, operation stri
 
 // handlePasswordResetConfirm accepts {token, password} to reset the password
 func handlePasswordResetConfirm(w http.ResponseWriter, r *http.Request) {
-	if !requestauth.BrowserRequestAllowed(r) {
+	if !browserRequestAllowed(r) {
 		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 		return
 	}
@@ -3380,7 +3382,7 @@ func handleInviteValidate(w http.ResponseWriter, r *http.Request) {
 // handleInviteAccept accepts an invitation and creates the user account (public endpoint)
 // POST /api/v1/users/invite/accept
 func handleInviteAccept(w http.ResponseWriter, r *http.Request) {
-	if !requestauth.BrowserRequestAllowed(r) {
+	if !browserRequestAllowed(r) {
 		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
 		return
 	}
@@ -3949,9 +3951,10 @@ func setupRoutes(cfg *Config) {
 	}))
 
 	// Proxy endpoints - require login
-	http.HandleFunc("/api/v1/proxy/agent/", requireWebAuth(handleAgentProxy))   // Proxy to agent's own web UI
-	http.HandleFunc("/api/v1/proxy/device/", requireWebAuth(handleDeviceProxy)) // Proxy to device web UI through agent
-	http.HandleFunc("/proxy/", requireWebAuth(handleLegacyDeviceProxy))         // Legacy compatibility for shared UI links
+	http.HandleFunc("/api/v1/proxy-access", requireWebAuth(handleProxyAccess))
+	http.HandleFunc("/api/v1/proxy/agent/", requirePrinterProxyAuth(handleAgentProxy))
+	http.HandleFunc("/api/v1/proxy/device/", requirePrinterProxyAuth(handleDeviceProxy))
+	http.HandleFunc("/proxy/", requirePrinterProxyAuth(handleLegacyDeviceProxy))
 
 	// Public OIDC endpoints
 	http.HandleFunc("/auth/oidc/start/", handleOIDCStart)

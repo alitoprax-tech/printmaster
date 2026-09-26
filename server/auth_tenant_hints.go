@@ -35,11 +35,11 @@ func primaryTenantID(user *storage.User) string {
 }
 
 func setTenantHintCookie(w http.ResponseWriter, r *http.Request, tenantID string) {
-	secure := requestIsHTTPS(r)
+	secure := secureAdminCookie(r)
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		http.SetCookie(w, &http.Cookie{
-			Name:     tenantHintCookieName,
+			Name:     tenantHintCookieNameForRequest(),
 			Value:    "",
 			Path:     "/",
 			MaxAge:   -1,
@@ -51,7 +51,7 @@ func setTenantHintCookie(w http.ResponseWriter, r *http.Request, tenantID string
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     tenantHintCookieName,
+		Name:     tenantHintCookieNameForRequest(),
 		Value:    tenantID,
 		Path:     "/",
 		Expires:  time.Now().Add(tenantHintCookieMaxAge),
