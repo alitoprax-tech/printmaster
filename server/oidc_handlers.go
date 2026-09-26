@@ -390,11 +390,11 @@ func handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 	// this cookie an attacker can complete their own IdP flow and force the
 	// callback URL onto another browser (login CSRF/session swapping).
 	http.SetCookie(w, &http.Cookie{
-		Name:     "printmaster_oidc_state",
+		Name:     oidcStateCookieName(),
 		Value:    state,
 		Path:     "/",
 		MaxAge:   600,
-		Secure:   requestIsHTTPS(r),
+		Secure:   secureAdminCookie(r),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
@@ -418,13 +418,13 @@ func handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
-	stateCookie, cookieErr := r.Cookie("printmaster_oidc_state")
+	stateCookie, cookieErr := r.Cookie(oidcStateCookieName())
 	if cookieErr != nil || stateCookie == nil || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(state)) != 1 {
 		http.Redirect(w, r, "/login?error=oidc_state", http.StatusFound)
 		return
 	}
 	// Consume the browser binding even when a later provider/token check fails.
-	http.SetCookie(w, &http.Cookie{Name: "printmaster_oidc_state", Value: "", Path: "/", MaxAge: -1, Secure: requestIsHTTPS(r), HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: oidcStateCookieName(), Value: "", Path: "/", MaxAge: -1, Secure: secureAdminCookie(r), HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	sess, err := serverStore.GetOIDCSession(ctx, state)
 	if err != nil {
 		serverLogger.Warn("OIDC session lookup failed", "state", state[:min(len(state), 16)]+"...", "error", err)
@@ -575,14 +575,13 @@ func resolveTenantForAuthRequest(ctx context.Context, r *http.Request) *tenantRe
 		value  string
 		source string
 	}{
-		{r.Host, "host"},
-		{firstForwardedHost(r.Header.Get("X-Forwarded-Host")), "forwarded_host"},
+		{canonicalAuthHost(r), "host"},
 	} {
 		if res := resolveTenantByHintValue(ctx, hostCandidate.value, hostCandidate.source); res != nil {
 			return res
 		}
 	}
-	if c, err := r.Cookie(tenantHintCookieName); err == nil {
+	if c, err := r.Cookie(tenantHintCookieNameForRequest()); err == nil {
 		if val := strings.TrimSpace(c.Value); val != "" {
 			res := &tenantResolution{id: val, source: "cookie"}
 			res.ensureName(ctx)
@@ -812,6 +811,9 @@ func buildOAuthConfig(r *http.Request, provider *storage.OIDCProvider, op *oidcl
 }
 
 func buildExternalURL(r *http.Request) string {
+	if trustDomainsEnforced() {
+		return configuredTrustExternalURL(serverConfig, trustDomainAdmin)
+	}
 	if serverConfig != nil {
 		if configured := strings.TrimRight(strings.TrimSpace(serverConfig.Server.ExternalURL), "/"); configured != "" {
 			if parsed, err := url.Parse(configured); err == nil && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && !strings.ContainsAny(configured, "\r\n\\") && strings.EqualFold(parsed.Scheme, "https") {

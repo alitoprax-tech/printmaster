@@ -51,6 +51,18 @@ type ServerConfig struct {
 	// It is disabled by default because active content from a customer network must
 	// never share the management panel's origin or session.
 	BrowserProxyEnabled bool `toml:"browser_proxy_enabled"`
+
+	// Trust-domain origins. When TrustDomainsEnabled is true (or any of these
+	// values is set), the HTTP middleware requires an exact host match before a
+	// route can run. Keep these values as host authorities only; external URLs
+	// are validated separately for redirects and browser-origin checks.
+	TrustDomainsEnabled     bool   `toml:"trust_domains_enabled"`
+	AgentHost               string `toml:"agent_host"`
+	AdminHost               string `toml:"admin_host"`
+	PrinterProxyHost        string `toml:"printer_proxy_host"`
+	AgentExternalURL        string `toml:"agent_external_url"`
+	AdminExternalURL        string `toml:"admin_external_url"`
+	PrinterProxyExternalURL string `toml:"printer_proxy_external_url"`
 }
 
 // ReleasesConfig tunes the GitHub release intake worker.
@@ -268,6 +280,34 @@ func applyEnvOverrides(cfg *Config, tracker *ConfigSourceTracker) {
 	if val := os.Getenv("BROWSER_PROXY_ENABLED"); val != "" {
 		cfg.Server.BrowserProxyEnabled = val == "true" || val == "1"
 		tracker.EnvKeys["server.browser_proxy_enabled"] = true
+	}
+	if val := os.Getenv("TRUST_DOMAINS_ENABLED"); val != "" {
+		cfg.Server.TrustDomainsEnabled = val == "true" || val == "1"
+		tracker.EnvKeys["server.trust_domains_enabled"] = true
+	}
+	if val := os.Getenv("AGENT_HOST"); val != "" {
+		cfg.Server.AgentHost = strings.TrimSpace(val)
+		tracker.EnvKeys["server.agent_host"] = true
+	}
+	if val := os.Getenv("ADMIN_HOST"); val != "" {
+		cfg.Server.AdminHost = strings.TrimSpace(val)
+		tracker.EnvKeys["server.admin_host"] = true
+	}
+	if val := os.Getenv("PRINTER_PROXY_HOST"); val != "" {
+		cfg.Server.PrinterProxyHost = strings.TrimSpace(val)
+		tracker.EnvKeys["server.printer_proxy_host"] = true
+	}
+	if val := os.Getenv("AGENT_EXTERNAL_URL"); val != "" {
+		cfg.Server.AgentExternalURL = strings.TrimRight(strings.TrimSpace(val), "/")
+		tracker.EnvKeys["server.agent_external_url"] = true
+	}
+	if val := os.Getenv("ADMIN_EXTERNAL_URL"); val != "" {
+		cfg.Server.AdminExternalURL = strings.TrimRight(strings.TrimSpace(val), "/")
+		tracker.EnvKeys["server.admin_external_url"] = true
+	}
+	if val := os.Getenv("PRINTER_PROXY_EXTERNAL_URL"); val != "" {
+		cfg.Server.PrinterProxyExternalURL = strings.TrimRight(strings.TrimSpace(val), "/")
+		tracker.EnvKeys["server.printer_proxy_external_url"] = true
 	}
 	if val := os.Getenv("RELEASES_MAX_RELEASES"); val != "" {
 		var v int
