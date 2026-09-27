@@ -219,6 +219,11 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 	}
 
 	logDebug("WebSocket authentication success", "agent_id_guess", agent.AgentID, "hostname", agent.Hostname, "ip", clientIP)
+	if !reserveAgentConnection(agent.AgentID, time.Now()) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "Agent connection quota exceeded", http.StatusTooManyRequests)
+		return
+	}
 
 	// Upgrade HTTP connection to WebSocket (use shared wrapper)
 	conn, err := wscommon.UpgradeHTTP(w, r)
@@ -386,6 +391,10 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 			}
 			break
 		}
+		if !reserveAgentTraffic(agent.AgentID, time.Now(), 0, 0, int64(len(message))) {
+			logWarn("Agent WebSocket traffic quota exceeded", "agent_id", agent.AgentID)
+			break
+		}
 
 		logTrace("WebSocket raw message received", "agent_id", agent.AgentID, "len", len(message))
 
@@ -396,10 +405,30 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 			sendWSError(conn, "Invalid message format")
 			continue
 		}
+		if msg.Data == nil || !agentWSMessageSizeAllowed(msg.Type, len(message)) {
+			logWarn("Agent WebSocket message rejected", "agent_id", agent.AgentID, "type", msg.Type, "bytes", len(message))
+			break
+		}
+		if msg.Type != wscommon.MessageTypeProxyResponse && msg.Type != wscommon.MessageTypeProxyStreamChunk {
+			if err := validateAgentJSONShape(msg.Data, 0); err != nil {
+				logWarn("Agent WebSocket payload rejected", "agent_id", agent.AgentID, "type", msg.Type)
+				break
+			}
+		}
 
 		// Handle different message types
 		switch msg.Type {
 		case wscommon.MessageTypeHeartbeat:
+			if raw, exists := msg.Data["status"]; exists && raw != nil {
+				if _, ok := raw.(string); !ok {
+					logWarn("Agent heartbeat status is not a string", "agent_id", agent.AgentID)
+					continue
+				}
+			}
+			if err := validateAgentHeartbeatMetadata(wsStringField(msg.Data, "status"), wsStringField(msg.Data, "ip"), wsStringField(msg.Data, "hostname"), wsStringField(msg.Data, "version")); err != nil {
+				logWarn("Agent heartbeat metadata rejected", "agent_id", agent.AgentID)
+				continue
+			}
 			handleWSHeartbeat(conn, agent, msg, serverStore)
 		case wscommon.MessageTypeProxyResponse:
 			handleWSProxyResponse(agent.AgentID, conn, msg)
@@ -412,6 +441,14 @@ func handleAgentWebSocket(w http.ResponseWriter, r *http.Request, serverStore st
 		case wscommon.MessageTypeJobProgress:
 			handleWSJobProgress(agent, msg)
 		case wscommon.MessageTypeDeviceDeleted:
+			if err := validateAgentStateMessage(agent.AgentID, msg, time.Now()); err != nil && !legacyAgentStateMessageAllowed(serverConfig, msg, time.Now()) {
+				logWarn("Rejected expired or replayed Agent state change", "agent_id", agent.AgentID)
+				continue
+			}
+			if !reserveAgentTraffic(agent.AgentID, time.Now(), 0, 1, 0) {
+				logWarn("Agent state-change write quota exceeded", "agent_id", agent.AgentID)
+				break
+			}
 			handleWSDeviceDeleted(agent, msg, serverStore)
 		default:
 			logWarn("Unknown WebSocket message type", "agent_id", agent.AgentID, "message_type", msg.Type)

@@ -97,6 +97,9 @@ type SecurityConfig struct {
 	AgentCACertPath          string `toml:"agent_ca_cert_path"`
 	AgentCAKeyPath           string `toml:"agent_ca_key_path"`
 	AgentCertificateTTLHours int    `toml:"agent_certificate_ttl_hours"`
+	// Explicit, time-bounded compatibility for old Agents that send device
+	// deletion notifications without an ID and expiry. Empty is fail closed.
+	AgentProtocolLegacyUntil string `toml:"agent_protocol_legacy_until"`
 }
 
 const maxPasswordLength = 4096
@@ -359,6 +362,10 @@ func applyEnvOverrides(cfg *Config, tracker *ConfigSourceTracker) {
 	if val := os.Getenv("AGENT_AUTH_MODE"); val != "" {
 		cfg.Security.AgentAuthMode = strings.ToLower(strings.TrimSpace(val))
 		tracker.EnvKeys["security.agent_auth_mode"] = true
+	}
+	if val := os.Getenv("AGENT_PROTOCOL_LEGACY_UNTIL"); val != "" {
+		cfg.Security.AgentProtocolLegacyUntil = strings.TrimSpace(val)
+		tracker.EnvKeys["security.agent_protocol_legacy_until"] = true
 	}
 	if val := os.Getenv("AGENT_CA_CERT_PATH"); val != "" {
 		cfg.Security.AgentCACertPath = val

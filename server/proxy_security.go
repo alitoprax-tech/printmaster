@@ -89,6 +89,16 @@ func registerProxyRequest(agentID string, responses chan wscommon.Message) strin
 	id := rand.Text()
 	conn, _ := getAgentWSConnection(agentID)
 	proxyRequestsLock.Lock()
+	count := 0
+	for _, pending := range proxyRequests {
+		if pending.agentID == agentID {
+			count++
+		}
+	}
+	if count >= maxOutstandingAgentProxies {
+		proxyRequestsLock.Unlock()
+		return ""
+	}
 	proxyRequests[id] = pendingProxy{agentID: agentID, connection: conn, responses: responses}
 	proxyRequestsLock.Unlock()
 	return id

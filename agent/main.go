@@ -1329,7 +1329,9 @@ func notifyServerDeviceDeleted(serial string) {
 	msg := wscommon.Message{
 		Type: wscommon.MessageTypeDeviceDeleted,
 		Data: map[string]interface{}{
-			"serial": serial,
+			"serial":     serial,
+			"message_id": rand.Text(),
+			"expires_at": time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano),
 		},
 		Timestamp: time.Now(),
 	}

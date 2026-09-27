@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -834,13 +835,15 @@ func (w *UploadWorker) uploadDevices() error {
 		deviceMaps = append(deviceMaps, deviceMap)
 	}
 
-	// Upload with retry
-	err = w.retryWithBackoff(func() error {
-		return w.client.UploadDevices(ctx, deviceMaps)
-	})
-
+	chunks, err := chunkAgentUploadItems(deviceMaps, 250, 512<<10)
 	if err != nil {
-		return fmt.Errorf("failed to upload devices: %w", err)
+		return fmt.Errorf("device batch validation failed: %w", err)
+	}
+	for _, chunk := range chunks {
+		batch := chunk
+		if err := w.retryWithBackoff(func() error { return w.client.UploadDevices(ctx, batch) }); err != nil {
+			return fmt.Errorf("failed to upload devices: %w", err)
+		}
 	}
 
 	w.mu.Lock()
@@ -899,13 +902,15 @@ func (w *UploadWorker) uploadMetrics() error {
 		return nil
 	}
 
-	// Upload with retry
-	err = w.retryWithBackoff(func() error {
-		return w.client.UploadMetrics(ctx, metricMaps)
-	})
-
+	chunks, err := chunkAgentUploadItems(metricMaps, 500, 512<<10)
 	if err != nil {
-		return fmt.Errorf("failed to upload metrics: %w", err)
+		return fmt.Errorf("metric batch validation failed: %w", err)
+	}
+	for _, chunk := range chunks {
+		batch := chunk
+		if err := w.retryWithBackoff(func() error { return w.client.UploadMetrics(ctx, batch) }); err != nil {
+			return fmt.Errorf("failed to upload metrics: %w", err)
+		}
 	}
 
 	w.mu.Lock()
@@ -914,6 +919,38 @@ func (w *UploadWorker) uploadMetrics() error {
 
 	w.logger.Info("Metrics uploaded successfully", "count", len(metricMaps))
 	return nil
+}
+
+// Leave room for the Agent ID and timestamp in the server's 1 MiB request
+// ceiling. Compute serialized sizes so large vendor fields do not accidentally
+// make an otherwise count-limited batch impossible to upload.
+func chunkAgentUploadItems(items []interface{}, maxCount, maxBytes int) ([][]interface{}, error) {
+	if maxCount <= 0 || maxBytes <= 0 {
+		return nil, fmt.Errorf("invalid upload limits")
+	}
+	var chunks [][]interface{}
+	current := make([]interface{}, 0, maxCount)
+	bytesUsed := 0
+	for _, item := range items {
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		if len(encoded) > maxBytes {
+			return nil, fmt.Errorf("upload item exceeds batch byte limit")
+		}
+		if len(current) >= maxCount || bytesUsed+len(encoded)+1 > maxBytes {
+			chunks = append(chunks, current)
+			current = make([]interface{}, 0, maxCount)
+			bytesUsed = 0
+		}
+		current = append(current, item)
+		bytesUsed += len(encoded) + 1
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks, nil
 }
 
 // retryWithBackoff retries a function with exponential backoff
