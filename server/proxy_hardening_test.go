@@ -96,6 +96,23 @@ func TestProxyResponseHeadersDiscardCookieAndPolicy(t *testing.T) {
 	}
 }
 
+func TestPrinterProxyHeadersAreBounded(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "https://printer-proxy.example.com/api/v1/proxy/device/test/", nil)
+	r.Header.Set("Authorization", "Bearer secret")
+	r.Header.Set("Cookie", "session=secret")
+	r.Header.Set("X-Printer-Long", strings.Repeat("x", 2049))
+	r.Header.Set("Accept", "text/html")
+	h := trustedProxyHeaders(r)
+	if h["Accept"] != "text/html" || h["Authorization"] != "" || h["Cookie"] != "" || h["X-Printer-Long"] != "" {
+		t.Fatalf("unexpected proxy header set: %#v", h)
+	}
+	resp := make(http.Header)
+	copySafeProxyResponseHeaders(resp, map[string]interface{}{"Content-Type": strings.Repeat("x", 4097)})
+	if resp.Get("Content-Type") != "" {
+		t.Fatal("oversized printer header was forwarded")
+	}
+}
+
 func TestReadBoundedProxyBody(t *testing.T) {
 	if _, err := readBoundedProxyBody(bytes.NewReader([]byte("12345")), 4); err == nil {
 		t.Fatal("oversized proxy body was accepted")
