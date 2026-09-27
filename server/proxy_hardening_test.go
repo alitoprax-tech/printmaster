@@ -4,7 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	wscommon "printmaster/common/ws"
 )
 
 func TestBrowserProxyIsDisabledUnlessExplicitlyConfigured(t *testing.T) {
@@ -17,6 +23,39 @@ func TestBrowserProxyIsDisabledUnlessExplicitlyConfigured(t *testing.T) {
 	serverConfig.Server.BrowserProxyEnabled = true
 	if !browserProxyEnabled() {
 		t.Fatal("explicit browser proxy configuration was ignored")
+	}
+}
+
+func TestPrinterProxyUnresponsiveAgentTimesOut(t *testing.T) {
+	const agentID = "printer-proxy-timeout-test"
+	upgraded := make(chan *wscommon.Conn, 1)
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wscommon.UpgradeHTTP(w, r)
+		if err == nil {
+			upgraded <- conn
+		}
+	}))
+	defer wsServer.Close()
+	peer, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	conn := <-upgraded
+	defer conn.Close()
+	wsConnectionsLock.Lock()
+	wsConnections[agentID] = conn
+	wsConnectionsLock.Unlock()
+	defer func() {
+		wsConnectionsLock.Lock()
+		delete(wsConnections, agentID)
+		wsConnectionsLock.Unlock()
+	}()
+	r := httptest.NewRequest(http.MethodGet, "https://printer-proxy.example.com/api/v1/proxy/device/test/", nil)
+	w := httptest.NewRecorder()
+	proxyThroughWebSocketWithTimeout(w, r, agentID, "http://localhost:8080/proxy/test/", 20*time.Millisecond)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("unresponsive Agent status %d, want timeout", w.Code)
 	}
 }
 

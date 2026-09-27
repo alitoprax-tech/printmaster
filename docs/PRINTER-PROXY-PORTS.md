@@ -15,5 +15,7 @@ own Agent host. The three-origin deployment described in
 Proxy tickets and five-minute sessions bind the user, tenant, Agent and
 device (where applicable). The server rechecks that binding against storage
 at redemption and on each request; deleting or moving the resource invalidates
-the session. The full hostile-content/streaming test matrix remains to be
-verified before public deployment.
+the session. Tests cover compressed-response expansion, bounded stream size,
+unresponsive Agent timeout, and sandboxing printer HTML with printer cookies
+discarded. A broader review of vendor login and local Agent UI behavior is
+still required before public deployment.
