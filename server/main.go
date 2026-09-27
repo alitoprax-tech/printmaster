@@ -692,6 +692,9 @@ func runServer(ctx context.Context, configFlag string) {
 	if err := validateTrustDomainConfig(cfg); err != nil {
 		logFatal("Invalid trust-domain configuration", "error", err)
 	}
+	if err := validateAgentProtocolConfig(cfg, time.Now()); err != nil {
+		logFatal("Invalid Agent protocol configuration", "error", err)
+	}
 	if err := configureAgentAuth(cfg); err != nil {
 		logFatal("Failed to configure Agent authentication", "error", err)
 	}
@@ -1601,6 +1604,9 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 				http.Error(w, "invalid client certificate", http.StatusUnauthorized)
 				return
 			}
+			if !admitAgentHTTPRequest(w, r, principal.Agent) {
+				return
+			}
 			ctx := context.WithValue(r.Context(), agentContextKey, principal.Agent)
 			ctx = context.WithValue(ctx, agentCredentialContextKey, principal.Credential)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -1708,6 +1714,9 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		// Store agent info in request context for handlers to use
+		if !admitAgentHTTPRequest(w, r, agent) {
+			return
+		}
 		ctx = context.WithValue(r.Context(), agentContextKey, agent)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
@@ -4406,6 +4415,16 @@ func handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthenticated", http.StatusUnauthorized)
 		return
 	}
+	if !req.Timestamp.IsZero() {
+		if err := validateAgentReportTime(req.Timestamp, time.Now()); err != nil {
+			http.Error(w, "invalid heartbeat timestamp", http.StatusBadRequest)
+			return
+		}
+	}
+	if err := validateAgentHeartbeatMetadata(req.Status, req.IP, req.Version, req.ProtocolVersion, req.Hostname, req.Platform, req.OSVersion, req.GoVersion, req.Architecture, req.BuildType, req.GitCommit, req.SettingsVersion); err != nil {
+		http.Error(w, "invalid heartbeat metadata", http.StatusBadRequest)
+		return
+	}
 
 	// Update agent using shared heartbeat logic
 	ctx := context.Background()
@@ -4751,8 +4770,22 @@ func handleAgentCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Command == "" {
-		http.Error(w, "command required", http.StatusBadRequest)
+	if !allowedAgentCommand(req.Command) {
+		http.Error(w, "unsupported Agent command", http.StatusBadRequest)
+		return
+	}
+	if err := validateAgentJSONShape(req.Data, 0); err != nil {
+		http.Error(w, "invalid Agent command data", http.StatusBadRequest)
+		return
+	}
+	for key := range req.Data {
+		if reservedAgentCommandField(key) {
+			http.Error(w, "reserved Agent command field", http.StatusBadRequest)
+			return
+		}
+	}
+	if len(req.Data) > 16 {
+		http.Error(w, "Agent command data too large", http.StatusBadRequest)
 		return
 	}
 
@@ -4785,11 +4818,15 @@ func handleAgentCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send command via WebSocket
+	issuedAt := time.Now()
 	msg := wscommon.Message{
 		Type:      wscommon.MessageTypeCommand,
-		Timestamp: time.Now(),
+		Timestamp: issuedAt,
 		Data: map[string]interface{}{
-			"command": req.Command,
+			"command":    req.Command,
+			"message_id": rand.Text(),
+			"issued_at":  issuedAt.UTC().Format(time.RFC3339Nano),
+			"expires_at": issuedAt.Add(time.Minute).UTC().Format(time.RFC3339Nano),
 		},
 	}
 	if req.Data != nil {
@@ -4802,6 +4839,10 @@ func handleAgentCommand(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logError("Failed to marshal command message", "error", err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if len(payload) > 32<<10 {
+		http.Error(w, "Agent command exceeds size limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -5500,6 +5541,10 @@ func proxyThroughWebSocketWithTimeout(w http.ResponseWriter, r *http.Request, ag
 
 	// Register the channel for this request
 	requestID := registerProxyRequest(agentID, respChan)
+	if requestID == "" {
+		http.Error(w, "Agent proxy session quota exceeded", http.StatusTooManyRequests)
+		return
+	}
 
 	// Clean up on exit
 	defer func() {
@@ -6295,6 +6340,10 @@ func proxyReportWithServerLogs(w http.ResponseWriter, r *http.Request, agentID s
 
 	// Register the channel for this request
 	requestID := registerProxyRequest(agentID, respChan)
+	if requestID == "" {
+		http.Error(w, "Agent proxy session quota exceeded", http.StatusTooManyRequests)
+		return
+	}
 
 	defer func() {
 		proxyRequestsLock.Lock()
@@ -6480,11 +6529,16 @@ func proxyReportWithTrueStreaming(w http.ResponseWriter, r *http.Request, agentI
 		return
 	}
 
-	// Create response channel with larger buffer for streaming
-	respChan := make(chan wscommon.Message, 100)
+	// Bound queued chunks per proxy request; a compromised Agent must not
+	// accumulate hundreds of unconsumed frames in server memory.
+	respChan := make(chan wscommon.Message, 8)
 
 	// Register the channel for this request
 	requestID := registerProxyRequest(agentID, respChan)
+	if requestID == "" {
+		http.Error(w, "Agent proxy session quota exceeded", http.StatusTooManyRequests)
+		return
+	}
 
 	defer func() {
 		proxyRequestsLock.Lock()
@@ -6835,15 +6889,10 @@ func handleDevicesBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		AgentID   string                   `json:"agent_id"`
-		Timestamp time.Time                `json:"timestamp"`
-		Devices   []map[string]interface{} `json:"devices"`
-	}
-
-	if err := decodeJSONBody(r, &req); err != nil {
+	req, devices, rawDevices, err := decodeAgentDeviceBatch(r)
+	if err != nil {
 		logWarn("Invalid JSON in devices batch", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		http.Error(w, "Invalid device telemetry", http.StatusBadRequest)
 		return
 	}
 
@@ -6852,69 +6901,31 @@ func handleDevicesBatch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if err := validateAgentReportTime(req.Timestamp, time.Now()); err != nil {
+		http.Error(w, "Invalid device telemetry timestamp", http.StatusBadRequest)
+		return
+	}
+	if !reserveAgentWrites(w, agent.AgentID, len(req.Devices)) {
+		return
+	}
 
 	// Store each device
 	ctx := r.Context()
 	stored := 0
-	for _, deviceMap := range req.Devices {
+	for index, item := range devices {
 		// Convert map to Device struct (simplified - in production, use proper unmarshaling)
 		device := &storage.Device{}
 		device.AgentID = agent.AgentID
 		device.LastSeen = req.Timestamp
 		device.FirstSeen = req.Timestamp
-		device.CreatedAt = req.Timestamp
+		device.CreatedAt = time.Now() // trusted server receive time
 
-		// Extract fields from map
-		if v, ok := deviceMap["serial"].(string); ok {
-			device.Serial = v
-		}
-		if v, ok := deviceMap["ip"].(string); ok {
-			device.IP = v
-		}
-		if v, ok := deviceMap["manufacturer"].(string); ok {
-			device.Manufacturer = v
-		}
-		if v, ok := deviceMap["model"].(string); ok {
-			device.Model = v
-		}
-		if v, ok := deviceMap["hostname"].(string); ok {
-			device.Hostname = v
-		}
-		if v, ok := deviceMap["firmware"].(string); ok {
-			device.Firmware = v
-		}
-		if v, ok := deviceMap["mac_address"].(string); ok {
-			device.MACAddress = v
-		}
-		// Device classification fields (USB/spooler support)
-		if v, ok := deviceMap["device_type"].(string); ok {
-			device.DeviceType = v
-		}
-		if v, ok := deviceMap["source_type"].(string); ok {
-			device.SourceType = v
-		}
-		if v, ok := deviceMap["is_usb"].(bool); ok {
-			device.IsUSB = v
-		}
-		if v, ok := deviceMap["port_name"].(string); ok {
-			device.PortName = v
-		}
-		if v, ok := deviceMap["driver_name"].(string); ok {
-			device.DriverName = v
-		}
-		if v, ok := deviceMap["is_default"].(bool); ok {
-			device.IsDefault = v
-		}
-		if v, ok := deviceMap["is_shared"].(bool); ok {
-			device.IsShared = v
-		}
-		if v, ok := deviceMap["spooler_status"].(string); ok {
-			device.SpoolerStatus = v
-		}
-		if v, ok := deviceMap["usb_webui_available"].(bool); ok {
-			device.UsbWebUIAvailable = v
-		}
-		device.RawData = deviceMap
+		device.Serial, device.IP, device.MACAddress = item.Serial, item.IP, item.MAC
+		device.Manufacturer, device.Model, device.Hostname, device.Firmware = item.Manufacturer, item.Model, item.Hostname, item.Firmware
+		device.DeviceType, device.SourceType, device.IsUSB = item.DeviceType, item.SourceType, item.IsUSB
+		device.PortName, device.DriverName, device.IsDefault, device.IsShared = item.PortName, item.DriverName, item.IsDefault, item.IsShared
+		device.SpoolerStatus, device.UsbWebUIAvailable = item.SpoolerStatus, item.USBWebUIAvailable
+		device.RawData = rawDevices[index]
 
 		if device.Serial == "" {
 			logWarn("Device missing serial, skipping", "ip", device.IP)
@@ -8244,15 +8255,10 @@ func handleMetricsBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		AgentID   string                   `json:"agent_id"`
-		Timestamp time.Time                `json:"timestamp"`
-		Metrics   []map[string]interface{} `json:"metrics"`
-	}
-
-	if err := decodeJSONBody(r, &req); err != nil {
+	req, metrics, err := decodeAgentMetricBatch(r)
+	if err != nil {
 		logWarn("Invalid JSON in metrics batch", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		http.Error(w, "Invalid metric telemetry", http.StatusBadRequest)
 		return
 	}
 
@@ -8261,34 +8267,23 @@ func handleMetricsBatch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if err := validateAgentReportTime(req.Timestamp, time.Now()); err != nil {
+		http.Error(w, "Invalid metric telemetry timestamp", http.StatusBadRequest)
+		return
+	}
+	if !reserveAgentWrites(w, agent.AgentID, len(req.Metrics)) {
+		return
+	}
 
 	// Store each metric snapshot
 	ctx := r.Context()
 	stored := 0
-	for _, metricMap := range req.Metrics {
+	for _, item := range metrics {
 		metric := &storage.MetricsSnapshot{}
 		metric.AgentID = agent.AgentID
 		metric.Timestamp = req.Timestamp
-
-		// Extract fields
-		if v, ok := metricMap["serial"].(string); ok {
-			metric.Serial = v
-		}
-		if v, ok := metricMap["page_count"].(float64); ok {
-			metric.PageCount = int(v)
-		}
-		if v, ok := metricMap["color_pages"].(float64); ok {
-			metric.ColorPages = int(v)
-		}
-		if v, ok := metricMap["mono_pages"].(float64); ok {
-			metric.MonoPages = int(v)
-		}
-		if v, ok := metricMap["scan_count"].(float64); ok {
-			metric.ScanCount = int(v)
-		}
-		if v, ok := metricMap["toner_levels"].(map[string]interface{}); ok {
-			metric.TonerLevels = v
-		}
+		metric.Serial, metric.TonerLevels = item.Serial, item.TonerLevels
+		metric.PageCount, metric.ColorPages, metric.MonoPages, metric.ScanCount = int(item.PageCount), int(item.ColorPages), int(item.MonoPages), int(item.ScanCount)
 
 		if metric.Serial == "" {
 			continue

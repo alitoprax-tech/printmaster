@@ -64,6 +64,9 @@ type WSClient struct {
 	localHandler      http.Handler
 	localHandlerMu    sync.RWMutex
 	localHandlerReady chan struct{} // closed when handler is set
+	commandReplayMu   sync.Mutex
+	commandReplay     map[string]time.Time
+	proxyWorkSlots    chan struct{}
 }
 
 // NewWSClient creates a new WebSocket client
@@ -81,6 +84,8 @@ func NewWSClient(serverURL, token string, insecureSkipVerify bool) *WSClient {
 		ctx:               ctx,
 		cancel:            cancel,
 		localHandlerReady: make(chan struct{}),
+		commandReplay:     make(map[string]time.Time),
+		proxyWorkSlots:    make(chan struct{}, 8),
 		// No stdlib logger; use agent package logging helpers instead
 		reconnectDelay:    5 * time.Second,
 		pingInterval:      30 * time.Second,
@@ -432,8 +437,8 @@ func (ws *WSClient) readLoop() {
 			case wscommon.MessageTypeError:
 				WarnCtx("Server error", "data", msg.Data)
 			case wscommon.MessageTypeCommand:
-				// Handle command from server (e.g., check_update, restart)
-				go ws.handleCommand(msg)
+				// Validate/replay-check before any work is scheduled.
+				ws.handleCommand(msg)
 			case wscommon.MessageTypeProxyRequest:
 				// Handle proxy request from server
 				// Log some request details to help trace proxy issues
@@ -448,7 +453,15 @@ func (ws *WSClient) readLoop() {
 						DebugCtx("Incoming proxy_request", "id", requestID, "note", "no url provided")
 					}
 				}
-				go ws.handleProxyRequest(msg)
+				select {
+				case ws.proxyWorkSlots <- struct{}{}:
+					go func() {
+						defer func() { <-ws.proxyWorkSlots }()
+						ws.handleProxyRequest(msg)
+					}()
+				default:
+					WarnCtx("Proxy request concurrency quota exceeded")
+				}
 			default:
 				DebugCtx("Unknown message type", "type", msg.Type)
 			}
@@ -999,9 +1012,9 @@ func SetCommandHandler(handler CommandHandler) {
 
 // handleCommand processes a command message from the server
 func (ws *WSClient) handleCommand(msg wscommon.Message) {
-	command, _ := msg.Data["command"].(string)
-	if command == "" {
-		WarnCtx("Received command message with no command field")
+	command, err := ws.validateServerCommand(msg, time.Now())
+	if err != nil {
+		WarnCtx("Rejected invalid, expired or replayed server command", "error", err)
 		return
 	}
 

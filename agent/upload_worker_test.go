@@ -1,12 +1,32 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	agentpkg "printmaster/agent/agent"
 	pmsettings "printmaster/common/settings"
 )
+
+func TestChunkAgentUploadItemsHonorsCountAndBytes(t *testing.T) {
+	items := make([]interface{}, 501)
+	for i := range items {
+		items[i] = map[string]interface{}{"serial": "device"}
+	}
+	chunks, err := chunkAgentUploadItems(items, 250, 512<<10)
+	if err != nil || len(chunks) != 3 || len(chunks[0]) != 250 || len(chunks[1]) != 250 || len(chunks[2]) != 1 {
+		t.Fatalf("count chunks: %v %v", len(chunks), err)
+	}
+	items = []interface{}{map[string]interface{}{"raw_data": strings.Repeat("x", 400)}, map[string]interface{}{"raw_data": strings.Repeat("x", 400)}}
+	chunks, err = chunkAgentUploadItems(items, 250, 512)
+	if err != nil || len(chunks) != 2 {
+		t.Fatalf("byte chunks: %v %v", len(chunks), err)
+	}
+	if _, err = chunkAgentUploadItems(items, 250, 16); err == nil {
+		t.Fatal("oversize single item accepted")
+	}
+}
 
 type stubLogger struct{}
 
