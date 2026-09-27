@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"net/http"
 	"testing"
 )
@@ -16,6 +17,23 @@ func TestBrowserProxyIsDisabledUnlessExplicitlyConfigured(t *testing.T) {
 	serverConfig.Server.BrowserProxyEnabled = true
 	if !browserProxyEnabled() {
 		t.Fatal("explicit browser proxy configuration was ignored")
+	}
+}
+
+func TestPrinterProxyRejectsGzipExpansionBomb(t *testing.T) {
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	for i := 0; i < (maxProxyDecompressedBodySize/(64<<10))+1; i++ {
+		if _, err := zw.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decompressProxyGzip(compressed.Bytes()); err == nil {
+		t.Fatal("compressed printer response expanded past the limit")
 	}
 }
 
