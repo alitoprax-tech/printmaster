@@ -72,7 +72,7 @@ func copySafeProxyResponseHeaders(dst http.Header, raw interface{}) {
 			continue
 		}
 		value, ok := v.(string)
-		if !ok || strings.ContainsAny(value, "\r\n") {
+		if !ok || len(value) > 4096 || strings.ContainsAny(value, "\r\n") {
 			continue
 		}
 		dst.Set(k, value)
@@ -119,13 +119,15 @@ func takeProxyChannel(agentID string, conn *wscommon.Conn, id string, remove boo
 
 func trustedProxyHeaders(r *http.Request) map[string]string {
 	h := make(map[string]string)
+	total := 0
 	for k, v := range r.Header {
 		key := strings.ToLower(k)
 		if strings.HasPrefix(key, "x-printmaster-") || key == "authorization" || key == "cookie" || key == "proxy-authorization" {
 			continue
 		}
-		if len(v) > 0 {
+		if len(v) > 0 && len(k) <= 128 && len(v[0]) <= 2048 && len(h) < 32 && total+len(k)+len(v[0]) <= 8192 {
 			h[k] = v[0]
+			total += len(k) + len(v[0])
 		}
 	}
 	if p := getPrincipal(r); p != nil && p.User != nil {
