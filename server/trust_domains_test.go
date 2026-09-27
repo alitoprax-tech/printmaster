@@ -178,6 +178,15 @@ func TestPrinterProxyTicketIsOneUseAndResourceScoped(t *testing.T) {
 	}
 	serverStore = store
 	t.Cleanup(func() { serverConfig, serverStore = previousConfig, previousStore; _ = store.Close() })
+	if err := store.CreateTenant(context.Background(), &storage.Tenant{ID: "proxy-tenant", Name: "Proxy Tenant"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterAgent(context.Background(), &storage.Agent{AgentID: "proxy-agent", TenantID: "proxy-tenant", Token: "test-proxy-agent-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDevice(context.Background(), &storage.Device{Serial: "serial1", AgentID: "proxy-agent"}); err != nil {
+		t.Fatal(err)
+	}
 	user := &storage.User{Username: "proxy-test", Role: storage.RoleAdmin}
 	if err := store.CreateUser(context.Background(), user, "testing-password"); err != nil {
 		t.Fatal(err)
@@ -253,5 +262,28 @@ func TestPrinterProxyTicketIsOneUseAndResourceScoped(t *testing.T) {
 	handler.ServeHTTP(w, r)
 	if w.Code != http.StatusSeeOther || !strings.HasPrefix(w.Header().Get("Location"), "https://printer-proxy.example.com/") {
 		t.Fatalf("old admin proxy URL did not redirect safely: status=%d location=%s", w.Code, w.Header().Get("Location"))
+	}
+	if err := store.DeleteDevice(context.Background(), "serial1", false); err != nil {
+		t.Fatal(err)
+	}
+	r = httptest.NewRequest(http.MethodGet, "https://printer-proxy.example.com/api/v1/proxy/device/serial1/", nil)
+	r.AddCookie(cookies[0])
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("deleted device retained proxy session: status=%d", w.Code)
+	}
+}
+
+func TestPrinterProxyBindingRejectsResourceReassignment(t *testing.T) {
+	bound := printerProxyGrant{scope: "device/serial1", tenantID: "tenant-a", agentID: "agent-a", deviceID: "serial1"}
+	for _, other := range []printerProxyGrant{
+		{scope: "device/serial1", tenantID: "tenant-b", agentID: "agent-a", deviceID: "serial1"},
+		{scope: "device/serial1", tenantID: "tenant-a", agentID: "agent-b", deviceID: "serial1"},
+		{scope: "device/serial2", tenantID: "tenant-a", agentID: "agent-a", deviceID: "serial2"},
+	} {
+		if samePrinterProxyBinding(bound, other) {
+			t.Fatalf("proxy session transferred across resource binding: %+v", other)
+		}
 	}
 }

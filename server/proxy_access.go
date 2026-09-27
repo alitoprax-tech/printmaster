@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -16,9 +17,12 @@ const printerProxyCookie = "__Host-pm_proxy"
 const printerProxyTTL = 5 * time.Minute
 
 type printerProxyGrant struct {
-	userID  int64
-	scope   string
-	expires time.Time
+	userID   int64
+	scope    string
+	tenantID string
+	agentID  string
+	deviceID string
+	expires  time.Time
 }
 
 var printerProxyGrants = struct {
@@ -72,7 +76,37 @@ func pruneProxyGrants(now time.Time) {
 	}
 }
 
-func mintPrinterTicket(userID int64, scope string) (string, bool) {
+func printerProxyBinding(ctx context.Context, scope string) (printerProxyGrant, error) {
+	kind, id, ok := strings.Cut(scope, "/")
+	if !ok || serverStore == nil {
+		return printerProxyGrant{}, errors.New("invalid proxy scope")
+	}
+	if kind == "device" {
+		device, err := serverStore.GetDevice(ctx, id)
+		if err != nil || device == nil || device.AgentID == "" {
+			return printerProxyGrant{}, errors.New("proxy device unavailable")
+		}
+		agent, err := serverStore.GetAgent(ctx, device.AgentID)
+		if err != nil || agent == nil || agent.TenantID == "" {
+			return printerProxyGrant{}, errors.New("proxy Agent unavailable")
+		}
+		return printerProxyGrant{scope: scope, tenantID: agent.TenantID, agentID: agent.AgentID, deviceID: id}, nil
+	}
+	if kind == "agent" {
+		agent, err := serverStore.GetAgent(ctx, id)
+		if err != nil || agent == nil || agent.TenantID == "" {
+			return printerProxyGrant{}, errors.New("proxy Agent unavailable")
+		}
+		return printerProxyGrant{scope: scope, tenantID: agent.TenantID, agentID: agent.AgentID}, nil
+	}
+	return printerProxyGrant{}, errors.New("invalid proxy scope")
+}
+
+func mintPrinterTicket(ctx context.Context, userID int64, scope string) (string, bool) {
+	binding, err := printerProxyBinding(ctx, scope)
+	if err != nil {
+		return "", false
+	}
 	token := rand.Text()
 	key := sha256.Sum256([]byte(token))
 	now := time.Now()
@@ -82,7 +116,8 @@ func mintPrinterTicket(userID int64, scope string) (string, bool) {
 	if len(printerProxyGrants.tickets) >= 2048 {
 		return "", false
 	}
-	printerProxyGrants.tickets[key] = printerProxyGrant{userID: userID, scope: scope, expires: now.Add(time.Minute)}
+	binding.userID, binding.expires = userID, now.Add(time.Minute)
+	printerProxyGrants.tickets[key] = binding
 	return token, true
 }
 
@@ -110,7 +145,7 @@ func handleAdminProxyRedirect(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	ticket, ok := mintPrinterTicket(p.User.ID, scope)
+	ticket, ok := mintPrinterTicket(r.Context(), p.User.ID, scope)
 	if !ok {
 		http.Error(w, "proxy busy", http.StatusServiceUnavailable)
 		return
@@ -151,7 +186,7 @@ func handleProxyAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	// Authorization and tenant checks are repeated on every actual proxy
 	// request. Issuance alone does not grant access to a different resource.
-	token, ok := mintPrinterTicket(principal.User.ID, scope)
+	token, ok := mintPrinterTicket(r.Context(), principal.User.ID, scope)
 	if !ok {
 		http.Error(w, "proxy busy", http.StatusServiceUnavailable)
 		return
@@ -185,7 +220,8 @@ func requirePrinterProxyAuth(next http.HandlerFunc) http.HandlerFunc {
 			grant, found := printerProxyGrants.tickets[key]
 			delete(printerProxyGrants.tickets, key)
 			printerProxyGrants.Unlock()
-			if !found || time.Now().After(grant.expires) || grant.scope != scope {
+			binding, bindErr := printerProxyBinding(r.Context(), scope)
+			if !found || time.Now().After(grant.expires) || grant.scope != scope || bindErr != nil || !samePrinterProxyBinding(grant, binding) {
 				http.Error(w, "invalid proxy ticket", http.StatusForbidden)
 				return
 			}
@@ -197,7 +233,8 @@ func requirePrinterProxyAuth(next http.HandlerFunc) http.HandlerFunc {
 				http.Error(w, "proxy busy", http.StatusServiceUnavailable)
 				return
 			}
-			printerProxyGrants.sessions[sha256.Sum256([]byte(session))] = printerProxyGrant{userID: grant.userID, scope: scope, expires: time.Now().Add(printerProxyTTL)}
+			grant.expires = time.Now().Add(printerProxyTTL)
+			printerProxyGrants.sessions[sha256.Sum256([]byte(session))] = grant
 			printerProxyGrants.Unlock()
 			http.SetCookie(w, &http.Cookie{Name: printerProxyCookie, Value: session, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: int(printerProxyTTL.Seconds())})
 			clean := *r.URL
@@ -215,7 +252,8 @@ func requirePrinterProxyAuth(next http.HandlerFunc) http.HandlerFunc {
 		printerProxyGrants.Lock()
 		grant, found := printerProxyGrants.sessions[sha256.Sum256([]byte(cookie.Value))]
 		printerProxyGrants.Unlock()
-		if !found || time.Now().After(grant.expires) || grant.scope != scope {
+		binding, bindErr := printerProxyBinding(r.Context(), scope)
+		if !found || time.Now().After(grant.expires) || grant.scope != scope || bindErr != nil || !samePrinterProxyBinding(grant, binding) {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
 			return
 		}
@@ -227,4 +265,8 @@ func requirePrinterProxyAuth(next http.HandlerFunc) http.HandlerFunc {
 		// Neither admin cookies nor Agent certificates can make a proxy principal.
 		next.ServeHTTP(w, r.WithContext(contextWithPrincipal(r.Context(), user)))
 	}
+}
+
+func samePrinterProxyBinding(a, b printerProxyGrant) bool {
+	return a.scope == b.scope && a.tenantID != "" && a.tenantID == b.tenantID && a.agentID != "" && a.agentID == b.agentID && a.deviceID == b.deviceID
 }

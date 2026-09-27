@@ -215,7 +215,12 @@ func (b *boundedProxyBody) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	if b.remaining <= 0 {
-		return 0, io.EOF
+		var probe [1]byte
+		n, err := b.ReadCloser.Read(probe[:])
+		if n > 0 {
+			return 0, fmt.Errorf("proxy response body exceeds %d bytes", maxAgentProxyResponseBodySize)
+		}
+		return 0, err
 	}
 	if int64(len(p)) > b.remaining {
 		p = p[:b.remaining]
@@ -6255,7 +6260,14 @@ func runInteractive(ctx context.Context, configFlag string) {
 		defer checkCancel()
 
 		d := net.Dialer{}
-		conn, err := d.DialContext(checkCtx, "tcp", host)
+		probePort := parsed.Port()
+		if probePort == "" {
+			probePort = "80"
+			if parsed.Scheme == "https" {
+				probePort = "443"
+			}
+		}
+		conn, err := d.DialContext(checkCtx, "tcp", net.JoinHostPort(parsed.Hostname(), probePort))
 		if err == nil {
 			conn.Close()
 			return targetURL // Primary URL works
@@ -6278,7 +6290,11 @@ func runInteractive(ctx context.Context, configFlag string) {
 			return targetURL
 		}
 
-		altConn, err := d.DialContext(checkCtx, "tcp", altParsed.Host)
+		altPort := "80"
+		if altParsed.Scheme == "https" {
+			altPort = "443"
+		}
+		altConn, err := d.DialContext(checkCtx, "tcp", net.JoinHostPort(altParsed.Hostname(), altPort))
 		if err == nil {
 			altConn.Close()
 			log.Info("Proxy: using fallback protocol", "serial", serial, "original", targetURL, "fallback", altURL)
@@ -6774,10 +6790,15 @@ window.top.location.href = '/proxy/%s/';
 				DisableCompression:    false,
 				DisableKeepAlives:     false,
 				ResponseHeaderTimeout: 30 * time.Second,
-				DialContext: (&net.Dialer{
-					Timeout:   15 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
+				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+					if network != "tcp" && network != "tcp4" && network != "tcp6" {
+						return nil, fmt.Errorf("printer transport requires TCP")
+					}
+					if err := validatePrinterProxyDial(address, target); err != nil {
+						return nil, err
+					}
+					return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, address)
+				},
 			}
 		}
 
@@ -6825,7 +6846,11 @@ window.top.location.href = '/proxy/%s/';
 
 			// Rewrite Location header for redirects to stay within proxy path
 			if loc := resp.Header.Get("Location"); loc != "" {
-				if locURL, err := url.Parse(loc); err == nil {
+				locURL, err := url.Parse(loc)
+				if usbTransport == nil {
+					locURL, err = validatePrinterProxyRedirect(target, loc, device.IP)
+				}
+				if err == nil {
 					// Rewrite relative or same-host absolute URLs
 					if locURL.Host == "" || locURL.Host == target.Host {
 						newPath := locURL.Path
@@ -6841,6 +6866,8 @@ window.top.location.href = '/proxy/%s/';
 						}
 						resp.Header.Set("Location", newLoc)
 					}
+				} else {
+					return err
 				}
 			}
 
